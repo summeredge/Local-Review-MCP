@@ -133,12 +133,12 @@ describe("list_files", () => {
     expect(file.error).toBe("PATH_NOT_DIRECTORY");
   });
 
-  it("does not expose a symlink that resolves outside the workspace", async ({ skip }) => {
+  it("does not expose an ordinary symlink that resolves outside the workspace", async ({ skip }) => {
     const workspace = await makeWorkspace();
     const outside = await makeWorkspace();
     await writeFile(join(outside, "outside-secret.txt"), "secret");
     try {
-      await symlink(outside, join(workspace, "outside-link"), "junction");
+      await symlink(outside, join(workspace, "outside-link"), "dir");
     } catch (error: unknown) {
       if (process.platform === "win32") {
         skip("symlink creation is unavailable");
@@ -150,5 +150,20 @@ describe("list_files", () => {
     const result = resultJson(await callListFiles(workspace, { depth: 3 }));
     expect(JSON.stringify(result)).not.toContain("outside-link");
     expect(JSON.stringify(result)).not.toContain("outside-secret");
+  });
+
+  const windowsIt = process.platform === "win32" ? it : it.skip;
+  windowsIt("does not expose a Windows Junction that resolves outside the workspace", async () => {
+    const workspace = await makeWorkspace();
+    const outside = await makeWorkspace();
+    await writeFile(join(outside, "secret.txt"), "junction-secret-content");
+    await symlink(outside, join(workspace, "outside-junction"), "junction");
+
+    const result = resultJson(await callListFiles(workspace, { depth: 2 }));
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("outside-junction");
+    expect(serialized).not.toContain("secret.txt");
+    expect(serialized).not.toContain("junction-secret-content");
+    expect(serialized).not.toContain(outside);
   });
 });

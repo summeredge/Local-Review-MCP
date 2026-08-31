@@ -105,13 +105,11 @@ describe("read_file", () => {
     }
   });
 
-  it("rejects binary, sensitive, and escaping paths with stable errors", async ({ skip }) => {
+  it("rejects binary and sensitive paths with stable errors", async () => {
     const workspace = await makeWorkspace();
-    const outside = await makeWorkspace();
     await mkdir(join(workspace, ".git"));
     await writeFile(join(workspace, ".env"), "secret");
     await writeFile(join(workspace, "binary.bin"), Buffer.from([0x61, 0x00, 0x62]));
-    await writeFile(join(outside, "secret.txt"), "outside");
 
     const binary = resultJson(await callReadFile(workspace, { path: "binary.bin" }));
     expect(binary.error).toBe("BINARY_FILE");
@@ -119,6 +117,13 @@ describe("read_file", () => {
     for (const path of [".env", ".git/config", "private.key", ".aws/credentials", ".localreviewignore"]) {
       expect(resultJson(await callReadFile(workspace, { path }))).toMatchObject({ error: "SENSITIVE_PATH" });
     }
+  });
+
+  it("rejects ordinary symlink escapes while allowing Windows privilege skips", async ({ skip }) => {
+    const workspace = await makeWorkspace();
+    const outside = await makeWorkspace();
+    await writeFile(join(workspace, ".env"), "secret");
+    await writeFile(join(outside, "secret.txt"), "outside");
 
     try {
       await symlink(join(workspace, ".env"), join(workspace, "safe-name"), "file");
@@ -134,6 +139,24 @@ describe("read_file", () => {
     expect(resultJson(await callReadFile(workspace, { path: "outside-link" }))).toMatchObject({
       error: "PATH_OUTSIDE_WORKSPACE",
     });
+  });
+
+  const windowsIt = process.platform === "win32" ? it : it.skip;
+  windowsIt("rejects a Windows Junction escape", async () => {
+    const workspace = await makeWorkspace();
+    const outside = await makeWorkspace();
+    await writeFile(join(outside, "secret.txt"), "junction-secret-content");
+    await symlink(outside, join(workspace, "outside-junction"), "junction");
+
+    const result = await callReadFile(workspace, { path: "outside-junction/secret.txt" });
+    expect(result.isError).toBe(true);
+    const parsed = resultJson(result);
+    expect(parsed.error).toBe("PATH_OUTSIDE_WORKSPACE");
+
+    const serialized = JSON.stringify(parsed);
+    expect(serialized).not.toContain("secret.txt");
+    expect(serialized).not.toContain("junction-secret-content");
+    expect(serialized).not.toContain(outside);
   });
 
   it("returns a controlled error for directories", async () => {
