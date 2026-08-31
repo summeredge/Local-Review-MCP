@@ -50,6 +50,7 @@ describe("WorkspaceManager", () => {
     const file = join(root, "file.txt");
     await writeFile(file, "content");
 
+    expect(errorCode(() => new WorkspaceManager(""))).toBe("WORKSPACE_INVALID");
     expect(errorCode(() => new WorkspaceManager(join(root, "missing")))).toBe("WORKSPACE_INVALID");
     expect(errorCode(() => new WorkspaceManager(file))).toBe("WORKSPACE_INVALID");
   });

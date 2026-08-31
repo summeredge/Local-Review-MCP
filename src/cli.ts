@@ -1,10 +1,11 @@
 import { loadSettings } from "./config/settings.js";
-import { startApp, startupMessage } from "./app.js";
+import { createAppContext, startApp, startupMessage } from "./app.js";
 
 try {
   const settings = await loadSettings();
-  const server = await startApp(settings);
-  console.log(startupMessage(settings));
+  const context = createAppContext(settings);
+  const server = await startApp(settings, context);
+  console.log(startupMessage(settings, context));
   const close = (): void => { void server.close(); };
   process.once("SIGINT", close);
   process.once("SIGTERM", close);

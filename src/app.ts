@@ -1,11 +1,24 @@
 import type { Server } from "node:http";
+import { basename } from "node:path";
 import { endpoint, type ResolvedSettings } from "./config/settings.js";
 import { isPortInUse, startHttpServer } from "./mcp/http.js";
-import { V01_TOOL_NAMES } from "./mcp/server.js";
+import { V01_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
+import { WorkspaceManager } from "./workspace/manager.js";
 
-export async function startApp(settings: ResolvedSettings): Promise<Server> {
+export interface AppContext extends McpRuntimeContext {
+  readonly settings: ResolvedSettings;
+}
+
+export function createAppContext(settings: ResolvedSettings): AppContext {
+  return { settings, workspace: new WorkspaceManager(settings.workspace) };
+}
+
+export async function startApp(
+  settings: ResolvedSettings,
+  context: AppContext = createAppContext(settings),
+): Promise<Server> {
   try {
-    return await startHttpServer(settings);
+    return await startHttpServer(settings, context);
   } catch (error: unknown) {
     if (isPortInUse(error)) {
       throw new Error(
@@ -18,10 +31,11 @@ export async function startApp(settings: ResolvedSettings): Promise<Server> {
   }
 }
 
-export function startupMessage(settings: ResolvedSettings): string {
+export function startupMessage(settings: ResolvedSettings, context?: McpRuntimeContext): string {
   return [
     "Local Review MCP started",
     `Endpoint: ${endpoint(settings)}`,
+    `Workspace: ${context === undefined ? basename(settings.workspace) : basename(context.workspace.canonicalRoot)}`,
     `Tools: ${V01_TOOL_NAMES.length}`,
   ].join("\n");
 }

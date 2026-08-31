@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstatSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { AccessPolicy } from "./policy.js";
 import {
@@ -87,7 +87,7 @@ function canonicalizeCandidate(candidate: string, relativePath: string): string 
 }
 
 function canonicalizeWorkspaceRoot(input: string): string {
-  if (typeof input !== "string") throw workspaceInvalid();
+  if (typeof input !== "string" || input.trim() === "") throw workspaceInvalid();
 
   let absoluteRoot: string;
   try {
@@ -148,6 +148,28 @@ export class WorkspaceManager {
       throw pathError("PATH_NOT_FOUND", resolvedPath.relativePath);
     }
     return resolvedPath;
+  }
+
+  public resolveExistingDirectory(remotePath: string): ResolvedWorkspacePath {
+    const resolvedPath = this.resolveExisting(remotePath);
+    try {
+      if (!statSync(resolvedPath.absolutePath).isDirectory()) {
+        throw pathError("PATH_NOT_DIRECTORY", resolvedPath.relativePath);
+      }
+    } catch (error: unknown) {
+      if (error instanceof WorkspacePathError) throw error;
+      throw pathError("PATH_NOT_FOUND", resolvedPath.relativePath);
+    }
+    return resolvedPath;
+  }
+
+  public readDirectory(remotePath: string): string[] {
+    const resolvedPath = this.resolveExistingDirectory(remotePath);
+    try {
+      return readdirSync(resolvedPath.absolutePath);
+    } catch {
+      throw pathError("PATH_NOT_FOUND", resolvedPath.relativePath);
+    }
   }
 }
 

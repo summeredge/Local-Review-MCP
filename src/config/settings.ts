@@ -7,15 +7,18 @@ export const MCP_PATH = "/mcp" as const;
 export interface ResolvedSettings {
   host: typeof DEFAULT_HOST;
   port: number;
+  workspace: string;
 }
 
 export interface CliOptions {
   port?: string;
   configPath?: string;
+  workspace?: string;
 }
 
 interface ConfigFile {
   port?: unknown;
+  workspace?: unknown;
 }
 
 export function parsePort(value: unknown): number {
@@ -32,17 +35,29 @@ export function parsePort(value: unknown): number {
   return port;
 }
 
+export function parseWorkspace(value: unknown): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error("workspace is required");
+  }
+  return value;
+}
+
 export function resolveSettings(options: {
   cliPort?: unknown;
   configPort?: unknown;
+  cliWorkspace?: unknown;
+  configWorkspace?: unknown;
 } = {}): ResolvedSettings {
   const port = options.cliPort !== undefined
     ? options.cliPort
     : options.configPort !== undefined
       ? options.configPort
       : DEFAULT_PORT;
+  const workspace = options.cliWorkspace !== undefined
+    ? options.cliWorkspace
+    : options.configWorkspace;
 
-  return { host: DEFAULT_HOST, port: parsePort(port) };
+  return { host: DEFAULT_HOST, port: parsePort(port), workspace: parseWorkspace(workspace) };
 }
 
 export function parseCliArgs(argv: readonly string[]): CliOptions {
@@ -50,13 +65,14 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
 
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
-    if (argument === "--port" || argument === "--config") {
+    if (argument === "--port" || argument === "--config" || argument === "--workspace") {
       const value = argv[index + 1];
       if (value === undefined || value.startsWith("--")) {
         throw new Error(`${argument} requires a value`);
       }
       if (argument === "--port") options.port = value;
-      else options.configPath = value;
+      else if (argument === "--config") options.configPath = value;
+      else options.workspace = value;
       index += 1;
     } else {
       throw new Error(`unknown argument: ${argument}`);
@@ -79,7 +95,12 @@ export async function loadSettings(argv: readonly string[] = process.argv.slice(
   Promise<ResolvedSettings> {
   const cli = parseCliArgs(argv);
   const config = cli.configPath === undefined ? {} : await readConfigFile(cli.configPath);
-  return resolveSettings({ cliPort: cli.port, configPort: config.port });
+  return resolveSettings({
+    cliPort: cli.port,
+    configPort: config.port,
+    cliWorkspace: cli.workspace,
+    configWorkspace: config.workspace,
+  });
 }
 
 export function endpoint(settings: ResolvedSettings): string {

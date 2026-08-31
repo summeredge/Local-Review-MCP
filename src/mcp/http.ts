@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { type ResolvedSettings, MCP_PATH } from "../config/settings.js";
-import { createMcpServer } from "./server.js";
+import { createMcpServer, type McpRuntimeContext } from "./server.js";
 
 async function parseBody(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -15,7 +15,11 @@ function sendJson(response: ServerResponse, statusCode: number, body: unknown): 
   response.end(JSON.stringify(body));
 }
 
-async function handleMcpRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+async function handleMcpRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: McpRuntimeContext,
+): Promise<void> {
   if (request.method !== "POST") {
     sendJson(response, 405, { error: "method_not_allowed" });
     return;
@@ -33,21 +37,21 @@ async function handleMcpRequest(request: IncomingMessage, response: ServerRespon
     return;
   }
 
-  const server = createMcpServer();
+  const server = createMcpServer(context);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   response.on("close", () => void transport.close());
   await server.connect(transport);
   await transport.handleRequest(request, response, body);
 }
 
-export function createHttpServer(_settings: ResolvedSettings): Server {
+export function createHttpServer(_settings: ResolvedSettings, context: McpRuntimeContext): Server {
   return createServer((request, response) => {
     if (request.url !== MCP_PATH) {
       sendJson(response, 404, { error: "not_found" });
       return;
     }
 
-    void handleMcpRequest(request, response).catch((error: unknown) => {
+    void handleMcpRequest(request, response, context).catch((error: unknown) => {
       if (response.headersSent) {
         response.destroy(error instanceof Error ? error : undefined);
         return;
@@ -74,9 +78,12 @@ export async function checkPort(settings: ResolvedSettings): Promise<void> {
   });
 }
 
-export async function startHttpServer(settings: ResolvedSettings): Promise<Server> {
+export async function startHttpServer(
+  settings: ResolvedSettings,
+  context: McpRuntimeContext,
+): Promise<Server> {
   await checkPort(settings);
-  const server = createHttpServer(settings);
+  const server = createHttpServer(settings, context);
   await new Promise<void>((resolve, reject) => {
     const onError = (error: NodeJS.ErrnoException): void => {
       server.removeListener("listening", onListening);

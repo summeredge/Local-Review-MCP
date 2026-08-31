@@ -21,7 +21,11 @@ async function getFreePort(): Promise<number> {
 
 describe("port checks", () => {
   it("reports an available port by completing successfully", async () => {
-    await expect(checkPort({ host: "127.0.0.1", port: await getFreePort() })).resolves.toBeUndefined();
+    await expect(checkPort({
+      host: "127.0.0.1",
+      port: await getFreePort(),
+      workspace: process.cwd(),
+    })).resolves.toBeUndefined();
   });
 
   it("rejects an occupied port without choosing another one", async () => {
@@ -31,7 +35,11 @@ describe("port checks", () => {
     const address = socket.address();
     if (address === null || typeof address === "string") throw new Error("test socket has no port");
 
-    await expect(checkPort({ host: "127.0.0.1", port: address.port })).rejects.toMatchObject({ code: "EADDRINUSE" });
+    await expect(checkPort({
+      host: "127.0.0.1",
+      port: address.port,
+      workspace: process.cwd(),
+    })).rejects.toMatchObject({ code: "EADDRINUSE" });
   });
 
   it("fails runtime startup with the occupied address and port", async () => {
@@ -41,7 +49,11 @@ describe("port checks", () => {
     const address = socket.address();
     if (address === null || typeof address === "string") throw new Error("test socket has no port");
 
-    await expect(startApp({ host: "127.0.0.1", port: address.port })).rejects.toThrow(
+    await expect(startApp({
+      host: "127.0.0.1",
+      port: address.port,
+      workspace: process.cwd(),
+    })).rejects.toThrow(
       `127.0.0.1:${address.port} is already in use`,
     );
   });
