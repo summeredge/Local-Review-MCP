@@ -2,7 +2,7 @@
 
 ## Current version
 
-V0.1 / Task 3
+V0.1 / Task 4
 
 ## Current capabilities
 
@@ -13,6 +13,7 @@ V0.1 / Task 3
 - startup port conflict detection
 - one explicitly configured active workspace
 - bounded workspace metadata, directory listing, and text-file reading
+- bounded literal or regular-expression search with ripgrep and Node fallback
 
 ## Default endpoint
 
@@ -37,6 +38,11 @@ provided with `--config <path>`; CLI options take precedence over the file:
 
 The workspace is required; the runtime does not guess a default directory.
 
-The current tools are `workspace_info`, `list_files`, and `read_file`. The
-`search_text`, `git_status`, and `git_diff` tools remain controlled
+The current tools are `workspace_info`, `list_files`, `read_file`, and
+`search_text`. `git_status` and `git_diff` remain controlled
 `not_implemented` placeholders.
+
+`search_text` accepts `query`, optional workspace-relative `path` and `glob`,
+`regex`, `case_sensitive`, and `limit`. Searches are restricted to allowed
+text files up to 2 MiB, with at most 200 returned results and 500 preview
+characters per result.

@@ -36,7 +36,7 @@ function toolText(result: unknown): string {
 }
 
 describe("MCP HTTP runtime", () => {
-  it("initializes, lists tools, and serves all Task 3 workspace tools", async () => {
+  it("initializes, lists tools, and serves all workspace tools", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-http-"));
     temporaryDirectories.push(workspace);
     await mkdir(join(workspace, "src"));
@@ -77,7 +77,15 @@ describe("MCP HTTP runtime", () => {
       content: "export const app = true;",
     });
 
-    for (const name of ["search_text", "git_status", "git_diff"]) {
+    const searchCall = await client.callTool({ name: "search_text", arguments: { query: "app" } });
+    expect(searchCall.isError).not.toBe(true);
+    expect(JSON.parse(toolText(searchCall))).toMatchObject({
+      query: "app",
+      returned: 1,
+      results: [{ path: "src/app.ts", line: 1 }],
+    });
+
+    for (const name of ["git_status", "git_diff"]) {
       const placeholder = await client.callTool({ name, arguments: {} });
       expect(placeholder.isError).not.toBe(true);
       expect(JSON.parse(toolText(placeholder))).toEqual({

@@ -1,10 +1,12 @@
 import { createReadStream } from "node:fs";
-import { open, readdir, stat } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { basename } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { WorkspaceManager, WorkspacePathError } from "../workspace/manager.js";
+import { searchText } from "../workspace/search.js";
+import { containsNullByte } from "../workspace/text.js";
 
 export interface McpRuntimeContext {
   readonly workspace: WorkspaceManager;
@@ -27,7 +29,6 @@ const READ_ONLY_ANNOTATIONS = {
 } as const;
 
 const MAX_VISITED_ENTRIES = 10_000;
-const BINARY_CHECK_BYTES = 16 * 1024;
 const ROOT_ALIAS = "workspace:/";
 
 const listFilesInputSchema = {
@@ -42,6 +43,18 @@ const readFileInputSchema = {
   start_line: z.number().finite().int().min(1).optional().default(1),
   max_lines: z.number().finite().int().min(1).max(2000).optional().default(400),
   max_bytes: z.number().finite().int().min(1).max(1024 * 1024).optional().default(256 * 1024),
+};
+
+const searchTextInputSchema = {
+  query: z.string()
+    .max(1000)
+    .refine((value) => value.trim() !== "", "query must not be empty")
+    .refine((value) => !value.includes("\0"), "query contains an invalid character"),
+  path: z.string().optional().default("."),
+  glob: z.string().min(1).max(1000).optional(),
+  regex: z.boolean().optional().default(false),
+  case_sensitive: z.boolean().optional().default(false),
+  limit: z.number().finite().int().min(1).max(200).optional().default(100),
 };
 
 interface ListedEntry {
@@ -142,20 +155,6 @@ async function listFiles(
     returned: selected.length,
     has_more: truncated || input.offset + selected.length < entries.length,
   };
-}
-
-async function containsNullByte(path: string, relativePath: string): Promise<boolean> {
-  let handle;
-  try {
-    handle = await open(path, "r");
-    const buffer = Buffer.alloc(BINARY_CHECK_BYTES);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    return buffer.subarray(0, bytesRead).includes(0);
-  } catch {
-    throw new WorkspacePathError("PATH_NOT_FOUND", "Workspace file could not be read.", relativePath);
-  } finally {
-    await handle?.close().catch(() => undefined);
-  }
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
@@ -297,7 +296,7 @@ async function workspaceInfo(workspace: WorkspaceManager) {
   };
 }
 
-function registerPlaceholder(server: McpServer, name: Exclude<V01ToolName, "workspace_info" | "list_files" | "read_file">): void {
+function registerPlaceholder(server: McpServer, name: Exclude<V01ToolName, "workspace_info" | "list_files" | "read_file" | "search_text">): void {
   server.registerTool(
     name,
     {
@@ -360,7 +359,30 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
   );
 
-  for (const name of ["search_text", "git_status", "git_diff"] as const) {
+  server.registerTool(
+    "search_text",
+    {
+      description: "Search non-sensitive text files within the authorized workspace using bounded literal or regular-expression matching.",
+      inputSchema: searchTextInputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        return jsonResult(await searchText(context.workspace, {
+          query: input.query,
+          path: input.path,
+          glob: input.glob,
+          regex: input.regex,
+          caseSensitive: input.case_sensitive,
+          limit: input.limit,
+        }));
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  for (const name of ["git_status", "git_diff"] as const) {
     registerPlaceholder(server, name);
   }
 

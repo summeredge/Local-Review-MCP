@@ -8,6 +8,8 @@ export const WORKSPACE_ERROR_CODES = [
   "WORKSPACE_INVALID",
   "PATH_NOT_DIRECTORY",
   "BINARY_FILE",
+  "INVALID_REGEX",
+  "SEARCH_FAILED",
 ] as const;
 
 export type WorkspaceErrorCode = typeof WORKSPACE_ERROR_CODES[number];
