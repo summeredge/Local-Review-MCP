@@ -2,7 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { startApp } from "../src/app.js";
-import { V01_TOOL_NAMES } from "../src/mcp/server.js";
+import { EXPECTED_V01_TOOL_NAMES } from "./fixtures/v01-tools.js";
 
 const runningServers: import("node:http").Server[] = [];
 
@@ -31,7 +31,8 @@ describe("MCP HTTP runtime", () => {
 
     await client.connect(transport);
     const result = await client.listTools();
-    expect(result.tools.map((tool) => tool.name).sort()).toEqual([...V01_TOOL_NAMES].sort());
+    expect(result.tools).toHaveLength(6);
+    expect(result.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_V01_TOOL_NAMES].sort());
 
     const call = await client.callTool({ name: "workspace_info", arguments: {} });
     expect(call.isError).not.toBe(true);

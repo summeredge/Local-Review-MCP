@@ -1,7 +1,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
-import { createMcpServer, V01_TOOL_NAMES } from "../src/mcp/server.js";
+import { createMcpServer } from "../src/mcp/server.js";
+import { EXPECTED_V01_TOOL_NAMES } from "./fixtures/v01-tools.js";
 
 const clients: Client[] = [];
 
@@ -20,7 +21,7 @@ describe("MCP tool registry", () => {
     const result = await client.listTools();
     const names = result.tools.map((tool) => tool.name).sort();
 
-    expect(names).toEqual([...V01_TOOL_NAMES].sort());
     expect(names).toHaveLength(6);
+    expect(names).toEqual([...EXPECTED_V01_TOOL_NAMES].sort());
   });
 });
