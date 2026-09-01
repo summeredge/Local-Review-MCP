@@ -49,6 +49,7 @@ describe("MCP HTTP runtime", () => {
       workspace,
       auth: { token: "test-token" },
       remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
     };
     const server = await startApp(settings);
     runningServers.push(server);

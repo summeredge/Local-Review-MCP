@@ -43,6 +43,7 @@ describe("health endpoint", () => {
       workspace,
       auth: { token: TOKEN },
       remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
     });
     runningServers.push(server);
     const address = server.address();

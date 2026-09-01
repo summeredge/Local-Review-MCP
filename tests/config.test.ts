@@ -2,7 +2,16 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_HOST, DEFAULT_PORT, endpoint, loadSettings, parseCliArgs, resolveSettings } from "../src/config/settings.js";
+import {
+  DEFAULT_HEALTH_INTERVAL_SECONDS,
+  DEFAULT_HOST,
+  DEFAULT_MAX_RESTART_ATTEMPTS,
+  DEFAULT_PORT,
+  endpoint,
+  loadSettings,
+  parseCliArgs,
+  resolveSettings,
+} from "../src/config/settings.js";
 
 describe("settings", () => {
   it("requires an explicit workspace", () => {
@@ -16,6 +25,11 @@ describe("settings", () => {
       workspace: "workspace",
       auth: { token: "config-token" },
       remote: { enabled: false, endpoint: "" },
+      supervisor: {
+        enabled: false,
+        healthIntervalSeconds: DEFAULT_HEALTH_INTERVAL_SECONDS,
+        maxRestartAttempts: DEFAULT_MAX_RESTART_ATTEMPTS,
+      },
     });
   });
 
@@ -30,6 +44,11 @@ describe("settings", () => {
       workspace: "workspace",
       auth: { token: "cli-token" },
       remote: { enabled: false, endpoint: "" },
+      supervisor: {
+        enabled: false,
+        healthIntervalSeconds: DEFAULT_HEALTH_INTERVAL_SECONDS,
+        maxRestartAttempts: DEFAULT_MAX_RESTART_ATTEMPTS,
+      },
     });
     expect(endpoint(resolveSettings({
       cliPort: "12081",
@@ -59,6 +78,11 @@ describe("settings", () => {
         workspace: "config-workspace",
         auth: { token: "config-token" },
         remote: { enabled: false, endpoint: "" },
+        supervisor: {
+          enabled: false,
+          healthIntervalSeconds: DEFAULT_HEALTH_INTERVAL_SECONDS,
+          maxRestartAttempts: DEFAULT_MAX_RESTART_ATTEMPTS,
+        },
       });
       await expect(loadSettings(["--config", configPath], {
         LOCAL_REVIEW_MCP_TOKEN: "env-token",
@@ -74,6 +98,11 @@ describe("settings", () => {
         workspace: "cli-workspace",
         auth: { token: "cli-token" },
         remote: { enabled: false, endpoint: "" },
+        supervisor: {
+          enabled: false,
+          healthIntervalSeconds: DEFAULT_HEALTH_INTERVAL_SECONDS,
+          maxRestartAttempts: DEFAULT_MAX_RESTART_ATTEMPTS,
+        },
       });
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -122,6 +151,42 @@ describe("settings", () => {
       provider: "cloudflare",
       endpoint: "https://review.example/mcp",
     });
+  });
+
+  it("defaults the supervisor off and accepts bounded recovery settings", () => {
+    expect(resolveSettings({ configWorkspace: "workspace", configToken: "token" }))
+      .toMatchObject({
+        supervisor: {
+          enabled: false,
+          healthIntervalSeconds: DEFAULT_HEALTH_INTERVAL_SECONDS,
+          maxRestartAttempts: DEFAULT_MAX_RESTART_ATTEMPTS,
+        },
+      });
+    expect(resolveSettings({
+      configWorkspace: "workspace",
+      configToken: "token",
+      configSupervisor: {
+        enabled: true,
+        healthIntervalSeconds: 10,
+        maxRestartAttempts: 2,
+      },
+    })).toMatchObject({
+      supervisor: {
+        enabled: true,
+        healthIntervalSeconds: 10,
+        maxRestartAttempts: 2,
+      },
+    });
+  });
+
+  it("rejects invalid supervisor settings", () => {
+    const common = { configWorkspace: "workspace", configToken: "token" };
+    expect(() => resolveSettings({ ...common, configSupervisor: { enabled: "yes" } }))
+      .toThrow("supervisor.enabled");
+    expect(() => resolveSettings({ ...common, configSupervisor: { healthIntervalSeconds: 0 } }))
+      .toThrow("healthIntervalSeconds");
+    expect(() => resolveSettings({ ...common, configSupervisor: { maxRestartAttempts: -1 } }))
+      .toThrow("maxRestartAttempts");
   });
 
   it("rejects invalid authentication and remote configuration", () => {

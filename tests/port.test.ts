@@ -27,6 +27,7 @@ describe("port checks", () => {
       workspace: process.cwd(),
       auth: { token: "test-token" },
       remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
     })).resolves.toBeUndefined();
   });
 
@@ -43,6 +44,7 @@ describe("port checks", () => {
       workspace: process.cwd(),
       auth: { token: "test-token" },
       remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
     })).rejects.toMatchObject({ code: "EADDRINUSE" });
   });
 
@@ -59,6 +61,7 @@ describe("port checks", () => {
       workspace: process.cwd(),
       auth: { token: "test-token" },
       remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
     })).rejects.toThrow(
       `127.0.0.1:${address.port} is already in use`,
     );

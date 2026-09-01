@@ -91,6 +91,7 @@ describe("MCP HTTP request body limit", () => {
       workspace,
       auth: { token: "test-token" },
       remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
     });
     runningServers.push(server);
     const address = server.address();
@@ -114,6 +115,7 @@ describe("MCP HTTP request body limit", () => {
       workspace: "unused",
       auth: { token: "test-token" },
       remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
     } satisfies ResolvedSettings, { workspace });
     runningServers.push(server);
     const port = await listen(server);

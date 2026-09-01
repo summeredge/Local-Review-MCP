@@ -2,7 +2,7 @@
 
 ## Current version
 
-V0.1 / Task 7
+V0.1 / Task 8
 
 ## Current capabilities
 
@@ -18,6 +18,8 @@ V0.1 / Task 7
 - bounded workspace metadata, directory listing, and text-file reading
 - bounded literal or regular-expression search with ripgrep and Node fallback
 - read-only structured Git status and bounded diff review
+- optional Windows Supervisor with health monitoring and bounded recovery
+- optional Windows Tray status/actions and per-user startup registration
 
 ## Default endpoint
 
@@ -39,9 +41,21 @@ then config file. A JSON config file can be provided with `--config <path>`:
   "port": 12080,
   "workspace": "C:\\path\\to\\project",
   "auth": { "token": "<token>" },
-  "remote": { "enabled": false, "endpoint": "" }
+  "remote": { "enabled": false, "endpoint": "" },
+  "supervisor": {
+    "enabled": false,
+    "healthIntervalSeconds": 30,
+    "maxRestartAttempts": 3
+  }
 }
 ```
+
+Set `supervisor.enabled` to `true` to run the MCP runtime under the Windows
+Supervisor. It checks `/health` at the configured interval, performs at most
+`maxRestartAttempts` automatic restarts, and exposes Start, Stop, Restart,
+Open Log Folder, startup registration, and Exit from the Tray menu. Supervisor
+logs are stored under the user's local application data directory and contain
+only fixed lifecycle events.
 
 Remote access is disabled by default. Enable the Cloudflare provider with:
 

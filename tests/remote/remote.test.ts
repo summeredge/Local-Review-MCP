@@ -31,6 +31,7 @@ function remoteSettings(workspace: string): ResolvedSettings {
     workspace,
     auth: { token: TOKEN },
     remote: { enabled: true, provider: "cloudflare", endpoint: REMOTE_ENDPOINT },
+    supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
   };
 }
 
@@ -179,6 +180,7 @@ describe("remote MCP deployment", () => {
       workspace,
       auth: { token: TOKEN },
       remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
     });
     runningServers.push(server);
     const address = server.address();

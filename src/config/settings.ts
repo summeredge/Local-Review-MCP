@@ -5,6 +5,9 @@ export const DEFAULT_PORT = 12080;
 export const MCP_PATH = "/mcp" as const;
 export const HEALTH_PATH = "/health" as const;
 export const APP_VERSION = "0.1" as const;
+export const DEFAULT_HEALTH_INTERVAL_SECONDS = 30;
+export const DEFAULT_MAX_RESTART_ATTEMPTS = 3;
+export const MAX_HEALTH_INTERVAL_SECONDS = 2_147_483;
 
 export const REMOTE_PROVIDERS = ["cloudflare"] as const;
 export type RemoteProvider = typeof REMOTE_PROVIDERS[number];
@@ -19,12 +22,19 @@ export interface RemoteSettings {
   readonly endpoint?: string;
 }
 
+export interface SupervisorSettings {
+  readonly enabled: boolean;
+  readonly healthIntervalSeconds: number;
+  readonly maxRestartAttempts: number;
+}
+
 export interface ResolvedSettings {
   host: typeof DEFAULT_HOST;
   port: number;
   workspace: string;
   auth: AuthSettings;
   remote: RemoteSettings;
+  supervisor: SupervisorSettings;
 }
 
 export interface CliOptions {
@@ -32,6 +42,7 @@ export interface CliOptions {
   configPath?: string;
   workspace?: string;
   token?: string;
+  runtimeOnly?: boolean;
 }
 
 interface ConfigFile {
@@ -39,6 +50,7 @@ interface ConfigFile {
   workspace?: unknown;
   auth?: unknown;
   remote?: unknown;
+  supervisor?: unknown;
 }
 
 export function parsePort(value: unknown): number {
@@ -110,6 +122,30 @@ export function parseRemoteEndpoint(value: unknown, enabled = false): string {
   return endpointValue;
 }
 
+export function parseSupervisorEnabled(value: unknown): boolean {
+  if (value === undefined) return false;
+  if (typeof value !== "boolean") throw new Error("supervisor.enabled must be a boolean");
+  return value;
+}
+
+export function parseHealthIntervalSeconds(value: unknown): number {
+  if (value === undefined) return DEFAULT_HEALTH_INTERVAL_SECONDS;
+  if (!Number.isSafeInteger(value)
+    || (value as number) < 1
+    || (value as number) > MAX_HEALTH_INTERVAL_SECONDS) {
+    throw new Error("supervisor.healthIntervalSeconds must be a positive integer");
+  }
+  return value as number;
+}
+
+export function parseMaxRestartAttempts(value: unknown): number {
+  if (value === undefined) return DEFAULT_MAX_RESTART_ATTEMPTS;
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new Error("supervisor.maxRestartAttempts must be a non-negative integer");
+  }
+  return value as number;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -134,6 +170,10 @@ export function resolveSettings(options: {
   configRemoteEndpoint?: unknown;
   envRemoteEndpoint?: unknown;
   configRemote?: unknown;
+  configSupervisorEnabled?: unknown;
+  configHealthIntervalSeconds?: unknown;
+  configMaxRestartAttempts?: unknown;
+  configSupervisor?: unknown;
 } = {}): ResolvedSettings {
   const port = options.cliPort !== undefined
     ? options.cliPort
@@ -167,6 +207,15 @@ export function resolveSettings(options: {
     ? options.configRemoteEndpoint
     : sectionValue(options.configRemote, "remote", "endpoint")
       ?? (remoteEnabled ? options.envRemoteEndpoint : undefined);
+  const supervisorEnabled = options.configSupervisorEnabled !== undefined
+    ? options.configSupervisorEnabled
+    : sectionValue(options.configSupervisor, "supervisor", "enabled");
+  const healthIntervalSeconds = options.configHealthIntervalSeconds !== undefined
+    ? options.configHealthIntervalSeconds
+    : sectionValue(options.configSupervisor, "supervisor", "healthIntervalSeconds");
+  const maxRestartAttempts = options.configMaxRestartAttempts !== undefined
+    ? options.configMaxRestartAttempts
+    : sectionValue(options.configSupervisor, "supervisor", "maxRestartAttempts");
 
   return {
     host: DEFAULT_HOST,
@@ -177,6 +226,11 @@ export function resolveSettings(options: {
       enabled: remoteEnabled,
       ...(remoteProvider === undefined ? {} : { provider: remoteProvider }),
       endpoint: parseRemoteEndpoint(remoteEndpoint, remoteEnabled),
+    },
+    supervisor: {
+      enabled: parseSupervisorEnabled(supervisorEnabled),
+      healthIntervalSeconds: parseHealthIntervalSeconds(healthIntervalSeconds),
+      maxRestartAttempts: parseMaxRestartAttempts(maxRestartAttempts),
     },
   };
 }
@@ -197,6 +251,8 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
       else if (argument === "--workspace") options.workspace = value;
       else options.token = value;
       index += 1;
+    } else if (argument === "--runtime") {
+      options.runtimeOnly = true;
     } else {
       throw new Error(`unknown argument: ${argument}`);
     }
@@ -231,6 +287,7 @@ export async function loadSettings(
     configAuth: config.auth,
     envRemoteEndpoint: environment.CLOUDFLARE_TUNNEL_ENDPOINT,
     configRemote: config.remote,
+    configSupervisor: config.supervisor,
   });
 }
 
