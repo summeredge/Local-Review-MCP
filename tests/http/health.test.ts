@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { startApp } from "../../src/app.js";
+import { HealthMonitor } from "../../src/supervisor/health-monitor.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
 
 const runningServers: Server[] = [];
@@ -20,9 +21,15 @@ afterEach(async () => {
   })));
 });
 
-async function getHealth(port: number): Promise<{ status: number; text: string }> {
+async function getHealth(port: number, authorization?: string): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
-    const request = httpRequest({ host: "127.0.0.1", port, path: "/health", method: "GET" }, (response) => {
+    const request = httpRequest({
+      host: "127.0.0.1",
+      port,
+      path: "/health",
+      method: "GET",
+      ...(authorization === undefined ? {} : { headers: { authorization } }),
+    }, (response) => {
       let text = "";
       response.setEncoding("utf8");
       response.on("data", (chunk: string) => { text += chunk; });
@@ -34,7 +41,7 @@ async function getHealth(port: number): Promise<{ status: number; text: string }
 }
 
 describe("health endpoint", () => {
-  it("returns safe health metadata without requiring the MCP token", async () => {
+  it("requires the MCP token and returns safe health metadata", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-health-"));
     temporaryDirectories.push(workspace);
     const server = await startApp({
@@ -49,7 +56,9 @@ describe("health endpoint", () => {
     const address = server.address();
     if (address === null || typeof address === "string") throw new Error("test server has no port");
 
-    const response = await getHealth(address.port);
+    await expect(getHealth(address.port)).resolves.toMatchObject({ status: 401 });
+    await expect(getHealth(address.port, "Bearer wrong-token")).resolves.toMatchObject({ status: 401 });
+    const response = await getHealth(address.port, `Bearer ${TOKEN}`);
     const health = JSON.parse(response.text) as Record<string, unknown>;
     const workspaceId = new WorkspaceManager(workspace).workspaceId;
 
@@ -64,5 +73,9 @@ describe("health endpoint", () => {
     expect(response.text).not.toContain(workspace);
     expect(response.text).not.toContain(TOKEN);
     expect(response.text).not.toContain(process.env.USERNAME ?? "__missing_username__");
+    await expect(new HealthMonitor({
+      healthUrl: `http://127.0.0.1:${address.port}/health`,
+      authToken: TOKEN,
+    }).check()).resolves.toBe(true);
   });
 });

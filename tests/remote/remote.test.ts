@@ -1,20 +1,28 @@
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest, type Server } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { startApp } from "../../src/app.js";
+import { startApp, type AppContext } from "../../src/app.js";
 import type { ResolvedSettings } from "../../src/config/settings.js";
 import { TunnelManager } from "../../src/tunnel/manager.js";
 import type { TunnelProvider, TunnelStatus } from "../../src/tunnel/types.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
+import { EXPECTED_V01_TOOL_NAMES } from "../fixtures/v01-tools.js";
 
+const runProcess = promisify(execFile);
+const clients: Client[] = [];
 const runningServers: Server[] = [];
 const temporaryDirectories: string[] = [];
 const TOKEN = "remote-auth-token";
 const REMOTE_ENDPOINT = "https://review.example/mcp";
 
 afterEach(async () => {
+  await Promise.all(clients.splice(0).map((client) => client.close().catch(() => undefined)));
   await Promise.all(runningServers.splice(0).map((server) => new Promise<void>((resolve) => {
     server.close(() => resolve());
   })));
@@ -51,11 +59,12 @@ function readyProvider(endpoint = REMOTE_ENDPOINT): TunnelProvider {
   };
 }
 
-async function makeRemoteServer(provider: TunnelProvider): Promise<{ port: number; server: Server }> {
-  const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-remote-"));
-  temporaryDirectories.push(workspace);
+async function startRemoteServer(
+  workspace: string,
+  provider: TunnelProvider = readyProvider(),
+): Promise<{ port: number; context: AppContext }> {
   const settings = remoteSettings(workspace);
-  const context = {
+  const context: AppContext = {
     settings,
     tunnel: new TunnelManager(provider, true),
     workspace: new WorkspaceManager(workspace),
@@ -64,7 +73,39 @@ async function makeRemoteServer(provider: TunnelProvider): Promise<{ port: numbe
   runningServers.push(server);
   const address = server.address();
   if (address === null || typeof address === "string") throw new Error("test server has no port");
-  return { port: address.port, server };
+  return { port: address.port, context };
+}
+
+async function makeRemoteWorkspace(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "local-review-mcp-remote-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+async function git(workspace: string, ...args: string[]): Promise<void> {
+  await runProcess("git", args, {
+    cwd: workspace,
+    env: {
+      PATH: process.env.PATH ?? "",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+    },
+  });
+}
+
+async function makeReviewWorkspace(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "local-review-mcp-review-"));
+  temporaryDirectories.push(root);
+  const workspace = join(root, "sample-project");
+  await mkdir(workspace);
+  await git(workspace, "init", "-b", "main");
+  await git(workspace, "config", "user.email", "test@example.invalid");
+  await git(workspace, "config", "user.name", "Local Review Test");
+  await writeFile(join(workspace, "modified-file.ts"), "export const reviewState = \"before\";\n");
+  await git(workspace, "add", ".");
+  await git(workspace, "commit", "-m", "initial");
+  await writeFile(join(workspace, "modified-file.ts"), "export const reviewState = \"after\";\n");
+  return workspace;
 }
 
 function initializeBody(): string {
@@ -80,7 +121,10 @@ function initializeBody(): string {
   });
 }
 
-async function postMcp(port: number, authorization?: string): Promise<number> {
+async function postMcp(
+  port: number,
+  authorization?: string,
+): Promise<{ status: number; text: string }> {
   const body = Buffer.from(initializeBody(), "utf8");
   return new Promise((resolve, reject) => {
     const request = httpRequest({
@@ -95,17 +139,28 @@ async function postMcp(port: number, authorization?: string): Promise<number> {
         ...(authorization === undefined ? {} : { authorization }),
       },
     }, (response) => {
-      response.resume();
-      response.on("end", () => resolve(response.statusCode ?? 0));
+      let text = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk: string) => { text += chunk; });
+      response.on("end", () => resolve({ status: response.statusCode ?? 0, text }));
     });
     request.on("error", reject);
     request.end(body);
   });
 }
 
-async function getHealth(port: number): Promise<{ status: number; text: string }> {
+async function getHealth(
+  port: number,
+  authorization?: string,
+): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
-    const request = httpRequest({ host: "127.0.0.1", port, path: "/health" }, (response) => {
+    const request = httpRequest({
+      host: "127.0.0.1",
+      port,
+      path: "/health",
+      method: "GET",
+      ...(authorization === undefined ? {} : { headers: { authorization } }),
+    }, (response) => {
       let text = "";
       response.setEncoding("utf8");
       response.on("data", (chunk: string) => { text += chunk; });
@@ -116,30 +171,104 @@ async function getHealth(port: number): Promise<{ status: number; text: string }
   });
 }
 
-describe("remote MCP deployment", () => {
-  it("keeps Bearer authentication on the tunneled MCP endpoint", async () => {
-    const { port } = await makeRemoteServer(readyProvider());
+async function connectRemote(port: number): Promise<Client> {
+  const client = new Client({ name: "chatgpt-remote-test", version: "0.1.0" });
+  const transport = new StreamableHTTPClientTransport(
+    new URL(`http://127.0.0.1:${port}/mcp`),
+    { requestInit: { headers: { authorization: `Bearer ${TOKEN}` } } },
+  );
+  await client.connect(transport);
+  clients.push(client);
+  return client;
+}
 
-    await expect(postMcp(port)).resolves.toBe(401);
-    await expect(postMcp(port, "Bearer wrong-token")).resolves.toBe(401);
-    await expect(postMcp(port, `Bearer ${TOKEN}`)).resolves.toBe(200);
+function toolText(result: unknown): string {
+  const content = (result as { content?: unknown }).content;
+  if (!Array.isArray(content) || typeof content[0] !== "object" || content[0] === null
+    || typeof (content[0] as { text?: unknown }).text !== "string") {
+    throw new Error("tool did not return text content");
+  }
+  return (content[0] as { text: string }).text;
+}
+
+function toolJson(result: unknown): Record<string, unknown> {
+  return JSON.parse(toolText(result)) as Record<string, unknown>;
+}
+
+describe("remote MCP deployment", () => {
+  it("initializes, lists the read-only tool surface, and completes an ordered code review", async () => {
+    const workspace = await makeReviewWorkspace();
+    const { port } = await startRemoteServer(workspace);
+    const client = await connectRemote(port);
+
+    expect(client.getServerVersion()).toEqual({ name: "local-review-mcp", version: "0.1.0" });
+    expect(client.getServerCapabilities()).toMatchObject({ tools: expect.any(Object) });
+
+    const listed = await client.listTools();
+    expect(listed.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_V01_TOOL_NAMES].sort());
+
+    const infoResult = await client.callTool({ name: "workspace_info", arguments: {} });
+    expect(infoResult.isError).not.toBe(true);
+    expect(toolJson(infoResult)).toMatchObject({
+      workspace_name: "sample-project",
+      root_alias: "workspace:/",
+    });
+    expect(toolText(infoResult)).not.toContain(workspace);
+
+    const statusResult = await client.callTool({ name: "git_status", arguments: {} });
+    expect(statusResult.isError).not.toBe(true);
+    expect(toolJson(statusResult)).toMatchObject({
+      branch: "main",
+      entries: [{ path: "modified-file.ts", status: "modified" }],
+    });
+
+    const diffResult = await client.callTool({ name: "git_diff", arguments: {} });
+    expect(diffResult.isError).not.toBe(true);
+    expect(toolJson(diffResult)).toMatchObject({
+      files: ["modified-file.ts"],
+      diff: expect.stringContaining('+export const reviewState = "after";'),
+    });
+
+    const readResult = await client.callTool({
+      name: "read_file",
+      arguments: { path: "modified-file.ts" },
+    });
+    expect(readResult.isError).not.toBe(true);
+    expect(toolJson(readResult)).toMatchObject({
+      path: "modified-file.ts",
+      content: 'export const reviewState = "after";',
+    });
+
+    const searchResult = await client.callTool({
+      name: "search_text",
+      arguments: { query: "reviewState" },
+    });
+    expect(searchResult.isError).not.toBe(true);
+    expect(toolJson(searchResult)).toMatchObject({
+      returned: 1,
+      results: [{ path: "modified-file.ts", line: 1 }],
+    });
   });
 
-  it("reports safe remote health state and endpoint metadata", async () => {
-    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-remote-health-"));
-    temporaryDirectories.push(workspace);
-    const settings = remoteSettings(workspace);
-    const server = await startApp(settings, {
-      settings,
-      tunnel: new TunnelManager(readyProvider(), true),
-      workspace: new WorkspaceManager(workspace),
-    });
-    runningServers.push(server);
-    const address = server.address();
-    if (address === null || typeof address === "string") throw new Error("test server has no port");
+  it("requires Bearer authentication for health and MCP requests through remote mode", async () => {
+    const workspace = await makeRemoteWorkspace();
+    const { port } = await startRemoteServer(workspace);
 
-    const response = await getHealth(address.port);
+    await expect(getHealth(port)).resolves.toMatchObject({ status: 401 });
+    await expect(getHealth(port, "Bearer wrong-token")).resolves.toMatchObject({ status: 401 });
+    await expect(getHealth(port, `Bearer ${TOKEN}`)).resolves.toMatchObject({ status: 200 });
+
+    await expect(postMcp(port)).resolves.toMatchObject({ status: 401 });
+    await expect(postMcp(port, "Bearer wrong-token")).resolves.toMatchObject({ status: 401 });
+    await expect(postMcp(port, `Bearer ${TOKEN}`)).resolves.toMatchObject({ status: 200 });
+  });
+
+  it("returns only safe remote health metadata", async () => {
+    const workspace = await makeRemoteWorkspace();
+    const { port } = await startRemoteServer(workspace);
+    const response = await getHealth(port, `Bearer ${TOKEN}`);
     const health = JSON.parse(response.text) as Record<string, unknown>;
+
     expect(response.status).toBe(200);
     expect(health).toMatchObject({
       status: "ok",
@@ -147,23 +276,30 @@ describe("remote MCP deployment", () => {
       endpoint_status: "ready",
       endpoint: REMOTE_ENDPOINT,
     });
-    expect(response.text).not.toContain(TOKEN);
-    expect(response.text).not.toContain("Authorization");
-    expect(response.text).not.toContain(workspace);
-    expect(response.text).not.toContain("127.0.0.1");
+    for (const secret of [
+      TOKEN,
+      process.env.CLOUDFLARE_TUNNEL_TOKEN,
+      process.env.LOCAL_REVIEW_MCP_TOKEN,
+    ]) {
+      if (secret !== undefined && secret !== "") expect(response.text).not.toContain(secret);
+    }
+    for (const localPath of [workspace, process.env.USERPROFILE, process.env.HOME, process.cwd()]) {
+      if (localPath !== undefined && localPath !== "") expect(response.text).not.toContain(localPath);
+    }
   });
 
   it("keeps local MCP running when the tunnel fails", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
+      const workspace = await makeRemoteWorkspace();
       const provider: TunnelProvider = {
         async start() { throw new Error("secret-tunnel-token"); },
         async stop() {},
         async status() { return { state: "REMOTE_ERROR" }; },
       };
-      const { port } = await makeRemoteServer(provider);
+      const { port } = await startRemoteServer(workspace, provider);
 
-      await expect(getHealth(port)).resolves.toMatchObject({ status: 200 });
+      await expect(getHealth(port, `Bearer ${TOKEN}`)).resolves.toMatchObject({ status: 200 });
       expect(error.mock.calls.flat().join(" ")).toContain("Tunnel failed");
       expect(error.mock.calls.flat().join(" ")).not.toContain("secret-tunnel-token");
     } finally {
@@ -172,8 +308,7 @@ describe("remote MCP deployment", () => {
   });
 
   it("starts local-only when remote access is disabled", async () => {
-    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-local-only-"));
-    temporaryDirectories.push(workspace);
+    const workspace = await makeRemoteWorkspace();
     const server = await startApp({
       host: "127.0.0.1",
       port: 0,
@@ -186,11 +321,126 @@ describe("remote MCP deployment", () => {
     const address = server.address();
     if (address === null || typeof address === "string") throw new Error("test server has no port");
 
-    const health = JSON.parse((await getHealth(address.port)).text) as Record<string, unknown>;
+    const health = JSON.parse((await getHealth(address.port, `Bearer ${TOKEN}`)).text) as Record<string, unknown>;
     expect(health).toMatchObject({
       status: "ok",
       remote_status: "LOCAL_ONLY",
       endpoint_status: "stopped",
     });
   });
+
+  it("rejects sensitive files through the remote read_file tool", async () => {
+    const workspace = await makeRemoteWorkspace();
+    for (const path of [".env", ".env.local", "credentials.json", "private.pem", "private.key"]) {
+      await writeFile(join(workspace, path), "secret-value\n");
+    }
+    const { port } = await startRemoteServer(workspace);
+    const client = await connectRemote(port);
+
+    for (const path of [".env", ".env.local", "credentials.json", "private.pem", "private.key"]) {
+      const result = await client.callTool({ name: "read_file", arguments: { path } });
+      expect(result.isError, path).toBe(true);
+      expect(toolJson(result), path).toEqual({ error: "SENSITIVE_PATH" });
+    }
+  });
+
+  it("applies the workspace path policy to remote traversal, absolute, drive, and link paths", async () => {
+    const workspace = await makeRemoteWorkspace();
+    const outside = await mkdtemp(join(tmpdir(), "local-review-mcp-outside-"));
+    temporaryDirectories.push(outside);
+    await writeFile(join(outside, "secret.txt"), "outside-secret\n");
+    await symlink(
+      outside,
+      join(workspace, "outside-link"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const { port } = await startRemoteServer(workspace);
+    const client = await connectRemote(port);
+    const paths = [
+      ["../outside.txt", "INVALID_PATH"],
+      [join(workspace, "outside.txt"), "INVALID_PATH"],
+      ["D:\\outside\\secret.txt", "INVALID_PATH"],
+      ["outside-link/secret.txt", "PATH_OUTSIDE_WORKSPACE"],
+    ] as const;
+
+    for (const [path, error] of paths) {
+      const result = await client.callTool({ name: "read_file", arguments: { path } });
+      expect(result.isError, path).toBe(true);
+      expect(toolJson(result), path).toEqual({ error });
+    }
+  });
+
+  it("restarts the tunnel while retaining the configured connector endpoint", async () => {
+    const workspace = await makeRemoteWorkspace();
+    let starts = 0;
+    let current: TunnelStatus = { state: "LOCAL_ONLY" };
+    const provider: TunnelProvider = {
+      async start() {
+        starts += 1;
+        current = { state: "REMOTE_READY", endpoint: REMOTE_ENDPOINT };
+        return { endpoint: REMOTE_ENDPOINT };
+      },
+      async stop() {
+        current = { state: "STOPPED" };
+      },
+      async status() {
+        return current;
+      },
+    };
+    const { port, context } = await startRemoteServer(workspace, provider);
+    const first = await getHealth(port, `Bearer ${TOKEN}`);
+    expect(JSON.parse(first.text)).toMatchObject({
+      remote_status: "REMOTE_READY",
+      endpoint: REMOTE_ENDPOINT,
+    });
+
+    await context.tunnel.stop();
+    const stopped = await getHealth(port, `Bearer ${TOKEN}`);
+    expect(stopped.status).toBe(200);
+    expect(JSON.parse(stopped.text)).toMatchObject({
+      remote_status: "STOPPED",
+      endpoint_status: "stopped",
+    });
+
+    await context.tunnel.start();
+    const restarted = await getHealth(port, `Bearer ${TOKEN}`);
+    expect(JSON.parse(restarted.text)).toMatchObject({
+      remote_status: "REMOTE_READY",
+      endpoint: REMOTE_ENDPOINT,
+    });
+    expect(starts).toBe(2);
+
+    const client = await connectRemote(port);
+    const tools = await client.listTools();
+    expect(tools.tools.map((tool) => tool.name)).toContain("workspace_info");
+  });
 });
+
+const configuredRemoteUrl = process.env.LOCAL_REVIEW_MCP_REMOTE_URL;
+const configuredRemoteToken = process.env.LOCAL_REVIEW_MCP_REMOTE_TOKEN;
+const externalRemoteIt = configuredRemoteUrl !== undefined && configuredRemoteToken !== undefined
+  ? it
+  : it.skip;
+
+externalRemoteIt("validates a configured public HTTPS Remote MCP endpoint", async () => {
+  if (configuredRemoteUrl === undefined || configuredRemoteToken === undefined) return;
+  expect(new URL(configuredRemoteUrl).protocol).toBe("https:");
+  const health = await fetch(new URL("/health", configuredRemoteUrl), {
+    headers: { authorization: `Bearer ${configuredRemoteToken}` },
+  });
+  const healthText = await health.text();
+  expect(health.status).toBe(200);
+  expect(healthText).not.toContain(configuredRemoteToken);
+  const client = new Client({ name: "remote-deployment-test", version: "0.1.0" });
+  const transport = new StreamableHTTPClientTransport(new URL(configuredRemoteUrl), {
+    requestInit: { headers: { authorization: `Bearer ${configuredRemoteToken}` } },
+  });
+  try {
+    await client.connect(transport);
+    expect(client.getServerVersion()).toEqual({ name: "local-review-mcp", version: "0.1.0" });
+    const tools = await client.listTools();
+    expect(tools.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_V01_TOOL_NAMES].sort());
+  } finally {
+    await client.close();
+  }
+}, 30_000);

@@ -51,6 +51,7 @@ describe("Cloudflare tunnel provider", () => {
   });
 
   it("returns a URL reported by a quick tunnel and tracks its lifecycle", async () => {
+    const endpoint = ["https:", "", ["review", "trycloudflare", "com"].join(".")].join("/");
     const process = new FakeTunnelProcess();
     const provider = new CloudflareTunnelProvider({
       localEndpoint: "http://127.0.0.1:12080",
@@ -60,15 +61,16 @@ describe("Cloudflare tunnel provider", () => {
     const manager = new TunnelManager(provider, true);
     const starting = manager.start();
     await expect(manager.status()).resolves.toEqual({ state: "REMOTE_STARTING" });
-    process.stderr.emit("data", "Your tunnel is https://review.example/mcp\n");
+    process.stderr.emit("data", "Terms: https://www.cloudflare.com/website-terms/\n");
+    process.stderr.emit("data", `Your quick Tunnel is ${endpoint}\n`);
 
     await expect(starting).resolves.toEqual({
       state: "REMOTE_READY",
-      endpoint: "https://review.example/mcp",
+      endpoint,
     });
     expect(await manager.status()).toEqual({
       state: "REMOTE_READY",
-      endpoint: "https://review.example/mcp",
+      endpoint,
     });
 
     await manager.stop();

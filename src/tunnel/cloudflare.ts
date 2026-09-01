@@ -56,7 +56,11 @@ function findEndpoint(output: string): string | undefined {
   for (const candidate of candidates) {
     const trimmed = candidate.replace(/[),.;\]}]+$/u, "");
     try {
-      return parseEndpoint(trimmed, "Cloudflare tunnel endpoint");
+      const endpoint = parseEndpoint(trimmed, "Cloudflare tunnel endpoint");
+      const hostname = new URL(endpoint).hostname.toLowerCase();
+      if (hostname === "trycloudflare.com" || hostname.endsWith(".trycloudflare.com")) {
+        return endpoint;
+      }
     } catch {
       continue;
     }

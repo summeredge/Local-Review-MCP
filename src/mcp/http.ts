@@ -128,6 +128,14 @@ async function handleMcpRequest(
 
 export function createHttpServer(settings: ResolvedSettings, context: HttpRuntimeContext): Server {
   return createServer((request, response) => {
+    if (request.url === HEALTH_PATH || request.url === MCP_PATH) {
+      if (!isAuthenticated(request, settings.auth.token)) {
+        request.resume();
+        console.warn("Auth failed");
+        sendUnauthorized(response);
+        return;
+      }
+    }
     if (request.url === HEALTH_PATH) {
       void handleHealthRequest(request, response, context).catch(() => {
         if (!response.headersSent) sendJson(response, 500, { error: "internal_server_error" });
@@ -137,13 +145,6 @@ export function createHttpServer(settings: ResolvedSettings, context: HttpRuntim
     if (request.url !== MCP_PATH) {
       request.resume();
       sendJson(response, 404, { error: "not_found" });
-      return;
-    }
-
-    if (!isAuthenticated(request, settings.auth.token)) {
-      request.resume();
-      console.warn("Auth failed");
-      sendUnauthorized(response);
       return;
     }
 

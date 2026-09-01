@@ -135,6 +135,15 @@ describe("settings", () => {
     expect(resolveSettings({
       configWorkspace: "workspace",
       configToken: "token",
+      configRemote: { enabled: true, provider: "cloudflare" },
+    }).remote).toEqual({
+      enabled: true,
+      provider: "cloudflare",
+      endpoint: "",
+    });
+    expect(resolveSettings({
+      configWorkspace: "workspace",
+      configToken: "token",
       configRemote: { enabled: true, provider: "cloudflare", endpoint: "https://review.example/mcp" },
     }).remote).toEqual({
       enabled: true,

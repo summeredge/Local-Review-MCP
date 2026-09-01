@@ -12,6 +12,7 @@ export interface HealthMonitorOptions {
   readonly healthUrl: string;
   readonly intervalSeconds?: number;
   readonly timeoutMs?: number;
+  readonly authToken?: string;
   readonly check?: () => Promise<boolean>;
 }
 
@@ -30,7 +31,7 @@ function validateUrl(value: string): URL {
   return url;
 }
 
-function requestHealth(url: URL, timeoutMs: number): Promise<boolean> {
+function requestHealth(url: URL, timeoutMs: number, authToken?: string): Promise<boolean> {
   return new Promise((resolve) => {
     const requestOptions = {
       hostname: url.hostname,
@@ -38,6 +39,7 @@ function requestHealth(url: URL, timeoutMs: number): Promise<boolean> {
       path: `${url.pathname || HEALTH_PATH}${url.search}`,
       method: "GET",
       timeout: timeoutMs,
+      ...(authToken === undefined ? {} : { headers: { authorization: `Bearer ${authToken}` } }),
     };
     const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(
       requestOptions,
@@ -60,6 +62,7 @@ export class HealthMonitor {
   private readonly healthUrl: URL;
   private readonly intervalMs: number;
   private readonly timeoutMs: number;
+  private readonly authToken: string | undefined;
   private readonly injectedCheck: (() => Promise<boolean>) | undefined;
   private timer: NodeJS.Timeout | undefined;
 
@@ -76,13 +79,14 @@ export class HealthMonitor {
     if (!Number.isInteger(this.timeoutMs) || this.timeoutMs < 1) {
       throw new Error("Health timeout must be a positive integer");
     }
+    this.authToken = options.authToken;
     this.injectedCheck = options.check;
   }
 
   public async check(): Promise<boolean> {
     try {
       return this.injectedCheck === undefined
-        ? await requestHealth(this.healthUrl, this.timeoutMs)
+        ? await requestHealth(this.healthUrl, this.timeoutMs, this.authToken)
         : await this.injectedCheck();
     } catch {
       return false;

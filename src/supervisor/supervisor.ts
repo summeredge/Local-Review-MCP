@@ -338,6 +338,7 @@ export function createSupervisor(
   const healthMonitor = options.healthMonitor ?? new HealthMonitor({
     healthUrl: `${localOrigin(settings)}${HEALTH_PATH}`,
     intervalSeconds: supervisor.healthIntervalSeconds,
+    authToken: settings.auth.token,
   });
   const tunnel = options.tunnel ?? createTunnelManager(settings.remote, {
     localEndpoint: localOrigin(settings),
