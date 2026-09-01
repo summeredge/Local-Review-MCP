@@ -86,12 +86,9 @@ describe("MCP HTTP runtime", () => {
     });
 
     for (const name of ["git_status", "git_diff"]) {
-      const placeholder = await client.callTool({ name, arguments: {} });
-      expect(placeholder.isError).not.toBe(true);
-      expect(JSON.parse(toolText(placeholder))).toEqual({
-        status: "not_implemented",
-        tool: name,
-      });
+      const gitCall = await client.callTool({ name, arguments: {} });
+      expect(gitCall.isError).toBe(true);
+      expect(JSON.parse(toolText(gitCall))).toEqual({ error: "NOT_A_REPOSITORY" });
     }
 
     await client.close();

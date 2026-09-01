@@ -4,6 +4,8 @@ import { createInterface } from "node:readline";
 import { basename } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { GitError } from "../git/errors.js";
+import { GitService } from "../git/service.js";
 import { WorkspaceManager, WorkspacePathError } from "../workspace/manager.js";
 import { searchText } from "../workspace/search.js";
 import { containsNullByte } from "../workspace/text.js";
@@ -58,6 +60,11 @@ const searchTextInputSchema = {
   limit: z.number().finite().int().min(1).max(200).optional().default(100),
 };
 
+const gitDiffInputSchema = {
+  path: z.string().optional().default("."),
+  stat: z.boolean().optional().default(false),
+};
+
 interface ListedEntry {
   readonly path: string;
   readonly name: string;
@@ -71,7 +78,9 @@ function jsonResult(value: unknown) {
 }
 
 export function toToolError(error: unknown) {
-  const code = error instanceof WorkspacePathError ? error.code : "INTERNAL_ERROR";
+  const code = error instanceof WorkspacePathError || error instanceof GitError
+    ? error.code
+    : "INTERNAL_ERROR";
   return {
     content: [{ type: "text" as const, text: JSON.stringify({ error: code }) }],
     isError: true as const,
@@ -307,20 +316,9 @@ async function workspaceInfo(workspace: WorkspaceManager) {
   };
 }
 
-function registerPlaceholder(server: McpServer, name: Exclude<V01ToolName, "workspace_info" | "list_files" | "read_file" | "search_text">): void {
-  server.registerTool(
-    name,
-    {
-      description: `Local Review MCP read-only tool ${name}; not implemented in V0.1.`,
-      inputSchema: {},
-      annotations: READ_ONLY_ANNOTATIONS,
-    },
-    async () => jsonResult({ status: "not_implemented", tool: name }),
-  );
-}
-
 export function createMcpServer(context: McpRuntimeContext): McpServer {
   const server = new McpServer({ name: "local-review-mcp", version: "0.1.0" });
+  const git = new GitService(context.workspace);
 
   server.registerTool(
     "workspace_info",
@@ -393,9 +391,37 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
   );
 
-  for (const name of ["git_status", "git_diff"] as const) {
-    registerPlaceholder(server, name);
-  }
+  server.registerTool(
+    "git_status",
+    {
+      description: "Return the structured Git status of the authorized workspace.",
+      inputSchema: {},
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async () => {
+      try {
+        return jsonResult(await git.status());
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "git_diff",
+    {
+      description: "Return a bounded Git diff for the authorized workspace or one relative path.",
+      inputSchema: gitDiffInputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        return jsonResult(await git.diff({ path: input.path, stat: input.stat }));
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
 
   return server;
 }
