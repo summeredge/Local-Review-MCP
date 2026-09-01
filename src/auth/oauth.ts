@@ -152,12 +152,17 @@ function supportedList(
   value: unknown,
   field: "grant_types" | "response_types",
   expected: string,
+  allowAdditional = false,
 ): void {
   if (value === undefined) return;
-  if (!Array.isArray(value) || value.length !== 1 || value[0] !== expected) {
+  if (!Array.isArray(value)
+    || value.length === 0
+    || value.some((item) => typeof item !== "string")
+    || !value.includes(expected)
+    || (!allowAdditional && value.length !== 1)) {
     throw new OAuthRequestError(
       "invalid_client_metadata",
-      `${field} must contain only ${expected}`,
+      `${field} must ${allowAdditional ? "include" : "contain only"} ${expected}`,
     );
   }
 }
@@ -201,7 +206,7 @@ export class OAuthService {
         "only public clients using token_endpoint_auth_method=none are supported",
       );
     }
-    supportedList(input.grant_types, "grant_types", "authorization_code");
+    supportedList(input.grant_types, "grant_types", "authorization_code", true);
     supportedList(input.response_types, "response_types", "code");
 
     const client: OAuthRegisteredClient = {

@@ -227,6 +227,40 @@ describe("MCP OAuth compatibility", () => {
     });
   });
 
+  it("accepts ChatGPT Connector DCR metadata without enabling extra grants", async () => {
+    const { port } = await makeServer();
+    const registration = await requestText(
+      port,
+      "/oauth/register",
+      "POST",
+      JSON.stringify({
+        client_name: "ChatGPT",
+        redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+        scope: "openid profile",
+        client_uri: "https://chatgpt.com/",
+        logo_uri: "https://chatgpt.com/favicon.ico",
+        contacts: ["support@example.com"],
+        software_id: "chatgpt-connector",
+        software_version: "1.0",
+        token_endpoint_auth_methods_supported: ["none", "private_key_jwt"],
+      }),
+      { "content-type": "application/json" },
+    );
+    const client = JSON.parse(registration.text) as {
+      client_id: string;
+      grant_types: string[];
+      client_secret?: string;
+    };
+
+    expect(registration.status).toBe(201);
+    expect(client.client_id).toEqual(expect.any(String));
+    expect(client.grant_types).toEqual(["authorization_code"]);
+    expect(client.client_secret).toBeUndefined();
+  });
+
   it("completes public-client registration, PKCE code exchange, and MCP access", async () => {
     const { port } = await makeServer();
     const redirectUri = "https://client.example/callback";
