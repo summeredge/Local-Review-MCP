@@ -35,6 +35,20 @@ export interface SupervisorFactoryOptions {
 
 export type SupervisorStateListener = (state: RuntimeState) => void;
 
+// ponytail: bounded startup polling; make this configurable only if measured cold starts exceed 2s.
+const STARTUP_HEALTH_RETRY_ATTEMPTS = 20;
+const STARTUP_HEALTH_RETRY_DELAY_MS = 100;
+
+async function waitForHealthy(check: () => Promise<boolean>): Promise<boolean> {
+  for (let attempt = 0; attempt < STARTUP_HEALTH_RETRY_ATTEMPTS; attempt += 1) {
+    if (await check()) return true;
+    if (attempt + 1 < STARTUP_HEALTH_RETRY_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, STARTUP_HEALTH_RETRY_DELAY_MS));
+    }
+  }
+  return false;
+}
+
 function workspaceLabel(value: string): string {
   const normalized = value.replaceAll("\\", "/").replace(/\/+$/u, "");
   return basename(normalized === "" ? "workspace" : normalized) || "workspace";
@@ -178,33 +192,36 @@ export class Supervisor {
     this.healthFailures = 0;
     this.setState("STARTING");
     try {
-      await this.startResources();
+      await this.startResources(true);
       this.healthMonitor.start((healthy) => this.handleHealth(healthy));
-    } catch {
+    } catch (error: unknown) {
       await this.stopResources().catch(() => undefined);
       this.setState("ERROR");
-      throw new Error("Supervisor failed to start");
+      throw new Error("Supervisor failed to start", { cause: error });
     }
   }
 
-  private async startResources(): Promise<void> {
+  private async startResources(waitForRuntimeHealth = false): Promise<void> {
     this.setState("STARTING");
-    const process = await this.processManager.start().catch(() => {
-      throw new Error("Runtime process failed to start");
+    const process = await this.processManager.start().catch((error: unknown) => {
+      throw new Error("Runtime process failed to start", { cause: error });
     });
     if (!process.running) throw new Error("Runtime process failed to start");
     this.runtimeStarted = true;
     this.logger.info("runtime started");
 
-    if (!await this.healthMonitor.check()) {
+    const healthy = waitForRuntimeHealth
+      ? await waitForHealthy(() => this.healthMonitor.check())
+      : await this.healthMonitor.check();
+    if (!healthy) {
       this.healthFailures += 1;
       this.setState("DEGRADED");
       this.logger.info("health failed");
       throw new Error("Runtime health check failed");
     }
 
-    await this.tunnel.start().catch(() => {
-      throw new Error("Tunnel failed to start");
+    await this.tunnel.start().catch((error: unknown) => {
+      throw new Error("Tunnel failed to start", { cause: error });
     });
     this.tunnelStarted = true;
     await this.recordTunnelState();

@@ -50,11 +50,13 @@ export class ProcessManager implements RuntimeProcessManager {
         }
         if (this.cancelStarting !== undefined) this.cancelStarting = undefined;
       };
-      const fail = (): void => {
+      const fail = (cause?: unknown): void => {
         if (settled) return;
         settled = true;
         clear();
-        reject(new Error("Runtime process failed to start"));
+        reject(cause === undefined
+          ? new Error("Runtime process failed to start")
+          : new Error("Runtime process failed to start", { cause }));
       };
       const markExited = (code: number | null, signal: NodeJS.Signals | null): void => {
         if (exited) return;
@@ -91,11 +93,11 @@ export class ProcessManager implements RuntimeProcessManager {
         child = this.spawnProcess(this.command, this.args, spawnOptions);
         this.child = child;
         child.once("spawn", started);
-        child.once("error", fail);
+        child.once("error", (error) => fail(error));
         child.once("exit", markExited);
         child.once("close", (code, signal) => markExited(code, signal));
-      } catch {
-        fail();
+      } catch (error: unknown) {
+        fail(error);
       }
 
       this.cancelStarting = () => fail();

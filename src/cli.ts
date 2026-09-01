@@ -4,6 +4,17 @@ import { createStartupManager } from "./supervisor/startup.js";
 import { createSupervisor } from "./supervisor/supervisor.js";
 import { WindowsTrayApp } from "./supervisor/tray.js";
 
+function printErrorDetails(error: unknown, warning = false): void {
+  const log = warning ? console.warn : console.error;
+  if (error instanceof Error) {
+    log(error.message);
+    if (error.stack !== undefined) log(error.stack);
+    log("Original error:", error.cause ?? error);
+    return;
+  }
+  log("Original error:", error);
+}
+
 try {
   const argv = process.argv.slice(2);
   const cli = parseCliArgs(argv);
@@ -17,7 +28,10 @@ try {
       }),
     });
     await supervisor.start();
-    await tray.start().catch(() => undefined);
+    void tray.start().catch((error: unknown) => {
+      console.warn("Windows tray failed to start; continuing without tray");
+      printErrorDetails(error, true);
+    });
     console.log(`Local Review MCP supervisor started\nStatus: ${supervisor.state}`);
     let closing = false;
     const close = (): void => {
@@ -38,6 +52,6 @@ try {
     process.once("SIGTERM", close);
   }
 } catch (error: unknown) {
-  console.error(error instanceof Error ? error.message : String(error));
+  printErrorDetails(error);
   process.exitCode = 1;
 }

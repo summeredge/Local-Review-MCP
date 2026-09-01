@@ -46,11 +46,13 @@ function runRegistryCommand(
   return new Promise((resolve, reject) => {
     let child: ChildProcess;
     let settled = false;
-    const finish = (code: number | null): void => {
+    const finish = (code: number | null, cause?: unknown): void => {
       if (settled) return;
       settled = true;
       if (code === 0) resolve();
-      else reject(new Error("Windows startup registry operation failed"));
+      else reject(cause === undefined
+        ? new Error("Windows startup registry operation failed")
+        : new Error("Windows startup registry operation failed", { cause }));
     };
     try {
       const options: SpawnOptions = {
@@ -59,11 +61,11 @@ function runRegistryCommand(
         stdio: "ignore",
       };
       child = spawnProcess(command, args, options);
-      child.once("error", () => finish(null));
+      child.once("error", (error) => finish(null, error));
       child.once("close", (code) => finish(code));
       child.once("exit", (code) => finish(code));
-    } catch {
-      reject(new Error("Windows startup registry operation failed"));
+    } catch (error: unknown) {
+      reject(new Error("Windows startup registry operation failed", { cause: error }));
     }
   });
 }

@@ -110,4 +110,77 @@ describe("Windows supervisor adapters", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("does not change the supervisor when the tray process cannot spawn", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "local-review-mcp-tray-failure-"));
+    const supervisor = {
+      logDirectory: directory,
+      onStateChange: () => () => {},
+      status: async () => ({
+        state: "RUNNING" as const,
+        workspace: "review-workspace",
+        restartAttempts: 0,
+        maxRestartAttempts: 3,
+        healthFailures: 0,
+        tunnel: { state: "LOCAL_ONLY" },
+      }),
+    } as unknown as Supervisor;
+    const app = new WindowsTrayApp(supervisor, {
+      platform: "win32",
+      statePath: join(directory, "tray-state.json"),
+      spawn: vi.fn(() => { throw new Error("PowerShell unavailable"); }) as unknown as typeof import("node:child_process").spawn,
+    });
+
+    try {
+      await expect(app.start()).rejects.toMatchObject({
+        message: "Windows tray failed to start",
+        cause: expect.objectContaining({ message: "PowerShell unavailable" }),
+      });
+      await expect(supervisor.status()).resolves.toMatchObject({ state: "RUNNING" });
+    } finally {
+      await app.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps startup registration failures inside the tray action", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "local-review-mcp-startup-failure-"));
+    const child = new FakeChildProcess();
+    const spawn = fakeSpawn(child);
+    const startupManager = {
+      enableStartup: vi.fn().mockRejectedValue(new Error("access denied")),
+    } as unknown as WindowsStartupManager;
+    const supervisor = {
+      logDirectory: directory,
+      onStateChange: () => () => {},
+      status: async () => ({
+        state: "RUNNING" as const,
+        workspace: "review-workspace",
+        restartAttempts: 0,
+        maxRestartAttempts: 3,
+        healthFailures: 0,
+        tunnel: { state: "LOCAL_ONLY" },
+      }),
+    } as unknown as Supervisor;
+    const app = new WindowsTrayApp(supervisor, {
+      platform: "win32",
+      statePath: join(directory, "tray-state.json"),
+      spawn: spawn as unknown as typeof import("node:child_process").spawn,
+      startupManager,
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      await app.start();
+      child.stdout.write("enable-startup\n");
+      await vi.waitFor(() => expect(startupManager.enableStartup).toHaveBeenCalledOnce());
+      await expect(supervisor.status()).resolves.toMatchObject({ state: "RUNNING" });
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("MCP runtime continues"));
+      expect(warning).toHaveBeenCalledWith("access denied");
+    } finally {
+      warning.mockRestore();
+      await app.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 });

@@ -142,6 +142,27 @@ describe("supervisor", () => {
     ]);
   });
 
+  it("waits for the runtime health endpoint after the child process spawns", async () => {
+    const healthMonitor = new FakeHealthMonitor();
+    healthMonitor.checks = [false, true];
+    const supervisor = makeSupervisor(new FakeProcessManager(), healthMonitor);
+
+    await expect(supervisor.start()).resolves.toMatchObject({ state: "RUNNING" });
+    await supervisor.stop();
+  });
+
+  it("preserves the startup cause while reporting the supervisor failure", async () => {
+    const processManager = new FakeProcessManager();
+    processManager.failNextStart = true;
+    const supervisor = makeSupervisor(processManager);
+
+    await expect(supervisor.start()).rejects.toMatchObject({
+      message: "Supervisor failed to start",
+      cause: expect.objectContaining({ message: "Runtime process failed to start" }),
+    });
+    expect(supervisor.state).toBe("ERROR");
+  });
+
   it("keeps a failed recovery degraded", async () => {
     const processManager = new FakeProcessManager();
     const healthMonitor = new FakeHealthMonitor();

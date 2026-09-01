@@ -158,21 +158,26 @@ export class WindowsTrayApp {
     await this.refresh();
     if (this.platform !== "win32" || this.child !== undefined) return;
 
-    const child = this.spawnProcess(this.powershellCommand, [
-      "-NoProfile",
-      "-NonInteractive",
-      "-WindowStyle",
-      "Hidden",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-Command",
-      TRAY_SCRIPT,
-    ], {
-      env: this.trayEnvironment(),
-      shell: false,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "ignore"],
-    } satisfies SpawnOptions);
+    let child: ChildProcess;
+    try {
+      child = this.spawnProcess(this.powershellCommand, [
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        TRAY_SCRIPT,
+      ], {
+        env: this.trayEnvironment(),
+        shell: false,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"],
+      } satisfies SpawnOptions);
+    } catch (error: unknown) {
+      throw new Error("Windows tray failed to start", { cause: error });
+    }
     this.child = child;
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => this.readActions(chunk));
@@ -184,10 +189,10 @@ export class WindowsTrayApp {
         child.removeListener("error", onError);
         resolve();
       };
-      const onError = (): void => {
+      const onError = (error: unknown): void => {
         child.removeListener("spawn", onSpawn);
         if (this.child === child) this.child = undefined;
-        reject(new Error("Windows tray failed to start"));
+        reject(new Error("Windows tray failed to start", { cause: error }));
       };
       child.once("spawn", onSpawn);
       child.once("error", onError);
@@ -265,8 +270,14 @@ export class WindowsTrayApp {
         await this.supervisor.stop().catch(() => undefined);
         await this.onExit?.();
       }
-    } catch {
-      // UI actions expose state through the next refresh; raw errors stay private.
+    } catch (error: unknown) {
+      console.warn(`Windows supervisor action failed (${action}); MCP runtime continues`);
+      if (error instanceof Error) {
+        console.warn(error.message);
+        if (error.stack !== undefined) console.warn(error.stack);
+      } else {
+        console.warn(String(error));
+      }
     }
     await this.refresh();
   }
