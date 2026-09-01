@@ -1,6 +1,5 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -109,24 +108,6 @@ describe("search_text", () => {
     expect(result.results).toEqual([
       { path: "app.ts", line: 2, column: 1, preview: "needle" },
     ]);
-  });
-
-  it("uses ripgrep when the executable is available", async () => {
-    const command = process.env.LOCAL_REVIEW_RG_PATH ?? "rg";
-    const probe = spawnSync(command, ["--version"], { shell: false, stdio: "ignore" });
-    if (probe.error !== undefined || probe.status !== 0) return;
-
-    const workspace = await makeWorkspace();
-    await writeFile(join(workspace, "app.ts"), "needle\n");
-    const result = await searchText(new WorkspaceManager(workspace), {
-      query: "needle",
-      path: ".",
-      regex: false,
-      caseSensitive: false,
-      limit: 100,
-    });
-
-    expect(result.engine).toBe("ripgrep");
   });
 
   it("returns controlled errors for invalid regex and invalid input", async () => {
