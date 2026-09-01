@@ -3,14 +3,20 @@ import { basename } from "node:path";
 import { endpoint, type ResolvedSettings } from "./config/settings.js";
 import { isPortInUse, startHttpServer } from "./mcp/http.js";
 import { V01_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
+import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { WorkspaceManager } from "./workspace/manager.js";
 
 export interface AppContext extends McpRuntimeContext {
   readonly settings: ResolvedSettings;
+  readonly tunnel: TunnelManager;
 }
 
 export function createAppContext(settings: ResolvedSettings): AppContext {
-  return { settings, workspace: new WorkspaceManager(settings.workspace) };
+  return {
+    settings,
+    tunnel: createTunnelManager(settings.remote),
+    workspace: new WorkspaceManager(settings.workspace),
+  };
 }
 
 export async function startApp(
@@ -18,7 +24,15 @@ export async function startApp(
   context: AppContext = createAppContext(settings),
 ): Promise<Server> {
   try {
-    return await startHttpServer(settings, context);
+    const server = await startHttpServer(settings, context);
+    try {
+      await context.tunnel.start();
+    } catch (error: unknown) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      throw error;
+    }
+    server.once("close", () => { void context.tunnel.stop(); });
+    return server;
   } catch (error: unknown) {
     if (isPortInUse(error)) {
       throw new Error(

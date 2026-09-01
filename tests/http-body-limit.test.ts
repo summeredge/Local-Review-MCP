@@ -49,6 +49,7 @@ async function postJson(port: number, body: string): Promise<{ status: number; t
         accept: "application/json, text/event-stream",
         "content-type": "application/json",
         "content-length": payload.byteLength,
+        authorization: "Bearer test-token",
       },
     }, (response) => {
       let text = "";
@@ -88,6 +89,8 @@ describe("MCP HTTP request body limit", () => {
       host: "127.0.0.1",
       port: 0,
       workspace,
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
     });
     runningServers.push(server);
     const address = server.address();
@@ -109,6 +112,8 @@ describe("MCP HTTP request body limit", () => {
       host: "127.0.0.1",
       port: 0,
       workspace: "unused",
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
     } satisfies ResolvedSettings, { workspace });
     runningServers.push(server);
     const port = await listen(server);

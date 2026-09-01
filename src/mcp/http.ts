@@ -1,6 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { DEFAULT_HOST, type ResolvedSettings, MCP_PATH } from "../config/settings.js";
+import { isAuthenticated } from "../auth/middleware.js";
+import {
+  APP_VERSION,
+  DEFAULT_HOST,
+  HEALTH_PATH,
+  MCP_PATH,
+  type ResolvedSettings,
+} from "../config/settings.js";
 import { createMcpServer, type McpRuntimeContext } from "./server.js";
 
 export const MAX_MCP_REQUEST_BYTES = 1024 * 1024;
@@ -41,6 +48,31 @@ function sendJson(response: ServerResponse, statusCode: number, body: unknown): 
   response.end(JSON.stringify(body));
 }
 
+function sendUnauthorized(response: ServerResponse): void {
+  response.writeHead(401, {
+    "content-type": "application/json",
+    "www-authenticate": "Bearer",
+  });
+  response.end(JSON.stringify({ error: "unauthorized" }));
+}
+
+function handleHealthRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: McpRuntimeContext,
+): void {
+  if (request.method !== "GET") {
+    request.resume();
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+  sendJson(response, 200, {
+    status: "ok",
+    workspace: context.workspace.workspaceId,
+    version: APP_VERSION,
+  });
+}
+
 async function handleMcpRequest(
   request: IncomingMessage,
   response: ServerResponse,
@@ -74,10 +106,22 @@ async function handleMcpRequest(
   await transport.handleRequest(request, response, body);
 }
 
-export function createHttpServer(_settings: ResolvedSettings, context: McpRuntimeContext): Server {
+export function createHttpServer(settings: ResolvedSettings, context: McpRuntimeContext): Server {
   return createServer((request, response) => {
+    if (request.url === HEALTH_PATH) {
+      handleHealthRequest(request, response, context);
+      return;
+    }
     if (request.url !== MCP_PATH) {
+      request.resume();
       sendJson(response, 404, { error: "not_found" });
+      return;
+    }
+
+    if (!isAuthenticated(request, settings.auth.token)) {
+      request.resume();
+      console.warn("Auth failed");
+      sendUnauthorized(response);
       return;
     }
 

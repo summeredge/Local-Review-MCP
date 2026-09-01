@@ -25,6 +25,8 @@ describe("port checks", () => {
       host: "127.0.0.1",
       port: await getFreePort(),
       workspace: process.cwd(),
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
     })).resolves.toBeUndefined();
   });
 
@@ -39,6 +41,8 @@ describe("port checks", () => {
       host: "127.0.0.1",
       port: address.port,
       workspace: process.cwd(),
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
     })).rejects.toMatchObject({ code: "EADDRINUSE" });
   });
 
@@ -53,6 +57,8 @@ describe("port checks", () => {
       host: "127.0.0.1",
       port: address.port,
       workspace: process.cwd(),
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
     })).rejects.toThrow(
       `127.0.0.1:${address.port} is already in use`,
     );

@@ -43,11 +43,20 @@ describe("MCP HTTP runtime", () => {
     await writeFile(join(workspace, "README.md"), "# Review\n");
     await writeFile(join(workspace, "src", "app.ts"), "export const app = true;\n");
 
-    const settings = { host: "127.0.0.1" as const, port: await getFreePort(), workspace };
+    const settings = {
+      host: "127.0.0.1" as const,
+      port: await getFreePort(),
+      workspace,
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
+    };
     const server = await startApp(settings);
     runningServers.push(server);
     const client = new Client({ name: "http-test", version: "0.1.0" });
-    const transport = new StreamableHTTPClientTransport(new URL(`http://${settings.host}:${settings.port}/mcp`));
+    const transport = new StreamableHTTPClientTransport(
+      new URL(`http://${settings.host}:${settings.port}/mcp`),
+      { requestInit: { headers: { authorization: "Bearer test-token" } } },
+    );
 
     await client.connect(transport);
     const result = await client.listTools();

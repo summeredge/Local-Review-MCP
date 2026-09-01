@@ -37,7 +37,13 @@ async function getFreePort(): Promise<number> {
 }
 
 function settings(host: string, workspace: string, port: number): ResolvedSettings {
-  return { host, workspace, port } as unknown as ResolvedSettings;
+  return {
+    host,
+    workspace,
+    port,
+    auth: { token: "test-token" },
+    remote: { enabled: false, endpoint: "" },
+  } as unknown as ResolvedSettings;
 }
 
 describe("HTTP runtime host security", () => {
