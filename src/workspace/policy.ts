@@ -7,6 +7,9 @@ import {
   WorkspacePathError,
 } from "./path.js";
 
+export const MAX_IGNORE_FILE_BYTES = 256 * 1024;
+export const MAX_IGNORE_RULES = 2048;
+
 interface IgnoreRule {
   readonly pattern: string;
   readonly matcher: RegExp;
@@ -22,6 +25,7 @@ function parseIgnoreRules(contents: string): IgnoreRule[] {
   for (const line of contents.split(/\r?\n/u)) {
     const pattern = line.trim();
     if (pattern === "" || pattern.startsWith("#")) continue;
+    if (rules.length >= MAX_IGNORE_RULES) throw policyInitializationError();
     if (pattern.startsWith("!")) throw policyInitializationError();
 
     let normalizedPattern: string;
@@ -53,7 +57,8 @@ function readIgnoreRules(workspaceRoot: string): IgnoreRule[] {
   try {
     canonicalIgnorePath = realpathSync.native(ignorePath);
     if (!isContainedPath(workspaceRoot, canonicalIgnorePath)) throw policyInitializationError();
-    if (!statSync(canonicalIgnorePath).isFile()) throw policyInitializationError();
+    const stats = statSync(canonicalIgnorePath);
+    if (!stats.isFile() || stats.size > MAX_IGNORE_FILE_BYTES) throw policyInitializationError();
   } catch (error: unknown) {
     if (error instanceof WorkspacePathError) throw error;
     throw policyInitializationError();

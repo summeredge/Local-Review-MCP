@@ -29,6 +29,7 @@ const READ_ONLY_ANNOTATIONS = {
 } as const;
 
 const MAX_VISITED_ENTRIES = 10_000;
+export const MAX_READ_SCAN_BYTES = 8 * 1024 * 1024;
 const ROOT_ALIAS = "workspace:/";
 
 const listFilesInputSchema = {
@@ -196,6 +197,7 @@ async function readFilePage(
   const lines = createInterface({ input: inputStream, crlfDelay: Infinity });
   const output: string[] = [];
   let currentLine = 0;
+  let scannedBytes = 0;
   let contentBytes = 0;
   let hasMore = false;
   let truncated = false;
@@ -203,6 +205,14 @@ async function readFilePage(
   try {
     for await (const rawLine of lines) {
       currentLine += 1;
+      scannedBytes += Buffer.byteLength(rawLine, "utf8") + 1;
+      if (scannedBytes > MAX_READ_SCAN_BYTES) {
+        throw new WorkspacePathError(
+          "READ_SCAN_LIMIT_EXCEEDED",
+          "Workspace file scan limit was exceeded.",
+          resolved.relativePath,
+        );
+      }
       let line = rawLine;
       if (currentLine === 1) line = line.replace(/^\uFEFF/u, "");
       if (currentLine < input.start_line) continue;
@@ -231,7 +241,8 @@ async function readFilePage(
       hasMore = true;
       break;
     }
-  } catch {
+  } catch (error: unknown) {
+    if (error instanceof WorkspacePathError) throw error;
     throw new WorkspacePathError("PATH_NOT_FOUND", "Workspace file could not be read.", resolved.relativePath);
   } finally {
     lines.close();

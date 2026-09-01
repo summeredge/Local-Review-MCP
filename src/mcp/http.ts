@@ -1,11 +1,37 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { type ResolvedSettings, MCP_PATH } from "../config/settings.js";
+import { DEFAULT_HOST, type ResolvedSettings, MCP_PATH } from "../config/settings.js";
 import { createMcpServer, type McpRuntimeContext } from "./server.js";
 
+export const MAX_MCP_REQUEST_BYTES = 1024 * 1024;
+
+class RequestBodyTooLargeError extends Error {
+  public constructor() {
+    super("MCP request body exceeds the maximum allowed size.");
+    this.name = "RequestBodyTooLargeError";
+  }
+}
+
 async function parseBody(request: IncomingMessage): Promise<unknown> {
+  const contentLength = request.headers["content-length"];
+  if (typeof contentLength === "string"
+    && Number.isFinite(Number(contentLength))
+    && Number(contentLength) > MAX_MCP_REQUEST_BYTES) {
+    request.resume();
+    throw new RequestBodyTooLargeError();
+  }
+
   const chunks: Buffer[] = [];
-  for await (const chunk of request) chunks.push(Buffer.from(chunk));
+  let totalBytes = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+    if (totalBytes > MAX_MCP_REQUEST_BYTES) {
+      request.resume();
+      throw new RequestBodyTooLargeError();
+    }
+    chunks.push(buffer);
+  }
   if (chunks.length === 0) return undefined;
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
@@ -28,7 +54,11 @@ async function handleMcpRequest(
   let body: unknown;
   try {
     body = await parseBody(request);
-  } catch {
+  } catch (error: unknown) {
+    if (error instanceof RequestBodyTooLargeError) {
+      sendJson(response, 413, { error: "payload_too_large" });
+      return;
+    }
     sendJson(response, 400, { error: "invalid_json_body" });
     return;
   }
@@ -61,7 +91,17 @@ export function createHttpServer(_settings: ResolvedSettings, context: McpRuntim
   });
 }
 
+function assertLoopbackHost(settings: ResolvedSettings): void {
+  if (settings.host !== DEFAULT_HOST) {
+    throw new Error(
+      `Local Review MCP refuses to bind to "${String(settings.host)}"; `
+      + `only "${DEFAULT_HOST}" is allowed.`,
+    );
+  }
+}
+
 export async function checkPort(settings: ResolvedSettings): Promise<void> {
+  assertLoopbackHost(settings);
   const probe = createServer();
   await new Promise<void>((resolve, reject) => {
     const onError = (error: NodeJS.ErrnoException): void => {
@@ -82,6 +122,7 @@ export async function startHttpServer(
   settings: ResolvedSettings,
   context: McpRuntimeContext,
 ): Promise<Server> {
+  assertLoopbackHost(settings);
   await checkPort(settings);
   const server = createHttpServer(settings, context);
   await new Promise<void>((resolve, reject) => {
@@ -95,6 +136,7 @@ export async function startHttpServer(
     };
     server.once("error", onError);
     server.once("listening", onListening);
+    assertLoopbackHost(settings);
     server.listen(settings.port, settings.host);
   });
   return server;
