@@ -2,7 +2,7 @@
 
 ## Current version
 
-V0.1 Release Candidate / Task 9
+V0.1 Release Candidate / Task 10A
 
 ## Current capabilities
 
@@ -57,6 +57,85 @@ Supervisor. It checks `/health` at the configured interval, performs at most
 Open Log Folder, startup registration, and Exit from the Tray menu. Supervisor
 logs are stored under the user's local application data directory and contain
 only fixed lifecycle events.
+
+## Production Deployment
+
+The supported deployment path is Windows → Local Review MCP → Cloudflare Tunnel
+→ ChatGPT Web custom MCP connector.
+
+### Windows requirements
+
+- Windows PowerShell 5.1 or PowerShell 7.
+- Node.js with npm available as `node --version` and `npm --version`.
+- `cloudflared` on `PATH` when `remote.enabled` is `true`. Install it from the
+  [Cloudflare tunnel documentation](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
+- A workspace directory that already exists and is readable. The deployment
+  scripts never create it.
+
+From the repository root, install dependencies and build the release runtime:
+
+```powershell
+npm install
+npm run build
+```
+
+Prepare the local production configuration. The example contains no real token,
+endpoint, or workspace:
+
+```powershell
+Copy-Item .\config.production.example.json .\config.production.json
+```
+
+Edit `config.production.json` and set `workspace` to the project directory the
+connector may review. `remote.endpoint` is optional for a Quick Tunnel. Keep
+`config.production.json` local; `.gitignore` excludes it.
+
+Set the bearer token in the process environment before starting. It is not
+stored in the repository:
+
+```powershell
+$env:LOCAL_REVIEW_MCP_TOKEN = "<long-random-review-token>"
+```
+
+For a Quick Tunnel, leave `remote.endpoint` empty and make sure `cloudflared`
+is installed. For a named tunnel, set `remote.endpoint` to the stable public
+HTTPS `/mcp` URL and set `CLOUDFLARE_TUNNEL_TOKEN` in the process environment.
+Do not put either token in source control.
+
+Run the standard startup entry point:
+
+```powershell
+.\scripts\start-production.ps1 -Config ".\config.production.json"
+```
+
+The entry point reads the configuration, runs `preflight-check.ps1`, then
+starts the existing Local Review MCP runtime. The runtime starts the Windows
+Supervisor when `supervisor.enabled` is `true` and starts the Cloudflare Tunnel
+when `remote.enabled` is `true`. It prints the local health endpoint and any
+ready remote endpoint without printing credentials.
+
+The preflight check verifies Node/npm, installed dependencies, required config
+sections, workspace access, and port availability. A missing `cloudflared` is
+fatal only when remote access is enabled. It reports an occupied port and asks
+you to change `port`; it never auto-installs dependencies, creates a workspace,
+or selects another port.
+
+### Remote verification
+
+After the tunnel reports a public endpoint, verify the deployment from a PowerShell
+process that has the remote URL and token:
+
+```powershell
+$env:LOCAL_REVIEW_MCP_REMOTE_URL = "https://<public-hostname>/mcp"
+$env:LOCAL_REVIEW_MCP_REMOTE_TOKEN = $env:LOCAL_REVIEW_MCP_TOKEN
+.\scripts\verify-remote.ps1
+```
+
+`verify-remote.ps1` checks that unauthenticated and wrong-token health requests
+return HTTP 401, the correct token returns `status=ok`, MCP `initialize` works,
+and `tools/list` contains exactly the six read-only tools:
+`workspace_info`, `list_files`, `read_file`, `search_text`, `git_status`, and
+`git_diff`.
 
 ## Remote MCP Setup
 
@@ -162,5 +241,16 @@ provide `LOCAL_REVIEW_MCP_REMOTE_URL` and
 `LOCAL_REVIEW_MCP_REMOTE_TOKEN` only in the process environment before running
 the remote test. No token or public URL is stored in the repository.
 
-Local Review MCP is intentionally limited to `read`, `search`, and `review`.
-It does not provide `modify`, `execute`, or `agent` capabilities.
+## Security Notes
+
+Local Review MCP intentionally provides only `read`, `search`, and `review`
+capabilities through its six registered tools. It does not provide:
+
+- `modify` or `write_file` operations;
+- `execute` or shell operations;
+- `agent` or Codex/ChatGPT automation controls.
+
+Keep `LOCAL_REVIEW_MCP_TOKEN`, `CLOUDFLARE_TUNNEL_TOKEN`, and
+`LOCAL_REVIEW_MCP_REMOTE_TOKEN` in the process environment or another local
+secret store. Never commit tokens, `.env` files, Cloudflare credentials,
+private keys, or `config.production.json`.

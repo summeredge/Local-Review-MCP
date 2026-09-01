@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy this file to config.production.json and set the local values before starting.",
+  "port": 12080,
+  "workspace": "C:\\Your\\Project",
+  "auth": {
+    "token": "",
+    "_comment": "Set a local token; never commit the token."
+  },
+  "remote": {
+    "enabled": true,
+    "provider": "cloudflare",
+    "endpoint": "",
+    "_comment": "The endpoint is optional for a Quick Tunnel; use a stable HTTPS endpoint for a named tunnel."
+  },
+  "supervisor": {
+    "enabled": true,
+    "healthIntervalSeconds": 30,
+    "maxRestartAttempts": 3
+  }
+}
