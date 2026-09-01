@@ -12,6 +12,7 @@ V0.1 Release Candidate / Task 10A
 - configurable fixed port
 - startup port conflict detection
 - Bearer-token authentication for all MCP HTTP requests
+- OAuth 2.1-compatible discovery, public-client registration, PKCE, and Bearer tokens
 - safe `GET /health` endpoint
 - Cloudflare Tunnel provider with managed lifecycle
 - one explicitly configured active workspace
@@ -190,9 +191,9 @@ configuration inputs. No module hardcodes a tunnel hostname.
    custom MCP app.
 2. Enter the HTTPS endpoint reported by `TunnelManager` or the authenticated
    `/health` response, using the `/mcp` path.
-3. Select the connector's bearer/API-key authentication option and configure
-   the value so ChatGPT sends `Authorization: Bearer <LOCAL_REVIEW_MCP_TOKEN>`.
-   Do not put the token in the URL or commit it to the JSON config.
+3. Select the connector's OAuth authentication option. The server publishes
+   MCP protected-resource metadata, authorization-server metadata, dynamic
+   client registration, and PKCE endpoints under the same public origin.
 4. Scan the tools, confirm the six read-only actions, save the draft app, and
    select it from a new chat. Ask for a code review; ChatGPT should call
    `workspace_info`, `git_status`, `git_diff`, `read_file`, and `search_text`.
@@ -208,8 +209,9 @@ The current tools are `workspace_info`, `list_files`, `read_file`, `search_text`
 `git_status`, and `git_diff`. Git tools are bound to the configured workspace,
 do not expose Git command arguments, and never perform write operations.
 
-MCP and health requests require `Authorization: Bearer <token>` even on
-localhost and through Cloudflare Tunnel. The health endpoint is
+The health endpoint requires the configured static `Authorization: Bearer <token>`
+even on localhost and through Cloudflare Tunnel. MCP requests accept either that
+legacy token or an OAuth access token. The health endpoint is
 `http://127.0.0.1:<port>/health`; it returns the status, stable workspace
 identifier, version, `remote_status`, `endpoint_status`, and the public endpoint
 only when it is ready. It never returns tokens, credentials, local IPs, or

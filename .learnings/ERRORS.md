@@ -24,3 +24,27 @@ PowerShell 变量名不区分大小写。将脚本参数 `$Config` 复用为 JSO
 - See Also: none
 
 ---
+
+## [ERR-20260901-002] agent-reach Windows console encoding
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+`agent-reach doctor --json` is unsupported by the installed CLI, and the
+fallback `agent-reach doctor` failed under the default GBK PowerShell console
+when its report contained Unicode characters.
+
+### 建议修复
+
+Use the installed command's supported syntax and set
+`PYTHONIOENCODING=utf-8` for Windows CLI invocations that emit Unicode.
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
