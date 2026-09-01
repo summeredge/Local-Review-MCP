@@ -1,8 +1,9 @@
 export const CONNECTION_STATES = [
-  "DISABLED",
   "LOCAL_ONLY",
+  "REMOTE_STARTING",
   "REMOTE_READY",
   "REMOTE_ERROR",
+  "STOPPED",
 ] as const;
 
 export type ConnectionState = typeof CONNECTION_STATES[number];

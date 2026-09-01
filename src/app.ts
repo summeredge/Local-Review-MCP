@@ -1,6 +1,6 @@
 import type { Server } from "node:http";
 import { basename } from "node:path";
-import { endpoint, type ResolvedSettings } from "./config/settings.js";
+import { endpoint, localOrigin, type ResolvedSettings } from "./config/settings.js";
 import { isPortInUse, startHttpServer } from "./mcp/http.js";
 import { V01_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
@@ -11,10 +11,16 @@ export interface AppContext extends McpRuntimeContext {
   readonly tunnel: TunnelManager;
 }
 
-export function createAppContext(settings: ResolvedSettings): AppContext {
+export function createAppContext(
+  settings: ResolvedSettings,
+  environment: NodeJS.ProcessEnv = process.env,
+): AppContext {
   return {
     settings,
-    tunnel: createTunnelManager(settings.remote),
+    tunnel: createTunnelManager(settings.remote, {
+      localEndpoint: localOrigin(settings),
+      environment,
+    }),
     workspace: new WorkspaceManager(settings.workspace),
   };
 }
@@ -27,11 +33,10 @@ export async function startApp(
     const server = await startHttpServer(settings, context);
     try {
       await context.tunnel.start();
-    } catch (error: unknown) {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      throw error;
+    } catch {
+      console.error("Tunnel failed to start; local MCP remains available");
     }
-    server.once("close", () => { void context.tunnel.stop(); });
+    server.once("close", () => { void context.tunnel.stop().catch(() => undefined); });
     return server;
   } catch (error: unknown) {
     if (isPortInUse(error)) {

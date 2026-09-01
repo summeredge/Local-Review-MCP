@@ -6,13 +6,13 @@ import {
 } from "../../src/tunnel/manager.js";
 
 describe("tunnel abstraction", () => {
-  it("keeps disabled remote mode disabled", async () => {
+  it("keeps disabled remote mode local-only", async () => {
     const manager = new TunnelManager(new NullTunnelProvider(), false);
 
-    expect(await manager.status()).toEqual({ state: "DISABLED" });
-    expect(await manager.start()).toEqual({ state: "DISABLED" });
+    expect(await manager.status()).toEqual({ state: "LOCAL_ONLY" });
+    expect(await manager.start()).toEqual({ state: "LOCAL_ONLY" });
     await manager.stop();
-    expect(await manager.status()).toEqual({ state: "DISABLED" });
+    expect(await manager.status()).toEqual({ state: "LOCAL_ONLY" });
   });
 
   it("tracks a manual endpoint without owning a tunnel service", async () => {
@@ -25,7 +25,7 @@ describe("tunnel abstraction", () => {
       endpoint: "https://review.example/mcp",
     });
     await manager.stop();
-    expect(await manager.status()).toEqual({ state: "LOCAL_ONLY" });
+    expect(await manager.status()).toEqual({ state: "STOPPED" });
   });
 
   it("records provider failures as REMOTE_ERROR without exposing the cause", async () => {

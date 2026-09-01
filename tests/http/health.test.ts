@@ -53,7 +53,13 @@ describe("health endpoint", () => {
     const workspaceId = new WorkspaceManager(workspace).workspaceId;
 
     expect(response.status).toBe(200);
-    expect(health).toEqual({ status: "ok", workspace: workspaceId, version: "0.1" });
+    expect(health).toEqual({
+      status: "ok",
+      workspace: workspaceId,
+      version: "0.1",
+      remote_status: "LOCAL_ONLY",
+      endpoint_status: "stopped",
+    });
     expect(response.text).not.toContain(workspace);
     expect(response.text).not.toContain(TOKEN);
     expect(response.text).not.toContain(process.env.USERNAME ?? "__missing_username__");

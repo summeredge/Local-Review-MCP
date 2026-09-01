@@ -1,4 +1,5 @@
 import type { RemoteSettings } from "../config/settings.js";
+import { CloudflareTunnelProvider, type CloudflareTunnelOptions } from "./cloudflare.js";
 import type { ConnectionState, TunnelInfo, TunnelProvider, TunnelStatus } from "./types.js";
 
 export class NullTunnelProvider implements TunnelProvider {
@@ -9,7 +10,7 @@ export class NullTunnelProvider implements TunnelProvider {
   public async stop(): Promise<void> {}
 
   public async status(): Promise<TunnelStatus> {
-    return { state: "DISABLED" };
+    return { state: "LOCAL_ONLY" };
   }
 }
 
@@ -31,8 +32,14 @@ export class ManualEndpointProvider implements TunnelProvider {
   public async status(): Promise<TunnelStatus> {
     return this.running
       ? { state: "REMOTE_READY", endpoint: this.endpoint }
-      : { state: "LOCAL_ONLY" };
+      : { state: "STOPPED" };
   }
+}
+
+export interface TunnelManagerOptions {
+  readonly localEndpoint?: string;
+  readonly environment?: NodeJS.ProcessEnv;
+  readonly cloudflare?: Pick<CloudflareTunnelOptions, "command" | "spawn" | "readyTimeoutMs">;
 }
 
 export class TunnelManager {
@@ -43,18 +50,23 @@ export class TunnelManager {
     private readonly provider: TunnelProvider,
     private readonly enabled: boolean,
   ) {
-    this.state = enabled ? "LOCAL_ONLY" : "DISABLED";
+    this.state = "LOCAL_ONLY";
   }
 
   public async start(): Promise<TunnelStatus> {
     if (!this.enabled) {
-      this.state = "DISABLED";
+      this.state = "LOCAL_ONLY";
       this.endpoint = undefined;
       return this.status();
     }
 
+    this.state = "REMOTE_STARTING";
+    this.endpoint = undefined;
     try {
       const info = await this.provider.start();
+      if (typeof info.endpoint !== "string" || info.endpoint.trim() === "") {
+        throw new Error("Tunnel provider did not return an endpoint");
+      }
       this.state = "REMOTE_READY";
       this.endpoint = info.endpoint;
     } catch {
@@ -67,16 +79,36 @@ export class TunnelManager {
 
   public async stop(): Promise<void> {
     if (!this.enabled) {
-      this.state = "DISABLED";
+      this.state = "LOCAL_ONLY";
       this.endpoint = undefined;
       return;
     }
-    await this.provider.stop();
-    this.state = "LOCAL_ONLY";
-    this.endpoint = undefined;
+    try {
+      await this.provider.stop();
+      this.state = "STOPPED";
+      this.endpoint = undefined;
+    } catch {
+      this.state = "REMOTE_ERROR";
+      this.endpoint = undefined;
+      throw new Error("Tunnel failed to stop");
+    }
   }
 
   public async status(): Promise<TunnelStatus> {
+    try {
+      const providerStatus = await this.provider.status();
+      if (this.enabled
+        && (this.state === "REMOTE_STARTING" || this.state === "REMOTE_READY")
+        && providerStatus.state === "REMOTE_ERROR") {
+        this.state = "REMOTE_ERROR";
+        this.endpoint = undefined;
+      }
+    } catch {
+      if (this.enabled) {
+        this.state = "REMOTE_ERROR";
+        this.endpoint = undefined;
+      }
+    }
     return {
       state: this.state,
       ...(this.endpoint === undefined ? {} : { endpoint: this.endpoint }),
@@ -84,9 +116,19 @@ export class TunnelManager {
   }
 }
 
-export function createTunnelManager(remote: RemoteSettings): TunnelManager {
-  const provider = remote.enabled
-    ? new ManualEndpointProvider(remote.endpoint)
-    : new NullTunnelProvider();
+export function createTunnelManager(
+  remote: RemoteSettings,
+  options: TunnelManagerOptions = {},
+): TunnelManager {
+  if (!remote.enabled) return new TunnelManager(new NullTunnelProvider(), false);
+  if (remote.provider !== "cloudflare") {
+    throw new Error("remote.provider must be cloudflare when remote is enabled");
+  }
+  const provider = new CloudflareTunnelProvider({
+    localEndpoint: options.localEndpoint,
+    endpoint: remote.endpoint,
+    environment: options.environment,
+    ...options.cloudflare,
+  });
   return new TunnelManager(provider, remote.enabled);
 }

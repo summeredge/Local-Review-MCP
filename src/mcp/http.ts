@@ -8,9 +8,14 @@ import {
   MCP_PATH,
   type ResolvedSettings,
 } from "../config/settings.js";
+import type { TunnelProvider, TunnelStatus } from "../tunnel/types.js";
 import { createMcpServer, type McpRuntimeContext } from "./server.js";
 
 export const MAX_MCP_REQUEST_BYTES = 1024 * 1024;
+
+type HttpRuntimeContext = McpRuntimeContext & {
+  readonly tunnel?: Pick<TunnelProvider, "status">;
+};
 
 class RequestBodyTooLargeError extends Error {
   public constructor() {
@@ -56,20 +61,35 @@ function sendUnauthorized(response: ServerResponse): void {
   response.end(JSON.stringify({ error: "unauthorized" }));
 }
 
-function handleHealthRequest(
+async function handleHealthRequest(
   request: IncomingMessage,
   response: ServerResponse,
-  context: McpRuntimeContext,
-): void {
+  context: HttpRuntimeContext,
+): Promise<void> {
   if (request.method !== "GET") {
     request.resume();
     sendJson(response, 405, { error: "method_not_allowed" });
     return;
   }
+  let tunnel: TunnelStatus = { state: "LOCAL_ONLY" };
+  try {
+    if (context.tunnel !== undefined) tunnel = await context.tunnel.status();
+  } catch {
+    tunnel = { state: "REMOTE_ERROR" };
+  }
   sendJson(response, 200, {
     status: "ok",
     workspace: context.workspace.workspaceId,
     version: APP_VERSION,
+    remote_status: tunnel.state,
+    endpoint_status: tunnel.endpoint === undefined
+      ? tunnel.state === "REMOTE_ERROR"
+        ? "error"
+        : tunnel.state === "REMOTE_STARTING"
+          ? "starting"
+          : "stopped"
+      : "ready",
+    ...(tunnel.endpoint === undefined ? {} : { endpoint: tunnel.endpoint }),
   });
 }
 
@@ -106,10 +126,12 @@ async function handleMcpRequest(
   await transport.handleRequest(request, response, body);
 }
 
-export function createHttpServer(settings: ResolvedSettings, context: McpRuntimeContext): Server {
+export function createHttpServer(settings: ResolvedSettings, context: HttpRuntimeContext): Server {
   return createServer((request, response) => {
     if (request.url === HEALTH_PATH) {
-      handleHealthRequest(request, response, context);
+      void handleHealthRequest(request, response, context).catch(() => {
+        if (!response.headersSent) sendJson(response, 500, { error: "internal_server_error" });
+      });
       return;
     }
     if (request.url !== MCP_PATH) {
@@ -164,7 +186,7 @@ export async function checkPort(settings: ResolvedSettings): Promise<void> {
 
 export async function startHttpServer(
   settings: ResolvedSettings,
-  context: McpRuntimeContext,
+  context: HttpRuntimeContext,
 ): Promise<Server> {
   assertLoopbackHost(settings);
   await checkPort(settings);

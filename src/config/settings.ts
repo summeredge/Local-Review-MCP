@@ -6,13 +6,17 @@ export const MCP_PATH = "/mcp" as const;
 export const HEALTH_PATH = "/health" as const;
 export const APP_VERSION = "0.1" as const;
 
+export const REMOTE_PROVIDERS = ["cloudflare"] as const;
+export type RemoteProvider = typeof REMOTE_PROVIDERS[number];
+
 export interface AuthSettings {
   readonly token: string;
 }
 
 export interface RemoteSettings {
   readonly enabled: boolean;
-  readonly endpoint: string;
+  readonly provider?: RemoteProvider;
+  readonly endpoint?: string;
 }
 
 export interface ResolvedSettings {
@@ -71,16 +75,25 @@ export function parseRemoteEnabled(value: unknown): boolean {
   return value;
 }
 
+export function parseRemoteProvider(value: unknown, enabled = false): RemoteProvider | undefined {
+  if (value === undefined) {
+    if (enabled) throw new Error("remote.provider is required when remote is enabled");
+    return undefined;
+  }
+  if (typeof value !== "string" || !REMOTE_PROVIDERS.includes(value as RemoteProvider)) {
+    throw new Error(`remote.provider must be one of: ${REMOTE_PROVIDERS.join(", ")}`);
+  }
+  return value as RemoteProvider;
+}
+
 export function parseRemoteEndpoint(value: unknown, enabled = false): string {
   if (value === undefined) {
-    if (enabled) throw new Error("remote.endpoint is required when remote is enabled");
     return "";
   }
-  if (typeof value !== "string") throw new Error("remote.endpoint must be a valid HTTP(S) URL");
+  if (typeof value !== "string") throw new Error("remote.endpoint must be a valid HTTPS URL");
 
   const endpointValue = value.trim();
   if (endpointValue === "") {
-    if (enabled) throw new Error("remote.endpoint is required when remote is enabled");
     return "";
   }
 
@@ -88,11 +101,11 @@ export function parseRemoteEndpoint(value: unknown, enabled = false): string {
   try {
     parsed = new URL(endpointValue);
   } catch {
-    throw new Error("remote.endpoint must be a valid HTTP(S) URL");
+    throw new Error("remote.endpoint must be a valid HTTPS URL");
   }
-  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:")
+  if (parsed.protocol !== "https:"
     || parsed.username !== "" || parsed.password !== "") {
-    throw new Error("remote.endpoint must be a valid HTTP(S) URL");
+    throw new Error("remote.endpoint must be a valid HTTPS URL");
   }
   return endpointValue;
 }
@@ -117,7 +130,9 @@ export function resolveSettings(options: {
   configToken?: unknown;
   configAuth?: unknown;
   configRemoteEnabled?: unknown;
+  configRemoteProvider?: unknown;
   configRemoteEndpoint?: unknown;
+  envRemoteEndpoint?: unknown;
   configRemote?: unknown;
 } = {}): ResolvedSettings {
   const port = options.cliPort !== undefined
@@ -141,10 +156,17 @@ export function resolveSettings(options: {
   const enabledValue = options.configRemoteEnabled !== undefined
     ? options.configRemoteEnabled
     : sectionValue(options.configRemote, "remote", "enabled");
-  const endpointValue = options.configRemoteEndpoint !== undefined
-    ? options.configRemoteEndpoint
-    : sectionValue(options.configRemote, "remote", "endpoint");
   const remoteEnabled = parseRemoteEnabled(enabledValue);
+  const remoteProvider = parseRemoteProvider(
+    options.configRemoteProvider !== undefined
+      ? options.configRemoteProvider
+      : sectionValue(options.configRemote, "remote", "provider"),
+    remoteEnabled,
+  );
+  const remoteEndpoint = options.configRemoteEndpoint !== undefined
+    ? options.configRemoteEndpoint
+    : sectionValue(options.configRemote, "remote", "endpoint")
+      ?? (remoteEnabled ? options.envRemoteEndpoint : undefined);
 
   return {
     host: DEFAULT_HOST,
@@ -153,7 +175,8 @@ export function resolveSettings(options: {
     auth: { token: parseToken(tokenValue) },
     remote: {
       enabled: remoteEnabled,
-      endpoint: parseRemoteEndpoint(endpointValue, remoteEnabled),
+      ...(remoteProvider === undefined ? {} : { provider: remoteProvider }),
+      endpoint: parseRemoteEndpoint(remoteEndpoint, remoteEnabled),
     },
   };
 }
@@ -206,10 +229,15 @@ export async function loadSettings(
     cliToken: cli.token,
     envToken: environment.LOCAL_REVIEW_MCP_TOKEN,
     configAuth: config.auth,
+    envRemoteEndpoint: environment.CLOUDFLARE_TUNNEL_ENDPOINT,
     configRemote: config.remote,
   });
 }
 
 export function endpoint(settings: ResolvedSettings): string {
   return `http://${settings.host}:${settings.port}${MCP_PATH}`;
+}
+
+export function localOrigin(settings: ResolvedSettings): string {
+  return `http://${settings.host}:${settings.port}`;
 }

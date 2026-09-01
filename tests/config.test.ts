@@ -100,14 +100,28 @@ describe("settings", () => {
     expect(resolveSettings({ ...common, cliToken: "cli-token" }).auth.token).toBe("cli-token");
   });
 
-  it("defaults remote access to disabled and accepts a configured endpoint", () => {
+  it("defaults remote access to disabled and accepts Cloudflare configuration", () => {
     expect(resolveSettings({ configWorkspace: "workspace", configToken: "token" }).remote)
       .toEqual({ enabled: false, endpoint: "" });
     expect(resolveSettings({
       configWorkspace: "workspace",
       configToken: "token",
-      configRemote: { enabled: true, endpoint: "https://review.example/mcp" },
-    }).remote).toEqual({ enabled: true, endpoint: "https://review.example/mcp" });
+      configRemote: { enabled: true, provider: "cloudflare", endpoint: "https://review.example/mcp" },
+    }).remote).toEqual({
+      enabled: true,
+      provider: "cloudflare",
+      endpoint: "https://review.example/mcp",
+    });
+    expect(resolveSettings({
+      configWorkspace: "workspace",
+      configToken: "token",
+      configRemote: { enabled: true, provider: "cloudflare" },
+      envRemoteEndpoint: "https://review.example/mcp",
+    }).remote).toEqual({
+      enabled: true,
+      provider: "cloudflare",
+      endpoint: "https://review.example/mcp",
+    });
   });
 
   it("rejects invalid authentication and remote configuration", () => {
@@ -117,12 +131,17 @@ describe("settings", () => {
       configWorkspace: "workspace",
       configToken: "token",
       configRemote: { enabled: true },
-    })).toThrow("remote.endpoint");
+    })).toThrow("remote.provider");
     expect(() => resolveSettings({
       configWorkspace: "workspace",
       configToken: "token",
-      configRemote: { enabled: "yes", endpoint: "https://review.example/mcp" },
+      configRemote: { enabled: "yes", provider: "cloudflare" },
     })).toThrow("remote.enabled");
+    expect(() => resolveSettings({
+      configWorkspace: "workspace",
+      configToken: "token",
+      configRemote: { enabled: true, provider: "unsupported" },
+    })).toThrow("remote.provider");
     expect(() => resolveSettings({
       configWorkspace: "workspace",
       configToken: "token",

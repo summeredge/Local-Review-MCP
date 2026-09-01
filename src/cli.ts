@@ -6,6 +6,8 @@ try {
   const context = createAppContext(settings);
   const server = await startApp(settings, context);
   console.log(startupMessage(settings, context));
+  const remote = await context.tunnel.status();
+  if (remote.endpoint !== undefined) console.log(`Remote endpoint: ${remote.endpoint}`);
   const close = (): void => { void server.close(); };
   process.once("SIGINT", close);
   process.once("SIGTERM", close);
