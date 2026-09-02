@@ -36,6 +36,34 @@ function Get-Version([string]$CommandName, [string]$InstallHint) {
     }
 }
 
+function Get-CloudflaredCommand {
+    if (-not [string]::IsNullOrWhiteSpace($env:CLOUDFLARED_PATH)) {
+        if (Test-Path -LiteralPath $env:CLOUDFLARED_PATH -PathType Leaf) {
+            return $env:CLOUDFLARED_PATH
+        }
+        throw "CLOUDFLARED_PATH does not point to a file: $env:CLOUDFLARED_PATH"
+    }
+
+    $command = Get-Command cloudflared -ErrorAction SilentlyContinue
+    if ($null -ne $command) {
+        return $command.Source
+    }
+
+    $candidates = @(
+        if ($env:ProgramW6432) { Join-Path $env:ProgramW6432 "cloudflared\cloudflared.exe" }
+        if ($env:ProgramFiles) { Join-Path $env:ProgramFiles "cloudflared\cloudflared.exe" }
+        if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} "cloudflared\cloudflared.exe" }
+        if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "cloudflared\cloudflared.exe" }
+        if ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".local\bin\cloudflared.exe" }
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $candidate
+        }
+    }
+    throw "cloudflared is required; install it or set CLOUDFLARED_PATH to cloudflared.exe."
+}
+
 function Test-PortInUse([string]$HostName, [int]$Port) {
     $client = [System.Net.Sockets.TcpClient]::new()
     try {
@@ -139,7 +167,21 @@ try {
         if ([string]$provider -ne "cloudflare") {
             throw "Production config field 'remote.provider' must be cloudflare when remote is enabled."
         }
-        $cloudflaredVersion = Get-Version "cloudflared" "Install cloudflared and make 'cloudflared --version' available in PATH."
+        $tunnelName = Get-RequiredProperty $remote "tunnelName" "remote"
+        $remoteEndpoint = Get-RequiredProperty $remote "endpoint" "remote"
+        if ([string]::IsNullOrWhiteSpace([string]$tunnelName) -or [string]$tunnelName -match "\s") {
+            throw "Production config field 'remote.tunnelName' must be a non-empty name or UUID without whitespace."
+        }
+        $endpointUri = $null
+        $endpointValid = [Uri]::TryCreate([string]$remoteEndpoint, [UriKind]::Absolute, [ref]$endpointUri)
+        if ($endpointValid) {
+            $endpointValid = $endpointUri.Scheme -eq "https" -and [string]::IsNullOrEmpty($endpointUri.UserInfo)
+        }
+        if (-not $endpointValid) {
+            throw "Production config field 'remote.endpoint' must be a public HTTPS URL."
+        }
+        $cloudflaredCommand = Get-CloudflaredCommand
+        $cloudflaredVersion = Get-Version $cloudflaredCommand "Install cloudflared or set CLOUDFLARED_PATH to cloudflared.exe."
         Write-Host "Cloudflare Tunnel: $cloudflaredVersion"
     } else {
         Write-Host "Cloudflare Tunnel: disabled"

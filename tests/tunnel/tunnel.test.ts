@@ -36,7 +36,10 @@ describe("tunnel abstraction", () => {
     };
     const manager = new TunnelManager(provider, true);
 
-    await expect(manager.start()).rejects.toThrow("Tunnel failed to start");
+    await expect(manager.start()).rejects.toMatchObject({
+      message: "Tunnel failed to start",
+      cause: expect.objectContaining({ message: "secret-token" }),
+    });
     expect(await manager.status()).toEqual({ state: "REMOTE_ERROR" });
   });
 });

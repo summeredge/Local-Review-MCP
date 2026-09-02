@@ -73,9 +73,14 @@ class FakeTunnel implements SupervisorTunnel {
   public state = "LOCAL_ONLY";
   public starts = 0;
   public stops = 0;
+  public failNextStart = false;
 
   public async start(): Promise<void> {
     this.starts += 1;
+    if (this.failNextStart) {
+      this.failNextStart = false;
+      throw new Error("tunnel start failed");
+    }
     this.state = "REMOTE_READY";
   }
 
@@ -161,6 +166,33 @@ describe("supervisor", () => {
       cause: expect.objectContaining({ message: "Runtime process failed to start" }),
     });
     expect(supervisor.state).toBe("ERROR");
+  });
+
+  it("cleans up a tunnel that fails during startup", async () => {
+    const tunnel = new FakeTunnel();
+    tunnel.failNextStart = true;
+    const processManager = new FakeProcessManager();
+    const supervisor = makeSupervisor(processManager, new FakeHealthMonitor(), tunnel);
+
+    await expect(supervisor.start()).rejects.toMatchObject({
+      message: "Supervisor failed to start",
+      cause: expect.objectContaining({ message: "Tunnel failed to start" }),
+    });
+    expect(tunnel.stops).toBe(1);
+    expect(processManager.stops).toBe(1);
+  });
+
+  it("recovers when the tunnel connector becomes unhealthy", async () => {
+    const tunnel = new FakeTunnel();
+    const healthMonitor = new FakeHealthMonitor();
+    const supervisor = makeSupervisor(new FakeProcessManager(), healthMonitor, tunnel);
+    await supervisor.start();
+
+    tunnel.state = "REMOTE_ERROR";
+    await healthMonitor.trigger(true);
+
+    expect(tunnel.starts).toBe(2);
+    expect(supervisor.state).toBe("RUNNING");
   });
 
   it("keeps a failed recovery degraded", async () => {

@@ -1,16 +1,21 @@
+import { existsSync } from "node:fs";
 import { spawn as defaultSpawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { isIP } from "node:net";
+import { win32 as win32Path } from "node:path";
 import type { ConnectionState, TunnelInfo, TunnelProvider, TunnelStatus } from "./types.js";
 
 const DEFAULT_READY_TIMEOUT_MS = 10_000;
 const MAX_PROCESS_OUTPUT_BYTES = 64 * 1024;
+const STOP_TIMEOUT_MS = 5_000;
 
 export interface CloudflareTunnelOptions {
   readonly localEndpoint?: string;
   readonly endpoint?: string;
+  readonly tunnelName?: string;
   readonly token?: string;
   readonly command?: string;
   readonly environment?: NodeJS.ProcessEnv;
+  readonly platform?: NodeJS.Platform;
   readonly spawn?: typeof defaultSpawn;
   readonly readyTimeoutMs?: number;
 }
@@ -47,33 +52,96 @@ function parseToken(value: string | undefined): string | undefined {
   return value;
 }
 
+function parseTunnelName(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const name = value.trim();
+  if (name === "" || /\s/u.test(name)) {
+    throw new Error("Cloudflare tunnel name must be non-empty and without whitespace");
+  }
+  return name;
+}
+
 function outputText(chunk: string | Buffer): string {
   return typeof chunk === "string" ? chunk : chunk.toString("utf8");
 }
 
-function findEndpoint(output: string): string | undefined {
-  const candidates = output.match(/https:\/\/[^\s"'<>]+/giu) ?? [];
-  for (const candidate of candidates) {
-    const trimmed = candidate.replace(/[),.;\]}]+$/u, "");
+function hasRegisteredConnection(output: string): boolean {
+  return /\bregistered\s+tunnel\s+connection\b/iu.test(output)
+    || /\btunnel\s+connection\b[^\r\n]*\bregistered\b/iu.test(output);
+}
+
+function lastErrorLine(output: string): string | undefined {
+  return output.split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => /\b(?:error|err|failed|fatal|timeout|unable)\b/iu.test(line))
+    .at(-1);
+}
+
+function commandLine(command: string, args: readonly string[]): string {
+  const safeArgs = args.map((arg, index) => args[index - 1] === "--token" ? "<redacted>" : arg);
+  return [command, ...safeArgs].map((value) => JSON.stringify(value)).join(" ");
+}
+
+function terminate(child: ChildProcess): Promise<void> {
+  return new Promise((resolve) => {
+    let timer: NodeJS.Timeout | undefined;
+    let finished = false;
+    const finish = (): void => {
+      if (finished) return;
+      finished = true;
+      if (timer !== undefined) clearTimeout(timer);
+      child.removeListener("close", finish);
+      child.removeListener("exit", finish);
+      child.removeListener("error", finish);
+      resolve();
+    };
+    child.once("close", finish);
+    child.once("exit", finish);
+    child.once("error", finish);
+    timer = setTimeout(finish, STOP_TIMEOUT_MS);
     try {
-      const endpoint = parseEndpoint(trimmed, "Cloudflare tunnel endpoint");
-      const hostname = new URL(endpoint).hostname.toLowerCase();
-      if (hostname === "trycloudflare.com" || hostname.endsWith(".trycloudflare.com")) {
-        return endpoint;
-      }
+      if (!child.killed) child.kill();
     } catch {
-      continue;
+      finish();
     }
+  });
+}
+
+function resolveCommand(
+  environment: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  configured?: string,
+): string {
+  if (configured !== undefined) return configured;
+  const environmentPath = environment.CLOUDFLARED_PATH?.trim();
+  if (environmentPath !== undefined && environmentPath !== "") return environmentPath;
+  if (platform !== "win32") return "cloudflared";
+
+  const candidates = [
+    environment.ProgramW6432,
+    environment.ProgramFiles,
+    environment["ProgramFiles(x86)"],
+  ].filter((value): value is string => value !== undefined && value !== "")
+    .map((directory) => win32Path.join(directory, "cloudflared", "cloudflared.exe"));
+  const localAppData = environment.LOCALAPPDATA;
+  if (localAppData !== undefined && localAppData !== "") {
+    candidates.push(win32Path.join(localAppData, "cloudflared", "cloudflared.exe"));
   }
-  return undefined;
+  const userProfile = environment.USERPROFILE;
+  if (userProfile !== undefined && userProfile !== "") {
+    candidates.push(win32Path.join(userProfile, ".local", "bin", "cloudflared.exe"));
+  }
+  return candidates.find((candidate) => existsSync(candidate)) ?? "cloudflared";
 }
 
 export class CloudflareTunnelProvider implements TunnelProvider {
   private readonly command: string;
   private readonly environment: NodeJS.ProcessEnv;
   private readonly spawnProcess: typeof defaultSpawn;
+  private readonly platform: NodeJS.Platform;
   private readonly localEndpoint: string | undefined;
   private readonly configuredEndpoint: string | undefined;
+  private readonly tunnelName: string | undefined;
   private readonly token: string | undefined;
   private readonly readyTimeoutMs: number;
   private child: ChildProcess | undefined;
@@ -84,7 +152,8 @@ export class CloudflareTunnelProvider implements TunnelProvider {
 
   public constructor(options: CloudflareTunnelOptions = {}) {
     this.environment = options.environment ?? process.env;
-    this.command = options.command ?? this.environment.CLOUDFLARED_PATH ?? "cloudflared";
+    this.platform = options.platform ?? process.platform;
+    this.command = resolveCommand(this.environment, this.platform, options.command);
     this.spawnProcess = options.spawn ?? defaultSpawn;
     this.localEndpoint = options.localEndpoint;
     const endpoint = options.endpoint === undefined || options.endpoint.trim() === ""
@@ -93,6 +162,7 @@ export class CloudflareTunnelProvider implements TunnelProvider {
     this.configuredEndpoint = endpoint === undefined || endpoint.trim() === ""
       ? undefined
       : parseEndpoint(endpoint, "Cloudflare tunnel endpoint");
+    this.tunnelName = parseTunnelName(options.tunnelName);
     this.token = parseToken(options.token ?? this.environment.CLOUDFLARE_TUNNEL_TOKEN);
     this.readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
     if (!Number.isInteger(this.readyTimeoutMs) || this.readyTimeoutMs < 1) {
@@ -114,14 +184,19 @@ export class CloudflareTunnelProvider implements TunnelProvider {
   }
 
   private args(): string[] {
-    if (this.token !== undefined) return ["tunnel", "run", "--token", this.token];
-    if (this.configuredEndpoint !== undefined) {
-      throw new Error("CLOUDFLARE_TUNNEL_TOKEN is required when a remote endpoint is configured");
+    if (this.configuredEndpoint === undefined) {
+      throw new Error("Cloudflare tunnel endpoint is required for a named tunnel");
     }
     if (this.localEndpoint === undefined) {
-      throw new Error("Cloudflare tunnel local endpoint is required when no tunnel token is configured");
+      throw new Error("Cloudflare tunnel local endpoint is required for a named tunnel");
     }
-    return ["tunnel", "--url", this.localEndpoint];
+    if (this.tunnelName === undefined && this.token === undefined) {
+      throw new Error("Cloudflare tunnel name or CLOUDFLARE_TUNNEL_TOKEN is required");
+    }
+    const args = ["tunnel", "run", "--url", this.localEndpoint];
+    if (this.token !== undefined) args.push("--token", this.token);
+    if (this.tunnelName !== undefined) args.push(this.tunnelName);
+    return args;
   }
 
   public start(): Promise<TunnelInfo> {
@@ -141,15 +216,18 @@ export class CloudflareTunnelProvider implements TunnelProvider {
     }
     const promise = new Promise<TunnelInfo>((resolve, reject) => {
       let child: ChildProcess | undefined;
-      let output = "";
+      let stdout = "";
+      let stderr = "";
       let settled = false;
       let timer: NodeJS.Timeout | undefined;
+      let exitCode: number | null | undefined;
+      let exitSignal: NodeJS.Signals | null | undefined;
 
       const clearReadyTimer = (): void => {
         if (timer !== undefined) clearTimeout(timer);
       };
 
-      const fail = (message: string): void => {
+      const fail = (message: string, cause?: unknown): void => {
         if (settled) return;
         settled = true;
         clearReadyTimer();
@@ -158,7 +236,24 @@ export class CloudflareTunnelProvider implements TunnelProvider {
           this.endpoint = undefined;
           this.state = "REMOTE_ERROR";
         }
-        reject(new Error(message));
+        if (child !== undefined && !child.killed) {
+          try {
+            child.kill();
+          } catch {
+            // The original startup error is more useful than a cleanup error.
+          }
+        }
+        const lastError = lastErrorLine(stderr) ?? lastErrorLine(stdout);
+        const details = [
+          `Cloudflare tunnel failed: ${message}`,
+          `command: ${commandLine(this.command, args)}`,
+          `exit code: ${exitCode === undefined ? "not available" : String(exitCode)}`,
+          `signal: ${exitSignal ?? "none"}`,
+          `last error: ${lastError ?? "none reported"}`,
+          `stderr:\n${stderr.trim() || "(empty)"}`,
+          `stdout:\n${stdout.trim() || "(empty)"}`,
+        ].join("\n");
+        reject(cause === undefined ? new Error(details) : new Error(details, { cause }));
       };
 
       const ready = (endpoint: string): void => {
@@ -170,14 +265,16 @@ export class CloudflareTunnelProvider implements TunnelProvider {
         resolve({ endpoint });
       };
 
-      const inspectOutput = (chunk: string | Buffer): void => {
-        if (this.configuredEndpoint !== undefined) return;
-        output = (output + outputText(chunk)).slice(-MAX_PROCESS_OUTPUT_BYTES);
-        const discovered = findEndpoint(output);
-        if (discovered !== undefined) ready(discovered);
+      const inspectOutput = (stream: "stdout" | "stderr", chunk: string | Buffer): void => {
+        const value = outputText(chunk);
+        if (stream === "stdout") stdout = (stdout + value).slice(-MAX_PROCESS_OUTPUT_BYTES);
+        else stderr = (stderr + value).slice(-MAX_PROCESS_OUTPUT_BYTES);
+        if (this.configuredEndpoint !== undefined && hasRegisteredConnection(`${stdout}\n${stderr}`)) {
+          ready(this.configuredEndpoint);
+        }
       };
 
-      const onError = (): void => {
+      const onError = (error: unknown): void => {
         if (settled) {
           if (this.child === child) {
             this.child = undefined;
@@ -186,12 +283,14 @@ export class CloudflareTunnelProvider implements TunnelProvider {
           }
           return;
         }
-        fail("Cloudflare tunnel process failed to start");
+        fail("cloudflared process error", error);
       };
 
-      const onClose = (): void => {
+      const onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
+        exitCode = code;
+        exitSignal = signal;
         if (!settled) {
-          fail("Cloudflare tunnel exited before becoming ready");
+          fail("cloudflared exited before registering a tunnel connection");
           return;
         }
         if (this.child === child) {
@@ -202,18 +301,13 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       };
 
       const onSpawn = (): void => {
-        if (this.configuredEndpoint !== undefined) {
+        if (settled) return;
+        if (this.configuredEndpoint !== undefined && hasRegisteredConnection(`${stdout}\n${stderr}`)) {
           ready(this.configuredEndpoint);
           return;
         }
-        const discovered = findEndpoint(output);
-        if (discovered !== undefined) {
-          ready(discovered);
-          return;
-        }
         timer = setTimeout(() => {
-          if (child !== undefined) child.kill();
-          fail("Cloudflare tunnel did not report a remote HTTPS endpoint");
+          fail("timed out waiting for a registered tunnel connection");
         }, this.readyTimeoutMs);
       };
 
@@ -225,13 +319,13 @@ export class CloudflareTunnelProvider implements TunnelProvider {
           stdio: ["ignore", "pipe", "pipe"],
         } satisfies SpawnOptions);
         this.child = child;
-        child.stdout?.on("data", inspectOutput);
-        child.stderr?.on("data", inspectOutput);
+        child.stdout?.on("data", (chunk) => inspectOutput("stdout", chunk));
+        child.stderr?.on("data", (chunk) => inspectOutput("stderr", chunk));
         child.once("error", onError);
         child.once("close", onClose);
         child.once("spawn", onSpawn);
-      } catch {
-        fail("Cloudflare tunnel process failed to start");
+      } catch (error: unknown) {
+        fail("cloudflared process failed to spawn", error);
       }
 
       this.cancelStart = () => fail("Cloudflare tunnel stopped");
@@ -252,13 +346,13 @@ export class CloudflareTunnelProvider implements TunnelProvider {
   }
 
   public async stop(): Promise<void> {
+    const child = this.child;
     this.cancelStart?.();
     this.cancelStart = undefined;
-    const child = this.child;
     this.child = undefined;
     this.endpoint = undefined;
     this.state = "STOPPED";
-    if (child !== undefined && !child.killed) child.kill();
+    if (child !== undefined) await terminate(child);
   }
 
   public async status(): Promise<TunnelStatus> {

@@ -9,8 +9,9 @@
   "remote": {
     "enabled": true,
     "provider": "cloudflare",
-    "endpoint": "",
-    "_comment": "The endpoint is optional for a Quick Tunnel; use a stable HTTPS endpoint for a named tunnel."
+    "tunnelName": "<tunnel-name-or-uuid>",
+    "endpoint": "https://<public-hostname>/mcp",
+    "_comment": "Use an existing Named Tunnel name or UUID and its stable public MCP endpoint."
   },
   "supervisor": {
     "enabled": true,

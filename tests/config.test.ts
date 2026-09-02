@@ -129,35 +129,43 @@ describe("settings", () => {
     expect(resolveSettings({ ...common, cliToken: "cli-token" }).auth.token).toBe("cli-token");
   });
 
-  it("defaults remote access to disabled and accepts Cloudflare configuration", () => {
+  it("requires stable Named Tunnel configuration for Cloudflare", () => {
     expect(resolveSettings({ configWorkspace: "workspace", configToken: "token" }).remote)
       .toEqual({ enabled: false, endpoint: "" });
-    expect(resolveSettings({
+    expect(() => resolveSettings({
       configWorkspace: "workspace",
       configToken: "token",
       configRemote: { enabled: true, provider: "cloudflare" },
-    }).remote).toEqual({
-      enabled: true,
-      provider: "cloudflare",
-      endpoint: "",
-    });
-    expect(resolveSettings({
+    })).toThrow("remote.endpoint");
+    expect(() => resolveSettings({
       configWorkspace: "workspace",
       configToken: "token",
       configRemote: { enabled: true, provider: "cloudflare", endpoint: "https://review.example/mcp" },
+    })).toThrow("remote.tunnelName");
+    expect(resolveSettings({
+      configWorkspace: "workspace",
+      configToken: "token",
+      configRemote: {
+        enabled: true,
+        provider: "cloudflare",
+        tunnelName: "review-tunnel",
+        endpoint: "https://review.example/mcp",
+      },
     }).remote).toEqual({
       enabled: true,
       provider: "cloudflare",
+      tunnelName: "review-tunnel",
       endpoint: "https://review.example/mcp",
     });
     expect(resolveSettings({
       configWorkspace: "workspace",
       configToken: "token",
-      configRemote: { enabled: true, provider: "cloudflare" },
+      configRemote: { enabled: true, provider: "cloudflare", tunnelName: "review-tunnel" },
       envRemoteEndpoint: "https://review.example/mcp",
     }).remote).toEqual({
       enabled: true,
       provider: "cloudflare",
+      tunnelName: "review-tunnel",
       endpoint: "https://review.example/mcp",
     });
   });
@@ -216,6 +224,16 @@ describe("settings", () => {
       configToken: "token",
       configRemote: { enabled: true, provider: "unsupported" },
     })).toThrow("remote.provider");
+    expect(() => resolveSettings({
+      configWorkspace: "workspace",
+      configToken: "token",
+      configRemote: {
+        enabled: true,
+        provider: "cloudflare",
+        tunnelName: "bad name",
+        endpoint: "https://review.example/mcp",
+      },
+    })).toThrow("remote.tunnelName");
     expect(() => resolveSettings({
       configWorkspace: "workspace",
       configToken: "token",

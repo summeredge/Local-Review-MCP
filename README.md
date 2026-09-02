@@ -88,8 +88,9 @@ Copy-Item .\config.production.example.json .\config.production.json
 ```
 
 Edit `config.production.json` and set `workspace` to the project directory the
-connector may review. `remote.endpoint` is optional for a Quick Tunnel. Keep
-`config.production.json` local; `.gitignore` excludes it.
+connector may review. Set `remote.tunnelName` to the existing Cloudflare Named
+Tunnel name or UUID and `remote.endpoint` to its stable public HTTPS `/mcp`
+endpoint. Keep `config.production.json` local; `.gitignore` excludes it.
 
 Set the bearer token in the process environment before starting. It is not
 stored in the repository:
@@ -98,10 +99,10 @@ stored in the repository:
 $env:LOCAL_REVIEW_MCP_TOKEN = "<long-random-review-token>"
 ```
 
-For a Quick Tunnel, leave `remote.endpoint` empty and make sure `cloudflared`
-is installed. For a named tunnel, set `remote.endpoint` to the stable public
-HTTPS `/mcp` URL and set `CLOUDFLARE_TUNNEL_TOKEN` in the process environment.
-Do not put either token in source control.
+Make sure `cloudflared` is installed. The production Supervisor runs the
+configured Named Tunnel with its local credentials file. If the installation
+uses a tunnel token instead, set `CLOUDFLARE_TUNNEL_TOKEN` for that same
+configured tunnel. Do not put either token in source control.
 
 Run the standard startup entry point:
 
@@ -146,7 +147,9 @@ Remote access is disabled by default. Enable the Cloudflare provider with:
 {
   "remote": {
     "enabled": true,
-    "provider": "cloudflare"
+    "provider": "cloudflare",
+    "tunnelName": "<tunnel-name-or-uuid>",
+    "endpoint": "https://<public-hostname>/mcp"
   }
 }
 ```
@@ -158,31 +161,23 @@ $env:LOCAL_REVIEW_MCP_TOKEN = "<long-random-review-token>"
 npm start -- --workspace "C:\path\to\project" --config "settings.json"
 ```
 
-Install `cloudflared` and choose one of these modes:
-
-- Quick tunnel: omit the Cloudflare tunnel token. `cloudflared` reports a
-  temporary public HTTPS URL; use the URL shown by the runtime as the Remote
-  MCP endpoint and append `/mcp` when needed. The URL can change after restart.
-- Named tunnel: set `CLOUDFLARE_TUNNEL_TOKEN` and configure the stable public
-  hostname as `remote.endpoint` or `CLOUDFLARE_TUNNEL_ENDPOINT`, for example
-  `https://<public-hostname>/mcp`. A named tunnel is required when the ChatGPT
-  app must reconnect after a tunnel restart without changing its endpoint.
-
-Choose one stable endpoint input. If both are supplied, `remote.endpoint` takes
-precedence over `CLOUDFLARE_TUNNEL_ENDPOINT`.
+Install `cloudflared` and configure an existing Named Tunnel. `remote.tunnelName`
+must contain its name or UUID, and `remote.endpoint` must contain the stable
+public HTTPS `/mcp` URL. The Supervisor runs `cloudflared tunnel run` for that
+tunnel and never creates a tunnel, changes DNS, or requests a temporary URL.
 
 ```powershell
 $env:LOCAL_REVIEW_MCP_TOKEN = "<long-random-review-token>"
+# Optional when using token-based credentials for the configured Named Tunnel.
 $env:CLOUDFLARE_TUNNEL_TOKEN = "<cloudflare-tunnel-token>"
-$env:CLOUDFLARE_TUNNEL_ENDPOINT = "https://<public-hostname>/mcp"
 npm start -- --workspace "C:\path\to\project" --config "settings.json"
 ```
 
 The Cloudflare provider invokes only the installed `cloudflared` executable,
 does not upload configuration, and never logs credentials.
 The live endpoint is returned by the provider and owned by `TunnelManager`;
-`remote.endpoint` and `CLOUDFLARE_TUNNEL_ENDPOINT` are only named-tunnel
-configuration inputs. No module hardcodes a tunnel hostname.
+`remote.tunnelName` and `remote.endpoint` are configuration inputs. No module
+hardcodes a tunnel hostname.
 
 ### ChatGPT Web connector
 

@@ -38,7 +38,12 @@ function remoteSettings(workspace: string): ResolvedSettings {
     port: 0,
     workspace,
     auth: { token: TOKEN },
-    remote: { enabled: true, provider: "cloudflare", endpoint: REMOTE_ENDPOINT },
+    remote: {
+      enabled: true,
+      provider: "cloudflare",
+      tunnelName: "review-tunnel",
+      endpoint: REMOTE_ENDPOINT,
+    },
     supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
   };
 }

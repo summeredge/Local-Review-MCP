@@ -20,6 +20,7 @@ export interface RemoteSettings {
   readonly enabled: boolean;
   readonly provider?: RemoteProvider;
   readonly endpoint?: string;
+  readonly tunnelName?: string;
 }
 
 export interface SupervisorSettings {
@@ -100,12 +101,14 @@ export function parseRemoteProvider(value: unknown, enabled = false): RemoteProv
 
 export function parseRemoteEndpoint(value: unknown, enabled = false): string {
   if (value === undefined) {
+    if (enabled) throw new Error("remote.endpoint is required when remote is enabled");
     return "";
   }
   if (typeof value !== "string") throw new Error("remote.endpoint must be a valid HTTPS URL");
 
   const endpointValue = value.trim();
   if (endpointValue === "") {
+    if (enabled) throw new Error("remote.endpoint is required when remote is enabled");
     return "";
   }
 
@@ -120,6 +123,17 @@ export function parseRemoteEndpoint(value: unknown, enabled = false): string {
     throw new Error("remote.endpoint must be a valid HTTPS URL");
   }
   return endpointValue;
+}
+
+export function parseRemoteTunnelName(value: unknown, enabled = false): string | undefined {
+  if (value === undefined) {
+    if (enabled) throw new Error("remote.tunnelName is required when remote is enabled");
+    return undefined;
+  }
+  if (typeof value !== "string" || value.trim() === "" || /\s/u.test(value)) {
+    throw new Error("remote.tunnelName must be a non-empty name or UUID without whitespace");
+  }
+  return value.trim();
 }
 
 export function parseSupervisorEnabled(value: unknown): boolean {
@@ -168,6 +182,7 @@ export function resolveSettings(options: {
   configRemoteEnabled?: unknown;
   configRemoteProvider?: unknown;
   configRemoteEndpoint?: unknown;
+  configRemoteTunnelName?: unknown;
   envRemoteEndpoint?: unknown;
   configRemote?: unknown;
   configSupervisorEnabled?: unknown;
@@ -207,6 +222,11 @@ export function resolveSettings(options: {
     ? options.configRemoteEndpoint
     : sectionValue(options.configRemote, "remote", "endpoint")
       ?? (remoteEnabled ? options.envRemoteEndpoint : undefined);
+  const remoteTunnelName = options.configRemoteTunnelName !== undefined
+    ? options.configRemoteTunnelName
+    : sectionValue(options.configRemote, "remote", "tunnelName");
+  const parsedRemoteEndpoint = parseRemoteEndpoint(remoteEndpoint, remoteEnabled);
+  const parsedRemoteTunnelName = parseRemoteTunnelName(remoteTunnelName, remoteEnabled);
   const supervisorEnabled = options.configSupervisorEnabled !== undefined
     ? options.configSupervisorEnabled
     : sectionValue(options.configSupervisor, "supervisor", "enabled");
@@ -225,7 +245,10 @@ export function resolveSettings(options: {
     remote: {
       enabled: remoteEnabled,
       ...(remoteProvider === undefined ? {} : { provider: remoteProvider }),
-      endpoint: parseRemoteEndpoint(remoteEndpoint, remoteEnabled),
+      ...(parsedRemoteTunnelName === undefined
+        ? {}
+        : { tunnelName: parsedRemoteTunnelName }),
+      endpoint: parsedRemoteEndpoint,
     },
     supervisor: {
       enabled: parseSupervisorEnabled(supervisorEnabled),

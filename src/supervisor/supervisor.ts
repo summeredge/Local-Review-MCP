@@ -220,10 +220,10 @@ export class Supervisor {
       throw new Error("Runtime health check failed");
     }
 
+    this.tunnelStarted = true;
     await this.tunnel.start().catch((error: unknown) => {
       throw new Error("Tunnel failed to start", { cause: error });
     });
-    this.tunnelStarted = true;
     await this.recordTunnelState();
     this.restartAttempts = 0;
     this.healthFailures = 0;
@@ -261,7 +261,8 @@ export class Supervisor {
 
   private async handleHealth(healthy: boolean): Promise<void> {
     if (this.state !== "RUNNING" && this.state !== "DEGRADED") return;
-    if (healthy) {
+    const tunnelHealthy = healthy && await this.isTunnelHealthy();
+    if (tunnelHealthy) {
       this.healthFailures = 0;
       this.restartAttempts = 0;
       this.setState("RUNNING");
@@ -283,6 +284,15 @@ export class Supervisor {
       await recovery;
     } finally {
       if (this.recovery === recovery) this.recovery = undefined;
+    }
+  }
+
+  private async isTunnelHealthy(): Promise<boolean> {
+    try {
+      const state = (await this.tunnel.status()).state;
+      return state !== "REMOTE_ERROR" && state !== "ERROR" && state !== "UNKNOWN" && state !== "STOPPED";
+    } catch {
+      return false;
     }
   }
 

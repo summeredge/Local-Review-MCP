@@ -73,7 +73,10 @@ async function writeConfig(
     remote: {
       enabled: options.remoteEnabled,
       provider: "cloudflare",
-      endpoint: "",
+      ...(options.remoteEnabled ? {
+        tunnelName: "review-tunnel",
+        endpoint: "https://review.example/mcp",
+      } : { endpoint: "" }),
     },
     supervisor: {
       enabled: false,
@@ -94,7 +97,17 @@ function withoutCloudflared(): NodeJS.ProcessEnv {
     join(systemRoot, "System32", "Wbem"),
     join(systemRoot, "System32", "WindowsPowerShell", "v1.0"),
   ].join(";");
-  return { Path: pathValue, PATH: pathValue };
+  const missingRoot = join(projectDirectory, "missing-cloudflared-home");
+  return {
+    Path: pathValue,
+    PATH: pathValue,
+    CLOUDFLARED_PATH: join(missingRoot, "cloudflared.exe"),
+    ProgramW6432: missingRoot,
+    ProgramFiles: missingRoot,
+    "ProgramFiles(x86)": missingRoot,
+    LOCALAPPDATA: missingRoot,
+    USERPROFILE: missingRoot,
+  };
 }
 
 async function closeServer(server: Server): Promise<void> {

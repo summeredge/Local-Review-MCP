@@ -39,7 +39,7 @@ export class ManualEndpointProvider implements TunnelProvider {
 export interface TunnelManagerOptions {
   readonly localEndpoint?: string;
   readonly environment?: NodeJS.ProcessEnv;
-  readonly cloudflare?: Pick<CloudflareTunnelOptions, "command" | "spawn" | "readyTimeoutMs">;
+  readonly cloudflare?: Pick<CloudflareTunnelOptions, "command" | "platform" | "spawn" | "readyTimeoutMs">;
 }
 
 export class TunnelManager {
@@ -69,10 +69,10 @@ export class TunnelManager {
       }
       this.state = "REMOTE_READY";
       this.endpoint = info.endpoint;
-    } catch {
+    } catch (error: unknown) {
       this.state = "REMOTE_ERROR";
       this.endpoint = undefined;
-      throw new Error("Tunnel failed to start");
+      throw new Error("Tunnel failed to start", { cause: error });
     }
     return this.status();
   }
@@ -87,10 +87,10 @@ export class TunnelManager {
       await this.provider.stop();
       this.state = "STOPPED";
       this.endpoint = undefined;
-    } catch {
+    } catch (error: unknown) {
       this.state = "REMOTE_ERROR";
       this.endpoint = undefined;
-      throw new Error("Tunnel failed to stop");
+      throw new Error("Tunnel failed to stop", { cause: error });
     }
   }
 
@@ -124,9 +124,13 @@ export function createTunnelManager(
   if (remote.provider !== "cloudflare") {
     throw new Error("remote.provider must be cloudflare when remote is enabled");
   }
+  if (remote.tunnelName === undefined || remote.endpoint === undefined || remote.endpoint === "") {
+    throw new Error("remote.tunnelName and remote.endpoint are required for a named tunnel");
+  }
   const provider = new CloudflareTunnelProvider({
     localEndpoint: options.localEndpoint,
     endpoint: remote.endpoint,
+    tunnelName: remote.tunnelName,
     environment: options.environment,
     ...options.cloudflare,
   });
