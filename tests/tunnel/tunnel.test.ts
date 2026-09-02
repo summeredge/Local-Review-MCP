@@ -4,6 +4,7 @@ import {
   NullTunnelProvider,
   TunnelManager,
 } from "../../src/tunnel/manager.js";
+import { resolveSettings } from "../../src/config/settings.js";
 
 describe("tunnel abstraction", () => {
   it("keeps disabled remote mode local-only", async () => {
@@ -41,5 +42,51 @@ describe("tunnel abstraction", () => {
       cause: expect.objectContaining({ message: "secret-token" }),
     });
     expect(await manager.status()).toEqual({ state: "REMOTE_ERROR" });
+  });
+
+  it("passes a configured Cloudflare token through the resolved remote settings", async () => {
+    const settings = resolveSettings({
+      configWorkspace: "workspace",
+      configToken: "auth-token",
+      configRemote: {
+        enabled: true,
+        provider: "cloudflare",
+        token: "abc",
+        endpoint: "https://review.example/mcp",
+      },
+    });
+
+    expect(settings.remote).toEqual({
+      enabled: true,
+      provider: "cloudflare",
+      token: "abc",
+      endpoint: "https://review.example/mcp",
+    });
+    expect(resolveSettings({
+      configWorkspace: "workspace",
+      configToken: "auth-token",
+      configRemote: {
+        enabled: true,
+        provider: "cloudflare",
+        endpoint: "https://review.example/mcp",
+      },
+      envRemoteToken: "abc",
+    }).remote).toEqual({
+      enabled: true,
+      provider: "cloudflare",
+      token: "abc",
+      endpoint: "https://review.example/mcp",
+    });
+    expect(() => resolveSettings({
+      configWorkspace: "workspace",
+      configToken: "auth-token",
+      configRemote: {
+        enabled: true,
+        provider: "cloudflare",
+        token: "abc",
+        tunnelName: "xxx",
+        endpoint: "https://review.example/mcp",
+      },
+    })).toThrow("Cloudflare tunnel configuration invalid: token and tunnelName cannot both be set");
   });
 });

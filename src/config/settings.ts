@@ -20,6 +20,7 @@ export interface RemoteSettings {
   readonly enabled: boolean;
   readonly provider?: RemoteProvider;
   readonly endpoint?: string;
+  readonly token?: string;
   readonly tunnelName?: string;
 }
 
@@ -136,6 +137,14 @@ export function parseRemoteTunnelName(value: unknown, enabled = false): string |
   return value.trim();
 }
 
+export function parseRemoteToken(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.trim() === "" || /\s/u.test(value)) {
+    throw new Error("remote.token must be a non-empty token without whitespace");
+  }
+  return value;
+}
+
 export function parseSupervisorEnabled(value: unknown): boolean {
   if (value === undefined) return false;
   if (typeof value !== "boolean") throw new Error("supervisor.enabled must be a boolean");
@@ -182,8 +191,10 @@ export function resolveSettings(options: {
   configRemoteEnabled?: unknown;
   configRemoteProvider?: unknown;
   configRemoteEndpoint?: unknown;
+  configRemoteToken?: unknown;
   configRemoteTunnelName?: unknown;
   envRemoteEndpoint?: unknown;
+  envRemoteToken?: unknown;
   configRemote?: unknown;
   configSupervisorEnabled?: unknown;
   configHealthIntervalSeconds?: unknown;
@@ -226,7 +237,18 @@ export function resolveSettings(options: {
     ? options.configRemoteTunnelName
     : sectionValue(options.configRemote, "remote", "tunnelName");
   const parsedRemoteEndpoint = parseRemoteEndpoint(remoteEndpoint, remoteEnabled);
-  const parsedRemoteTunnelName = parseRemoteTunnelName(remoteTunnelName, remoteEnabled);
+  const remoteToken = options.configRemoteToken !== undefined
+    ? options.configRemoteToken
+    : sectionValue(options.configRemote, "remote", "token")
+      ?? (remoteEnabled ? options.envRemoteToken : undefined);
+  const parsedRemoteTunnelName = parseRemoteTunnelName(remoteTunnelName);
+  const parsedRemoteToken = parseRemoteToken(remoteToken);
+  if (parsedRemoteToken !== undefined && parsedRemoteTunnelName !== undefined) {
+    throw new Error("Cloudflare tunnel configuration invalid: token and tunnelName cannot both be set");
+  }
+  if (remoteEnabled && parsedRemoteToken === undefined && parsedRemoteTunnelName === undefined) {
+    throw new Error("remote.tunnelName or remote.token is required when remote is enabled");
+  }
   const supervisorEnabled = options.configSupervisorEnabled !== undefined
     ? options.configSupervisorEnabled
     : sectionValue(options.configSupervisor, "supervisor", "enabled");
@@ -245,6 +267,7 @@ export function resolveSettings(options: {
     remote: {
       enabled: remoteEnabled,
       ...(remoteProvider === undefined ? {} : { provider: remoteProvider }),
+      ...(parsedRemoteToken === undefined ? {} : { token: parsedRemoteToken }),
       ...(parsedRemoteTunnelName === undefined
         ? {}
         : { tunnelName: parsedRemoteTunnelName }),
@@ -309,6 +332,7 @@ export async function loadSettings(
     envToken: environment.LOCAL_REVIEW_MCP_TOKEN,
     configAuth: config.auth,
     envRemoteEndpoint: environment.CLOUDFLARE_TUNNEL_ENDPOINT,
+    envRemoteToken: environment.CLOUDFLARE_TUNNEL_TOKEN,
     configRemote: config.remote,
     configSupervisor: config.supervisor,
   });

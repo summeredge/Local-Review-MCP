@@ -197,10 +197,7 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       throw new Error("Cloudflare tunnel endpoint is required");
     }
     if (this.tunnelName !== undefined) {
-      if (this.localEndpoint === undefined) {
-        throw new Error("Cloudflare tunnel local endpoint is required for a named tunnel");
-      }
-      return ["tunnel", "--no-autoupdate", "--url", this.localEndpoint, "run", this.tunnelName];
+      return ["tunnel", "--no-autoupdate", "run", this.tunnelName];
     }
     if (this.token !== undefined) return ["tunnel", "--no-autoupdate", "run", "--token", this.token];
     throw new Error("Cloudflare tunnel name or CLOUDFLARE_TUNNEL_TOKEN is required");

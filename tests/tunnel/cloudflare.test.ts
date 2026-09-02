@@ -47,7 +47,6 @@ describe("Cloudflare tunnel provider", () => {
     const provider = new CloudflareTunnelProvider({
       endpoint: "https://review.example/mcp",
       tunnelName: "review-tunnel",
-      localEndpoint: "http://127.0.0.1:12080",
       command: "cloudflared.exe",
       environment: {},
       spawn: spawn as unknown as typeof import("node:child_process").spawn,
@@ -65,7 +64,7 @@ describe("Cloudflare tunnel provider", () => {
     await expect(starting).resolves.toEqual({ endpoint: "https://review.example/mcp" });
     expect(spawn).toHaveBeenCalledWith(
       "cloudflared.exe",
-      ["tunnel", "--no-autoupdate", "--url", "http://127.0.0.1:12080", "run", "review-tunnel"],
+      ["tunnel", "--no-autoupdate", "run", "review-tunnel"],
       expect.objectContaining({ shell: false, windowsHide: true }),
     );
   });

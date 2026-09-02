@@ -130,6 +130,7 @@ export function createTunnelManager(
   const provider = new CloudflareTunnelProvider({
     localEndpoint: options.localEndpoint,
     endpoint: remote.endpoint,
+    token: remote.token,
     tunnelName: remote.tunnelName,
     environment: options.environment,
     ...options.cloudflare,
