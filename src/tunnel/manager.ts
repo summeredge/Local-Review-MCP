@@ -39,7 +39,7 @@ export class ManualEndpointProvider implements TunnelProvider {
 export interface TunnelManagerOptions {
   readonly localEndpoint?: string;
   readonly environment?: NodeJS.ProcessEnv;
-  readonly cloudflare?: Pick<CloudflareTunnelOptions, "command" | "platform" | "spawn" | "readyTimeoutMs">;
+  readonly cloudflare?: Pick<CloudflareTunnelOptions, "command" | "platform" | "spawn" | "readyTimeoutMs" | "token">;
 }
 
 export class TunnelManager {
@@ -124,8 +124,8 @@ export function createTunnelManager(
   if (remote.provider !== "cloudflare") {
     throw new Error("remote.provider must be cloudflare when remote is enabled");
   }
-  if (remote.tunnelName === undefined || remote.endpoint === undefined || remote.endpoint === "") {
-    throw new Error("remote.tunnelName and remote.endpoint are required for a named tunnel");
+  if (remote.endpoint === undefined || remote.endpoint === "") {
+    throw new Error("remote.endpoint is required when remote is enabled");
   }
   const provider = new CloudflareTunnelProvider({
     localEndpoint: options.localEndpoint,

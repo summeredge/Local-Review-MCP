@@ -28,6 +28,12 @@ describe("Cloudflare tunnel provider", () => {
       .toThrow("public HTTPS URL");
     expect(() => new CloudflareTunnelProvider({ token: "token with spaces" }))
       .toThrow("CLOUDFLARE_TUNNEL_TOKEN");
+    expect(() => new CloudflareTunnelProvider({ tunnelName: "review-tunnel", token: "tunnel-token" }))
+      .toThrow("Cloudflare tunnel configuration invalid: token and tunnelName cannot both be set");
+    expect(() => new CloudflareTunnelProvider({
+      tunnelName: "review-tunnel",
+      environment: { CLOUDFLARE_TUNNEL_TOKEN: "environment-token" },
+    })).toThrow("Cloudflare tunnel configuration invalid: token and tunnelName cannot both be set");
     await expect(new CloudflareTunnelProvider({
       endpoint: "https://review.example/mcp",
       localEndpoint: "http://127.0.0.1:12080",
@@ -59,7 +65,29 @@ describe("Cloudflare tunnel provider", () => {
     await expect(starting).resolves.toEqual({ endpoint: "https://review.example/mcp" });
     expect(spawn).toHaveBeenCalledWith(
       "cloudflared.exe",
-      ["tunnel", "run", "--url", "http://127.0.0.1:12080", "review-tunnel"],
+      ["tunnel", "--no-autoupdate", "--url", "http://127.0.0.1:12080", "run", "review-tunnel"],
+      expect.objectContaining({ shell: false, windowsHide: true }),
+    );
+  });
+
+  it("runs a token tunnel without adding a local URL", async () => {
+    const process = new FakeTunnelProcess();
+    const spawn = spawnFake(process);
+    const provider = new CloudflareTunnelProvider({
+      endpoint: "https://review.example/mcp",
+      token: "tunnel-token",
+      command: "cloudflared.exe",
+      environment: {},
+      spawn: spawn as unknown as typeof import("node:child_process").spawn,
+    });
+    const starting = provider.start();
+    process.emit("spawn");
+    process.stdout.emit("data", "INF Connection established to the Cloudflare edge\n");
+
+    await expect(starting).resolves.toEqual({ endpoint: "https://review.example/mcp" });
+    expect(spawn).toHaveBeenCalledWith(
+      "cloudflared.exe",
+      ["tunnel", "--no-autoupdate", "run", "--token", "tunnel-token"],
       expect.objectContaining({ shell: false, windowsHide: true }),
     );
   });
@@ -68,7 +96,6 @@ describe("Cloudflare tunnel provider", () => {
     const process = new FakeTunnelProcess();
     const provider = new CloudflareTunnelProvider({
       endpoint: "https://review.example/mcp",
-      tunnelName: "review-tunnel",
       token: "secret-tunnel-token",
       localEndpoint: "http://127.0.0.1:12080",
       environment: {},
@@ -78,6 +105,7 @@ describe("Cloudflare tunnel provider", () => {
     });
     const starting = provider.start();
     process.emit("spawn");
+    process.stdout.emit("data", "cloudflared stdout diagnostic\n");
     process.stderr.emit("data", "ERR failed to authenticate with the edge\n");
     process.emit("close", 23, null);
 
@@ -92,6 +120,11 @@ describe("Cloudflare tunnel provider", () => {
     expect(message).toContain("exit code: 23");
     expect(message).toContain("failed to authenticate with the edge");
     expect(message).toContain("cloudflared.exe");
+    expect(message).toContain("cloudflared stdout diagnostic");
+    expect(message).toContain("<redacted>");
+    expect(message).toContain("stderr:");
+    expect(message).toContain("stdout:");
+    expect(message).toContain("original error: none");
     expect(message).not.toContain("secret-tunnel-token");
     expect(process.kill).toHaveBeenCalledOnce();
   });

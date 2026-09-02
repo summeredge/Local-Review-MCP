@@ -65,9 +65,15 @@ function outputText(chunk: string | Buffer): string {
   return typeof chunk === "string" ? chunk : chunk.toString("utf8");
 }
 
-function hasRegisteredConnection(output: string): boolean {
-  return /\bregistered\s+tunnel\s+connection\b/iu.test(output)
-    || /\btunnel\s+connection\b[^\r\n]*\bregistered\b/iu.test(output);
+function hasReadySignal(output: string): boolean {
+  const normalized = output.replace(/\u001b\[[0-?]*[ -\/]*[@-~]/gu, " ");
+  return [
+    /\bregistered\s+tunnel\s+connection\b/iu,
+    /\btunnel\s+connection\b[^\r\n]*\b(?:registered|connected|established)\b/iu,
+    /\bconnection\b[^\r\n]*\b(?:registered|connected|established)\b/iu,
+    /\bconnected\b[^\r\n]*\b(?:cloudflare|edge|tunnel)\b/iu,
+    /\btunnel\b[^\r\n]*\b(?:started|running|ready|connected|established)\b/iu,
+  ].some((pattern) => pattern.test(normalized));
 }
 
 function lastErrorLine(output: string): string | undefined {
@@ -164,6 +170,9 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       : parseEndpoint(endpoint, "Cloudflare tunnel endpoint");
     this.tunnelName = parseTunnelName(options.tunnelName);
     this.token = parseToken(options.token ?? this.environment.CLOUDFLARE_TUNNEL_TOKEN);
+    if (this.tunnelName !== undefined && this.token !== undefined) {
+      throw new Error("Cloudflare tunnel configuration invalid: token and tunnelName cannot both be set");
+    }
     this.readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
     if (!Number.isInteger(this.readyTimeoutMs) || this.readyTimeoutMs < 1) {
       throw new Error("Cloudflare tunnel ready timeout must be a positive integer");
@@ -185,18 +194,16 @@ export class CloudflareTunnelProvider implements TunnelProvider {
 
   private args(): string[] {
     if (this.configuredEndpoint === undefined) {
-      throw new Error("Cloudflare tunnel endpoint is required for a named tunnel");
+      throw new Error("Cloudflare tunnel endpoint is required");
     }
-    if (this.localEndpoint === undefined) {
-      throw new Error("Cloudflare tunnel local endpoint is required for a named tunnel");
+    if (this.tunnelName !== undefined) {
+      if (this.localEndpoint === undefined) {
+        throw new Error("Cloudflare tunnel local endpoint is required for a named tunnel");
+      }
+      return ["tunnel", "--no-autoupdate", "--url", this.localEndpoint, "run", this.tunnelName];
     }
-    if (this.tunnelName === undefined && this.token === undefined) {
-      throw new Error("Cloudflare tunnel name or CLOUDFLARE_TUNNEL_TOKEN is required");
-    }
-    const args = ["tunnel", "run", "--url", this.localEndpoint];
-    if (this.token !== undefined) args.push("--token", this.token);
-    if (this.tunnelName !== undefined) args.push(this.tunnelName);
-    return args;
+    if (this.token !== undefined) return ["tunnel", "--no-autoupdate", "run", "--token", this.token];
+    throw new Error("Cloudflare tunnel name or CLOUDFLARE_TUNNEL_TOKEN is required");
   }
 
   public start(): Promise<TunnelInfo> {
@@ -244,12 +251,14 @@ export class CloudflareTunnelProvider implements TunnelProvider {
           }
         }
         const lastError = lastErrorLine(stderr) ?? lastErrorLine(stdout);
+        const originalError = cause instanceof Error ? cause.message : cause === undefined ? undefined : String(cause);
         const details = [
           `Cloudflare tunnel failed: ${message}`,
           `command: ${commandLine(this.command, args)}`,
           `exit code: ${exitCode === undefined ? "not available" : String(exitCode)}`,
           `signal: ${exitSignal ?? "none"}`,
           `last error: ${lastError ?? "none reported"}`,
+          `original error: ${originalError ?? "none"}`,
           `stderr:\n${stderr.trim() || "(empty)"}`,
           `stdout:\n${stdout.trim() || "(empty)"}`,
         ].join("\n");
@@ -269,7 +278,7 @@ export class CloudflareTunnelProvider implements TunnelProvider {
         const value = outputText(chunk);
         if (stream === "stdout") stdout = (stdout + value).slice(-MAX_PROCESS_OUTPUT_BYTES);
         else stderr = (stderr + value).slice(-MAX_PROCESS_OUTPUT_BYTES);
-        if (this.configuredEndpoint !== undefined && hasRegisteredConnection(`${stdout}\n${stderr}`)) {
+        if (this.configuredEndpoint !== undefined && hasReadySignal(`${stdout}\n${stderr}`)) {
           ready(this.configuredEndpoint);
         }
       };
@@ -302,7 +311,7 @@ export class CloudflareTunnelProvider implements TunnelProvider {
 
       const onSpawn = (): void => {
         if (settled) return;
-        if (this.configuredEndpoint !== undefined && hasRegisteredConnection(`${stdout}\n${stderr}`)) {
+        if (this.configuredEndpoint !== undefined && hasReadySignal(`${stdout}\n${stderr}`)) {
           ready(this.configuredEndpoint);
           return;
         }
