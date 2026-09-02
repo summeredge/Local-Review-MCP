@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  createTunnelManager,
   ManualEndpointProvider,
   NullTunnelProvider,
   TunnelManager,
@@ -77,6 +78,26 @@ describe("tunnel abstraction", () => {
       token: "abc",
       endpoint: "https://review.example/mcp",
     });
+    expect(() => resolveSettings({
+      configWorkspace: "workspace",
+      configToken: "auth-token",
+      configRemote: {
+        enabled: true,
+        provider: "cloudflare",
+        token: "remote-token",
+        endpoint: "https://review.example/mcp",
+      },
+      envRemoteToken: "environment-token",
+    })).toThrow("Cloudflare tunnel token configuration conflict");
+    expect(() => createTunnelManager({
+      enabled: true,
+      provider: "cloudflare",
+      token: "remote-token",
+      endpoint: "https://review.example/mcp",
+    }, {
+      environment: {},
+      cloudflare: { token: "option-token" },
+    })).toThrow("Cloudflare tunnel token configuration conflict");
     expect(() => resolveSettings({
       configWorkspace: "workspace",
       configToken: "auth-token",

@@ -34,6 +34,10 @@ describe("Cloudflare tunnel provider", () => {
       tunnelName: "review-tunnel",
       environment: { CLOUDFLARE_TUNNEL_TOKEN: "environment-token" },
     })).toThrow("Cloudflare tunnel configuration invalid: token and tunnelName cannot both be set");
+    expect(() => new CloudflareTunnelProvider({
+      token: "configured-token",
+      environment: { CLOUDFLARE_TUNNEL_TOKEN: "environment-token" },
+    })).toThrow("Cloudflare tunnel token configuration conflict");
     await expect(new CloudflareTunnelProvider({
       endpoint: "https://review.example/mcp",
       localEndpoint: "http://127.0.0.1:12080",
@@ -89,6 +93,34 @@ describe("Cloudflare tunnel provider", () => {
       ["tunnel", "--no-autoupdate", "run", "--token", "tunnel-token"],
       expect.objectContaining({ shell: false, windowsHide: true }),
     );
+  });
+
+  it("runs an environment-token tunnel and reports a safe mode diagnostic", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const process = new FakeTunnelProcess();
+      const spawn = spawnFake(process);
+      const provider = new CloudflareTunnelProvider({
+        endpoint: "https://review.example/mcp",
+        command: "cloudflared.exe",
+        environment: { CLOUDFLARE_TUNNEL_TOKEN: "environment-token" },
+        spawn: spawn as unknown as typeof import("node:child_process").spawn,
+      });
+      const starting = provider.start();
+      process.emit("spawn");
+      process.stdout.emit("data", "INF Connection established to the Cloudflare edge\n");
+
+      await expect(starting).resolves.toEqual({ endpoint: "https://review.example/mcp" });
+      expect(spawn).toHaveBeenCalledWith(
+        "cloudflared.exe",
+        ["tunnel", "--no-autoupdate", "run", "--token", "environment-token"],
+        expect.objectContaining({ shell: false, windowsHide: true }),
+      );
+      expect(log).toHaveBeenCalledWith("Cloudflare tunnel mode: token");
+      expect(log.mock.calls.flat().join(" ")).not.toContain("environment-token");
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it("preserves stderr, exit status, and startup parameters on failure", async () => {

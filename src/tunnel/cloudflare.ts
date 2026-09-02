@@ -169,7 +169,13 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       ? undefined
       : parseEndpoint(endpoint, "Cloudflare tunnel endpoint");
     this.tunnelName = parseTunnelName(options.tunnelName);
-    this.token = parseToken(options.token ?? this.environment.CLOUDFLARE_TUNNEL_TOKEN);
+    const configuredToken = parseToken(options.token);
+    const environmentToken = parseToken(this.environment.CLOUDFLARE_TUNNEL_TOKEN);
+    if (configuredToken !== undefined && environmentToken !== undefined
+      && configuredToken !== environmentToken) {
+      throw new Error("Cloudflare tunnel token configuration conflict");
+    }
+    this.token = configuredToken ?? environmentToken;
     if (this.tunnelName !== undefined && this.token !== undefined) {
       throw new Error("Cloudflare tunnel configuration invalid: token and tunnelName cannot both be set");
     }
@@ -218,6 +224,7 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       this.state = "REMOTE_ERROR";
       return Promise.reject(error instanceof Error ? error : new Error("Invalid Cloudflare tunnel configuration"));
     }
+    console.log(`Cloudflare tunnel mode: ${this.tunnelName === undefined ? "token" : "named"}`);
     const promise = new Promise<TunnelInfo>((resolve, reject) => {
       let child: ChildProcess | undefined;
       let stdout = "";

@@ -127,13 +127,23 @@ export function createTunnelManager(
   if (remote.endpoint === undefined || remote.endpoint === "") {
     throw new Error("remote.endpoint is required when remote is enabled");
   }
+  const environment = options.environment ?? process.env;
+  const optionToken = options.cloudflare?.token;
+  if (remote.token !== undefined && optionToken !== undefined && remote.token !== optionToken) {
+    throw new Error("Cloudflare tunnel token configuration conflict");
+  }
+  if (optionToken !== undefined
+    && environment.CLOUDFLARE_TUNNEL_TOKEN !== undefined
+    && optionToken !== environment.CLOUDFLARE_TUNNEL_TOKEN) {
+    throw new Error("Cloudflare tunnel token configuration conflict");
+  }
   const provider = new CloudflareTunnelProvider({
+    ...options.cloudflare,
     localEndpoint: options.localEndpoint,
     endpoint: remote.endpoint,
-    token: remote.token,
+    token: remote.token ?? environment.CLOUDFLARE_TUNNEL_TOKEN ?? optionToken,
     tunnelName: remote.tunnelName,
-    environment: options.environment,
-    ...options.cloudflare,
+    environment,
   });
   return new TunnelManager(provider, remote.enabled);
 }

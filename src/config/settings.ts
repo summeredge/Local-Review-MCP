@@ -237,12 +237,19 @@ export function resolveSettings(options: {
     ? options.configRemoteTunnelName
     : sectionValue(options.configRemote, "remote", "tunnelName");
   const parsedRemoteEndpoint = parseRemoteEndpoint(remoteEndpoint, remoteEnabled);
-  const remoteToken = options.configRemoteToken !== undefined
+  const configuredRemoteToken = options.configRemoteToken !== undefined
     ? options.configRemoteToken
-    : sectionValue(options.configRemote, "remote", "token")
-      ?? (remoteEnabled ? options.envRemoteToken : undefined);
+    : sectionValue(options.configRemote, "remote", "token");
   const parsedRemoteTunnelName = parseRemoteTunnelName(remoteTunnelName);
-  const parsedRemoteToken = parseRemoteToken(remoteToken);
+  const environmentRemoteToken = remoteEnabled ? options.envRemoteToken : undefined;
+  const parsedConfiguredRemoteToken = parseRemoteToken(configuredRemoteToken);
+  const parsedEnvironmentRemoteToken = parseRemoteToken(environmentRemoteToken);
+  if (parsedConfiguredRemoteToken !== undefined
+    && parsedEnvironmentRemoteToken !== undefined
+    && parsedConfiguredRemoteToken !== parsedEnvironmentRemoteToken) {
+    throw new Error("Cloudflare tunnel token configuration conflict");
+  }
+  const parsedRemoteToken = parsedConfiguredRemoteToken ?? parsedEnvironmentRemoteToken;
   if (parsedRemoteToken !== undefined && parsedRemoteTunnelName !== undefined) {
     throw new Error("Cloudflare tunnel configuration invalid: token and tunnelName cannot both be set");
   }
