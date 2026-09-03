@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 
 LOCAL_HEALTH_URL = "http://127.0.0.1:12080/health"
 REMOTE_STATUS_URL = "https://review.syqiu.kdns.fr/.well-known/oauth-protected-resource"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class StatusChecker:
                 encoding="utf-8",
                 errors="replace",
                 timeout=5,
+                creationflags=NO_WINDOW,
             )
         except (OSError, subprocess.TimeoutExpired):
             return False

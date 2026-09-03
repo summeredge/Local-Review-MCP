@@ -6,7 +6,7 @@ from enum import Enum
 from pathlib import Path
 from time import monotonic
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QThreadPool, QTimer, Slot
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from config_manager import ConfigManager, LauncherConfig, LauncherConfigError
 from process_manager import ProductionProcessManager
 from status_checker import LauncherStatus, StatusChecker
+from status_worker import StatusCheckScheduler, StatusCheckWorker
 
 
 STARTUP_TIMEOUT_SECONDS = 60
@@ -45,6 +46,11 @@ class LauncherWindow(QMainWindow):
         self.status_checker = StatusChecker()
         self.state = LauncherState.STOPPED
         self._last_status = LauncherStatus(False, False, False)
+        self._status_check_scheduler = StatusCheckScheduler()
+        self._status_check_generation = 0
+        self._status_thread_pool = QThreadPool(self)
+        self._status_thread_pool.setMaxThreadCount(1)
+        self._closing = False
         self._startup_started_at: float | None = None
 
         self.setWindowTitle("Local Review MCP Launcher")
@@ -114,17 +120,28 @@ class LauncherWindow(QMainWindow):
         return row
 
     def refresh_status(self) -> None:
-        status = self._read_status()
+        if self.state == LauncherState.STARTING:
+            return
+        self._request_status_check("normal")
+
+    def _request_status_check(self, source: str) -> None:
+        if self._closing or not self._status_check_scheduler.begin(source):
+            return
+        generation = self._status_check_generation
+        worker = StatusCheckWorker(self.status_checker, generation)
+        worker.signals.finished.connect(self._status_check_finished)
+        self._status_thread_pool.start(worker)
+
+    @Slot(int, object)
+    def _status_check_finished(self, generation: int, status: LauncherStatus) -> None:
+        source = self._status_check_scheduler.finish()
+        if self._closing or source is None or generation != self._status_check_generation:
+            return
         self._render_status(status)
         self._update_log()
+        if source == "startup":
+            self._handle_startup_status(status)
         self._apply_controls(status)
-
-    def _read_status(self) -> LauncherStatus:
-        try:
-            return self.status_checker.check()
-        except Exception as error:
-            self.message_label.setText(f"Status check failed: {error}")
-            return LauncherStatus(False, False, False)
 
     def _render_status(self, status: LauncherStatus) -> None:
         self._last_status = status
@@ -173,24 +190,30 @@ class LauncherWindow(QMainWindow):
             self.startup_timer.stop()
             return
 
-        status = self._read_status()
-        self._render_status(status)
-        self._update_log()
+        self._request_status_check("startup")
+
+    def _handle_startup_status(self, status: LauncherStatus) -> None:
+        if self.state != LauncherState.STARTING:
+            return
         failure_reason = self.process_manager.failure_reason
         timed_out = self._startup_started_at is not None and monotonic() - self._startup_started_at >= STARTUP_TIMEOUT_SECONDS
         if failure_reason and not status.mcp_running:
             self._fail_startup(failure_reason)
         elif timed_out:
-            self._fail_startup("MCP startup timeout.\nCheck logs.")
+            self._fail_startup(
+                "MCP startup timeout. Check logs.\n"
+                "Startup timeout: local MCP or tunnel may still be running."
+            )
         elif status.mcp_running and status.tunnel_connected and status.remote_online:
             self.startup_timer.stop()
+            self.timer.start(5_000)
             self._startup_started_at = None
             self._set_state(LauncherState.RUNNING)
             self.message_label.setText("MCP started successfully.")
-        self._apply_controls(status)
 
     def _fail_startup(self, message: str) -> None:
         self.startup_timer.stop()
+        self.timer.start(5_000)
         self._set_state(LauncherState.FAILED)
         self.message_label.setText(message)
         self._update_log()
@@ -218,6 +241,8 @@ class LauncherWindow(QMainWindow):
         self._startup_started_at = monotonic()
         self._set_state(LauncherState.STARTING)
         self.message_label.setText("Starting the existing production startup flow...")
+        self._status_check_generation += 1
+        self.timer.stop()
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.workspace_button.setEnabled(False)
@@ -229,12 +254,14 @@ class LauncherWindow(QMainWindow):
             self._show_error(str(error))
             return
         self.startup_timer.start()
-        self.refresh_status()
+        self._poll_startup()
 
     def stop_mcp(self) -> None:
         if self.state == LauncherState.STOPPING:
             return
         self.startup_timer.stop()
+        self.timer.stop()
+        self._status_check_generation += 1
         self._set_state(LauncherState.STOPPING)
         self.message_label.setText("Stopping MCP...")
         self.start_button.setEnabled(False)
@@ -251,6 +278,7 @@ class LauncherWindow(QMainWindow):
             self.message_label.setText(message)
         finally:
             self.refresh_status()
+            self.timer.start(5_000)
 
     def choose_workspace(self) -> None:
         initial = self.configuration.workspace if Path(self.configuration.workspace).is_dir() else ""
@@ -266,6 +294,8 @@ class LauncherWindow(QMainWindow):
         self.refresh_status()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._closing = True
+        self._status_check_generation += 1
         self.timer.stop()
         self.startup_timer.stop()
         if self.process_manager.has_started:

@@ -13,6 +13,7 @@ from config_manager import ConfigManager, LauncherConfig
 
 
 MAX_OUTPUT_CHARS = 10_000
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class ProductionProcessManager:
@@ -54,7 +55,7 @@ class ProductionProcessManager:
             "-Config",
             str(config_path),
         ]
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        creation_flags = NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         try:
             process = subprocess.Popen(
                 command,
@@ -133,6 +134,7 @@ class ProductionProcessManager:
                 encoding="utf-8",
                 errors="replace",
                 timeout=10,
+                creationflags=NO_WINDOW,
             )
             if result.returncode != 0:
                 errors.append((result.stderr or result.stdout).strip() or f"taskkill failed for PID {pid}")
@@ -186,6 +188,7 @@ class ProductionProcessManager:
                 encoding="utf-8",
                 errors="replace",
                 timeout=5,
+                creationflags=NO_WINDOW,
             )
         except (OSError, subprocess.TimeoutExpired):
             return set()
@@ -236,6 +239,7 @@ class ProductionProcessManager:
                 encoding="utf-8",
                 errors="replace",
                 timeout=5,
+                creationflags=NO_WINDOW,
             )
             if result.returncode != 0 or not result.stdout.strip():
                 return None
