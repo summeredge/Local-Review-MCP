@@ -260,6 +260,31 @@ export function redirectUriMatches(requested: string, registered: string): boole
   return true;
 }
 
+function isChatGPTConnectorRedirectUri(value: string): boolean {
+  let uri: URL;
+  try {
+    uri = new URL(value);
+  } catch {
+    return false;
+  }
+  return uri.protocol === "https:"
+    && uri.hostname === "chatgpt.com"
+    && uri.port === ""
+    && uri.username === ""
+    && uri.password === ""
+    && uri.search === ""
+    && uri.hash === ""
+    && /^\/connector\/oauth\/[A-Za-z0-9_-]+$/u.test(uri.pathname);
+}
+
+export function validateRedirectUri(
+  client: OAuthRegisteredClient,
+  redirectUri: string,
+): boolean {
+  return client.redirect_uris.some((registered) => redirectUriMatches(redirectUri, registered))
+    || isChatGPTConnectorRedirectUri(redirectUri);
+}
+
 export function isValidCodeChallenge(value: string): boolean {
   return /^[A-Za-z0-9_-]{43,128}$/u.test(value);
 }
@@ -378,7 +403,7 @@ export class OAuthService {
   public createAuthorizationCode(request: AuthorizationCodeRequest): string {
     const client = this.clients.get(request.clientId);
     if (client === undefined) throw new OAuthRequestError("invalid_client", "Invalid client_id");
-    if (!client.redirect_uris.some((uri) => redirectUriMatches(request.redirectUri, uri))) {
+    if (!validateRedirectUri(client, request.redirectUri)) {
       throw new OAuthRequestError("invalid_request", "Unregistered redirect_uri");
     }
     if (!isValidCodeChallenge(request.codeChallenge)) {

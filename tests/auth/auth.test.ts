@@ -276,6 +276,49 @@ describe("MCP OAuth compatibility", () => {
     expect(client.client_secret).toBeUndefined();
   });
 
+  it("accepts fixed and safe dynamic ChatGPT connector redirects only", async () => {
+    const { port } = await makeServer();
+    const registeredRedirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
+    const registration = await requestText(
+      port,
+      "/oauth/register",
+      "POST",
+      JSON.stringify({
+        client_name: "ChatGPT",
+        redirect_uris: [registeredRedirectUri],
+        token_endpoint_auth_method: "none",
+      }),
+      { "content-type": "application/json" },
+    );
+    const client = JSON.parse(registration.text) as { client_id: string };
+    expect(registration.status).toBe(201);
+
+    const authorize = (redirectUri: string) => requestText(
+      port,
+      `/oauth/authorize?${new URLSearchParams({
+        client_id: client.client_id,
+        redirect_uri: redirectUri,
+        response_type: "code",
+        code_challenge: "c".repeat(43),
+        code_challenge_method: "S256",
+        resource: `http://127.0.0.1:${port}/mcp`,
+      }).toString()}`,
+      "GET",
+    );
+
+    const fixed = await authorize(registeredRedirectUri);
+    const dynamic = await authorize("https://chatgpt.com/connector/oauth/test123");
+    const evil = await authorize("https://evil.com/connector/oauth/test");
+    const queryInjection = await authorize("https://chatgpt.com/connector/oauth/test123?next=https://evil.com");
+
+    expect(fixed.status).toBe(302);
+    expect(dynamic.status).toBe(302);
+    expect(evil.status).toBe(400);
+    expect(queryInjection.status).toBe(400);
+    expect(JSON.parse(evil.text)).toMatchObject({ error: "invalid_request" });
+    expect(JSON.parse(queryInjection.text)).toMatchObject({ error: "invalid_request" });
+  });
+
   it("persists clients and restores them after a runtime restart", async () => {
     const first = await makeServer();
     const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";

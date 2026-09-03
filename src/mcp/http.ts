@@ -9,7 +9,7 @@ import {
   OAuthRequestError,
   OAuthService,
   isValidCodeChallenge,
-  redirectUriMatches,
+  validateRedirectUri,
 } from "../auth/oauth.js";
 import { isAuthenticated } from "../auth/middleware.js";
 import {
@@ -376,8 +376,7 @@ async function handleOAuthRequest(
     const requestedRedirectUri = params.get("redirect_uri");
     const redirectUri = requestedRedirectUri
       ?? (client.redirect_uris.length === 1 ? client.redirect_uris[0] : undefined);
-    if (redirectUri === undefined
-      || !client.redirect_uris.some((registered) => redirectUriMatches(redirectUri, registered))) {
+    if (redirectUri === undefined || !validateRedirectUri(client, redirectUri)) {
       sendOAuthError(response, 400, "invalid_request", "Unregistered redirect_uri");
       return true;
     }
