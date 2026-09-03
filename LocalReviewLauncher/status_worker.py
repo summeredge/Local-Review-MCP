@@ -43,4 +43,14 @@ class StatusCheckWorker(QRunnable):
             status = self.status_checker.check()
         except Exception:
             status = LauncherStatus(False, False, False)
+        try:
+            version = self.status_checker.cloudflared_version()
+        except Exception:
+            version = "unavailable"
+        status = LauncherStatus(
+            status.mcp_running,
+            status.tunnel_connected,
+            status.remote_online,
+            version if isinstance(version, str) else "unavailable",
+        )
         self.signals.finished.emit(self.generation, status)

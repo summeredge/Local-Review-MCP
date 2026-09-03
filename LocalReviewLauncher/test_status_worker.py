@@ -51,6 +51,19 @@ class StatusCheckWorkerTests(unittest.TestCase):
 
         self.assertEqual(results, [LauncherStatus(False, False, False)])
 
+    def test_worker_includes_cloudflared_version(self) -> None:
+        checker = SimpleNamespace(
+            check=lambda: LauncherStatus(True, True, False),
+            cloudflared_version=lambda: "2026.8.2",
+        )
+        results: list[LauncherStatus] = []
+        worker = StatusCheckWorker(checker)  # type: ignore[arg-type]
+        worker.signals.finished.connect(lambda _generation, status: results.append(status))
+
+        worker.run()
+
+        self.assertEqual(results, [LauncherStatus(True, True, False, "2026.8.2")])
+
     def test_worker_runs_outside_the_gui_thread(self) -> None:
         checker = SimpleNamespace(thread_id=None)
 
@@ -77,6 +90,22 @@ class StatusCheckerTests(unittest.TestCase):
 
         self.assertEqual(run.call_args.args[0][0], "tasklist")
         self.assertEqual(run.call_args.kwargs["creationflags"], getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+    def test_cloudflared_version_is_hidden_and_parsed(self) -> None:
+        result = SimpleNamespace(
+            returncode=0,
+            stdout="cloudflared version 2026.8.2 (built 2026-08-01)",
+            stderr="",
+        )
+        with patch("status_checker.subprocess.run", return_value=result) as run:
+            self.assertEqual(StatusChecker.cloudflared_version(), "2026.8.2")
+
+        self.assertEqual(run.call_args.args[0], ["cloudflared", "--version"])
+        self.assertEqual(run.call_args.kwargs["creationflags"], getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+    def test_missing_cloudflared_returns_unavailable(self) -> None:
+        with patch("status_checker.subprocess.run", side_effect=FileNotFoundError):
+            self.assertEqual(StatusChecker.cloudflared_version(), "unavailable")
 
     def test_check_reports_tunnel_only_when_mcp_is_healthy(self) -> None:
         with patch.object(StatusChecker, "_reachable", side_effect=[True, False]), patch.object(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
@@ -18,6 +19,7 @@ class LauncherStatus:
     mcp_running: bool
     tunnel_connected: bool
     remote_online: bool
+    cloudflared_version: str = "unavailable"
 
 
 class StatusChecker:
@@ -55,3 +57,26 @@ class StatusChecker:
         except (OSError, subprocess.TimeoutExpired):
             return False
         return result.returncode == 0 and "cloudflared.exe" in result.stdout.casefold()
+
+    @staticmethod
+    def cloudflared_version() -> str:
+        try:
+            result = subprocess.run(
+                ["cloudflared", "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                creationflags=NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "unavailable"
+        if result.returncode != 0:
+            return "unavailable"
+        output = "\n".join(
+            value for value in (getattr(result, "stdout", ""), getattr(result, "stderr", ""))
+            if isinstance(value, str) and value.strip()
+        )
+        match = re.search(r"\b\d+\.\d+\.\d+\b", output)
+        return match.group(0) if match else "unavailable"

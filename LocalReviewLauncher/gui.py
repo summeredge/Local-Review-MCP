@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from time import monotonic
 
 from PySide6.QtCore import QThreadPool, QTimer, Slot
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -19,7 +22,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from config_manager import ConfigManager, LauncherConfig, LauncherConfigError
+from config_manager import (
+    DEFAULT_REMOTE_ENDPOINT,
+    ConfigManager,
+    LauncherConfig,
+    LauncherConfigError,
+)
 from process_manager import ProductionProcessManager
 from status_checker import LauncherStatus, StatusChecker
 from status_worker import StatusCheckScheduler, StatusCheckWorker
@@ -61,6 +69,14 @@ class LauncherWindow(QMainWindow):
         self.remote_status = QLabel()
         self.workspace_label = QLabel()
         self.workspace_label.setWordWrap(True)
+        self.runtime_workspace_label = QLabel()
+        self.runtime_workspace_label.setWordWrap(True)
+        self.production_config_label = QLabel()
+        self.production_config_label.setWordWrap(True)
+        self.tunnel_mode_label = QLabel()
+        self.remote_endpoint_label = QLabel()
+        self.remote_endpoint_label.setWordWrap(True)
+        self.cloudflared_version_label = QLabel("unavailable")
         self.message_label = QLabel()
         self.message_label.setWordWrap(True)
         self.log_output = QPlainTextEdit()
@@ -71,10 +87,22 @@ class LauncherWindow(QMainWindow):
         self.stop_button = QPushButton("停止 MCP")
         self.refresh_button = QPushButton("刷新状态")
         self.workspace_button = QPushButton("选择 Workspace")
+        self.open_config_button = QPushButton("打开配置文件")
+        self.backup_config_button = QPushButton("备份配置")
+        self.validate_config_button = QPushButton("校验配置")
+        self.copy_log_button = QPushButton("复制日志")
+        self.clear_log_button = QPushButton("清空显示")
+        self.save_log_button = QPushButton("保存日志")
         self.start_button.clicked.connect(self.start_mcp)
         self.stop_button.clicked.connect(self.stop_mcp)
         self.refresh_button.clicked.connect(self.refresh_status)
         self.workspace_button.clicked.connect(self.choose_workspace)
+        self.open_config_button.clicked.connect(self.open_config)
+        self.backup_config_button.clicked.connect(self.backup_config)
+        self.validate_config_button.clicked.connect(self.validate_config)
+        self.copy_log_button.clicked.connect(self.copy_log)
+        self.clear_log_button.clicked.connect(self.clear_log)
+        self.save_log_button.clicked.connect(self.save_log)
 
         layout = QVBoxLayout()
         title = QLabel("Local Review MCP")
@@ -86,13 +114,32 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(self._row("Remote Endpoint:", self.remote_status))
         layout.addWidget(self._row("Workspace:", self.workspace_label))
         layout.addSpacing(8)
+        layout.addWidget(QLabel("运行信息"))
+        layout.addWidget(self._row("Workspace:", self.runtime_workspace_label))
+        layout.addWidget(self._row("Production Config:", self.production_config_label))
+        layout.addWidget(self._row("Tunnel Mode:", self.tunnel_mode_label))
+        layout.addWidget(self._row("Remote Endpoint:", self.remote_endpoint_label))
+        layout.addWidget(self._row("cloudflared Version:", self.cloudflared_version_label))
+        layout.addSpacing(8)
         layout.addWidget(self.start_button)
         layout.addWidget(self.stop_button)
         layout.addWidget(self.refresh_button)
         layout.addWidget(self.workspace_button)
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("配置"))
+        config_buttons = QHBoxLayout()
+        config_buttons.addWidget(self.open_config_button)
+        config_buttons.addWidget(self.backup_config_button)
+        config_buttons.addWidget(self.validate_config_button)
+        layout.addLayout(config_buttons)
         layout.addWidget(self.message_label)
         layout.addWidget(QLabel("Startup log:"))
         layout.addWidget(self.log_output)
+        log_buttons = QHBoxLayout()
+        log_buttons.addWidget(self.copy_log_button)
+        log_buttons.addWidget(self.clear_log_button)
+        log_buttons.addWidget(self.save_log_button)
+        layout.addLayout(log_buttons)
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
@@ -104,6 +151,7 @@ class LauncherWindow(QMainWindow):
         self.startup_timer.setInterval(STARTUP_POLL_INTERVAL_MS)
         self.startup_timer.timeout.connect(self._poll_startup)
         self._set_state(LauncherState.STOPPED)
+        self._render_runtime_info()
         self.refresh_status()
         if self.configuration.auto_start:
             QTimer.singleShot(0, self.start_mcp)
@@ -122,6 +170,7 @@ class LauncherWindow(QMainWindow):
     def refresh_status(self) -> None:
         if self.state == LauncherState.STARTING:
             return
+        self._render_runtime_info()
         self._request_status_check("normal")
 
     def _request_status_check(self, source: str) -> None:
@@ -149,6 +198,21 @@ class LauncherWindow(QMainWindow):
         self._set_status(self.tunnel_status, "Connected" if status.tunnel_connected else "Offline", status.tunnel_connected)
         self._set_status(self.remote_status, "Online" if status.remote_online else "Offline", status.remote_online)
         self.workspace_label.setText(self.configuration.workspace or "Not configured")
+        self.cloudflared_version_label.setText(getattr(status, "cloudflared_version", "unavailable"))
+
+    def _render_runtime_info(self) -> None:
+        try:
+            info = self.config_manager.runtime_info(self.configuration)
+        except LauncherConfigError:
+            self.runtime_workspace_label.setText(self.configuration.workspace or "Not configured")
+            self.production_config_label.setText(str(self.config_manager.production_path(self.configuration.config_file)))
+            self.tunnel_mode_label.setText("unavailable")
+            self.remote_endpoint_label.setText(DEFAULT_REMOTE_ENDPOINT)
+            return
+        self.runtime_workspace_label.setText(info.workspace or "Not configured")
+        self.production_config_label.setText(str(info.production_config))
+        self.tunnel_mode_label.setText(info.tunnel_mode)
+        self.remote_endpoint_label.setText(info.remote_endpoint)
 
     def _update_log(self) -> None:
         self.log_output.setPlainText(self.process_manager.get_output())
@@ -292,6 +356,53 @@ class LauncherWindow(QMainWindow):
             return
         self.message_label.setText("Workspace saved. It will be used on the next MCP start.")
         self.refresh_status()
+
+    def open_config(self) -> None:
+        path = self.config_manager.production_path(self.configuration.config_file)
+        if not path.is_file():
+            self._show_error(f"Production configuration was not found: {path}")
+            return
+        try:
+            opener = getattr(os, "startfile")
+            opener(str(path))
+        except (AttributeError, OSError) as error:
+            self._show_error(f"Could not open production configuration: {error}")
+
+    def backup_config(self) -> None:
+        try:
+            path = self.config_manager.backup_production_config(self.configuration)
+        except LauncherConfigError as error:
+            self._show_error(str(error))
+            return
+        self.message_label.setText(f"Configuration backup created:\n{path}")
+
+    def validate_config(self) -> None:
+        errors = self.config_manager.validate_production_config(self.configuration)
+        if errors:
+            self.message_label.setText("Configuration validation failed:\n\n" + "\n".join(f"- {error}" for error in errors))
+        else:
+            self.message_label.setText("Configuration valid.")
+
+    def copy_log(self) -> None:
+        QApplication.clipboard().setText(self.log_output.toPlainText())
+        self.message_label.setText("Log copied to clipboard.")
+
+    def clear_log(self) -> None:
+        self.log_output.clear()
+
+    def save_log(self) -> None:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        default_name = f"local-review-mcp-launcher-{timestamp}.log"
+        path, _ = QFileDialog.getSaveFileName(self, "保存日志", default_name, "Log files (*.log);;All files (*)")
+        if not path:
+            return
+        try:
+            with Path(path).open("w", encoding="utf-8", newline="\n") as stream:
+                stream.write(self.log_output.toPlainText())
+        except OSError as error:
+            self._show_error(f"Could not save log: {error}")
+            return
+        self.message_label.setText(f"Log saved to:\n{path}")
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._closing = True

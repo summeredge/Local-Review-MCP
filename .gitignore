@@ -6,3 +6,4 @@ dist/
 *.secret
 *.token
 config.production.json
+config.production.backup-*.json
