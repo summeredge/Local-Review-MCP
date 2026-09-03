@@ -5,26 +5,36 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 from config_manager import ConfigManager, LauncherConfig
 
 
+MAX_OUTPUT_CHARS = 10_000
+
+
 class ProductionProcessManager:
     def __init__(self, project_root: Path, config_manager: ConfigManager):
         self.project_root = project_root
         self.config_manager = config_manager
-        self._process: subprocess.Popen[str] | None = None
+        self._launcher_process: subprocess.Popen[str] | None = None
         self._temporary_config: Path | None = None
         self._output = ""
         self._failure_reason = ""
+        self._start_time: float | None = None
         self._stopping = False
         self._lock = threading.Lock()
 
     def start(self, configuration: LauncherConfig) -> None:
-        if self.is_running:
+        if self.has_started:
             return
+        self._failure_reason = ""
+        self._start_time = None
+        with self._lock:
+            self._output = ""
+
         config_path, temporary_config = self.config_manager.runtime_config(configuration)
         script = self.project_root / "scripts" / "start-production.ps1"
         if not script.is_file():
@@ -46,7 +56,7 @@ class ProductionProcessManager:
         ]
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         try:
-            self._process = subprocess.Popen(
+            process = subprocess.Popen(
                 command,
                 cwd=self.project_root,
                 stdout=subprocess.PIPE,
@@ -61,27 +71,53 @@ class ProductionProcessManager:
                 temporary_config.unlink(missing_ok=True)
             raise RuntimeError(f"Could not start the production script: {error}") from error
 
+        self._launcher_process = process
         self._temporary_config = temporary_config
-        self._failure_reason = ""
-        with self._lock:
-            self._output = ""
-        threading.Thread(target=self._capture_output, args=(self._process,), daemon=True).start()
+        self._start_time = time.monotonic()
+        self._stopping = False
+        threading.Thread(target=self._capture_output, args=(process,), daemon=True).start()
+
+    @property
+    def launcher_is_running(self) -> bool:
+        """Whether the PowerShell launcher process is still running.
+
+        This is deliberately not the MCP health state. The production script
+        may hand ownership to the Supervisor/runtime before it exits.
+        """
+        self._record_exit()
+        return self._launcher_process is not None and self._launcher_process.poll() is None
 
     @property
     def is_running(self) -> bool:
+        """Compatibility alias for the launcher process state."""
+        return self.launcher_is_running
+
+    @property
+    def start_time(self) -> float | None:
+        return self._start_time
+
+    @property
+    def has_started(self) -> bool:
         self._record_exit()
-        return self._process is not None and self._process.poll() is None
+        return self._start_time is not None or self._launcher_process is not None
 
     @property
     def failure_reason(self) -> str:
+        """Failure reported by the launcher process, not MCP health."""
         self._record_exit()
-        return self._failure_reason
+        with self._lock:
+            return self._failure_reason
+
+    def get_output(self) -> str:
+        with self._lock:
+            return self._output[-MAX_OUTPUT_CHARS:]
 
     def stop(self, port: int = 12080) -> str:
         self._stopping = True
+        self._record_exit()
         targets: set[int] = set()
-        if self._process is not None and self._process.poll() is None:
-            targets.add(self._process.pid)
+        if self._launcher_process is not None and self._launcher_process.poll() is None:
+            targets.add(self._launcher_process.pid)
         else:
             for listener_pid in self._listener_pids(port):
                 supervisor_pid = self._local_review_supervisor_pid(listener_pid)
@@ -101,13 +137,15 @@ class ProductionProcessManager:
             if result.returncode != 0:
                 errors.append((result.stderr or result.stdout).strip() or f"taskkill failed for PID {pid}")
 
-        if self._process is not None:
+        if self._launcher_process is not None:
             try:
-                self._process.wait(timeout=5)
+                self._launcher_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 errors.append("Production process did not stop within five seconds")
-        self._process = None
+        self._launcher_process = None
         self._cleanup_temporary_config()
+        if not errors:
+            self._start_time = None
         self._stopping = False
         if errors:
             raise RuntimeError("\n".join(errors))
@@ -118,19 +156,19 @@ class ProductionProcessManager:
             return
         for line in process.stdout:
             with self._lock:
-                self._output = (self._output + line)[-64_000:]
+                self._output = (self._output + line)[-MAX_OUTPUT_CHARS:]
 
     def _record_exit(self) -> None:
-        if self._process is None:
+        if self._launcher_process is None:
             return
-        exit_code = self._process.poll()
+        exit_code = self._launcher_process.poll()
         if exit_code is None:
             return
         if not self._stopping and exit_code != 0:
             with self._lock:
                 detail = self._output[-4_000:].strip()
-            self._failure_reason = f"Production startup exited with code {exit_code}." + (f"\n{detail}" if detail else "")
-        self._process = None
+                self._failure_reason = f"Production startup exited with code {exit_code}." + (f"\n{detail}" if detail else "")
+        self._launcher_process = None
         self._cleanup_temporary_config()
 
     def _cleanup_temporary_config(self) -> None:
