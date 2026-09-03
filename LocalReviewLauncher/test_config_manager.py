@@ -102,17 +102,56 @@ class ConfigManagerTests(unittest.TestCase):
             workspace = root / "workspace"
             workspace.mkdir()
             source = root / "config.production.json"
-            source.write_text("first", encoding="utf-8")
+            source.write_text(json.dumps({"workspace": str(workspace), "value": "first"}), encoding="utf-8")
             manager = ConfigManager(root)
             configuration = self._configuration(workspace)
 
             first = manager.backup_production_config(configuration)
-            source.write_text("second", encoding="utf-8")
+            source.write_text(json.dumps({"workspace": str(workspace), "value": "second"}), encoding="utf-8")
             second = manager.backup_production_config(configuration)
 
             self.assertNotEqual(first, second)
-            self.assertEqual(first.read_text(encoding="utf-8"), "first")
-            self.assertEqual(second.read_text(encoding="utf-8"), "second")
+            self.assertEqual(json.loads(first.read_text(encoding="utf-8"))["value"], "first")
+            self.assertEqual(json.loads(second.read_text(encoding="utf-8"))["value"], "second")
+
+    def test_backup_uses_latest_saved_workspace_and_preserves_production(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "LocalReviewLauncher").mkdir()
+            original_workspace = root / "original"
+            selected_workspace = root / "selected"
+            original_workspace.mkdir()
+            selected_workspace.mkdir()
+            production = root / "config.production.json"
+            production_document = {"workspace": str(original_workspace), "auth": {"token": "test"}}
+            production.write_text(json.dumps(production_document), encoding="utf-8")
+            manager = ConfigManager(root)
+
+            initial = manager.load()
+            manager.save_workspace(initial, selected_workspace)
+            runtime_path, temporary_path = manager.runtime_config(initial)
+            runtime_document = json.loads(runtime_path.read_text(encoding="utf-8"))
+            if temporary_path is not None:
+                temporary_path.unlink()
+            backup = manager.backup_production_config(initial)
+
+            backup_document = json.loads(backup.read_text(encoding="utf-8"))
+            self.assertEqual(backup_document["workspace"], str(selected_workspace))
+            self.assertEqual(backup_document, runtime_document)
+            self.assertEqual(json.loads(production.read_text(encoding="utf-8")), production_document)
+
+    def test_backup_uses_production_workspace_when_not_switched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            production = root / "config.production.json"
+            production_document = {"workspace": str(workspace), "auth": {"token": "test"}}
+            production.write_text(json.dumps(production_document), encoding="utf-8")
+
+            backup = ConfigManager(root).backup_production_config(self._configuration(workspace))
+
+            self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), production_document)
 
     def test_validation_rejects_invalid_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

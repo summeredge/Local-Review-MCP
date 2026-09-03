@@ -146,23 +146,28 @@ class ConfigManager:
         source = self.production_path(configuration.config_file)
         if not source.is_file():
             raise LauncherConfigError(f"Production configuration was not found: {source}")
+        runtime_path, temporary_path = self.runtime_config(configuration)
 
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        base_name = f"{source.stem}.backup-{timestamp}{source.suffix}"
-        candidate = source.with_name(base_name)
-        counter = 1
-        while True:
-            try:
-                with candidate.open("xb") as destination, source.open("rb") as original:
-                    shutil.copyfileobj(original, destination)
-                shutil.copystat(source, candidate)
-                return candidate
-            except FileExistsError:
-                candidate = source.with_name(f"{source.stem}.backup-{timestamp}-{counter}{source.suffix}")
-                counter += 1
-            except OSError as error:
-                candidate.unlink(missing_ok=True)
-                raise LauncherConfigError(f"Could not back up production configuration: {error}") from error
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            base_name = f"{source.stem}.backup-{timestamp}{source.suffix}"
+            candidate = source.with_name(base_name)
+            counter = 1
+            while True:
+                try:
+                    with candidate.open("xb") as destination, runtime_path.open("rb") as original:
+                        shutil.copyfileobj(original, destination)
+                    shutil.copystat(source, candidate)
+                    return candidate
+                except FileExistsError:
+                    candidate = source.with_name(f"{source.stem}.backup-{timestamp}-{counter}{source.suffix}")
+                    counter += 1
+                except OSError as error:
+                    candidate.unlink(missing_ok=True)
+                    raise LauncherConfigError(f"Could not back up production configuration: {error}") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def validate_production_config(self, configuration: LauncherConfig) -> list[str]:
         path = self.production_path(configuration.config_file)
