@@ -25,6 +25,10 @@ export const V01_TOOL_NAMES = [
 
 export type V01ToolName = typeof V01_TOOL_NAMES[number];
 
+export function registeredMcpToolsMessage(): string {
+  return ["Registered MCP tools:", ...V01_TOOL_NAMES.map((name) => `- ${name}`)].join("\n");
+}
+
 const READ_ONLY_ANNOTATIONS = {
   readOnlyHint: true,
   destructiveHint: false,

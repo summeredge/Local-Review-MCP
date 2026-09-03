@@ -20,7 +20,7 @@ import {
   type ResolvedSettings,
 } from "../config/settings.js";
 import type { TunnelProvider, TunnelStatus } from "../tunnel/types.js";
-import { createMcpServer, type McpRuntimeContext } from "./server.js";
+import { createMcpServer, registeredMcpToolsMessage, type McpRuntimeContext } from "./server.js";
 
 export const MAX_MCP_REQUEST_BYTES = 1024 * 1024;
 
@@ -599,6 +599,7 @@ export async function startHttpServer(
     assertLoopbackHost(settings);
     server.listen(settings.port, settings.host);
   });
+  console.log(registeredMcpToolsMessage());
   return server;
 }
 

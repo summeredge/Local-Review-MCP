@@ -1,5 +1,6 @@
 import { loadSettings, parseCliArgs } from "./config/settings.js";
 import { createAppContext, startApp, startupMessage } from "./app.js";
+import { registeredMcpToolsMessage } from "./mcp/server.js";
 import { createStartupManager } from "./supervisor/startup.js";
 import { createSupervisor } from "./supervisor/supervisor.js";
 import { WindowsTrayApp } from "./supervisor/tray.js";
@@ -32,7 +33,7 @@ try {
       console.warn("Windows tray failed to start; continuing without tray");
       printErrorDetails(error, true);
     });
-    console.log(`Local Review MCP supervisor started\nStatus: ${supervisor.state}`);
+    console.log(`Local Review MCP supervisor started\nStatus: ${supervisor.state}\n${registeredMcpToolsMessage()}`);
     let closing = false;
     const close = (): void => {
       if (closing) return;

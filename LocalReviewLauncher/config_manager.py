@@ -97,13 +97,15 @@ class ConfigManager:
         return updated
 
     def runtime_config(self, configuration: LauncherConfig) -> tuple[Path, Path | None]:
+        saved = self.load()
+        workspace = saved.workspace or configuration.workspace
         source_path = self.production_path(configuration.config_file)
         source = _read_json_object(source_path, "Production configuration")
-        if source.get("workspace") == configuration.workspace:
+        if source.get("workspace") == workspace:
             return source_path, None
 
         runtime = dict(source)
-        runtime["workspace"] = configuration.workspace
+        runtime["workspace"] = workspace
         descriptor, temporary_name = tempfile.mkstemp(prefix="local-review-launcher-", suffix=".json")
         temporary_path = Path(temporary_name)
         try:

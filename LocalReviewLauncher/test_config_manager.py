@@ -41,6 +41,25 @@ class ConfigManagerTests(unittest.TestCase):
             self.assertEqual(json.loads(runtime_path.read_text(encoding="utf-8"))["workspace"], str(selected_workspace))
             temporary_path.unlink()
 
+    def test_runtime_config_uses_latest_saved_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "LocalReviewLauncher").mkdir()
+            original_workspace = root / "original"
+            selected_workspace = root / "selected"
+            original_workspace.mkdir()
+            selected_workspace.mkdir()
+            self._write_production(root, {"workspace": str(original_workspace), "auth": {"token": "test"}})
+            manager = ConfigManager(root)
+            initial = manager.load()
+            manager.save_workspace(initial, selected_workspace)
+
+            runtime_path, temporary_path = manager.runtime_config(initial)
+
+            self.assertIsNotNone(temporary_path)
+            self.assertEqual(json.loads(runtime_path.read_text(encoding="utf-8"))["workspace"], str(selected_workspace))
+            temporary_path.unlink()
+
     def test_production_path_is_absolute(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
