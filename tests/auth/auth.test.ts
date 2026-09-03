@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { discoverOAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { request as httpRequest, type IncomingHttpHeaders, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,9 +22,18 @@ afterEach(async () => {
   })));
 });
 
-async function makeServer(): Promise<{ port: number; server: Server }> {
-  const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-auth-"));
-  temporaryDirectories.push(workspace);
+async function makeServer(options: {
+  readonly workspace?: string;
+  readonly registryPath?: string;
+} = {}): Promise<{
+  port: number;
+  server: Server;
+  workspace: string;
+  registryPath: string;
+}> {
+  const workspace = options.workspace ?? await mkdtemp(join(tmpdir(), "local-review-mcp-auth-"));
+  if (options.workspace === undefined) temporaryDirectories.push(workspace);
+  const registryPath = options.registryPath ?? join(workspace, "oauth", "clients.json");
   const server = await startApp({
     host: "127.0.0.1",
     port: 0,
@@ -32,11 +41,17 @@ async function makeServer(): Promise<{ port: number; server: Server }> {
     auth: { token: TOKEN },
     remote: { enabled: false, endpoint: "" },
     supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
-  });
+  }, undefined, { oauthClientRegistryPath: registryPath });
   runningServers.push(server);
   const address = server.address();
   if (address === null || typeof address === "string") throw new Error("test server has no port");
-  return { port: address.port, server };
+  return { port: address.port, server, workspace, registryPath };
+}
+
+async function stopServer(server: Server): Promise<void> {
+  const index = runningServers.indexOf(server);
+  if (index !== -1) runningServers.splice(index, 1);
+  await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
 function initializeBody(): string {
@@ -259,6 +274,83 @@ describe("MCP OAuth compatibility", () => {
     expect(client.client_id).toEqual(expect.any(String));
     expect(client.grant_types).toEqual(["authorization_code"]);
     expect(client.client_secret).toBeUndefined();
+  });
+
+  it("persists clients and restores them after a runtime restart", async () => {
+    const first = await makeServer();
+    const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
+    const body = JSON.stringify({
+      client_name: "ChatGPT",
+      redirect_uris: [redirectUri],
+      grant_types: ["authorization_code"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    });
+    const [registration, concurrentRegistration] = await Promise.all([
+      requestText(first.port, "/oauth/register", "POST", body, { "content-type": "application/json" }),
+      requestText(first.port, "/oauth/register", "POST", body, { "content-type": "application/json" }),
+    ]);
+    const client = JSON.parse(registration.text) as { client_id: string };
+
+    expect(registration.status).toBe(201);
+    expect(concurrentRegistration.status).toBe(201);
+    const registry = JSON.parse(await readFile(first.registryPath, "utf8")) as {
+      version: number;
+      clients: Array<Record<string, unknown>>;
+    };
+    expect(registry.version).toBe(1);
+    expect(registry.clients).toHaveLength(2);
+    expect(registry.clients[0]).toMatchObject({
+      client_id: expect.any(String),
+      client_name: "ChatGPT",
+      redirect_uris: [redirectUri],
+      grant_types: ["authorization_code"],
+      token_endpoint_auth_method: "none",
+      created_at: expect.any(Number),
+    });
+
+    await stopServer(first.server);
+    const second = await makeServer({
+      workspace: first.workspace,
+      registryPath: first.registryPath,
+    });
+    const verifier = "v".repeat(43);
+    const resource = `http://127.0.0.1:${second.port}/mcp`;
+    const authorization = await requestText(
+      second.port,
+      `/oauth/authorize?${new URLSearchParams({
+        client_id: client.client_id,
+        redirect_uri: redirectUri,
+        response_type: "code",
+        code_challenge: pkceChallenge(verifier),
+        code_challenge_method: "S256",
+        resource,
+      }).toString()}`,
+      "GET",
+    );
+    const location = authorization.headers.location;
+    expect(authorization.status).toBe(302);
+    expect(location).toBeDefined();
+
+    const code = new URL(location ?? redirectUri).searchParams.get("code");
+    const token = await requestText(
+      second.port,
+      "/oauth/token",
+      "POST",
+      new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: client.client_id,
+        code: code ?? "",
+        redirect_uri: redirectUri,
+        code_verifier: verifier,
+        resource,
+      }).toString(),
+      { "content-type": "application/x-www-form-urlencoded" },
+    );
+    const tokenBody = JSON.parse(token.text) as { access_token: string };
+    expect(token.status).toBe(200);
+    await expect(postMcp(second.port, `Bearer ${tokenBody.access_token}`))
+      .resolves.toMatchObject({ status: 200 });
   });
 
   it("completes public-client registration, PKCE code exchange, and MCP access", async () => {

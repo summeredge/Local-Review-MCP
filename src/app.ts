@@ -1,7 +1,7 @@
 import type { Server } from "node:http";
 import { basename } from "node:path";
 import { endpoint, localOrigin, type ResolvedSettings } from "./config/settings.js";
-import { isPortInUse, startHttpServer } from "./mcp/http.js";
+import { isPortInUse, startHttpServer, type HttpServerOptions } from "./mcp/http.js";
 import { V01_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { WorkspaceManager } from "./workspace/manager.js";
@@ -10,6 +10,8 @@ export interface AppContext extends McpRuntimeContext {
   readonly settings: ResolvedSettings;
   readonly tunnel: TunnelManager;
 }
+
+export type AppStartOptions = HttpServerOptions;
 
 export function createAppContext(
   settings: ResolvedSettings,
@@ -28,9 +30,10 @@ export function createAppContext(
 export async function startApp(
   settings: ResolvedSettings,
   context: AppContext = createAppContext(settings),
+  options: AppStartOptions = {},
 ): Promise<Server> {
   try {
-    const server = await startHttpServer(settings, context);
+    const server = await startHttpServer(settings, context, options);
     try {
       await context.tunnel.start();
     } catch {

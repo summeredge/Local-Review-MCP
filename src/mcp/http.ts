@@ -28,6 +28,10 @@ type HttpRuntimeContext = McpRuntimeContext & {
   readonly tunnel?: Pick<TunnelProvider, "status">;
 };
 
+export interface HttpServerOptions {
+  readonly oauthClientRegistryPath?: string;
+}
+
 class RequestBodyTooLargeError extends Error {
   public constructor() {
     super("MCP request body exceeds the maximum allowed size.");
@@ -491,8 +495,12 @@ async function handleOAuthRequest(
   return false;
 }
 
-export function createHttpServer(settings: ResolvedSettings, context: HttpRuntimeContext): Server {
-  const oauth = new OAuthService();
+export function createHttpServer(
+  settings: ResolvedSettings,
+  context: HttpRuntimeContext,
+  options: HttpServerOptions = {},
+): Server {
+  const oauth = new OAuthService({ clientRegistryPath: options.oauthClientRegistryPath });
   return createServer((request, response) => {
     void (async () => {
       const path = request.url === undefined
@@ -573,10 +581,11 @@ export async function checkPort(settings: ResolvedSettings): Promise<void> {
 export async function startHttpServer(
   settings: ResolvedSettings,
   context: HttpRuntimeContext,
+  options: HttpServerOptions = {},
 ): Promise<Server> {
   assertLoopbackHost(settings);
   await checkPort(settings);
-  const server = createHttpServer(settings, context);
+  const server = createHttpServer(settings, context, options);
   await new Promise<void>((resolve, reject) => {
     const onError = (error: NodeJS.ErrnoException): void => {
       server.removeListener("listening", onListening);

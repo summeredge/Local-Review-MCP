@@ -1,5 +1,14 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import {
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import {
   OAuthTokenStore,
   type IssuedOAuthToken,
 } from "./token.js";
@@ -31,12 +40,33 @@ export class OAuthRequestError extends Error {
 
 export interface OAuthRegisteredClient {
   readonly client_id: string;
+  readonly client_secret?: string;
   readonly client_name: string;
   readonly redirect_uris: readonly string[];
   readonly token_endpoint_auth_method: "none";
   readonly grant_types: readonly ["authorization_code"];
   readonly response_types: readonly ["code"];
   readonly client_id_issued_at: number;
+}
+
+export interface OAuthServiceOptions {
+  readonly clientRegistryPath?: string;
+}
+
+interface PersistedOAuthClient {
+  readonly client_id: string;
+  readonly client_secret?: string;
+  readonly client_name: string;
+  readonly redirect_uris: readonly string[];
+  readonly grant_types: readonly string[];
+  readonly token_endpoint_auth_method: "none";
+  readonly response_types: readonly string[];
+  readonly created_at: number;
+}
+
+interface PersistedOAuthRegistry {
+  readonly version: 1;
+  readonly clients: readonly PersistedOAuthClient[];
 }
 
 interface AuthorizationCode {
@@ -56,6 +86,113 @@ interface AuthorizationCodeRequest {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function defaultOAuthClientRegistryPath(
+  environment: NodeJS.ProcessEnv = process.env,
+): string {
+  return join(
+    environment.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"),
+    "LocalReviewMCP",
+    "oauth",
+    "clients.json",
+  );
+}
+
+function persistedClient(client: OAuthRegisteredClient): PersistedOAuthClient {
+  return {
+    client_id: client.client_id,
+    ...(client.client_secret === undefined ? {} : { client_secret: client.client_secret }),
+    client_name: client.client_name,
+    redirect_uris: [...client.redirect_uris],
+    grant_types: [...client.grant_types],
+    token_endpoint_auth_method: client.token_endpoint_auth_method,
+    response_types: [...client.response_types],
+    created_at: client.client_id_issued_at,
+  };
+}
+
+function loadClientRegistry(path: string): Map<string, OAuthRegisteredClient> {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Map();
+    throw new Error("OAuth client registry could not be loaded", { cause: error });
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error: unknown) {
+    throw new Error("OAuth client registry is invalid", { cause: error });
+  }
+  if (!isRecord(parsed) || parsed.version !== 1 || !Array.isArray(parsed.clients)) {
+    throw new Error("OAuth client registry is invalid");
+  }
+
+  const clients = new Map<string, OAuthRegisteredClient>();
+  for (const value of parsed.clients) {
+    if (!isRecord(value)
+      || typeof value.client_id !== "string"
+      || value.client_id.trim() === ""
+      || (value.client_secret !== undefined && typeof value.client_secret !== "string")
+      || typeof value.client_name !== "string"
+      || value.client_name.trim() === ""
+      || value.client_name.length > 200
+      || !Array.isArray(value.redirect_uris)
+      || value.redirect_uris.length === 0
+      || value.redirect_uris.length > 20
+      || value.redirect_uris.some((uri) => typeof uri !== "string")
+      || !Array.isArray(value.grant_types)
+      || value.grant_types.length !== 1
+      || value.grant_types[0] !== "authorization_code"
+      || value.token_endpoint_auth_method !== "none"
+      || !Array.isArray(value.response_types)
+      || value.response_types.length !== 1
+      || value.response_types[0] !== "code"
+      || typeof value.created_at !== "number"
+      || !Number.isSafeInteger(value.created_at)
+      || value.created_at < 0) {
+      throw new Error("OAuth client registry is invalid");
+    }
+    for (const uri of value.redirect_uris) assertValidRedirectUri(uri);
+    if (clients.has(value.client_id)) throw new Error("OAuth client registry is invalid");
+    clients.set(value.client_id, {
+      client_id: value.client_id,
+      ...(value.client_secret === undefined ? {} : { client_secret: value.client_secret }),
+      client_name: value.client_name,
+      redirect_uris: [...value.redirect_uris],
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code"],
+      response_types: ["code"],
+      client_id_issued_at: value.created_at,
+    });
+  }
+  return clients;
+}
+
+function saveClientRegistry(path: string, clients: Iterable<OAuthRegisteredClient>): void {
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const registry: PersistedOAuthRegistry = {
+      version: 1,
+      clients: [...clients].map(persistedClient),
+    };
+    writeFileSync(temporaryPath, `${JSON.stringify(registry, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    renameSync(temporaryPath, path);
+  } catch (error: unknown) {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {
+      // Preserve the original storage error.
+    }
+    throw new Error("OAuth client registry could not be saved", { cause: error });
+  }
 }
 
 function hashValue(value: string): string {
@@ -170,8 +307,16 @@ function supportedList(
 export class OAuthService {
   public readonly tokens = new OAuthTokenStore();
 
-  private readonly clients = new Map<string, OAuthRegisteredClient>();
+  private readonly clients: Map<string, OAuthRegisteredClient>;
+  private readonly clientRegistryPath: string;
   private readonly authorizationCodes = new Map<string, AuthorizationCode>();
+
+  public constructor(options: OAuthServiceOptions = {}) {
+    this.clientRegistryPath = resolve(
+      options.clientRegistryPath ?? defaultOAuthClientRegistryPath(),
+    );
+    this.clients = loadClientRegistry(this.clientRegistryPath);
+  }
 
   public registerClient(input: unknown): OAuthRegisteredClient {
     if (!isRecord(input)) {
@@ -218,6 +363,10 @@ export class OAuthService {
       response_types: ["code"],
       client_id_issued_at: Math.floor(Date.now() / 1000),
     };
+    // ponytail: synchronous atomic replace serializes one runtime; add a cross-process lock if runtimes share this file.
+    const nextClients = new Map(this.clients);
+    nextClients.set(client.client_id, client);
+    saveClientRegistry(this.clientRegistryPath, nextClients.values());
     this.clients.set(client.client_id, client);
     return client;
   }
