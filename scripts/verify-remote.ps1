@@ -164,13 +164,15 @@ try {
             "search_text",
             "git_status",
             "git_diff",
-            "workspace_list"
+            "workspace_list",
+            "review_summary",
+            "execution_output"
         )
         $actualTools = @($tools | ForEach-Object { Get-PropertyValue $_ "name" })
         if ($actualTools.Count -ne $expectedTools.Count -or (($actualTools | Sort-Object) -join ",") -ne (($expectedTools | Sort-Object) -join ",")) {
-            throw "tools/list returned an unexpected tool surface; expected seven read-only tools."
+            throw "tools/list returned an unexpected tool surface; expected nine read-only tools."
         }
-        Write-Host "tools/list: passed (seven read-only tools)"
+        Write-Host "tools/list: passed (nine read-only tools)"
         Write-Host "Remote verification passed."
         exit 0
     } finally {

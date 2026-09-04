@@ -1,10 +1,11 @@
 import { createReadStream } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { GitError } from "../git/errors.js";
 import { GitService } from "../git/service.js";
+import type { GitDiffResponse, GitStatusResponse } from "../git/types.js";
 import { WorkspaceManager, WorkspacePathError } from "../workspace/manager.js";
 import { WorkspaceRegistry, type WorkspaceSelection } from "../workspace/registry.js";
 import { searchText } from "../workspace/search.js";
@@ -25,9 +26,11 @@ export const V01_TOOL_NAMES = [
 ] as const;
 
 export const WORKSPACE_REGISTRY_TOOL_NAMES = ["workspace_list"] as const;
+export const REVIEW_CONTEXT_TOOL_NAMES = ["review_summary", "execution_output"] as const;
 export const REGISTERED_TOOL_NAMES = [
   ...V01_TOOL_NAMES,
   ...WORKSPACE_REGISTRY_TOOL_NAMES,
+  ...REVIEW_CONTEXT_TOOL_NAMES,
 ] as const;
 
 export type V01ToolName = typeof V01_TOOL_NAMES[number];
@@ -82,6 +85,7 @@ const gitDiffInputSchema = {
   path: z.string().optional().default("."),
   stat: z.boolean().optional().default(false),
 };
+const EXECUTION_OUTPUT_PATH = ".review/execution_output.json";
 
 interface ListedEntry {
   readonly path: string;
@@ -337,6 +341,69 @@ async function workspaceInfo(selection: WorkspaceSelection) {
   };
 }
 
+function summarizeGitStatus(status: GitStatusResponse) {
+  const summary = { modified: 0, added: 0, deleted: 0 };
+  for (const entry of status.entries) {
+    if (entry.status === "deleted") summary.deleted += 1;
+    else if (entry.status === "added" || entry.status === "untracked") summary.added += 1;
+    else summary.modified += 1;
+  }
+  return summary;
+}
+
+function statCount(value: string, noun: "insertion" | "deletion"): number {
+  const match = value.match(new RegExp(`\\b(\\d+)\\s+${noun}s?\\s*\\([+-]\\)`, "u"));
+  return match === null ? 0 : Number(match[1]);
+}
+
+function summarizeDiff(diff: GitDiffResponse) {
+  const statLine = diff.diff.split(/\r?\n/u).find((line) => /^\s*\d+\s+files? changed\b/u.test(line)) ?? "";
+  return {
+    files_changed: diff.files.length,
+    insertions: statCount(statLine, "insertion"),
+    deletions: statCount(statLine, "deletion"),
+  };
+}
+
+async function reviewSummary(selection: WorkspaceSelection) {
+  const git = new GitService(selection.manager);
+  const [status, diff] = await Promise.all([
+    git.status(),
+    git.diff({ stat: true }),
+  ]);
+  return {
+    workspace_id: selection.id,
+    workspace_name: selection.name,
+    git_branch: status.branch,
+    git_status_summary: summarizeGitStatus(status),
+    diff_summary: summarizeDiff(diff),
+  };
+}
+
+async function executionOutput(workspace: WorkspaceManager): Promise<unknown> {
+  let resolved;
+  try {
+    resolved = workspace.resolveExisting(EXECUTION_OUTPUT_PATH);
+  } catch (error: unknown) {
+    if (error instanceof WorkspacePathError && error.code === "PATH_NOT_FOUND") {
+      return { available: false };
+    }
+    throw error;
+  }
+
+  let stats;
+  try {
+    stats = await stat(resolved.absolutePath);
+  } catch (error: unknown) {
+    if (error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { available: false };
+    }
+    throw error;
+  }
+  if (!stats.isFile()) return { available: false };
+  return JSON.parse(await readFile(resolved.absolutePath, "utf8")) as unknown;
+}
+
 export function createMcpServer(context: McpRuntimeContext): McpServer {
   const registry = context.registry
     ?? (context.workspace === undefined ? undefined : WorkspaceRegistry.fromManager(context.workspace));
@@ -457,6 +524,38 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async () => jsonResult({ workspaces: registry.list() }),
+  );
+
+  server.registerTool(
+    "review_summary",
+    {
+      description: "Return a read-only Git and workspace summary for review; omitted workspace_id uses the active workspace.",
+      inputSchema: workspaceIdInputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        return jsonResult(await reviewSummary(registry.resolve(input.workspace_id)));
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "execution_output",
+    {
+      description: "Read the fixed .review/execution_output.json result for the authorized workspace; omitted workspace_id uses the active workspace.",
+      inputSchema: workspaceIdInputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        return jsonResult(await executionOutput(registry.resolve(input.workspace_id).manager));
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
   );
 
   return server;

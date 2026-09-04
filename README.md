@@ -2,12 +2,12 @@
 
 ## Current version
 
-V0.1 Release Candidate / Task 11
+V0.1 Release Candidate / Task 12
 
 ## Current capabilities
 
 - MCP Streamable HTTP runtime
-- six existing read-only tools plus the read-only workspace registry tool
+- nine read-only tools, including the workspace registry and review context tools
 - fixed loopback host
 - configurable fixed port
 - startup port conflict detection
@@ -146,9 +146,9 @@ $env:LOCAL_REVIEW_MCP_REMOTE_TOKEN = $env:LOCAL_REVIEW_MCP_TOKEN
 
 `verify-remote.ps1` checks that unauthenticated and wrong-token health requests
 return HTTP 401, the correct token returns `status=ok`, MCP `initialize` works,
-and `tools/list` contains the seven read-only tools:
+and `tools/list` contains the nine read-only tools:
 `workspace_info`, `list_files`, `read_file`, `search_text`, `git_status`, and
-`git_diff`, plus `workspace_list`.
+`git_diff`, plus `workspace_list`, `review_summary`, and `execution_output`.
 
 ## Remote MCP Setup
 
@@ -200,11 +200,11 @@ hardcodes a tunnel hostname.
 3. Select the connector's OAuth authentication option. The server publishes
    MCP protected-resource metadata, authorization-server metadata, dynamic
    client registration, and PKCE endpoints under the same public origin.
-4. Scan the tools, confirm the seven read-only actions, save the draft app, and
+4. Scan the tools, confirm the nine read-only actions, save the draft app, and
    select it from a new chat. Ask for a code review; ChatGPT should call
-   `workspace_list` first, then `workspace_info`, `git_status`, `git_diff`,
-   `read_file`, and `search_text` with a `workspace_id` when selecting a
-   registered workspace.
+   `workspace_list` first, then `review_summary`, `execution_output`,
+   `workspace_info`, `git_status`, `git_diff`, `read_file`, and `search_text`
+   with a `workspace_id` when selecting a registered workspace.
 
 The exact ChatGPT Web menu labels and availability depend on the workspace
 plan. The MCP endpoint itself is `/mcp`; `/health` is an authenticated
@@ -216,11 +216,17 @@ legacy active workspace unless the top-level `workspace` matches another
 registered path. Without `workspace_id`, tools use that active workspace.
 
 The current tools are `workspace_info`, `list_files`, `read_file`, `search_text`,
-`git_status`, `git_diff`, and `workspace_list`. The first six accept an
-optional `workspace_id`; an omitted ID preserves the active-workspace behavior.
+`git_status`, `git_diff`, `workspace_list`, `review_summary`, and
+`execution_output`. All workspace-scoped tools except `workspace_list` accept
+an optional `workspace_id`; an omitted ID preserves the active-workspace
+behavior.
 Git tools are bound to the selected registered workspace, do not expose Git
 command arguments, and never perform write operations. `workspace_list` returns
 only each workspace's stable `id` and display `name`, never its local path.
+`review_summary` combines workspace metadata with Git status and diff counts.
+`execution_output` only reads `.review/execution_output.json` and returns
+`{"available":false}` when that file is absent; it never runs the recorded
+command or accepts a file path.
 
 The health endpoint requires the configured static `Authorization: Bearer <token>`
 even on localhost and through Cloudflare Tunnel. MCP requests accept either that
@@ -260,7 +266,7 @@ the remote test. No token or public URL is stored in the repository.
 ## Security Notes
 
 Local Review MCP intentionally provides only `read`, `search`, and `review`
-capabilities through its seven registered tools. It does not provide:
+capabilities through its nine registered tools. It does not provide:
 
 - `modify` or `write_file` operations;
 - `execute` or shell operations;

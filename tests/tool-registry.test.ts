@@ -17,7 +17,7 @@ afterEach(async () => {
 });
 
 describe("MCP tool registry", () => {
-  it("exposes the six V0.1 tools and the workspace registry tool", async () => {
+  it("exposes all registered read-only tools", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-registry-"));
     temporaryDirectories.push(workspace);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -29,7 +29,7 @@ describe("MCP tool registry", () => {
     const result = await client.listTools();
     const names = result.tools.map((tool) => tool.name).sort();
 
-    expect(names).toHaveLength(7);
+    expect(names).toHaveLength(9);
     expect(names).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
   });
 });
