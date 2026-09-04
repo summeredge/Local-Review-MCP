@@ -121,4 +121,23 @@ describe("Workspace Registry", () => {
     expect(absolute.isError).toBe(true);
     expect(resultJson(absolute)).toEqual({ error: "INVALID_PATH" });
   });
+
+  it("uses the configured id across reloads and allows a new id after re-add", async () => {
+    const originalPath = await makeWorkspace("identity-original", "original\n");
+    const movedPath = await makeWorkspace("identity-moved", "moved\n");
+    const originalEntry = { id: "stable-workspace", name: "Review", path: originalPath };
+
+    const first = new WorkspaceRegistry([originalEntry]);
+    const reloaded = new WorkspaceRegistry([{ ...originalEntry, path: movedPath }]);
+    expect(first.resolve("stable-workspace").id).toBe("stable-workspace");
+    expect(reloaded.resolve("stable-workspace").id).toBe("stable-workspace");
+
+    const readded = new WorkspaceRegistry([{
+      id: "new-workspace",
+      name: "Review",
+      path: movedPath,
+    }]);
+    expect(() => readded.resolve("stable-workspace")).toThrow();
+    expect(readded.resolve("new-workspace").id).toBe("new-workspace");
+  });
 });

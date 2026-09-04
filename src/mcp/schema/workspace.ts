@@ -1,13 +1,10 @@
 import { z } from "zod";
 import {
   rootAliasSchema,
-  workspaceIdSchema,
-  workspaceNameSchema,
+  workspaceContextSchema,
 } from "./common.js";
 
-export const workspaceInfoOutputSchema = z.object({
-  workspace_id: workspaceIdSchema,
-  workspace_name: workspaceNameSchema,
+export const workspaceInfoOutputSchema = workspaceContextSchema.extend({
   root_alias: rootAliasSchema,
   project_types: z.array(z.string()),
 });

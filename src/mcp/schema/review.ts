@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { workspaceIdSchema, workspaceNameSchema } from "./common.js";
+import { workspaceContextSchema } from "./common.js";
 
 const gitStatusSummarySchema = z.object({
   modified: z.number().int().nonnegative(),
@@ -13,9 +13,7 @@ const diffSummarySchema = z.object({
   deletions: z.number().int().nonnegative(),
 });
 
-export const reviewSummaryOutputSchema = z.object({
-  workspace_id: workspaceIdSchema,
-  workspace_name: workspaceNameSchema,
+export const reviewSummaryOutputSchema = workspaceContextSchema.extend({
   git_branch: z.string().nullable(),
   git_status_summary: gitStatusSummarySchema,
   diff_summary: diffSummarySchema,
