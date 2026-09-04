@@ -61,3 +61,36 @@ export interface UpdateExecutionContextInput {
   readonly command?: string;
   readonly summary?: string;
 }
+
+export const REVIEW_REQUEST_STATUSES = [
+  "pending",
+  "requested",
+  "completed",
+] as const;
+
+export type ReviewRequestStatus = typeof REVIEW_REQUEST_STATUSES[number];
+
+export interface ReviewRequestContext {
+  readonly review_request_id: string;
+  readonly task_id: string;
+  readonly execution_id: string;
+  readonly workspace_id: string;
+  readonly conversation_id?: string;
+  readonly status: ReviewRequestStatus;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface CreateReviewRequestInput {
+  readonly review_request_id?: string;
+  readonly task_id: string;
+  readonly execution_id: string;
+  readonly workspace_id: string;
+  readonly conversation_id?: string;
+  readonly status?: ReviewRequestStatus;
+}
+
+export interface UpdateReviewRequestInput {
+  readonly conversation_id?: string;
+  readonly status?: ReviewRequestStatus;
+}
