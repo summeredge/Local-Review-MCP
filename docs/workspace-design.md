@@ -7,6 +7,28 @@ selects an authorized local workspace for read, search, Git, and review-context
 operations. It does not bind a workspace to a conversation or session, and it
 does not provide agent-control or execution capabilities.
 
+## Registry
+
+The registry contains only workspaces authorized by the local configuration
+owner:
+
+```text
+Workspace Registry
+    |
+    +-- workspace A
+    +-- workspace B
+```
+
+It is responsible for:
+
+- saving authorized workspaces;
+- preserving a stable `workspace_id` for each registered workspace;
+- providing the authorized workspace set for Launcher management and MCP
+  runtime selection.
+
+The MCP runtime reads this registry. It does not add, remove, or mutate
+registry entries.
+
 ## Workspace context
 
 The shared context schema is:
@@ -56,6 +78,50 @@ when it matches a registered entry; otherwise the first registry entry is the
 legacy active workspace. A legacy single-workspace configuration is wrapped as
 a one-entry registry. An unknown `workspace_id` is rejected and never treated
 as a filesystem path.
+
+## Runtime
+
+The active workspace runtime remains part of V0.1. The registry selects it, and
+the MCP server performs read-only operations against that selection:
+
+```text
+Registry
+    |
+    v
+active workspace
+    |
+    v
+MCP Runtime
+```
+
+An explicit `workspace_id` selects another registered workspace for one tool
+call. Omitting it preserves the existing active-workspace fallback.
+
+## Security boundary
+
+The allowed path flow is:
+
+```text
+Launcher user selects path
+        |
+        v
+Registry saves authorized workspace
+        |
+        v
+MCP accesses the registered workspace
+```
+
+ChatGPT or any MCP caller must not provide an arbitrary local filesystem path
+to select a workspace. `workspace_id` resolves only to a registry entry, and
+tool path arguments remain workspace-relative and subject to containment and
+sensitive-path checks.
+
+## Out of scope
+
+This model intentionally does not include Workspace-to-Conversation or
+Workspace-to-ChatGPT-Project binding, C2C session lifecycle/state, or an agent
+control plane. It also does not provide file writes, command execution, or Git
+mutation.
 
 Future automatic review task flows must carry an explicit `workspace_id` at
 each task boundary. They must not rely on the active-workspace fallback.

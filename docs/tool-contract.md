@@ -4,14 +4,26 @@ This document freezes the V0.1 Release Candidate tool surface. All nine tools
 are read-only. The names and input fields below are the current MCP contract;
 the runtime does not add write, exec, shell, commit, or push operations.
 
+| Tool | Scope | Permission |
+| --- | --- | --- |
+| `workspace_list` | global | read-only |
+| `workspace_info` | workspace | read-only |
+| `list_files` | workspace | read-only |
+| `read_file` | workspace | read-only |
+| `search_text` | workspace | read-only |
+| `git_status` | workspace | read-only |
+| `git_diff` | workspace | read-only |
+| `review_summary` | workspace | read-only |
+| `execution_output` | workspace | read-only |
+
 ## Common rules
 
 - The HTTP endpoint requires the configured Bearer token or a valid local OAuth
   access token. In-process tests use the same handlers without HTTP auth.
-- `workspace_id` is an optional non-empty string on workspace-scoped tools.
-  When present it selects a registered workspace; when omitted the active
-  workspace is used. `workspace_list` is registry-scoped and has no
-  `workspace_id` input.
+- `workspace_id` is an optional string of 1..128 characters on
+  workspace-scoped tools. When present it selects a registered workspace; when
+  omitted the active workspace is used. `workspace_list` is registry-scoped
+  and has no `workspace_id` input.
 - Workspace paths are relative to the selected workspace and pass the existing
   containment and sensitive-path policy. Absolute paths and path traversal are
   rejected.
@@ -23,6 +35,7 @@ the runtime does not add write, exec, shell, commit, or push operations.
 
 ### `workspace_info`
 
+- Purpose: Return metadata about one authorized workspace.
 - Input: `{ "workspace_id"?: string }`
 - Output:
 
@@ -37,19 +50,21 @@ the runtime does not add write, exec, shell, commit, or push operations.
 
 - Workspace scope: selected registry workspace, or active workspace when the
   ID is omitted.
-- Permission: authenticated read-only workspace metadata; project detection
-  checks only bounded workspace entries.
+- Permission: authenticated read-only; project detection checks only bounded
+  workspace entries.
 
 ### `workspace_list`
 
+- Purpose: List authorized workspaces without exposing local paths.
 - Input: `{}`
 - Output: `{ "workspaces": [{ "id": "string", "name": "string" }] }`
 - Workspace scope: authorized registry; no single workspace is selected.
-- Permission: authenticated read-only registry metadata. Local filesystem paths
-  are not returned.
+- Permission: authenticated read-only registry metadata. Local filesystem
+  paths are not returned.
 
 ### `list_files`
 
+- Purpose: List authorized files and directories within a workspace.
 - Input:
 
   ```json
@@ -70,6 +85,7 @@ the runtime does not add write, exec, shell, commit, or push operations.
 
 ### `read_file`
 
+- Purpose: Read a bounded range of an authorized text file.
 - Input:
 
   ```json
@@ -90,6 +106,7 @@ the runtime does not add write, exec, shell, commit, or push operations.
 
 ### `search_text`
 
+- Purpose: Search authorized non-sensitive text files with bounded matching.
 - Input:
 
   ```json
@@ -112,6 +129,7 @@ the runtime does not add write, exec, shell, commit, or push operations.
 
 ### `git_status`
 
+- Purpose: Return the Git status for an authorized workspace repository.
 - Input: `{ "workspace_id"?: string }`
 - Output: `{ "branch": string|null, "entries": [{ "path": string, "index": string, "worktree": string, "status": "modified"|"added"|"deleted"|"renamed"|"untracked", "original_path"?: string }] }`
 - Workspace scope: selected workspace Git repository.
@@ -120,6 +138,7 @@ the runtime does not add write, exec, shell, commit, or push operations.
 
 ### `git_diff`
 
+- Purpose: Return a bounded Git diff for an authorized workspace repository.
 - Input: `{ "workspace_id"?: string, "path"?: string, "stat"?: boolean }`
 
   Defaults: `path="."`, `stat=false`.
@@ -130,6 +149,7 @@ the runtime does not add write, exec, shell, commit, or push operations.
 
 ### `review_summary`
 
+- Purpose: Return the read-only Git and workspace summary used by review.
 - Input: `{ "workspace_id"?: string }`
 - Output:
 
@@ -150,6 +170,7 @@ the runtime does not add write, exec, shell, commit, or push operations.
 
 ### `execution_output`
 
+- Purpose: Read the fixed review execution result for an authorized workspace.
 - Input: `{ "workspace_id"?: string }`
 - Output: the JSON object stored at `.review/execution_output.json`; when the
   file is absent, `{ "available": false }` is returned. Existing optional
