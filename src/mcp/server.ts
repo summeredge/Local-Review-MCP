@@ -17,6 +17,12 @@ import {
   gitStatusOutputSchema,
 } from "./schema/git.js";
 import {
+  executionOutputOutputSchema,
+  reviewSummaryOutputSchema,
+  type ExecutionOutputOutput,
+  type ReviewSummaryOutput,
+} from "./schema/review.js";
+import {
   workspaceInfoOutputSchema,
   type WorkspaceInfoOutput,
 } from "./schema/workspace.js";
@@ -374,7 +380,7 @@ function summarizeDiff(diff: GitDiffResponse) {
   };
 }
 
-async function reviewSummary(selection: WorkspaceSelection) {
+async function reviewSummary(selection: WorkspaceSelection): Promise<ReviewSummaryOutput> {
   const git = new GitService(selection.manager);
   const [status, diff] = await Promise.all([
     git.status(),
@@ -389,7 +395,7 @@ async function reviewSummary(selection: WorkspaceSelection) {
   };
 }
 
-async function executionOutput(workspace: WorkspaceManager): Promise<unknown> {
+async function executionOutput(workspace: WorkspaceManager): Promise<ExecutionOutputOutput> {
   let resolved;
   try {
     resolved = workspace.resolveExisting(EXECUTION_OUTPUT_PATH);
@@ -410,7 +416,11 @@ async function executionOutput(workspace: WorkspaceManager): Promise<unknown> {
     throw error;
   }
   if (!stats.isFile()) return { available: false };
-  return JSON.parse(await readFile(resolved.absolutePath, "utf8")) as unknown;
+  const output = JSON.parse(await readFile(resolved.absolutePath, "utf8")) as unknown;
+  if (typeof output !== "object" || output === null || Array.isArray(output)) {
+    throw new Error("Execution output must be a JSON object.");
+  }
+  return output as ExecutionOutputOutput;
 }
 
 export function createMcpServer(context: McpRuntimeContext): McpServer {
@@ -543,11 +553,12 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     {
       description: "Return a read-only Git and workspace summary for review; omitted workspace_id uses the active workspace.",
       inputSchema: workspaceIdInputSchema,
+      outputSchema: reviewSummaryOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async (input) => {
       try {
-        return jsonResult(await reviewSummary(registry.resolve(input.workspace_id)));
+        return structuredResponse(await reviewSummary(registry.resolve(input.workspace_id)));
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -559,11 +570,12 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     {
       description: "Read the fixed .review/execution_output.json result for the authorized workspace; omitted workspace_id uses the active workspace.",
       inputSchema: workspaceIdInputSchema,
+      outputSchema: executionOutputOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async (input) => {
       try {
-        return jsonResult(await executionOutput(registry.resolve(input.workspace_id).manager));
+        return structuredResponse(await executionOutput(registry.resolve(input.workspace_id).manager));
       } catch (error: unknown) {
         return toToolError(error);
       }

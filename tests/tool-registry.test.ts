@@ -57,5 +57,25 @@ describe("MCP tool registry", () => {
         binary: expect.any(Object),
       },
     });
+    expect(result.tools.find((tool) => tool.name === "review_summary")?.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        workspace_id: expect.any(Object),
+        workspace_name: expect.any(Object),
+        git_branch: expect.any(Object),
+        git_status_summary: expect.any(Object),
+        diff_summary: expect.any(Object),
+      },
+    });
+    expect(result.tools.find((tool) => tool.name === "execution_output")?.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        available: expect.any(Object),
+        timestamp: expect.any(Object),
+        command: expect.any(Object),
+        status: expect.any(Object),
+        summary: expect.any(Object),
+      },
+    });
   });
 });

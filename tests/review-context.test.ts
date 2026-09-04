@@ -71,7 +71,9 @@ function resultJson(result: Awaited<ReturnType<Client["callTool"]>>): Record<str
     || typeof (content[0] as { text?: unknown }).text !== "string") {
     throw new Error("tool did not return text content");
   }
-  return JSON.parse((content[0] as { text: string }).text) as Record<string, unknown>;
+  const parsed = JSON.parse((content[0] as { text: string }).text) as Record<string, unknown>;
+  expect(result.structuredContent).toEqual(parsed);
+  return parsed;
 }
 
 describe("Review context tools", () => {
