@@ -60,6 +60,7 @@ describe("workspace_info", () => {
     const result = await callWorkspaceInfo(workspace);
     expect(result.isError).not.toBe(true);
     const info = JSON.parse(toolText(result)) as Record<string, unknown>;
+    expect(result.structuredContent).toEqual(info);
 
     expect(info.workspace_id).toMatch(/^[0-9a-f]{12}$/u);
     expect(info.workspace_name).toBe(basename(workspace));

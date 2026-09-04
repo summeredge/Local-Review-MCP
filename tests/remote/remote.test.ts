@@ -211,10 +211,16 @@ describe("remote MCP deployment", () => {
 
     const listed = await client.listTools();
     expect(listed.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
+    expect(listed.tools.find((tool) => tool.name === "workspace_info")?.outputSchema).toMatchObject({
+      type: "object",
+      properties: { workspace_id: expect.any(Object) },
+    });
 
     const infoResult = await client.callTool({ name: "workspace_info", arguments: {} });
     expect(infoResult.isError).not.toBe(true);
-    expect(toolJson(infoResult)).toMatchObject({
+    const info = toolJson(infoResult);
+    expect(infoResult.structuredContent).toEqual(info);
+    expect(info).toMatchObject({
       workspace_name: "sample-project",
       root_alias: "workspace:/",
     });

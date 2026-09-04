@@ -31,5 +31,14 @@ describe("MCP tool registry", () => {
 
     expect(names).toHaveLength(9);
     expect(names).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
+    expect(result.tools.find((tool) => tool.name === "workspace_info")?.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        workspace_id: expect.any(Object),
+        workspace_name: expect.any(Object),
+        root_alias: expect.any(Object),
+        project_types: expect.any(Object),
+      },
+    });
   });
 });

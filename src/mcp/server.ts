@@ -10,6 +10,12 @@ import { WorkspaceManager, WorkspacePathError } from "../workspace/manager.js";
 import { WorkspaceRegistry, type WorkspaceSelection } from "../workspace/registry.js";
 import { searchText } from "../workspace/search.js";
 import { containsNullByte } from "../workspace/text.js";
+import { structuredResponse } from "./respond.js";
+import { ROOT_ALIAS } from "./schema/common.js";
+import {
+  workspaceInfoOutputSchema,
+  type WorkspaceInfoOutput,
+} from "./schema/workspace.js";
 
 export interface McpRuntimeContext {
   readonly workspace?: WorkspaceManager;
@@ -46,7 +52,6 @@ const READ_ONLY_ANNOTATIONS = {
 
 const MAX_VISITED_ENTRIES = 10_000;
 export const MAX_READ_SCAN_BYTES = 8 * 1024 * 1024;
-const ROOT_ALIAS = "workspace:/";
 const workspaceIdInputSchema = {
   workspace_id: z.string().min(1).max(128).optional(),
 };
@@ -332,7 +337,7 @@ async function detectProjectTypes(workspace: WorkspaceManager): Promise<string[]
   return [...types].sort();
 }
 
-async function workspaceInfo(selection: WorkspaceSelection) {
+async function workspaceInfo(selection: WorkspaceSelection): Promise<WorkspaceInfoOutput> {
   return {
     workspace_id: selection.id,
     workspace_name: selection.name,
@@ -415,11 +420,12 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     {
       description: "Return metadata about an authorized local workspace; omitted workspace_id uses the active workspace.",
       inputSchema: workspaceIdInputSchema,
+      outputSchema: workspaceInfoOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async (input) => {
       try {
-        return jsonResult(await workspaceInfo(registry.resolve(input.workspace_id)));
+        return structuredResponse(await workspaceInfo(registry.resolve(input.workspace_id)));
       } catch (error: unknown) {
         return toToolError(error);
       }
