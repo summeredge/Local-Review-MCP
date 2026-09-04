@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { startApp } from "../src/app.js";
-import { EXPECTED_V01_TOOL_NAMES } from "./fixtures/v01-tools.js";
+import { EXPECTED_REGISTERED_TOOL_NAMES } from "./fixtures/v01-tools.js";
 
 const runningServers: import("node:http").Server[] = [];
 const temporaryDirectories: string[] = [];
@@ -61,8 +61,8 @@ describe("MCP HTTP runtime", () => {
 
     await client.connect(transport);
     const result = await client.listTools();
-    expect(result.tools).toHaveLength(6);
-    expect(result.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_V01_TOOL_NAMES].sort());
+    expect(result.tools).toHaveLength(7);
+    expect(result.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
 
     const infoCall = await client.callTool({ name: "workspace_info", arguments: {} });
     expect(infoCall.isError).not.toBe(true);

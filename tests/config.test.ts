@@ -10,10 +10,29 @@ import {
   endpoint,
   loadSettings,
   parseCliArgs,
+  parseWorkspaces,
   resolveSettings,
 } from "../src/config/settings.js";
 
 describe("settings", () => {
+  it("uses the first registered workspace as the legacy active workspace", () => {
+    const workspaces = [
+      { id: "data-project", name: "DataProject", path: "C:\\data" },
+      { id: "pca-builder", name: "PCA_Model_Builder", path: "C:\\pca" },
+    ];
+    expect(resolveSettings({ configWorkspaces: workspaces, configToken: "token" })).toMatchObject({
+      workspace: "C:\\data",
+      workspaces,
+    });
+    expect(parseWorkspaces(workspaces)).toEqual(workspaces);
+  });
+
+  it("rejects malformed workspace registry entries", () => {
+    expect(() => parseWorkspaces([])).toThrow("at least one workspace");
+    expect(() => parseWorkspaces([{ id: "C:\\outside", name: "Outside", path: "C:\\outside" }]))
+      .toThrow("valid id");
+  });
+
   it("requires an explicit workspace", () => {
     expect(() => resolveSettings()).toThrow("workspace is required");
   });

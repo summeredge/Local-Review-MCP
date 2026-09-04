@@ -157,6 +157,7 @@ async function makeRemoteServer(): Promise<string> {
                 "search_text",
                 "git_status",
                 "git_diff",
+                "workspace_list",
               ].map((name) => ({ name })),
             }
           : undefined;
@@ -246,7 +247,7 @@ describe("deployment scripts", () => {
     expect(result.output).toMatch(/authenticated health check.*401/i);
   });
 
-  it("verifies health, MCP initialize, and the six read-only tools", async () => {
+  it("verifies health, MCP initialize, and the seven read-only tools", async () => {
     const remoteUrl = await makeRemoteServer();
     const result = await runPowerShell(verifyScript, [], {
       LOCAL_REVIEW_MCP_REMOTE_URL: remoteUrl,
@@ -255,7 +256,7 @@ describe("deployment scripts", () => {
     expect(result.code).toBe(0);
     expect(result.output).toMatch(/health: passed.*status=ok/i);
     expect(result.output).toMatch(/mcp initialize: passed/i);
-    expect(result.output).toMatch(/tools\/list: passed.*six read-only tools/i);
+    expect(result.output).toMatch(/tools\/list: passed.*seven read-only tools/i);
     expect(result.output).toMatch(/remote verification passed/i);
     expect(result.output).not.toContain(REMOTE_TOKEN);
   });

@@ -1,17 +1,18 @@
 import { createReadStream } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { basename } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { GitError } from "../git/errors.js";
 import { GitService } from "../git/service.js";
 import { WorkspaceManager, WorkspacePathError } from "../workspace/manager.js";
+import { WorkspaceRegistry, type WorkspaceSelection } from "../workspace/registry.js";
 import { searchText } from "../workspace/search.js";
 import { containsNullByte } from "../workspace/text.js";
 
 export interface McpRuntimeContext {
-  readonly workspace: WorkspaceManager;
+  readonly workspace?: WorkspaceManager;
+  readonly registry?: WorkspaceRegistry;
 }
 
 export const V01_TOOL_NAMES = [
@@ -23,10 +24,16 @@ export const V01_TOOL_NAMES = [
   "git_diff",
 ] as const;
 
+export const WORKSPACE_REGISTRY_TOOL_NAMES = ["workspace_list"] as const;
+export const REGISTERED_TOOL_NAMES = [
+  ...V01_TOOL_NAMES,
+  ...WORKSPACE_REGISTRY_TOOL_NAMES,
+] as const;
+
 export type V01ToolName = typeof V01_TOOL_NAMES[number];
 
 export function registeredMcpToolsMessage(): string {
-  return ["Registered MCP tools:", ...V01_TOOL_NAMES.map((name) => `- ${name}`)].join("\n");
+  return ["Registered MCP tools:", ...REGISTERED_TOOL_NAMES.map((name) => `- ${name}`)].join("\n");
 }
 
 const READ_ONLY_ANNOTATIONS = {
@@ -37,8 +44,12 @@ const READ_ONLY_ANNOTATIONS = {
 const MAX_VISITED_ENTRIES = 10_000;
 export const MAX_READ_SCAN_BYTES = 8 * 1024 * 1024;
 const ROOT_ALIAS = "workspace:/";
+const workspaceIdInputSchema = {
+  workspace_id: z.string().min(1).max(128).optional(),
+};
 
 const listFilesInputSchema = {
+  ...workspaceIdInputSchema,
   path: z.string().optional().default("."),
   depth: z.number().finite().int().min(1).max(4).optional().default(1),
   offset: z.number().finite().int().min(0).optional().default(0),
@@ -46,6 +57,7 @@ const listFilesInputSchema = {
 };
 
 const readFileInputSchema = {
+  ...workspaceIdInputSchema,
   path: z.string(),
   start_line: z.number().finite().int().min(1).optional().default(1),
   max_lines: z.number().finite().int().min(1).max(2000).optional().default(400),
@@ -53,6 +65,7 @@ const readFileInputSchema = {
 };
 
 const searchTextInputSchema = {
+  ...workspaceIdInputSchema,
   query: z.string()
     .max(1000)
     .refine((value) => value.trim() !== "", "query must not be empty")
@@ -65,6 +78,7 @@ const searchTextInputSchema = {
 };
 
 const gitDiffInputSchema = {
+  ...workspaceIdInputSchema,
   path: z.string().optional().default("."),
   stat: z.boolean().optional().default(false),
 };
@@ -85,8 +99,11 @@ export function toToolError(error: unknown) {
   const code = error instanceof WorkspacePathError || error instanceof GitError
     ? error.code
     : "INTERNAL_ERROR";
+  const details = code === "UNKNOWN_WORKSPACE_ID"
+    ? { message: "Unknown workspace_id" }
+    : {};
   return {
-    content: [{ type: "text" as const, text: JSON.stringify({ error: code }) }],
+    content: [{ type: "text" as const, text: JSON.stringify({ error: code, ...details }) }],
     isError: true as const,
   };
 }
@@ -311,29 +328,31 @@ async function detectProjectTypes(workspace: WorkspaceManager): Promise<string[]
   return [...types].sort();
 }
 
-async function workspaceInfo(workspace: WorkspaceManager) {
+async function workspaceInfo(selection: WorkspaceSelection) {
   return {
-    workspace_id: workspace.workspaceId,
-    workspace_name: basename(workspace.canonicalRoot),
+    workspace_id: selection.id,
+    workspace_name: selection.name,
     root_alias: ROOT_ALIAS,
-    project_types: await detectProjectTypes(workspace),
+    project_types: await detectProjectTypes(selection.manager),
   };
 }
 
 export function createMcpServer(context: McpRuntimeContext): McpServer {
+  const registry = context.registry
+    ?? (context.workspace === undefined ? undefined : WorkspaceRegistry.fromManager(context.workspace));
+  if (registry === undefined) throw new Error("Workspace registry is required.");
   const server = new McpServer({ name: "local-review-mcp", version: "0.1.0" });
-  const git = new GitService(context.workspace);
 
   server.registerTool(
     "workspace_info",
     {
-      description: "Return metadata about the currently authorized local workspace.",
-      inputSchema: {},
+      description: "Return metadata about an authorized local workspace; omitted workspace_id uses the active workspace.",
+      inputSchema: workspaceIdInputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    async () => {
+    async (input) => {
       try {
-        return jsonResult(await workspaceInfo(context.workspace));
+        return jsonResult(await workspaceInfo(registry.resolve(input.workspace_id)));
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -349,7 +368,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return jsonResult(await listFiles(context.workspace, input));
+        return jsonResult(await listFiles(registry.resolve(input.workspace_id).manager, input));
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -365,7 +384,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return jsonResult(await readFilePage(context.workspace, input));
+        return jsonResult(await readFilePage(registry.resolve(input.workspace_id).manager, input));
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -381,7 +400,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return jsonResult(await searchText(context.workspace, {
+        return jsonResult(await searchText(registry.resolve(input.workspace_id).manager, {
           query: input.query,
           path: input.path,
           glob: input.glob,
@@ -399,12 +418,12 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     "git_status",
     {
       description: "Return the structured Git status of the authorized workspace.",
-      inputSchema: {},
+      inputSchema: workspaceIdInputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    async () => {
+    async (input) => {
       try {
-        return jsonResult(await git.status());
+        return jsonResult(await new GitService(registry.resolve(input.workspace_id).manager).status());
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -420,11 +439,24 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return jsonResult(await git.diff({ path: input.path, stat: input.stat }));
+        return jsonResult(await new GitService(registry.resolve(input.workspace_id).manager).diff({
+          path: input.path,
+          stat: input.stat,
+        }));
       } catch (error: unknown) {
         return toToolError(error);
       }
     },
+  );
+
+  server.registerTool(
+    "workspace_list",
+    {
+      description: "List the authorized workspaces without exposing local filesystem paths.",
+      inputSchema: {},
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async () => jsonResult({ workspaces: registry.list() }),
   );
 
   return server;

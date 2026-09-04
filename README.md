@@ -2,12 +2,12 @@
 
 ## Current version
 
-V0.1 Release Candidate / Task 10A
+V0.1 Release Candidate / Task 11
 
 ## Current capabilities
 
 - MCP Streamable HTTP runtime
-- exactly six registered read-only tools
+- six existing read-only tools plus the read-only workspace registry tool
 - fixed loopback host
 - configurable fixed port
 - startup port conflict detection
@@ -15,7 +15,7 @@ V0.1 Release Candidate / Task 10A
 - OAuth 2.1-compatible discovery, public-client registration, PKCE, and Bearer tokens
 - safe `GET /health` endpoint
 - Cloudflare Tunnel provider with managed lifecycle
-- one explicitly configured active workspace
+- a registry of authorized workspaces with legacy single-workspace compatibility
 - bounded workspace metadata, directory listing, and text-file reading
 - bounded literal or regular-expression search with ripgrep and Node fallback
 - read-only structured Git status and bounded diff review
@@ -42,6 +42,13 @@ then config file. A JSON config file can be provided with `--config <path>`:
 {
   "port": 12080,
   "workspace": "C:\\path\\to\\project",
+  "workspaces": [
+    {
+      "id": "project",
+      "name": "Project",
+      "path": "C:\\path\\to\\project"
+    }
+  ],
   "auth": { "token": "<token>" },
   "remote": { "enabled": false, "endpoint": "" },
   "supervisor": {
@@ -51,6 +58,10 @@ then config file. A JSON config file can be provided with `--config <path>`:
   }
 }
 ```
+
+`workspaces` is optional for legacy configurations. When present, its entries
+are the only workspaces that MCP can select; `workspace` remains the active
+workspace for the existing Launcher and for calls without `workspace_id`.
 
 Set `supervisor.enabled` to `true` to run the MCP runtime under the Windows
 Supervisor. It checks `/health` at the configured interval, performs at most
@@ -135,9 +146,9 @@ $env:LOCAL_REVIEW_MCP_REMOTE_TOKEN = $env:LOCAL_REVIEW_MCP_TOKEN
 
 `verify-remote.ps1` checks that unauthenticated and wrong-token health requests
 return HTTP 401, the correct token returns `status=ok`, MCP `initialize` works,
-and `tools/list` contains exactly the six read-only tools:
+and `tools/list` contains the seven read-only tools:
 `workspace_info`, `list_files`, `read_file`, `search_text`, `git_status`, and
-`git_diff`.
+`git_diff`, plus `workspace_list`.
 
 ## Remote MCP Setup
 
@@ -189,20 +200,27 @@ hardcodes a tunnel hostname.
 3. Select the connector's OAuth authentication option. The server publishes
    MCP protected-resource metadata, authorization-server metadata, dynamic
    client registration, and PKCE endpoints under the same public origin.
-4. Scan the tools, confirm the six read-only actions, save the draft app, and
+4. Scan the tools, confirm the seven read-only actions, save the draft app, and
    select it from a new chat. Ask for a code review; ChatGPT should call
-   `workspace_info`, `git_status`, `git_diff`, `read_file`, and `search_text`.
+   `workspace_list` first, then `workspace_info`, `git_status`, `git_diff`,
+   `read_file`, and `search_text` with a `workspace_id` when selecting a
+   registered workspace.
 
 The exact ChatGPT Web menu labels and availability depend on the workspace
 plan. The MCP endpoint itself is `/mcp`; `/health` is an authenticated
 readiness check. OpenAI's current [MCP and Connectors guide](https://developers.openai.com/api/docs/guides/tools-connectors-mcp)
 describes remote MCP server URLs and tool approval configuration.
 
-The workspace is required; the runtime does not guess a default directory.
+At least one workspace is required. With a registry, the first entry is the
+legacy active workspace unless the top-level `workspace` matches another
+registered path. Without `workspace_id`, tools use that active workspace.
 
 The current tools are `workspace_info`, `list_files`, `read_file`, `search_text`,
-`git_status`, and `git_diff`. Git tools are bound to the configured workspace,
-do not expose Git command arguments, and never perform write operations.
+`git_status`, `git_diff`, and `workspace_list`. The first six accept an
+optional `workspace_id`; an omitted ID preserves the active-workspace behavior.
+Git tools are bound to the selected registered workspace, do not expose Git
+command arguments, and never perform write operations. `workspace_list` returns
+only each workspace's stable `id` and display `name`, never its local path.
 
 The health endpoint requires the configured static `Authorization: Bearer <token>`
 even on localhost and through Cloudflare Tunnel. MCP requests accept either that
@@ -212,15 +230,16 @@ identifier, version, `remote_status`, `endpoint_status`, and the public endpoint
 only when it is ready. It never returns tokens, credentials, local IPs, or
 workspace absolute paths.
 
-`search_text` accepts `query`, optional workspace-relative `path` and `glob`,
-`regex`, `case_sensitive`, and `limit`. Searches are restricted to allowed
-text files up to 2 MiB, with at most 200 returned results and 500 preview
-characters per result.
+`search_text` accepts an optional `workspace_id`, `query`, workspace-relative
+`path` and `glob`, `regex`, `case_sensitive`, and `limit`. Searches are
+restricted to allowed text files up to 2 MiB, with at most 200 returned results
+and 500 preview characters per result.
 
 ## E2E verification
 
 The remote suite uses the same Streamable HTTP MCP client flow as a remote
-connector and covers `initialize`, `tools/list`, ordered workspace review,
+connector and covers `initialize`, `tools/list`, workspace registry selection,
+ordered workspace review,
 Bearer authentication, safe health metadata, sensitive-file denial, traversal/
 absolute/drive/symlink path denial, and tunnel stop/restart. It creates a
 temporary `sample-project` Git workspace and never commits review changes.
@@ -241,7 +260,7 @@ the remote test. No token or public URL is stored in the repository.
 ## Security Notes
 
 Local Review MCP intentionally provides only `read`, `search`, and `review`
-capabilities through its six registered tools. It does not provide:
+capabilities through its seven registered tools. It does not provide:
 
 - `modify` or `write_file` operations;
 - `execute` or shell operations;

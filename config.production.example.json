@@ -2,6 +2,13 @@
   "_comment": "Copy this file to config.production.json and set the local values before starting.",
   "port": 12080,
   "workspace": "C:\\Your\\Project",
+  "workspaces": [
+    {
+      "id": "your-project",
+      "name": "Your Project",
+      "path": "C:\\Your\\Project"
+    }
+  ],
   "auth": {
     "token": "",
     "_comment": "Set a local token; never commit the token."

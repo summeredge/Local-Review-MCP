@@ -11,6 +11,8 @@ export const WORKSPACE_ERROR_CODES = [
   "INVALID_REGEX",
   "SEARCH_FAILED",
   "READ_SCAN_LIMIT_EXCEEDED",
+  "WORKSPACE_REGISTRY_INVALID",
+  "UNKNOWN_WORKSPACE_ID",
 ] as const;
 
 export type WorkspaceErrorCode = typeof WORKSPACE_ERROR_CODES[number];

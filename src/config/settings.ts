@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import type { WorkspaceRegistryEntry } from "../workspace/types.js";
 
 export const DEFAULT_HOST = "127.0.0.1" as const;
 export const DEFAULT_PORT = 12080;
@@ -34,6 +35,7 @@ export interface ResolvedSettings {
   host: typeof DEFAULT_HOST;
   port: number;
   workspace: string;
+  workspaces?: readonly WorkspaceRegistryEntry[];
   auth: AuthSettings;
   remote: RemoteSettings;
   supervisor: SupervisorSettings;
@@ -50,6 +52,7 @@ export interface CliOptions {
 interface ConfigFile {
   port?: unknown;
   workspace?: unknown;
+  workspaces?: unknown;
   auth?: unknown;
   remote?: unknown;
   supervisor?: unknown;
@@ -74,6 +77,31 @@ export function parseWorkspace(value: unknown): string {
     throw new Error("workspace is required");
   }
   return value;
+}
+
+const WORKSPACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+
+export function parseWorkspaces(value: unknown): WorkspaceRegistryEntry[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("workspaces must contain at least one workspace");
+  }
+
+  const ids = new Set<string>();
+  return value.map((entry, index) => {
+    if (!isRecord(entry)
+      || typeof entry.id !== "string"
+      || !WORKSPACE_ID_PATTERN.test(entry.id)
+      || typeof entry.name !== "string"
+      || entry.name.trim() === ""
+      || typeof entry.path !== "string"
+      || entry.path.trim() === "") {
+      throw new Error(`workspaces[${index}] must have a valid id, name, and path`);
+    }
+    if (ids.has(entry.id)) throw new Error("workspaces must not contain duplicate ids");
+    ids.add(entry.id);
+    return { id: entry.id, name: entry.name.trim(), path: entry.path };
+  });
 }
 
 export function parseToken(value: unknown): string {
@@ -184,6 +212,7 @@ export function resolveSettings(options: {
   configPort?: unknown;
   cliWorkspace?: unknown;
   configWorkspace?: unknown;
+  configWorkspaces?: unknown;
   cliToken?: unknown;
   envToken?: unknown;
   configToken?: unknown;
@@ -209,8 +238,12 @@ export function resolveSettings(options: {
   const workspace = options.cliWorkspace !== undefined
     ? options.cliWorkspace
     : options.configWorkspace;
+  const workspaces = parseWorkspaces(options.configWorkspaces);
   const resolvedPort = parsePort(port);
-  const resolvedWorkspace = parseWorkspace(workspace);
+  const resolvedWorkspace = workspace === undefined
+    ? workspaces?.[0]?.path
+    : parseWorkspace(workspace);
+  if (resolvedWorkspace === undefined) throw new Error("workspace is required");
   const configToken = options.configToken !== undefined
     ? options.configToken
     : sectionValue(options.configAuth, "auth", "token");
@@ -270,6 +303,7 @@ export function resolveSettings(options: {
     host: DEFAULT_HOST,
     port: resolvedPort,
     workspace: resolvedWorkspace,
+    ...(workspaces === undefined ? {} : { workspaces }),
     auth: { token: parseToken(tokenValue) },
     remote: {
       enabled: remoteEnabled,
@@ -335,6 +369,7 @@ export async function loadSettings(
     configPort: config.port,
     cliWorkspace: cli.workspace,
     configWorkspace: config.workspace,
+    configWorkspaces: config.workspaces,
     cliToken: cli.token,
     envToken: environment.LOCAL_REVIEW_MCP_TOKEN,
     configAuth: config.auth,

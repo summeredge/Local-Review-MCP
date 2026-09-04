@@ -6,3 +6,8 @@ export const EXPECTED_V01_TOOL_NAMES = [
   "git_status",
   "git_diff",
 ] as const;
+
+export const EXPECTED_REGISTERED_TOOL_NAMES = [
+  ...EXPECTED_V01_TOOL_NAMES,
+  "workspace_list",
+] as const;

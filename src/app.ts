@@ -2,9 +2,10 @@ import type { Server } from "node:http";
 import { basename } from "node:path";
 import { endpoint, localOrigin, type ResolvedSettings } from "./config/settings.js";
 import { isPortInUse, startHttpServer, type HttpServerOptions } from "./mcp/http.js";
-import { V01_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
+import { REGISTERED_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { WorkspaceManager } from "./workspace/manager.js";
+import { WorkspaceRegistry } from "./workspace/registry.js";
 
 export interface AppContext extends McpRuntimeContext {
   readonly settings: ResolvedSettings;
@@ -17,13 +18,17 @@ export function createAppContext(
   settings: ResolvedSettings,
   environment: NodeJS.ProcessEnv = process.env,
 ): AppContext {
+  const registry = settings.workspaces === undefined
+    ? WorkspaceRegistry.fromManager(new WorkspaceManager(settings.workspace))
+    : new WorkspaceRegistry(settings.workspaces, { activeWorkspacePath: settings.workspace });
   return {
     settings,
     tunnel: createTunnelManager(settings.remote, {
       localEndpoint: localOrigin(settings),
       environment,
     }),
-    workspace: new WorkspaceManager(settings.workspace),
+    workspace: registry.active.manager,
+    registry,
   };
 }
 
@@ -54,10 +59,11 @@ export async function startApp(
 }
 
 export function startupMessage(settings: ResolvedSettings, context?: McpRuntimeContext): string {
+  const workspace = context?.registry?.active.manager ?? context?.workspace;
   return [
     "Local Review MCP started",
     `Endpoint: ${endpoint(settings)}`,
-    `Workspace: ${context === undefined ? basename(settings.workspace) : basename(context.workspace.canonicalRoot)}`,
-    `Tools: ${V01_TOOL_NAMES.length}`,
+    `Workspace: ${workspace === undefined ? basename(settings.workspace) : basename(workspace.canonicalRoot)}`,
+    `Tools: ${REGISTERED_TOOL_NAMES.length}`,
   ].join("\n");
 }

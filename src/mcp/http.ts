@@ -108,9 +108,11 @@ async function handleHealthRequest(
   } catch {
     tunnel = { state: "REMOTE_ERROR" };
   }
+  const activeWorkspace = context.registry?.active;
+  const workspace = activeWorkspace?.manager ?? context.workspace;
   sendJson(response, 200, {
     status: "ok",
-    workspace: context.workspace.workspaceId,
+    workspace: activeWorkspace?.id ?? workspace?.workspaceId ?? "unknown",
     version: APP_VERSION,
     remote_status: tunnel.state,
     endpoint_status: tunnel.endpoint === undefined

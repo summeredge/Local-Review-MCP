@@ -12,7 +12,7 @@ import type { ResolvedSettings } from "../../src/config/settings.js";
 import { TunnelManager } from "../../src/tunnel/manager.js";
 import type { TunnelProvider, TunnelStatus } from "../../src/tunnel/types.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
-import { EXPECTED_V01_TOOL_NAMES } from "../fixtures/v01-tools.js";
+import { EXPECTED_REGISTERED_TOOL_NAMES } from "../fixtures/v01-tools.js";
 
 const runProcess = promisify(execFile);
 const clients: Client[] = [];
@@ -210,7 +210,7 @@ describe("remote MCP deployment", () => {
     expect(client.getServerCapabilities()).toMatchObject({ tools: expect.any(Object) });
 
     const listed = await client.listTools();
-    expect(listed.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_V01_TOOL_NAMES].sort());
+    expect(listed.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
 
     const infoResult = await client.callTool({ name: "workspace_info", arguments: {} });
     expect(infoResult.isError).not.toBe(true);
@@ -444,7 +444,7 @@ externalRemoteIt("validates a configured public HTTPS Remote MCP endpoint", asyn
     await client.connect(transport);
     expect(client.getServerVersion()).toEqual({ name: "local-review-mcp", version: "0.1.0" });
     const tools = await client.listTools();
-    expect(tools.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_V01_TOOL_NAMES].sort());
+    expect(tools.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
   } finally {
     await client.close();
   }
