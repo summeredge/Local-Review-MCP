@@ -23,6 +23,11 @@ import {
   type ReviewSummaryOutput,
 } from "./schema/review.js";
 import {
+  listFilesOutputSchema,
+  readFileOutputSchema,
+  searchTextOutputSchema,
+} from "./schema/files.js";
+import {
   workspaceInfoOutputSchema,
   type WorkspaceInfoOutput,
 } from "./schema/workspace.js";
@@ -451,11 +456,12 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     {
       description: "List non-sensitive files and directories within the authorized workspace.",
       inputSchema: listFilesInputSchema,
+      outputSchema: listFilesOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async (input) => {
       try {
-        return jsonResult(await listFiles(registry.resolve(input.workspace_id).manager, input));
+        return structuredResponse(await listFiles(registry.resolve(input.workspace_id).manager, input));
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -467,11 +473,12 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     {
       description: "Read a bounded range of a non-sensitive text file in the authorized workspace.",
       inputSchema: readFileInputSchema,
+      outputSchema: readFileOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async (input) => {
       try {
-        return jsonResult(await readFilePage(registry.resolve(input.workspace_id).manager, input));
+        return structuredResponse(await readFilePage(registry.resolve(input.workspace_id).manager, input));
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -483,11 +490,12 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     {
       description: "Search non-sensitive text files within the authorized workspace using bounded literal or regular-expression matching.",
       inputSchema: searchTextInputSchema,
+      outputSchema: searchTextOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async (input) => {
       try {
-        return jsonResult(await searchText(registry.resolve(input.workspace_id).manager, {
+        return structuredResponse(await searchText(registry.resolve(input.workspace_id).manager, {
           query: input.query,
           path: input.path,
           glob: input.glob,

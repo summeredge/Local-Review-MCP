@@ -15,6 +15,8 @@ export const listFilesOutputSchema = z.object({
   has_more: z.boolean(),
 });
 
+export type ListFilesOutput = z.infer<typeof listFilesOutputSchema>;
+
 export const readFileOutputSchema = z.object({
   path: workspaceRelativePathSchema,
   start_line: z.number().int().positive(),
@@ -23,6 +25,8 @@ export const readFileOutputSchema = z.object({
   content: z.string(),
   truncated: z.boolean().optional(),
 });
+
+export type ReadFileOutput = z.infer<typeof readFileOutputSchema>;
 
 export const searchTextResultOutputSchema = z.object({
   path: workspaceRelativePathSchema,
@@ -41,3 +45,5 @@ export const searchTextOutputSchema = z.object({
   has_more: z.boolean(),
   engine: z.enum(["ripgrep", "node"]),
 });
+
+export type SearchTextOutput = z.infer<typeof searchTextOutputSchema>;

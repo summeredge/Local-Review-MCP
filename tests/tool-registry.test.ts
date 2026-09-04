@@ -40,6 +40,40 @@ describe("MCP tool registry", () => {
         project_types: expect.any(Object),
       },
     });
+    expect(result.tools.find((tool) => tool.name === "list_files")?.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        path: expect.any(Object),
+        entries: expect.any(Object),
+        offset: expect.any(Object),
+        returned: expect.any(Object),
+        has_more: expect.any(Object),
+      },
+    });
+    expect(result.tools.find((tool) => tool.name === "read_file")?.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        path: expect.any(Object),
+        start_line: expect.any(Object),
+        end_line: expect.any(Object),
+        has_more: expect.any(Object),
+        content: expect.any(Object),
+        truncated: expect.any(Object),
+      },
+    });
+    expect(result.tools.find((tool) => tool.name === "search_text")?.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        query: expect.any(Object),
+        path: expect.any(Object),
+        regex: expect.any(Object),
+        case_sensitive: expect.any(Object),
+        results: expect.any(Object),
+        returned: expect.any(Object),
+        has_more: expect.any(Object),
+        engine: expect.any(Object),
+      },
+    });
     expect(result.tools.find((tool) => tool.name === "git_status")?.outputSchema).toMatchObject({
       type: "object",
       properties: {

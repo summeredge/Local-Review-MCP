@@ -35,6 +35,12 @@ function toolText(result: unknown): string {
   return (content[0] as { text: string }).text;
 }
 
+function structuredJson(result: unknown): Record<string, unknown> {
+  const parsed = JSON.parse(toolText(result)) as Record<string, unknown>;
+  expect((result as { structuredContent?: unknown }).structuredContent).toEqual(parsed);
+  return parsed;
+}
+
 describe("MCP HTTP runtime", () => {
   it("initializes, lists tools, and serves all workspace tools", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-http-"));
@@ -72,7 +78,7 @@ describe("MCP HTTP runtime", () => {
 
     const listCall = await client.callTool({ name: "list_files", arguments: {} });
     expect(listCall.isError).not.toBe(true);
-    const listing = JSON.parse(toolText(listCall)) as {
+    const listing = structuredJson(listCall) as {
       entries: { path: string; type: string }[];
     };
     expect(listing.entries).toEqual([
@@ -82,14 +88,14 @@ describe("MCP HTTP runtime", () => {
 
     const readCall = await client.callTool({ name: "read_file", arguments: { path: "src/app.ts" } });
     expect(readCall.isError).not.toBe(true);
-    expect(JSON.parse(toolText(readCall))).toMatchObject({
+    expect(structuredJson(readCall)).toMatchObject({
       path: "src/app.ts",
       content: "export const app = true;",
     });
 
     const searchCall = await client.callTool({ name: "search_text", arguments: { query: "app" } });
     expect(searchCall.isError).not.toBe(true);
-    expect(JSON.parse(toolText(searchCall))).toMatchObject({
+    expect(structuredJson(searchCall)).toMatchObject({
       query: "app",
       returned: 1,
       results: [{ path: "src/app.ts", line: 1 }],
