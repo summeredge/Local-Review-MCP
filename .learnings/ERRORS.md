@@ -1,5 +1,29 @@
 # Errors
 
+## [ERR-20260904-001] Launcher project venv execution permission
+
+**Priority**: medium
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+Launcher 的项目 venv 和其 `pyvenv.cfg` 中声明的 Python 3.11 基解释器都存在，
+但直接执行时被 Windows 拒绝访问，导致测试进程无法创建。
+
+### 建议修复
+
+先验证 `sys.executable` 和版本；确认不是代码错误后，用同一个
+`C:\Users\shaoy\Documents\PythonEnvs\local-review-launcher` 解释器在必要时提升权限重试，
+不要改用 Codex bundled Python。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
 ## [ERR-20260901-001] PowerShell deployment script binding
 
 **Priority**: medium

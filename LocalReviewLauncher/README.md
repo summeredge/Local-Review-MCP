@@ -12,10 +12,14 @@ double-click `start-launcher.cmd`:
 & "C:\Users\shaoy\Documents\PythonEnvs\local-review-launcher\Scripts\python.exe" -m pip install -r .\LocalReviewLauncher\requirements.txt
 ```
 
-`launcher.config.json` stores only the selected workspace, the existing
-production config filename, and `autoStart`. Selecting a workspace never edits
-`config.production.json`; when the selected workspace differs, the launcher
-passes a temporary copy to the existing production startup script.
+`launcher.config.json` stores the selected workspace together with the local
+Workspace Registry, the existing production config filename, and `autoStart`.
+Old configurations containing only `workspace` are migrated on first load. A
+registry ID is generated once and then retained across name changes and
+restarts. Selecting or removing a registry entry never edits or deletes the
+workspace directory or `config.production.json`; the launcher passes a
+temporary effective config to the existing production startup script when
+needed.
 
 Run the launcher-only configuration check with:
 

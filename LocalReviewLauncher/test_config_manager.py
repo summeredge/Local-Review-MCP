@@ -60,6 +60,89 @@ class ConfigManagerTests(unittest.TestCase):
             self.assertEqual(json.loads(runtime_path.read_text(encoding="utf-8"))["workspace"], str(selected_workspace))
             temporary_path.unlink()
 
+    def test_registry_adds_two_workspaces_and_persists_the_active_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_a = root / "workspace-a"
+            workspace_b = root / "workspace-b"
+            workspace_a.mkdir()
+            workspace_b.mkdir()
+            self._write_production(root, {"auth": {"token": "test"}})
+            manager = ConfigManager(root)
+
+            configuration = manager.load()
+            configuration = manager.add_workspace(configuration, workspace_a, "Workspace A")
+            configuration = manager.add_workspace(configuration, workspace_b, "Workspace B")
+            reloaded = manager.load()
+            document = json.loads(manager.path.read_text(encoding="utf-8"))
+
+            self.assertEqual([record.name for record in reloaded.workspaces], ["Workspace A", "Workspace B"])
+            self.assertEqual(document["active_workspace_id"], configuration.active_workspace_id)
+            self.assertEqual(document["workspaces"], [
+                {"id": record.id, "name": record.name, "path": record.path}
+                for record in reloaded.workspaces
+            ])
+            self.assertEqual(reloaded.workspace, str(workspace_b.resolve()))
+            self.assertNotEqual(reloaded.workspaces[0].id, reloaded.workspaces[1].id)
+
+    def test_registry_rename_keeps_id_and_path_after_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            self._write_production(root, {"auth": {"token": "test"}})
+            manager = ConfigManager(root)
+
+            added = manager.add_workspace(manager.load(), workspace, "Original")
+            record = added.workspaces[0]
+            manager.rename_workspace(added, record.id, "Renamed")
+            reloaded = manager.load()
+
+            self.assertEqual(reloaded.workspaces[0].id, record.id)
+            self.assertEqual(reloaded.workspaces[0].path, record.path)
+            self.assertEqual(reloaded.workspaces[0].name, "Renamed")
+
+    def test_registry_delete_keeps_workspace_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            self._write_production(root, {"auth": {"token": "test"}})
+            manager = ConfigManager(root)
+
+            added = manager.add_workspace(manager.load(), workspace, "Workspace")
+            removed = manager.remove_workspace(added, added.active_workspace_id or "")
+
+            self.assertEqual(removed.workspaces, ())
+            self.assertIsNone(removed.active_workspace_id)
+            self.assertTrue(workspace.is_dir())
+            self.assertEqual(manager.load().workspaces, ())
+
+    def test_runtime_config_passes_registry_and_active_workspace_to_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_a = root / "workspace-a"
+            workspace_b = root / "workspace-b"
+            workspace_a.mkdir()
+            workspace_b.mkdir()
+            self._write_production(root, {"auth": {"token": "test"}})
+            manager = ConfigManager(root)
+
+            configuration = manager.add_workspace(manager.load(), workspace_a, "Workspace A")
+            configuration = manager.add_workspace(configuration, workspace_b, "Workspace B")
+            configuration = manager.set_active_workspace(configuration, configuration.workspaces[0].id)
+            runtime_path, temporary_path = manager.runtime_config(configuration)
+            try:
+                runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+                self.assertEqual(runtime["workspace"], str(workspace_a.resolve()))
+                self.assertEqual(runtime["workspaces"], [
+                    {"id": record.id, "name": record.name, "path": record.path}
+                    for record in configuration.workspaces
+                ])
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+
     def test_production_path_is_absolute(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

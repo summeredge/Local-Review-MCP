@@ -10,14 +10,18 @@ from time import monotonic
 
 from PySide6.QtCore import QThreadPool, QTimer, Slot
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QInputDialog,
     QPlainTextEdit,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -77,6 +81,12 @@ class LauncherWindow(QMainWindow):
         self.remote_endpoint_label = QLabel()
         self.remote_endpoint_label.setWordWrap(True)
         self.cloudflared_version_label = QLabel("unavailable")
+        self.workspace_table = QTableWidget(0, 3)
+        self.workspace_table.setHorizontalHeaderLabels(["Workspace ID", "名称", "路径"])
+        self.workspace_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.workspace_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.workspace_table.horizontalHeader().setStretchLastSection(True)
+        self.workspace_table.setMinimumHeight(120)
         self.message_label = QLabel()
         self.message_label.setWordWrap(True)
         self.log_output = QPlainTextEdit()
@@ -86,7 +96,10 @@ class LauncherWindow(QMainWindow):
         self.start_button = QPushButton("启动 MCP")
         self.stop_button = QPushButton("停止 MCP")
         self.refresh_button = QPushButton("刷新状态")
-        self.workspace_button = QPushButton("选择 Workspace")
+        self.workspace_button = QPushButton("添加 Workspace")
+        self.delete_workspace_button = QPushButton("删除 Workspace")
+        self.rename_workspace_button = QPushButton("编辑名称")
+        self.set_current_workspace_button = QPushButton("设为当前")
         self.open_config_button = QPushButton("打开配置文件")
         self.backup_config_button = QPushButton("备份配置")
         self.validate_config_button = QPushButton("校验配置")
@@ -97,6 +110,9 @@ class LauncherWindow(QMainWindow):
         self.stop_button.clicked.connect(self.stop_mcp)
         self.refresh_button.clicked.connect(self.refresh_status)
         self.workspace_button.clicked.connect(self.choose_workspace)
+        self.delete_workspace_button.clicked.connect(self.delete_workspace)
+        self.rename_workspace_button.clicked.connect(self.rename_workspace)
+        self.set_current_workspace_button.clicked.connect(self.set_current_workspace)
         self.open_config_button.clicked.connect(self.open_config)
         self.backup_config_button.clicked.connect(self.backup_config)
         self.validate_config_button.clicked.connect(self.validate_config)
@@ -114,6 +130,15 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(self._row("Remote Endpoint:", self.remote_status))
         layout.addWidget(self._row("Workspace:", self.workspace_label))
         layout.addSpacing(8)
+        layout.addWidget(QLabel("Workspace Registry"))
+        layout.addWidget(self.workspace_table)
+        workspace_buttons = QHBoxLayout()
+        workspace_buttons.addWidget(self.workspace_button)
+        workspace_buttons.addWidget(self.delete_workspace_button)
+        workspace_buttons.addWidget(self.rename_workspace_button)
+        workspace_buttons.addWidget(self.set_current_workspace_button)
+        layout.addLayout(workspace_buttons)
+        layout.addSpacing(8)
         layout.addWidget(QLabel("运行信息"))
         layout.addWidget(self._row("Workspace:", self.runtime_workspace_label))
         layout.addWidget(self._row("Production Config:", self.production_config_label))
@@ -124,7 +149,6 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(self.start_button)
         layout.addWidget(self.stop_button)
         layout.addWidget(self.refresh_button)
-        layout.addWidget(self.workspace_button)
         layout.addSpacing(8)
         layout.addWidget(QLabel("配置"))
         config_buttons = QHBoxLayout()
@@ -151,6 +175,7 @@ class LauncherWindow(QMainWindow):
         self.startup_timer.setInterval(STARTUP_POLL_INTERVAL_MS)
         self.startup_timer.timeout.connect(self._poll_startup)
         self._set_state(LauncherState.STOPPED)
+        self._render_workspace_registry()
         self._render_runtime_info()
         self.refresh_status()
         if self.configuration.auto_start:
@@ -197,8 +222,40 @@ class LauncherWindow(QMainWindow):
         self._set_status(self.mcp_status, "Running" if status.mcp_running else "Stopped", status.mcp_running)
         self._set_status(self.tunnel_status, "Connected" if status.tunnel_connected else "Offline", status.tunnel_connected)
         self._set_status(self.remote_status, "Online" if status.remote_online else "Offline", status.remote_online)
-        self.workspace_label.setText(self.configuration.workspace or "Not configured")
+        self.workspace_label.setText(self._current_workspace_text())
         self.cloudflared_version_label.setText(getattr(status, "cloudflared_version", "unavailable"))
+
+    def _current_workspace_text(self) -> str:
+        if not self.configuration.workspace:
+            return "Not configured"
+        current = next(
+            (
+                record
+                for record in self.configuration.workspaces
+                if record.id == self.configuration.active_workspace_id
+            ),
+            None,
+        )
+        return f"{current.name} ({current.path})" if current else self.configuration.workspace
+
+    def _render_workspace_registry(self) -> None:
+        self.workspace_table.setRowCount(0)
+        active_row = -1
+        for row, record in enumerate(self.configuration.workspaces):
+            self.workspace_table.insertRow(row)
+            self.workspace_table.setItem(row, 0, QTableWidgetItem(record.id))
+            self.workspace_table.setItem(row, 1, QTableWidgetItem(record.name))
+            self.workspace_table.setItem(row, 2, QTableWidgetItem(record.path))
+            if record.id == self.configuration.active_workspace_id:
+                active_row = row
+        self.workspace_table.resizeColumnsToContents()
+        if active_row >= 0:
+            self.workspace_table.selectRow(active_row)
+
+    def _selected_workspace_id(self) -> str | None:
+        row = self.workspace_table.currentRow()
+        item = self.workspace_table.item(row, 0) if row >= 0 else None
+        return item.text() if item is not None else None
 
     def _render_runtime_info(self) -> None:
         try:
@@ -237,6 +294,12 @@ class LauncherWindow(QMainWindow):
             and not launcher_running
             and not has_started
         )
+        for button in (
+            self.delete_workspace_button,
+            self.rename_workspace_button,
+            self.set_current_workspace_button,
+        ):
+            button.setEnabled(self.workspace_button.isEnabled())
 
     def _set_state(self, state: LauncherState) -> None:
         self.state = state
@@ -345,16 +408,85 @@ class LauncherWindow(QMainWindow):
             self.timer.start(5_000)
 
     def choose_workspace(self) -> None:
-        initial = self.configuration.workspace if Path(self.configuration.workspace).is_dir() else ""
+        initial = self.configuration.workspace if self.configuration.workspace and Path(self.configuration.workspace).is_dir() else ""
         selected = QFileDialog.getExistingDirectory(self, "选择 Workspace", initial)
         if not selected:
             return
         try:
-            self.configuration = self.config_manager.save_workspace(self.configuration, Path(selected))
+            self.configuration = self.config_manager.add_workspace(self.configuration, Path(selected))
         except LauncherConfigError as error:
             self._show_error(str(error))
             return
-        self.message_label.setText("Workspace saved. It will be used on the next MCP start.")
+        self._render_workspace_registry()
+        self.message_label.setText("Workspace added and set as current. It will be used on the next MCP start.")
+        self.refresh_status()
+
+    def delete_workspace(self) -> None:
+        workspace_id = self._selected_workspace_id()
+        if workspace_id is None:
+            self._show_error("Select a Workspace to delete.")
+            return
+        record = next(
+            (record for record in self.configuration.workspaces if record.id == workspace_id),
+            None,
+        )
+        if record is None:
+            self._show_error("The selected Workspace is no longer registered.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除 Workspace",
+            f"只删除 Registry 中的记录，不会删除磁盘目录：\n{record.name}\n{record.path}\n\n继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.configuration = self.config_manager.remove_workspace(self.configuration, workspace_id)
+        except LauncherConfigError as error:
+            self._show_error(str(error))
+            return
+        self._render_workspace_registry()
+        self.message_label.setText("Workspace removed from the Registry. The directory was kept.")
+        self.refresh_status()
+
+    def rename_workspace(self) -> None:
+        workspace_id = self._selected_workspace_id()
+        if workspace_id is None:
+            self._show_error("Select a Workspace to rename.")
+            return
+        record = next(
+            (record for record in self.configuration.workspaces if record.id == workspace_id),
+            None,
+        )
+        if record is None:
+            self._show_error("The selected Workspace is no longer registered.")
+            return
+        name, accepted = QInputDialog.getText(self, "编辑 Workspace 名称", "名称：", text=record.name)
+        if not accepted:
+            return
+        try:
+            self.configuration = self.config_manager.rename_workspace(self.configuration, workspace_id, name)
+        except LauncherConfigError as error:
+            self._show_error(str(error))
+            return
+        self._render_workspace_registry()
+        self.message_label.setText("Workspace name saved.")
+        self.refresh_status()
+
+    def set_current_workspace(self) -> None:
+        workspace_id = self._selected_workspace_id()
+        if workspace_id is None:
+            self._show_error("Select a Workspace to make current.")
+            return
+        try:
+            self.configuration = self.config_manager.set_active_workspace(self.configuration, workspace_id)
+        except LauncherConfigError as error:
+            self._show_error(str(error))
+            return
+        self._render_workspace_registry()
+        self.message_label.setText("Current Workspace saved. It will be used on the next MCP start.")
         self.refresh_status()
 
     def open_config(self) -> None:
