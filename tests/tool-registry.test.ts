@@ -40,5 +40,22 @@ describe("MCP tool registry", () => {
         project_types: expect.any(Object),
       },
     });
+    expect(result.tools.find((tool) => tool.name === "git_status")?.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        branch: expect.any(Object),
+        entries: expect.any(Object),
+      },
+    });
+    expect(result.tools.find((tool) => tool.name === "git_diff")?.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        path: expect.any(Object),
+        stat: expect.any(Object),
+        diff: expect.any(Object),
+        files: expect.any(Object),
+        binary: expect.any(Object),
+      },
+    });
   });
 });

@@ -200,6 +200,12 @@ function toolJson(result: unknown): Record<string, unknown> {
   return JSON.parse(toolText(result)) as Record<string, unknown>;
 }
 
+function structuredToolJson(result: unknown): Record<string, unknown> {
+  const parsed = toolJson(result);
+  expect((result as { structuredContent?: unknown }).structuredContent).toEqual(parsed);
+  return parsed;
+}
+
 describe("remote MCP deployment", () => {
   it("initializes, lists the read-only tool surface, and completes an ordered code review", async () => {
     const workspace = await makeReviewWorkspace();
@@ -228,14 +234,14 @@ describe("remote MCP deployment", () => {
 
     const statusResult = await client.callTool({ name: "git_status", arguments: {} });
     expect(statusResult.isError).not.toBe(true);
-    expect(toolJson(statusResult)).toMatchObject({
+    expect(structuredToolJson(statusResult)).toMatchObject({
       branch: "main",
       entries: [{ path: "modified-file.ts", status: "modified" }],
     });
 
     const diffResult = await client.callTool({ name: "git_diff", arguments: {} });
     expect(diffResult.isError).not.toBe(true);
-    expect(toolJson(diffResult)).toMatchObject({
+    expect(structuredToolJson(diffResult)).toMatchObject({
       files: ["modified-file.ts"],
       diff: expect.stringContaining('+export const reviewState = "after";'),
     });

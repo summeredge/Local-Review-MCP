@@ -13,6 +13,10 @@ import { containsNullByte } from "../workspace/text.js";
 import { structuredResponse } from "./respond.js";
 import { ROOT_ALIAS } from "./schema/common.js";
 import {
+  gitDiffOutputSchema,
+  gitStatusOutputSchema,
+} from "./schema/git.js";
+import {
   workspaceInfoOutputSchema,
   type WorkspaceInfoOutput,
 } from "./schema/workspace.js";
@@ -492,11 +496,12 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     {
       description: "Return the structured Git status of the authorized workspace.",
       inputSchema: workspaceIdInputSchema,
+      outputSchema: gitStatusOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async (input) => {
       try {
-        return jsonResult(await new GitService(registry.resolve(input.workspace_id).manager).status());
+        return structuredResponse(await new GitService(registry.resolve(input.workspace_id).manager).status());
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -508,11 +513,12 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     {
       description: "Return a bounded Git diff for the authorized workspace or one relative path.",
       inputSchema: gitDiffInputSchema,
+      outputSchema: gitDiffOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async (input) => {
       try {
-        return jsonResult(await new GitService(registry.resolve(input.workspace_id).manager).diff({
+        return structuredResponse(await new GitService(registry.resolve(input.workspace_id).manager).diff({
           path: input.path,
           stat: input.stat,
         }));

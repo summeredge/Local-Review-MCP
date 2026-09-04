@@ -61,6 +61,12 @@ function toolText(result: unknown): string {
   return (content[0] as { text: string }).text;
 }
 
+function toolJson<T>(result: unknown): T {
+  const parsed = JSON.parse(toolText(result)) as T;
+  expect((result as { structuredContent?: unknown }).structuredContent).toEqual(parsed);
+  return parsed;
+}
+
 async function callTool(
   workspace: string,
   name: "git_status" | "git_diff",
@@ -92,10 +98,10 @@ describe("Git readonly review tools", () => {
     await git(workspace, "add", "added.txt");
     await writeFile(join(workspace, "untracked.txt"), "untracked\n");
 
-    const result = JSON.parse(toolText(await callTool(workspace, "git_status", {}))) as {
+    const result = toolJson<{
       branch: string;
       entries: { path: string; original_path?: string; status: string; index: string; worktree: string }[];
-    };
+    }>(await callTool(workspace, "git_status", {}));
     expect(result.branch).toBe("main");
     expect(result.entries.map((entry) => entry.path)).toEqual([
       "added.txt",
@@ -122,25 +128,25 @@ describe("Git readonly review tools", () => {
     await initRepository(workspace, { "src/app.txt": "hello\n" });
     await writeFile(join(workspace, "src/app.txt"), "hello world\n");
 
-    const result = JSON.parse(toolText(await callTool(workspace, "git_diff", {}))) as {
+    const result = toolJson<{
       diff: string;
       files: string[];
       binary: boolean;
-    };
+    }>(await callTool(workspace, "git_diff", {}));
     expect(result.diff).toContain("-hello");
     expect(result.diff).toContain("+hello world");
     expect(result.files).toEqual(["src/app.txt"]);
     expect(result.binary).toBe(false);
 
-    const pathResult = JSON.parse(toolText(await callTool(workspace, "git_diff", {
+    const pathResult = toolJson<{ path: string; diff: string }>(await callTool(workspace, "git_diff", {
       path: "src/app.txt",
-    }))) as { path: string; diff: string };
+    }));
     expect(pathResult.path).toBe("src/app.txt");
     expect(pathResult.diff).toContain("+hello world");
 
-    const statResult = JSON.parse(toolText(await callTool(workspace, "git_diff", {
+    const statResult = toolJson<{ stat: boolean; diff: string }>(await callTool(workspace, "git_diff", {
       stat: true,
-    }))) as { stat: boolean; diff: string };
+    }));
     expect(statResult.stat).toBe(true);
     expect(statResult.diff).toContain("app.txt");
   });
@@ -166,13 +172,11 @@ describe("Git readonly review tools", () => {
     await writeFile(join(workspace, "secret.txt"), "after-secret\n");
     await writeFile(join(workspace, "public.txt"), "after-public\n");
 
-    const status = JSON.parse(toolText(await callTool(workspace, "git_status", {}))) as {
-      entries: { path: string }[];
-    };
-    const diff = JSON.parse(toolText(await callTool(workspace, "git_diff", {}))) as {
+    const status = toolJson<{ entries: { path: string }[] }>(await callTool(workspace, "git_status", {}));
+    const diff = toolJson<{
       diff: string;
       files: string[];
-    };
+    }>(await callTool(workspace, "git_diff", {}));
     expect(status.entries.map((entry) => entry.path)).toEqual(["public.txt"]);
     expect(diff.files).toEqual(["public.txt"]);
     expect(diff.diff).toContain("after-public");
@@ -185,11 +189,11 @@ describe("Git readonly review tools", () => {
     await initRepository(workspace, { "image.png": "not really binary\n" });
     await writeFile(join(workspace, "image.png"), Buffer.from([0, 1, 2, 3, 4]));
 
-    const result = JSON.parse(toolText(await callTool(workspace, "git_diff", {}))) as {
+    const result = toolJson<{
       binary: boolean;
       binary_paths: string[];
       diff: string;
-    };
+    }>(await callTool(workspace, "git_diff", {}));
     expect(result.binary).toBe(true);
     expect(result.binary_paths).toEqual(["image.png"]);
     expect(result.diff).not.toContain("\u0000");
