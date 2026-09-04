@@ -6,6 +6,7 @@ export const DEFAULT_PORT = 12080;
 export const MCP_PATH = "/mcp" as const;
 export const HEALTH_PATH = "/health" as const;
 export const APP_VERSION = "0.1" as const;
+export const SERVICE_NAME = "local-review-mcp" as const;
 export const DEFAULT_HEALTH_INTERVAL_SECONDS = 30;
 export const DEFAULT_MAX_RESTART_ATTEMPTS = 3;
 export const MAX_HEALTH_INTERVAL_SECONDS = 2_147_483;

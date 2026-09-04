@@ -38,6 +38,20 @@ export type SupervisorStateListener = (state: RuntimeState) => void;
 // ponytail: bounded startup polling; make this configurable only if measured cold starts exceed 2s.
 const STARTUP_HEALTH_RETRY_ATTEMPTS = 20;
 const STARTUP_HEALTH_RETRY_DELAY_MS = 100;
+// ponytail: fixed at 3 consecutive degraded observations; make it configurable only when operations data shows churn.
+const DEGRADED_RECOVERY_THRESHOLD = 3;
+
+export type RuntimeObservation =
+  | { readonly state: "healthy" }
+  | { readonly state: "degraded"; readonly reason: string }
+  | { readonly state: "stopped"; readonly reason: string }
+  | { readonly state: "unknown"; readonly reason: string };
+
+export function observeRuntime(healthOk: boolean, processRunning: boolean): RuntimeObservation {
+  if (healthOk && processRunning) return { state: "healthy" };
+  if (!processRunning) return { state: "stopped", reason: "runtime process is not running" };
+  return { state: "degraded", reason: "runtime health check failed" };
+}
 
 async function waitForHealthy(check: () => Promise<boolean>): Promise<boolean> {
   for (let attempt = 0; attempt < STARTUP_HEALTH_RETRY_ATTEMPTS; attempt += 1) {
@@ -261,23 +275,42 @@ export class Supervisor {
 
   private async handleHealth(healthy: boolean): Promise<void> {
     if (this.state !== "RUNNING" && this.state !== "DEGRADED") return;
-    const tunnelHealthy = healthy && await this.isTunnelHealthy();
-    if (tunnelHealthy) {
+    if (healthy && await this.isTunnelHealthy()) {
       this.healthFailures = 0;
       this.restartAttempts = 0;
       this.setState("RUNNING");
       return;
     }
 
+    if (healthy) {
+      // The runtime answers, but the remote connector no longer reports healthy.
+      this.setState("DEGRADED");
+      await this.recoverIfAllowed();
+      return;
+    }
+
+    const process = this.processManager.status();
+    const observation = observeRuntime(false, process.running);
+    if (observation.state === "stopped") {
+      this.setState("DEGRADED");
+      await this.recoverIfAllowed();
+      return;
+    }
+
     this.healthFailures += 1;
     this.setState("DEGRADED");
     this.logger.info("health failed");
+    if (this.healthFailures >= DEGRADED_RECOVERY_THRESHOLD) {
+      await this.recoverIfAllowed();
+    }
+  }
+
+  private async recoverIfAllowed(): Promise<void> {
     if (this.recovery !== undefined) return;
     if (this.restartAttempts >= this.maxRestartAttempts) {
       await this.enterError();
       return;
     }
-
     const recovery = this.recover();
     this.recovery = recovery;
     try {
@@ -301,7 +334,7 @@ export class Supervisor {
     this.logger.info("restart triggered");
     await this.stopResources().catch(() => undefined);
     try {
-      await this.startResources();
+      await this.startResources(true);
       this.healthMonitor.start((healthy) => this.handleHealth(healthy));
     } catch {
       await this.stopResources().catch(() => undefined);
@@ -369,6 +402,7 @@ export function createSupervisor(
   });
   const tunnel = options.tunnel ?? createTunnelManager(settings.remote, {
     localEndpoint: localOrigin(settings),
+    authToken: settings.auth.token,
     environment,
   });
   return new Supervisor({

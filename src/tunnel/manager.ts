@@ -38,6 +38,7 @@ export class ManualEndpointProvider implements TunnelProvider {
 
 export interface TunnelManagerOptions {
   readonly localEndpoint?: string;
+  readonly authToken?: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly cloudflare?: Pick<CloudflareTunnelOptions, "command" | "platform" | "spawn" | "readyTimeoutMs" | "token">;
 }
@@ -140,6 +141,7 @@ export function createTunnelManager(
   const provider = new CloudflareTunnelProvider({
     ...options.cloudflare,
     localEndpoint: options.localEndpoint,
+    healthAuthToken: options.authToken,
     endpoint: remote.endpoint,
     token: remote.token ?? environment.CLOUDFLARE_TUNNEL_TOKEN ?? optionToken,
     tunnelName: remote.tunnelName,

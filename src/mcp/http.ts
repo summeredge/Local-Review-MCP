@@ -17,6 +17,7 @@ import {
   DEFAULT_HOST,
   HEALTH_PATH,
   MCP_PATH,
+  SERVICE_NAME,
   type ResolvedSettings,
 } from "../config/settings.js";
 import type { TunnelProvider, TunnelStatus } from "../tunnel/types.js";
@@ -111,6 +112,7 @@ async function handleHealthRequest(
   const activeWorkspace = context.registry?.active;
   const workspace = activeWorkspace?.manager ?? context.workspace;
   sendJson(response, 200, {
+    service: SERVICE_NAME,
     status: "ok",
     workspace: activeWorkspace?.id ?? workspace?.workspaceId ?? "unknown",
     version: APP_VERSION,

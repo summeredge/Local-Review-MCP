@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FileSupervisorLogger } from "../../src/supervisor/logger.js";
 import { Supervisor } from "../../src/supervisor/supervisor.js";
 import type {
@@ -195,12 +195,67 @@ describe("supervisor", () => {
     expect(supervisor.state).toBe("RUNNING");
   });
 
-  it("keeps a failed recovery degraded", async () => {
+  it("keeps a live runtime degraded after one health failure without restarting", async () => {
     const processManager = new FakeProcessManager();
     const healthMonitor = new FakeHealthMonitor();
     const logger = new MemoryLogger();
     const supervisor = makeSupervisor(processManager, healthMonitor, new FakeTunnel(), logger);
     await supervisor.start();
+
+    await healthMonitor.trigger(false);
+
+    expect(supervisor.state).toBe("DEGRADED");
+    expect(processManager.starts).toBe(1);
+    expect(logger.events).not.toContain("restart triggered");
+    await expect(supervisor.status()).resolves.toMatchObject({
+      restartAttempts: 0,
+      healthFailures: 1,
+    });
+  });
+
+  it("restarts immediately when the runtime process exits", async () => {
+    const processManager = new FakeProcessManager();
+    const tunnel = new FakeTunnel();
+    const supervisor = makeSupervisor(processManager, new FakeHealthMonitor(), tunnel);
+    await supervisor.start();
+
+    processManager.exit();
+
+    await vi.waitFor(() => expect(processManager.starts).toBe(2));
+    await vi.waitFor(() => expect(supervisor.state).toBe("RUNNING"));
+    expect(tunnel.starts).toBe(2);
+  });
+
+  it("recovers after three consecutive health failures while the runtime stays alive", async () => {
+    const processManager = new FakeProcessManager();
+    const tunnel = new FakeTunnel();
+    const healthMonitor = new FakeHealthMonitor();
+    const supervisor = makeSupervisor(processManager, healthMonitor, tunnel);
+    await supervisor.start();
+
+    await healthMonitor.trigger(false);
+    await healthMonitor.trigger(false);
+    expect(processManager.starts).toBe(1);
+
+    await healthMonitor.trigger(false);
+
+    expect(processManager.starts).toBe(2);
+    expect(tunnel.starts).toBe(2);
+    await expect(supervisor.status()).resolves.toMatchObject({
+      state: "RUNNING",
+      restartAttempts: 0,
+      healthFailures: 0,
+    });
+  });
+
+  it("keeps a failed recovery degraded and retries on later observations", async () => {
+    const processManager = new FakeProcessManager();
+    const healthMonitor = new FakeHealthMonitor();
+    const logger = new MemoryLogger();
+    const supervisor = makeSupervisor(processManager, healthMonitor, new FakeTunnel(), logger);
+    await supervisor.start();
+    await healthMonitor.trigger(false);
+    await healthMonitor.trigger(false);
     processManager.failNextStart = true;
 
     await healthMonitor.trigger(false);
@@ -208,24 +263,28 @@ describe("supervisor", () => {
     expect(supervisor.state).toBe("DEGRADED");
     expect(logger.events).toContain("health failed");
     expect(logger.events).toContain("restart triggered");
+    expect(processManager.starts).toBe(2);
+
+    processManager.failNextStart = true;
+    await healthMonitor.trigger(false);
+    expect(processManager.starts).toBe(3);
+    expect(supervisor.state).toBe("DEGRADED");
   });
 
   it("enters ERROR after the configured restart limit", async () => {
     const processManager = new FakeProcessManager();
     const healthMonitor = new FakeHealthMonitor();
-    healthMonitor.checks = [true, false, false, false];
-    const supervisor = makeSupervisor(processManager, healthMonitor, new FakeTunnel(), new MemoryLogger(), 3);
+    const supervisor = makeSupervisor(processManager, healthMonitor, new FakeTunnel(), new MemoryLogger(), 1);
     await supervisor.start();
+    processManager.failNextStart = true;
 
-    await healthMonitor.trigger(false);
-    await healthMonitor.trigger(false);
-    await healthMonitor.trigger(false);
+    processManager.exit();
+    await vi.waitFor(() => expect(supervisor.state).toBe("ERROR"));
 
-    expect(supervisor.state).toBe("ERROR");
     await expect(supervisor.status()).resolves.toMatchObject({
       state: "ERROR",
-      restartAttempts: 3,
-      maxRestartAttempts: 3,
+      restartAttempts: 1,
+      maxRestartAttempts: 1,
     });
   });
 

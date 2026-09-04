@@ -29,6 +29,7 @@ import {
 } from "./schema/files.js";
 import {
   workspaceInfoOutputSchema,
+  workspaceListOutputSchema,
   type WorkspaceInfoOutput,
 } from "./schema/workspace.js";
 
@@ -111,12 +112,6 @@ interface ListedEntry {
   readonly path: string;
   readonly name: string;
   readonly type: "file" | "directory";
-}
-
-function jsonResult(value: unknown) {
-  return {
-    content: [{ type: "text" as const, text: JSON.stringify(value) }],
-  };
 }
 
 export function toToolError(error: unknown) {
@@ -444,7 +439,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return structuredResponse(await workspaceInfo(registry.resolve(input.workspace_id)));
+        return structuredResponse(workspaceInfoOutputSchema, await workspaceInfo(registry.resolve(input.workspace_id)));
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -461,7 +456,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return structuredResponse(await listFiles(registry.resolve(input.workspace_id).manager, input));
+        return structuredResponse(listFilesOutputSchema, await listFiles(registry.resolve(input.workspace_id).manager, input));
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -478,7 +473,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return structuredResponse(await readFilePage(registry.resolve(input.workspace_id).manager, input));
+        return structuredResponse(readFileOutputSchema, await readFilePage(registry.resolve(input.workspace_id).manager, input));
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -495,7 +490,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return structuredResponse(await searchText(registry.resolve(input.workspace_id).manager, {
+        return structuredResponse(searchTextOutputSchema, await searchText(registry.resolve(input.workspace_id).manager, {
           query: input.query,
           path: input.path,
           glob: input.glob,
@@ -519,7 +514,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return structuredResponse(await new GitService(registry.resolve(input.workspace_id).manager).status());
+        return structuredResponse(gitStatusOutputSchema, await new GitService(registry.resolve(input.workspace_id).manager).status());
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -536,7 +531,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return structuredResponse(await new GitService(registry.resolve(input.workspace_id).manager).diff({
+        return structuredResponse(gitDiffOutputSchema, await new GitService(registry.resolve(input.workspace_id).manager).diff({
           path: input.path,
           stat: input.stat,
         }));
@@ -551,9 +546,16 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     {
       description: "List the authorized workspaces without exposing local filesystem paths.",
       inputSchema: {},
+      outputSchema: workspaceListOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    async () => jsonResult({ workspaces: registry.list() }),
+    async () => {
+      try {
+        return structuredResponse(workspaceListOutputSchema, { workspaces: [...registry.list()] });
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
   );
 
   server.registerTool(
@@ -566,7 +568,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return structuredResponse(await reviewSummary(registry.resolve(input.workspace_id)));
+        return structuredResponse(reviewSummaryOutputSchema, await reviewSummary(registry.resolve(input.workspace_id)));
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -583,7 +585,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return structuredResponse(await executionOutput(registry.resolve(input.workspace_id).manager));
+        return structuredResponse(executionOutputOutputSchema, await executionOutput(registry.resolve(input.workspace_id).manager));
       } catch (error: unknown) {
         return toToolError(error);
       }

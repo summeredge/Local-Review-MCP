@@ -64,6 +64,7 @@ describe("health endpoint", () => {
 
     expect(response.status).toBe(200);
     expect(health).toEqual({
+      service: "local-review-mcp",
       status: "ok",
       workspace: workspaceId,
       version: "0.1",

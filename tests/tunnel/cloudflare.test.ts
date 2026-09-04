@@ -53,6 +53,7 @@ describe("Cloudflare tunnel provider", () => {
       tunnelName: "review-tunnel",
       command: "cloudflared.exe",
       environment: {},
+      healthCheck: async () => true,
       spawn: spawn as unknown as typeof import("node:child_process").spawn,
     });
     const starting = provider.start();
@@ -81,6 +82,7 @@ describe("Cloudflare tunnel provider", () => {
       token: "tunnel-token",
       command: "cloudflared.exe",
       environment: {},
+      healthCheck: async () => true,
       spawn: spawn as unknown as typeof import("node:child_process").spawn,
     });
     const starting = provider.start();
@@ -104,6 +106,7 @@ describe("Cloudflare tunnel provider", () => {
         endpoint: "https://review.example/mcp",
         command: "cloudflared.exe",
         environment: { CLOUDFLARE_TUNNEL_TOKEN: "environment-token" },
+        healthCheck: async () => true,
         spawn: spawn as unknown as typeof import("node:child_process").spawn,
       });
       const starting = provider.start();
@@ -160,6 +163,55 @@ describe("Cloudflare tunnel provider", () => {
     expect(process.kill).toHaveBeenCalledOnce();
   });
 
+  it("waits for the public endpoint health check before reporting ready", async () => {
+    const process = new FakeTunnelProcess();
+    let healthCalls = 0;
+    const healthCheck = vi.fn(async () => {
+      healthCalls += 1;
+      return healthCalls > 1;
+    });
+    const provider = new CloudflareTunnelProvider({
+      endpoint: "https://review.example/mcp",
+      tunnelName: "review-tunnel",
+      command: "cloudflared.exe",
+      environment: {},
+      readyTimeoutMs: 1_000,
+      healthCheck,
+      spawn: spawnFake(process) as unknown as typeof import("node:child_process").spawn,
+    });
+    const starting = provider.start();
+    process.emit("spawn");
+    process.stderr.emit("data", "Registered tunnel connection connIndex=0\n");
+
+    await expect(starting).resolves.toEqual({ endpoint: "https://review.example/mcp" });
+    expect(healthCheck).toHaveBeenCalledWith("https://review.example/health");
+    expect(healthCalls).toBeGreaterThan(1);
+  });
+
+  it("fails startup when the public health endpoint never becomes healthy", async () => {
+    const process = new FakeTunnelProcess();
+    const healthCheck = vi.fn(async () => false);
+    const provider = new CloudflareTunnelProvider({
+      endpoint: "https://review.example/mcp",
+      tunnelName: "review-tunnel",
+      command: "cloudflared.exe",
+      environment: {},
+      readyTimeoutMs: 100,
+      healthCheck,
+      spawn: spawnFake(process) as unknown as typeof import("node:child_process").spawn,
+    });
+    const starting = provider.start();
+    process.emit("spawn");
+    process.stderr.emit("data", "Registered tunnel connection connIndex=0\n");
+
+    await expect(starting).rejects.toMatchObject({
+      message: expect.stringContaining("public endpoint health check"),
+    });
+    expect(healthCheck).toHaveBeenCalled();
+    expect(process.kill).toHaveBeenCalledOnce();
+    await expect(provider.status()).resolves.toEqual({ state: "REMOTE_ERROR" });
+  });
+
   it("stops a connected named tunnel and waits for its child to close", async () => {
     const process = new FakeTunnelProcess();
     const provider = new CloudflareTunnelProvider({
@@ -167,6 +219,7 @@ describe("Cloudflare tunnel provider", () => {
       tunnelName: "review-tunnel",
       localEndpoint: "http://127.0.0.1:12080",
       environment: {},
+      healthCheck: async () => true,
       spawn: spawnFake(process) as unknown as typeof import("node:child_process").spawn,
     });
     const starting = provider.start();

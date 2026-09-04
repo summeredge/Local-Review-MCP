@@ -25,6 +25,7 @@ export function createAppContext(
     settings,
     tunnel: createTunnelManager(settings.remote, {
       localEndpoint: localOrigin(settings),
+      authToken: settings.auth.token,
       environment,
     }),
     workspace: registry.active.manager,

@@ -1,12 +1,17 @@
 import { existsSync } from "node:fs";
 import { spawn as defaultSpawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { win32 as win32Path } from "node:path";
+import { HEALTH_PATH, SERVICE_NAME } from "../config/settings.js";
 import type { ConnectionState, TunnelInfo, TunnelProvider, TunnelStatus } from "./types.js";
 
 const DEFAULT_READY_TIMEOUT_MS = 10_000;
 const MAX_PROCESS_OUTPUT_BYTES = 64 * 1024;
 const STOP_TIMEOUT_MS = 5_000;
+const REMOTE_HEALTH_REQUEST_TIMEOUT_MS = 5_000;
+const REMOTE_HEALTH_RETRY_DELAY_MS = 250;
+const MAX_REMOTE_HEALTH_RESPONSE_BYTES = 16 * 1024;
 
 export interface CloudflareTunnelOptions {
   readonly localEndpoint?: string;
@@ -18,6 +23,8 @@ export interface CloudflareTunnelOptions {
   readonly platform?: NodeJS.Platform;
   readonly spawn?: typeof defaultSpawn;
   readonly readyTimeoutMs?: number;
+  readonly healthAuthToken?: string;
+  readonly healthCheck?: (endpoint: string) => Promise<boolean>;
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -63,6 +70,57 @@ function parseTunnelName(value: string | undefined): string | undefined {
 
 function outputText(chunk: string | Buffer): string {
   return typeof chunk === "string" ? chunk : chunk.toString("utf8");
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function isValidServiceHealth(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null) return false;
+  const health = payload as Record<string, unknown>;
+  return health.service === SERVICE_NAME && health.status === "ok";
+}
+
+function requestPublicHealth(endpoint: string, authToken: string | undefined): Promise<boolean> {
+  return new Promise((resolve) => {
+    const request = httpsRequest(new URL(endpoint), {
+      method: "GET",
+      timeout: REMOTE_HEALTH_REQUEST_TIMEOUT_MS,
+      ...(authToken === undefined ? {} : { headers: { authorization: `Bearer ${authToken}` } }),
+    }, (response) => {
+      if (response.statusCode !== 200) {
+        response.resume();
+        resolve(false);
+        return;
+      }
+      let text = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk: string) => {
+        text += chunk;
+        if (text.length > MAX_REMOTE_HEALTH_RESPONSE_BYTES) {
+          response.destroy();
+          resolve(false);
+        }
+      });
+      response.on("error", () => resolve(false));
+      response.on("end", () => {
+        if (text.length <= MAX_REMOTE_HEALTH_RESPONSE_BYTES) {
+          try {
+            resolve(isValidServiceHealth(JSON.parse(text) as unknown));
+          } catch {
+            resolve(false);
+          }
+        }
+      });
+    });
+    request.once("error", () => resolve(false));
+    request.once("timeout", () => {
+      request.destroy();
+      resolve(false);
+    });
+    request.end();
+  });
 }
 
 function hasReadySignal(output: string): boolean {
@@ -150,6 +208,8 @@ export class CloudflareTunnelProvider implements TunnelProvider {
   private readonly tunnelName: string | undefined;
   private readonly token: string | undefined;
   private readonly readyTimeoutMs: number;
+  private readonly healthAuthToken: string | undefined;
+  private readonly healthCheck: (endpoint: string) => Promise<boolean>;
   private child: ChildProcess | undefined;
   private starting: Promise<TunnelInfo> | undefined;
   private cancelStart: (() => void) | undefined;
@@ -183,6 +243,9 @@ export class CloudflareTunnelProvider implements TunnelProvider {
     if (!Number.isInteger(this.readyTimeoutMs) || this.readyTimeoutMs < 1) {
       throw new Error("Cloudflare tunnel ready timeout must be a positive integer");
     }
+    this.healthAuthToken = options.healthAuthToken;
+    this.healthCheck = options.healthCheck
+      ?? ((endpoint: string) => requestPublicHealth(endpoint, this.healthAuthToken));
     if (this.localEndpoint !== undefined) {
       let parsed: URL;
       try {
@@ -225,6 +288,9 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       return Promise.reject(error instanceof Error ? error : new Error("Invalid Cloudflare tunnel configuration"));
     }
     console.log(`Cloudflare tunnel mode: ${this.tunnelName === undefined ? "token" : "named"}`);
+    const healthUrl = this.configuredEndpoint === undefined
+      ? undefined
+      : new URL(HEALTH_PATH, this.configuredEndpoint).href;
     const promise = new Promise<TunnelInfo>((resolve, reject) => {
       let child: ChildProcess | undefined;
       let stdout = "";
@@ -233,6 +299,8 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       let timer: NodeJS.Timeout | undefined;
       let exitCode: number | null | undefined;
       let exitSignal: NodeJS.Signals | null | undefined;
+      let connectedAt = 0;
+      let healthPolling = false;
 
       const clearReadyTimer = (): void => {
         if (timer !== undefined) clearTimeout(timer);
@@ -282,8 +350,41 @@ export class CloudflareTunnelProvider implements TunnelProvider {
         const value = outputText(chunk);
         if (stream === "stdout") stdout = (stdout + value).slice(-MAX_PROCESS_OUTPUT_BYTES);
         else stderr = (stderr + value).slice(-MAX_PROCESS_OUTPUT_BYTES);
-        if (this.configuredEndpoint !== undefined && hasReadySignal(`${stdout}\n${stderr}`)) {
-          ready(this.configuredEndpoint);
+        if (!healthPolling && this.configuredEndpoint !== undefined && healthUrl !== undefined
+          && hasReadySignal(`${stdout}\n${stderr}`)) {
+          clearReadyTimer();
+          connectedAt = Date.now();
+          void pollPublicHealth();
+        }
+      };
+
+      const pollPublicHealth = async (): Promise<void> => {
+        if (settled || healthPolling || healthUrl === undefined) return;
+        if (this.configuredEndpoint === undefined) return;
+        const configuredEndpoint = this.configuredEndpoint;
+        healthPolling = true;
+        try {
+          while (!settled) {
+            if (this.child !== child) return;
+            let healthy = false;
+            try {
+              healthy = await this.healthCheck(healthUrl);
+            } catch {
+              // A failed probe is an unavailable endpoint, not a settled tunnel.
+            }
+            if (healthy) {
+              ready(configuredEndpoint);
+              return;
+            }
+            if (settled) return;
+            if (Date.now() - connectedAt >= this.readyTimeoutMs) {
+              fail("timed out waiting for the public endpoint health check");
+              return;
+            }
+            await delay(REMOTE_HEALTH_RETRY_DELAY_MS);
+          }
+        } finally {
+          healthPolling = false;
         }
       };
 
@@ -315,8 +416,11 @@ export class CloudflareTunnelProvider implements TunnelProvider {
 
       const onSpawn = (): void => {
         if (settled) return;
-        if (this.configuredEndpoint !== undefined && hasReadySignal(`${stdout}\n${stderr}`)) {
-          ready(this.configuredEndpoint);
+        if (!healthPolling && this.configuredEndpoint !== undefined && healthUrl !== undefined
+          && hasReadySignal(`${stdout}\n${stderr}`)) {
+          clearReadyTimer();
+          connectedAt = Date.now();
+          void pollPublicHealth();
           return;
         }
         timer = setTimeout(() => {
