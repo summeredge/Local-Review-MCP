@@ -1,5 +1,31 @@
 # Learnings
 
+## [LRN-20260904-001] Task Context 保持独立于 Workspace 与 MCP
+
+**Priority**: medium
+**Status**: resolved
+**Area**: infra
+
+### 内容
+
+在只读 Review Data Plane 中加入未来任务元数据时，最小安全边界是把
+Task Context 作为独立内部数据层：使用用户级应用状态目录持久化，保存
+`task_id`、`workspace_id` 和可选 `conversation_id`，不接入 MCP 注册、
+Workspace Registry 变更或 C2C Session 状态机。这样同一 workspace 可以有
+多个 task，conversation 也不会被 workspace 固定绑定。
+
+### 建议修复
+
+后续 Execution Context 扩展应沿用该边界；只有明确的读取场景、权限和
+兼容性契约都确定后，才评估增加只读 MCP 投影。
+
+### 元数据
+
+- Source: task_review
+- See Also: none
+
+---
+
 ## [LRN-20260901-001] MCP OAuth discovery compatibility
 
 **Priority**: medium

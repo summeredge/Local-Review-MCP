@@ -1,5 +1,39 @@
 # Errors
 
+## [ERR-20260904-002] Vitest unsupported Jest parallel flag
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+本项目通过 Vitest 执行测试；误传 Jest 的 `--runInBand` 参数会被 Vitest
+拒绝，导致测试命令在收集测试前退出。
+
+### 错误信息
+
+```text
+CACError: Unknown option `--runInBand`
+```
+
+### 上下文
+
+- 执行了 `npm test -- --runInBand`
+- 改用任务要求的 `npm test` 后完整测试通过
+
+### 建议修复
+
+遵循 `package.json` 中的 Vitest 脚本；需要调度选项时先查看当前 Vitest
+版本支持的参数，不要套用 Jest CLI 参数。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
 ## [ERR-20260904-001] Launcher project venv execution permission
 
 **Priority**: medium
