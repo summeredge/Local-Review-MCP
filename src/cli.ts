@@ -39,6 +39,9 @@ try {
     console.log(JSON.stringify(await generateReviewDeliveryExample(), null, 2));
   } else if (argv[0] === "diagnose-browser-router") {
     console.log(JSON.stringify(await generateBrowserRouterExample(), null, 2));
+  } else if (argv[0] === "diagnose-browser-worker") {
+    const { generateBrowserWorkerExample } = await import("./browser-worker/diagnostic.js");
+    console.log(JSON.stringify(await generateBrowserWorkerExample(), null, 2));
   } else if (argv[0] === "diagnose-conversation-routing") {
     const diagnosticArgs = argv.slice(1);
     const diagnosticCli = parseCliArgs(diagnosticArgs);

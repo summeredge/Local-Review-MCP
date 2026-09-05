@@ -13,11 +13,14 @@
     "diagnose:conversation-routing": "npm run build && node dist/src/cli.js diagnose-conversation-routing",
     "diagnose:review-delivery": "npm run build && node dist/src/cli.js diagnose-review-delivery",
     "diagnose:browser-router": "npm run build && node dist/src/cli.js diagnose-browser-router",
+    "diagnose:browser-worker": "npm run build && node dist/src/cli.js diagnose-browser-worker",
     "diagnose:review-context": "npm run build && node dist/src/cli.js diagnose-review-context",
+    "start:browser-worker": "npm run build && node dist/src/browser-worker/cli.js",
     "start": "node dist/src/cli.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "playwright": "^1.55.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
