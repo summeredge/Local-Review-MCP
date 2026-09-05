@@ -62,7 +62,7 @@ describe("workspace_info", () => {
     const info = JSON.parse(toolText(result)) as Record<string, unknown>;
     expect(result.structuredContent).toEqual(info);
 
-    expect(info.workspace_id).toMatch(/^[0-9a-f]{12}$/u);
+    expect(info.workspace_id).toBe("legacy-workspace");
     expect(info.workspace_name).toBe(basename(workspace));
     expect(info.root_alias).toBe("workspace:/");
     expect(info.project_types).toEqual(["dotnet", "go", "node", "python", "rust", "typescript"]);

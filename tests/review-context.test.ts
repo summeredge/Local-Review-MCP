@@ -93,6 +93,12 @@ describe("Review context tools", () => {
     ]);
     const result = resultJson(await callTool(registry, "review_summary"));
 
+    const info = resultJson(await callTool(registry, "workspace_info"));
+    expect(info).toMatchObject({
+      workspace_id: result.workspace_id,
+      workspace_name: result.workspace_name,
+    });
+
     expect(result).toEqual({
       workspace_id: "data-project",
       workspace_name: "DataProject",

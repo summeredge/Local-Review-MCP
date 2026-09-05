@@ -30,6 +30,7 @@ export interface SupervisorFactoryOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly runtimeCommand?: string;
   readonly runtimeScript?: string;
+  readonly runtimeConfigPath?: string;
   readonly runtimeArgs?: readonly string[];
 }
 
@@ -383,10 +384,9 @@ export function createSupervisor(
   const runtimeArgs = options.runtimeArgs ?? [
     runtimeScript,
     "--runtime",
-    "--port",
-    String(settings.port),
-    "--workspace",
-    settings.workspace,
+    ...(options.runtimeConfigPath === undefined
+      ? ["--port", String(settings.port), "--workspace", settings.workspace]
+      : ["--config", options.runtimeConfigPath]),
   ];
   const logDirectory = options.logDirectory ?? defaultLogDirectory(environment);
   const logger = options.logger ?? new FileSupervisorLogger(logDirectory);

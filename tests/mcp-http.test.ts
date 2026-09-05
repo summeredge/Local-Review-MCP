@@ -2,7 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { startApp } from "../src/app.js";
 import { EXPECTED_REGISTERED_TOOL_NAMES } from "./fixtures/v01-tools.js";
@@ -49,10 +49,17 @@ describe("MCP HTTP runtime", () => {
     await writeFile(join(workspace, "README.md"), "# Review\n");
     await writeFile(join(workspace, "src", "app.ts"), "export const app = true;\n");
 
+    const workspaceIdentity = {
+      id: "runtime-workspace",
+      name: "Runtime Workspace",
+      path: workspace,
+    } as const;
     const settings = {
       host: "127.0.0.1" as const,
       port: await getFreePort(),
       workspace,
+      workspaceIdentity,
+      workspaces: [workspaceIdentity],
       auth: { token: "test-token" },
       remote: { enabled: false, endpoint: "" },
       supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
@@ -73,7 +80,11 @@ describe("MCP HTTP runtime", () => {
     const infoCall = await client.callTool({ name: "workspace_info", arguments: {} });
     expect(infoCall.isError).not.toBe(true);
     const info = JSON.parse(toolText(infoCall)) as Record<string, unknown>;
-    expect(info).toMatchObject({ root_alias: "workspace:/", workspace_name: basename(workspace) });
+    expect(info).toMatchObject({
+      root_alias: "workspace:/",
+      workspace_id: workspaceIdentity.id,
+      workspace_name: workspaceIdentity.name,
+    });
     expect(JSON.stringify(info)).not.toContain(workspace);
 
     const listCall = await client.callTool({ name: "list_files", arguments: {} });

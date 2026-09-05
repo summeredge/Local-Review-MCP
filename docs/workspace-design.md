@@ -60,9 +60,9 @@ For a configured registry, `workspaces[].id` is the stable workspace identity:
 LRM V0.1 does not expose a registry mutation tool. Add/remove operations belong
 to the local configuration owner; the MCP runtime only validates and reads the
 registry. The legacy configuration without `workspaces` remains supported. In
-that compatibility path, the single wrapper uses the existing deterministic
-`WorkspaceManager.workspaceId`; use an explicit `workspaces` registry for the
-persisted multi-workspace ID contract above.
+that compatibility path, the single wrapper uses the fixed `legacy-workspace`
+identity; use an explicit `workspaces` registry for the persisted multi-
+workspace ID contract above.
 
 ## Active workspace strategy
 
@@ -73,11 +73,12 @@ workspace_id present    -> use the matching registered workspace
 workspace_id omitted    -> use the registry's active workspace
 ```
 
-The active workspace is selected from the configured top-level `workspace` path
-when it matches a registered entry; otherwise the first registry entry is the
-legacy active workspace. A legacy single-workspace configuration is wrapped as
-a one-entry registry. An unknown `workspace_id` is rejected and never treated
-as a filesystem path.
+The active workspace is selected from the configured top-level `workspace`
+identity when it is present. Older configurations may provide only its path;
+that path is matched to a registered entry, otherwise the first registry entry
+is the legacy active workspace. A legacy single-workspace configuration is
+wrapped as a one-entry registry. An unknown `workspace_id` is rejected and
+never treated as a filesystem path.
 
 ## Runtime
 
@@ -85,10 +86,10 @@ The active workspace runtime remains part of V0.1. The registry selects it, and
 the MCP server performs read-only operations against that selection:
 
 ```text
-Registry
+Workspace Registry
     |
     v
-active workspace
+Runtime Config identity
     |
     v
 MCP Runtime

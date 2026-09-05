@@ -38,7 +38,7 @@ class ConfigManagerTests(unittest.TestCase):
 
             runtime_path, temporary_path = manager.runtime_config(saved)
             self.assertIsNotNone(temporary_path)
-            self.assertEqual(json.loads(runtime_path.read_text(encoding="utf-8"))["workspace"], str(selected_workspace))
+            self.assertEqual(json.loads(runtime_path.read_text(encoding="utf-8"))["workspace"]["path"], str(selected_workspace))
             temporary_path.unlink()
 
     def test_runtime_config_uses_latest_saved_workspace(self) -> None:
@@ -57,7 +57,7 @@ class ConfigManagerTests(unittest.TestCase):
             runtime_path, temporary_path = manager.runtime_config(initial)
 
             self.assertIsNotNone(temporary_path)
-            self.assertEqual(json.loads(runtime_path.read_text(encoding="utf-8"))["workspace"], str(selected_workspace))
+            self.assertEqual(json.loads(runtime_path.read_text(encoding="utf-8"))["workspace"]["path"], str(selected_workspace))
             temporary_path.unlink()
 
     def test_registry_adds_two_workspaces_and_persists_the_active_id(self) -> None:
@@ -134,11 +134,34 @@ class ConfigManagerTests(unittest.TestCase):
             runtime_path, temporary_path = manager.runtime_config(configuration)
             try:
                 runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-                self.assertEqual(runtime["workspace"], str(workspace_a.resolve()))
+                self.assertEqual(runtime["workspace"], {
+                    "id": configuration.workspaces[0].id,
+                    "name": configuration.workspaces[0].name,
+                    "path": configuration.workspaces[0].path,
+                })
                 self.assertEqual(runtime["workspaces"], [
                     {"id": record.id, "name": record.name, "path": record.path}
                     for record in configuration.workspaces
                 ])
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+
+    def test_runtime_config_preserves_identity_from_production_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            identity = {"id": "workspace-id", "name": "Workspace", "path": str(workspace)}
+            self._write_production(root, {"workspace": identity, "auth": {"token": "test"}})
+
+            runtime_path, temporary_path = ConfigManager(root).runtime_config(
+                self._configuration(workspace),
+            )
+            try:
+                runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+                self.assertEqual(runtime["workspace"], identity)
+                self.assertEqual(runtime["workspaces"], [identity])
             finally:
                 if temporary_path is not None:
                     temporary_path.unlink(missing_ok=True)
@@ -219,7 +242,7 @@ class ConfigManagerTests(unittest.TestCase):
             backup = manager.backup_production_config(initial)
 
             backup_document = json.loads(backup.read_text(encoding="utf-8"))
-            self.assertEqual(backup_document["workspace"], str(selected_workspace))
+            self.assertEqual(backup_document["workspace"]["path"], str(selected_workspace))
             self.assertEqual(backup_document, runtime_document)
             self.assertEqual(json.loads(production.read_text(encoding="utf-8")), production_document)
 

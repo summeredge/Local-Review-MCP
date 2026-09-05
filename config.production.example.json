@@ -1,7 +1,11 @@
 {
   "_comment": "Copy this file to config.production.json and set the local values before starting.",
   "port": 12080,
-  "workspace": "C:\\Your\\Project",
+  "workspace": {
+    "id": "your-project",
+    "name": "Your Project",
+    "path": "C:\\Your\\Project"
+  },
   "workspaces": [
     {
       "id": "your-project",

@@ -19,7 +19,9 @@ registry ID is generated once and then retained across name changes and
 restarts. Selecting or removing a registry entry never edits or deletes the
 workspace directory or `config.production.json`; the launcher passes a
 temporary effective config to the existing production startup script when
-needed.
+needed. That config carries the active registry entry as `workspace.id`,
+`workspace.name`, and `workspace.path`, alongside the compatible `workspaces`
+array.
 
 Run the launcher-only configuration check with:
 

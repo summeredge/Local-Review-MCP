@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
-import type { WorkspaceRegistryEntry } from "../workspace/types.js";
+import { validateWorkspaceIdentity } from "../workspace/identity.js";
+import type { WorkspaceIdentity, WorkspaceRegistryEntry } from "../workspace/types.js";
 
 export const DEFAULT_HOST = "127.0.0.1" as const;
 export const DEFAULT_PORT = 12080;
@@ -36,6 +37,7 @@ export interface ResolvedSettings {
   host: typeof DEFAULT_HOST;
   port: number;
   workspace: string;
+  workspaceIdentity?: WorkspaceIdentity;
   workspaces?: readonly WorkspaceRegistryEntry[];
   auth: AuthSettings;
   remote: RemoteSettings;
@@ -80,7 +82,9 @@ export function parseWorkspace(value: unknown): string {
   return value;
 }
 
-const WORKSPACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+export function parseWorkspaceIdentity(value: unknown): WorkspaceIdentity {
+  return validateWorkspaceIdentity(value);
+}
 
 export function parseWorkspaces(value: unknown): WorkspaceRegistryEntry[] | undefined {
   if (value === undefined) return undefined;
@@ -90,18 +94,15 @@ export function parseWorkspaces(value: unknown): WorkspaceRegistryEntry[] | unde
 
   const ids = new Set<string>();
   return value.map((entry, index) => {
-    if (!isRecord(entry)
-      || typeof entry.id !== "string"
-      || !WORKSPACE_ID_PATTERN.test(entry.id)
-      || typeof entry.name !== "string"
-      || entry.name.trim() === ""
-      || typeof entry.path !== "string"
-      || entry.path.trim() === "") {
+    let identity: WorkspaceIdentity;
+    try {
+      identity = parseWorkspaceIdentity(entry);
+    } catch {
       throw new Error(`workspaces[${index}] must have a valid id, name, and path`);
     }
-    if (ids.has(entry.id)) throw new Error("workspaces must not contain duplicate ids");
-    ids.add(entry.id);
-    return { id: entry.id, name: entry.name.trim(), path: entry.path };
+    if (ids.has(identity.id)) throw new Error("workspaces must not contain duplicate ids");
+    ids.add(identity.id);
+    return identity;
   });
 }
 
@@ -236,9 +237,14 @@ export function resolveSettings(options: {
     : options.configPort !== undefined
       ? options.configPort
       : DEFAULT_PORT;
+  const workspaceIdentity = options.cliWorkspace === undefined
+    && options.configWorkspace !== undefined
+    && isRecord(options.configWorkspace)
+    ? parseWorkspaceIdentity(options.configWorkspace)
+    : undefined;
   const workspace = options.cliWorkspace !== undefined
     ? options.cliWorkspace
-    : options.configWorkspace;
+    : workspaceIdentity?.path ?? options.configWorkspace;
   const workspaces = parseWorkspaces(options.configWorkspaces);
   const resolvedPort = parsePort(port);
   const resolvedWorkspace = workspace === undefined
@@ -304,6 +310,7 @@ export function resolveSettings(options: {
     host: DEFAULT_HOST,
     port: resolvedPort,
     workspace: resolvedWorkspace,
+    ...(workspaceIdentity === undefined ? {} : { workspaceIdentity }),
     ...(workspaces === undefined ? {} : { workspaces }),
     auth: { token: parseToken(tokenValue) },
     remote: {

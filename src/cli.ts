@@ -5,6 +5,7 @@ import { registeredMcpToolsMessage } from "./mcp/server.js";
 import { createStartupManager } from "./supervisor/startup.js";
 import { createSupervisor } from "./supervisor/supervisor.js";
 import { WindowsTrayApp } from "./supervisor/tray.js";
+import { WorkspaceManager } from "./workspace/manager.js";
 
 function printErrorDetails(error: unknown, warning = false): void {
   const log = warning ? console.warn : console.error;
@@ -20,13 +21,25 @@ function printErrorDetails(error: unknown, warning = false): void {
 try {
   const argv = process.argv.slice(2);
   if (argv[0] === "diagnose-review-context") {
-    if (argv.length !== 1) throw new Error("diagnose-review-context does not accept arguments");
-    console.log(JSON.stringify(await generateReviewContextExample(), null, 2));
+    const diagnosticArgs = argv.slice(1);
+    const diagnosticCli = parseCliArgs(diagnosticArgs);
+    const diagnosticSettings = diagnosticCli.configPath === undefined
+      ? undefined
+      : await loadSettings(diagnosticArgs);
+    const identity = diagnosticSettings?.workspaceIdentity
+      ?? diagnosticSettings?.workspaces?.find((entry) => entry.path === diagnosticSettings.workspace)
+      ?? (diagnosticSettings === undefined
+        ? undefined
+        : new WorkspaceManager(diagnosticSettings.workspace).identity);
+    console.log(JSON.stringify(await generateReviewContextExample(identity), null, 2));
   } else {
     const cli = parseCliArgs(argv);
     const settings = await loadSettings(argv);
     if (settings.supervisor?.enabled && !cli.runtimeOnly) {
-      const supervisor = createSupervisor(settings, { runtimeScript: process.argv[1] });
+      const supervisor = createSupervisor(settings, {
+        runtimeScript: process.argv[1],
+        runtimeConfigPath: cli.configPath,
+      });
       const tray = new WindowsTrayApp(supervisor, {
         startupManager: createStartupManager(settings, {
           configPath: cli.configPath,
@@ -38,7 +51,15 @@ try {
         console.warn("Windows tray failed to start; continuing without tray");
         printErrorDetails(error, true);
       });
-      console.log(`Local Review MCP supervisor started\nStatus: ${supervisor.state}\n${registeredMcpToolsMessage()}`);
+      const workspace = settings.workspaceIdentity
+        ?? settings.workspaces?.find((entry) => entry.path === settings.workspace);
+      console.log([
+        "Local Review MCP supervisor started",
+        `Status: ${supervisor.state}`,
+        `Workspace ID: ${workspace?.id ?? "unknown"}`,
+        `Workspace Name: ${workspace?.name ?? "unknown"}`,
+        registeredMcpToolsMessage(),
+      ].join("\n"));
       let closing = false;
       const close = (): void => {
         if (closing) return;

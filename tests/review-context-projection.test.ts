@@ -54,10 +54,14 @@ async function makeContexts(storageRoot: string, workspaceId = "workspace-a") {
 
 describe("ReviewContextService", () => {
   it("generates a self-contained diagnostic example", async () => {
-    const projection = await generateReviewContextExample();
+    const projection = await generateReviewContextExample({
+      id: "registered-workspace",
+      name: "Registered Workspace",
+      path: ".",
+    });
 
     expect(projection).toMatchObject({
-      workspace_id: "example-workspace",
+      workspace_id: "registered-workspace",
       task: { task_id: "example-task", status: "reviewing" },
       execution: { execution_id: "example-execution", status: "passed" },
       review_request: { review_request_id: "example-review" },

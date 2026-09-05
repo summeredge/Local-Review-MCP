@@ -41,7 +41,11 @@ then config file. A JSON config file can be provided with `--config <path>`:
 ```json
 {
   "port": 12080,
-  "workspace": "C:\\path\\to\\project",
+  "workspace": {
+    "id": "project",
+    "name": "Project",
+    "path": "C:\\path\\to\\project"
+  },
   "workspaces": [
     {
       "id": "project",
@@ -60,8 +64,9 @@ then config file. A JSON config file can be provided with `--config <path>`:
 ```
 
 `workspaces` is optional for legacy configurations. When present, its entries
-are the only workspaces that MCP can select; `workspace` remains the active
-workspace for the existing Launcher and for calls without `workspace_id`.
+are the only workspaces that MCP can select; the top-level `workspace` identity
+selects the active entry and is checked against the registry. A legacy string
+`workspace` remains supported for direct single-workspace startup.
 
 Set `supervisor.enabled` to `true` to run the MCP runtime under the Windows
 Supervisor. It checks `/health` at the configured interval, performs at most

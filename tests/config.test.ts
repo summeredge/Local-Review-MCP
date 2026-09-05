@@ -27,6 +27,23 @@ describe("settings", () => {
     expect(parseWorkspaces(workspaces)).toEqual(workspaces);
   });
 
+  it("preserves the runtime workspace identity from config", () => {
+    const identity = {
+      id: "launcher-id",
+      name: "Launcher Workspace",
+      path: "C:\\workspace",
+    };
+    expect(resolveSettings({
+      configWorkspace: identity,
+      configWorkspaces: [identity],
+      configToken: "token",
+    })).toMatchObject({
+      workspace: identity.path,
+      workspaceIdentity: identity,
+      workspaces: [identity],
+    });
+  });
+
   it("rejects malformed workspace registry entries", () => {
     expect(() => parseWorkspaces([])).toThrow("at least one workspace");
     expect(() => parseWorkspaces([{ id: "C:\\outside", name: "Outside", path: "C:\\outside" }]))

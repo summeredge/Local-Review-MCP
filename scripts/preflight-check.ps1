@@ -106,7 +106,19 @@ try {
     }
     Write-Host "Dependencies: node_modules found"
 
-    $workspace = Get-RequiredProperty $configDocument "workspace" "config"
+    $workspaceValue = Get-RequiredProperty $configDocument "workspace" "config"
+    if ($workspaceValue -is [string]) {
+        $workspace = $workspaceValue
+    } elseif ($null -ne $workspaceValue -and $workspaceValue -isnot [array]) {
+        $workspaceId = Get-RequiredProperty $workspaceValue "id" "config.workspace"
+        $workspaceName = Get-RequiredProperty $workspaceValue "name" "config.workspace"
+        $workspace = Get-RequiredProperty $workspaceValue "path" "config.workspace"
+        if ([string]::IsNullOrWhiteSpace([string]$workspaceId) -or [string]::IsNullOrWhiteSpace([string]$workspaceName)) {
+            throw "Production config field 'workspace' must contain a valid id, name, and path."
+        }
+    } else {
+        throw "Production config field 'workspace' must be a path or identity object."
+    }
     $auth = Get-RequiredProperty $configDocument "auth" "config"
     $remote = Get-RequiredProperty $configDocument "remote" "config"
     $supervisor = Get-RequiredProperty $configDocument "supervisor" "config"

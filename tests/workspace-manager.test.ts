@@ -34,14 +34,14 @@ function errorCode(action: () => unknown): WorkspaceErrorCode {
 }
 
 describe("WorkspaceManager", () => {
-  it("stores a canonical root and stable 12-character workspace ID", async () => {
+  it("stores a canonical root and stable legacy workspace identity", async () => {
     const root = await makeWorkspace();
     const first = new WorkspaceManager(root);
     const second = new WorkspaceManager(join(root, "."));
 
     expect(first.canonicalRoot).toBe(realpathSync.native(root));
     expect(first.root).toBe(first.canonicalRoot);
-    expect(first.workspaceId).toMatch(/^[0-9a-f]{12}$/u);
+    expect(first.workspaceId).toBe("legacy-workspace");
     expect(second.workspaceId).toBe(first.workspaceId);
   });
 

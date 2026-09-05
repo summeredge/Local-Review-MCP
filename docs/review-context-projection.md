@@ -100,8 +100,10 @@ removes the temporary directory:
 npm run diagnose:review-context
 ```
 
-It does not load runtime configuration, start the MCP server, or modify the
-configured application state.
+Without arguments it does not load runtime configuration, start the MCP
+server, or modify configured application state. To diagnose a concrete runtime
+identity, pass the same config file used by the runtime with `--config`; the
+projection then carries that registry identity.
 
 ## Boundary
 

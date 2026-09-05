@@ -1,12 +1,13 @@
-import { createHash } from "node:crypto";
 import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { AccessPolicy } from "./policy.js";
+import { validateWorkspaceIdentity } from "./identity.js";
 import {
   isContainedPath,
   normalizeRemotePath,
   WorkspacePathError,
 } from "./path.js";
+import type { WorkspaceIdentity } from "./types.js";
 
 export interface ResolvedWorkspacePath {
   readonly absolutePath: string;
@@ -29,13 +30,12 @@ function pathError(
   return new WorkspacePathError(code, message, relativePath);
 }
 
-function canonicalIdInput(canonicalRoot: string): string {
-  const normalized = canonicalRoot.replaceAll("\\", "/");
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
-
-function makeWorkspaceId(canonicalRoot: string): string {
-  return createHash("sha256").update(canonicalIdInput(canonicalRoot)).digest("hex").slice(0, 12);
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = left.replaceAll("\\", "/").replace(/\/+$/u, "");
+  const normalizedRight = right.replaceAll("\\", "/").replace(/\/+$/u, "");
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
 }
 
 function canonicalRelativePath(root: string, candidate: string): string {
@@ -110,11 +110,39 @@ function canonicalizeWorkspaceRoot(input: string): string {
 export class WorkspaceManager {
   public readonly canonicalRoot: string;
   public readonly workspaceId: string;
+  public readonly workspaceName: string;
+  public readonly identity: WorkspaceIdentity;
   public readonly policy: AccessPolicy;
 
-  public constructor(workspaceRoot: string) {
+  public constructor(workspaceRoot: string, identity?: WorkspaceIdentity) {
     this.canonicalRoot = canonicalizeWorkspaceRoot(workspaceRoot);
-    this.workspaceId = makeWorkspaceId(this.canonicalRoot);
+    const parsedIdentity = identity === undefined ? undefined : validateWorkspaceIdentity(identity);
+    if (parsedIdentity !== undefined) {
+      let identityRoot: string;
+      try {
+        identityRoot = realpathSync.native(resolve(parsedIdentity.path));
+      } catch {
+        throw new WorkspacePathError(
+          "WORKSPACE_IDENTITY_INVALID",
+          "Workspace identity path does not exist.",
+        );
+      }
+      if (!samePath(identityRoot, this.canonicalRoot)) {
+        throw new WorkspacePathError(
+          "WORKSPACE_IDENTITY_INVALID",
+          "Workspace identity path does not match the workspace root.",
+        );
+      }
+    }
+    this.identity = parsedIdentity === undefined
+      ? {
+        id: "legacy-workspace",
+        name: basename(this.canonicalRoot) || "workspace",
+        path: this.canonicalRoot,
+      }
+      : parsedIdentity;
+    this.workspaceId = this.identity.id;
+    this.workspaceName = this.identity.name;
     this.policy = new AccessPolicy(this.canonicalRoot);
   }
 
@@ -182,3 +210,5 @@ export {
   WorkspacePathError,
 } from "./path.js";
 export type { WorkspaceErrorCode } from "./path.js";
+export { validateWorkspaceIdentity } from "./identity.js";
+export type { WorkspaceIdentity } from "./types.js";

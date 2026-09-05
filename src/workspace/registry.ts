@@ -1,19 +1,17 @@
 import { realpathSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { resolve } from "node:path";
+import { validateWorkspaceIdentity } from "./identity.js";
 import { WorkspaceManager, WorkspacePathError } from "./manager.js";
-import type { WorkspaceRegistryEntry, WorkspaceSummary } from "./types.js";
+import type { WorkspaceIdentity, WorkspaceRegistryEntry, WorkspaceSummary } from "./types.js";
 
-const WORKSPACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
-
-export interface WorkspaceSelection {
-  readonly id: string;
-  readonly name: string;
+export interface WorkspaceSelection extends WorkspaceIdentity {
   readonly manager: WorkspaceManager;
 }
 
 export interface WorkspaceRegistryOptions {
   readonly activeWorkspaceId?: string;
   readonly activeWorkspacePath?: string;
+  readonly activeWorkspaceIdentity?: WorkspaceIdentity;
 }
 
 function registryInvalid(message = "Workspace registry is invalid."): WorkspacePathError {
@@ -50,23 +48,20 @@ export class WorkspaceRegistry {
     const roots = new Set<string>();
     const records: WorkspaceSelection[] = [];
     for (const entry of entries) {
-      if (typeof entry !== "object" || entry === null
-        || typeof entry.id !== "string"
-        || !WORKSPACE_ID_PATTERN.test(entry.id)
-        || typeof entry.name !== "string"
-        || entry.name.trim() === ""
-        || typeof entry.path !== "string"
-        || entry.path.trim() === "") {
+      let identity: WorkspaceIdentity;
+      try {
+        identity = validateWorkspaceIdentity(entry);
+      } catch {
         throw registryInvalid("Each workspace must have a valid id, name, and path.");
       }
-      if (ids.has(entry.id)) throw registryInvalid("Workspace registry contains duplicate ids.");
-      ids.add(entry.id);
+      if (ids.has(identity.id)) throw registryInvalid("Workspace registry contains duplicate ids.");
+      ids.add(identity.id);
 
-      const manager = new WorkspaceManager(entry.path);
+      const manager = new WorkspaceManager(identity.path, identity);
       const root = comparablePath(manager.canonicalRoot);
       if (roots.has(root)) throw registryInvalid("Workspace registry contains duplicate paths.");
       roots.add(root);
-      records.push({ id: entry.id, name: entry.name.trim(), manager });
+      records.push({ ...identity, manager });
     }
 
     this.records = records;
@@ -75,6 +70,18 @@ export class WorkspaceRegistry {
       ? { activeWorkspaceId: options }
       : options ?? {};
     let activeWorkspaceId = resolvedOptions.activeWorkspaceId;
+    const activeIdentity = resolvedOptions.activeWorkspaceIdentity === undefined
+      ? undefined
+      : validateWorkspaceIdentity(resolvedOptions.activeWorkspaceIdentity);
+    if (activeIdentity !== undefined) {
+      const selected = this.recordsById.get(activeIdentity.id);
+      if (selected === undefined
+        || selected.name !== activeIdentity.name
+        || canonicalPathForComparison(selected.path) !== canonicalPathForComparison(activeIdentity.path)) {
+        throw registryInvalid("The active workspace identity does not match the registry.");
+      }
+      activeWorkspaceId = activeIdentity.id;
+    }
     if (activeWorkspaceId !== undefined && !this.recordsById.has(activeWorkspaceId)) {
       throw registryInvalid("The active workspace is not registered.");
     }
@@ -90,11 +97,8 @@ export class WorkspaceRegistry {
   }
 
   public static fromManager(manager: WorkspaceManager): WorkspaceRegistry {
-    const name = basename(manager.canonicalRoot) || "workspace";
     return new WorkspaceRegistry([{
-      id: manager.workspaceId,
-      name,
-      path: manager.canonicalRoot,
+      ...manager.identity,
     }]);
   }
 
@@ -104,9 +108,7 @@ export class WorkspaceRegistry {
 
   public resolve(workspaceId?: string): WorkspaceSelection {
     const id = workspaceId === undefined ? this.activeWorkspaceId : workspaceId;
-    const selected = typeof id === "string" && WORKSPACE_ID_PATTERN.test(id)
-      ? this.recordsById.get(id)
-      : undefined;
+    const selected = typeof id === "string" ? this.recordsById.get(id) : undefined;
     if (selected === undefined) {
       throw new WorkspacePathError("UNKNOWN_WORKSPACE_ID", "Unknown workspace_id.");
     }

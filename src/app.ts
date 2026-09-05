@@ -18,9 +18,15 @@ export function createAppContext(
   settings: ResolvedSettings,
   environment: NodeJS.ProcessEnv = process.env,
 ): AppContext {
-  const registry = settings.workspaces === undefined
-    ? WorkspaceRegistry.fromManager(new WorkspaceManager(settings.workspace))
-    : new WorkspaceRegistry(settings.workspaces, { activeWorkspacePath: settings.workspace });
+  const registry = settings.workspaces !== undefined
+    ? new WorkspaceRegistry(settings.workspaces, settings.workspaceIdentity === undefined
+      ? { activeWorkspacePath: settings.workspace }
+      : { activeWorkspaceIdentity: settings.workspaceIdentity })
+    : settings.workspaceIdentity === undefined
+      ? WorkspaceRegistry.fromManager(new WorkspaceManager(settings.workspace))
+      : new WorkspaceRegistry([settings.workspaceIdentity], {
+        activeWorkspaceId: settings.workspaceIdentity.id,
+      });
   return {
     settings,
     tunnel: createTunnelManager(settings.remote, {
@@ -60,10 +66,15 @@ export async function startApp(
 }
 
 export function startupMessage(settings: ResolvedSettings, context?: McpRuntimeContext): string {
-  const workspace = context?.registry?.active.manager ?? context?.workspace;
+  const selection = context?.registry?.active;
+  const workspace = selection?.manager ?? context?.workspace;
+  const workspaceId = selection?.id ?? workspace?.workspaceId ?? "unknown";
+  const workspaceName = selection?.name ?? workspace?.workspaceName ?? basename(settings.workspace);
   return [
     "Local Review MCP started",
     `Endpoint: ${endpoint(settings)}`,
+    `Workspace ID: ${workspaceId}`,
+    `Workspace Name: ${workspaceName}`,
     `Workspace: ${workspace === undefined ? basename(settings.workspace) : basename(workspace.canonicalRoot)}`,
     `Tools: ${REGISTERED_TOOL_NAMES.length}`,
   ].join("\n");

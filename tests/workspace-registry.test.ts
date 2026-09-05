@@ -140,4 +140,31 @@ describe("Workspace Registry", () => {
     expect(() => readded.resolve("stable-workspace")).toThrow();
     expect(readded.resolve("new-workspace").id).toBe("new-workspace");
   });
+
+  it("uses the registry identity instead of deriving an id from the path", async () => {
+    const workspace = await makeWorkspace("explicit-identity", "identity\n");
+    const registry = new WorkspaceRegistry([{
+      id: "launcher-id",
+      name: "Launcher Workspace",
+      path: workspace,
+    }]);
+
+    expect(registry.active.manager.workspaceId).toBe("launcher-id");
+    expect(registry.active.manager.identity).toEqual({
+      id: "launcher-id",
+      name: "Launcher Workspace",
+      path: workspace,
+    });
+    expect(() => new WorkspaceRegistry([{
+      id: "launcher-id",
+      name: "Launcher Workspace",
+      path: workspace,
+    }], {
+      activeWorkspaceIdentity: {
+        id: "launcher-id",
+        name: "Other Workspace",
+        path: workspace,
+      },
+    })).toThrow("active workspace identity");
+  });
 });

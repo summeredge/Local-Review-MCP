@@ -98,14 +98,15 @@ class ConfigManager:
             except LauncherConfigError:
                 production_values = {}
         if not workspace.strip():
-            source_workspace = production_values.get("workspace", "")
-            if isinstance(source_workspace, str):
-                workspace = source_workspace
+            workspace = self._workspace_path(production_values.get("workspace", ""))
 
         registry_value = values.get("workspaces", self._MISSING)
         migrated = False
         if registry_value is self._MISSING:
             records = self._legacy_records(production_values.get("workspaces"), production_path)
+            identity_record = self._workspace_identity(production_values.get("workspace"))
+            if not records and identity_record is not None:
+                records.append(identity_record)
             if workspace.strip() and not self._find_record(records, workspace):
                 records.append(self._new_record(workspace, records))
             active = self._find_record(records, workspace) or (records[0] if records else None)
@@ -230,7 +231,23 @@ class ConfigManager:
         source = _read_json_object(source_path, "Production configuration")
         runtime = dict(source)
         runtime["workspace"] = workspace
-        if saved.workspaces and self.path.exists():
+        has_registry = (
+            bool(saved.workspaces)
+            and (self.path.exists() or isinstance(source.get("workspaces"), list)
+                 or isinstance(source.get("workspace"), dict))
+        )
+        if has_registry:
+            active = next(
+                (record for record in saved.workspaces if record.id == saved.active_workspace_id),
+                None,
+            ) or self._find_record(saved.workspaces, workspace)
+            if active is None:
+                raise LauncherConfigError("Active workspace is not registered")
+            runtime["workspace"] = {
+                "id": active.id,
+                "name": active.name,
+                "path": active.path,
+            }
             runtime["workspaces"] = self._records_json(saved.workspaces)
         elif not workspace and "workspaces" in runtime:
             runtime.pop("workspaces")
@@ -396,6 +413,32 @@ class ConfigManager:
         return workspace.name or "Workspace"
 
     @staticmethod
+    def _workspace_path(value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict) and isinstance(value.get("path"), str):
+            return value["path"]
+        return ""
+
+    @classmethod
+    def _workspace_identity(cls, value: object) -> WorkspaceRecord | None:
+        if not isinstance(value, dict):
+            return None
+        workspace_id = value.get("id")
+        name = value.get("name")
+        workspace_path = value.get("path")
+        if (
+            not isinstance(workspace_id, str)
+            or not cls._WORKSPACE_ID_PATTERN.fullmatch(workspace_id)
+            or not isinstance(name, str)
+            or not name.strip()
+            or not isinstance(workspace_path, str)
+            or not workspace_path.strip()
+        ):
+            return None
+        return WorkspaceRecord(workspace_id, name.strip(), workspace_path)
+
+    @staticmethod
     def _records_json(records: tuple[WorkspaceRecord, ...] | list[WorkspaceRecord]) -> list[dict[str, str]]:
         return [{"id": record.id, "name": record.name, "path": record.path} for record in records]
 
@@ -452,10 +495,16 @@ class ConfigManager:
                 return None
             return value
 
-        workspace = document.get("workspace", missing)
-        if workspace is missing:
+        workspace_value = document.get("workspace", missing)
+        if workspace_value is missing:
             errors.append("workspace is missing")
-        elif not isinstance(workspace, str) or not workspace.strip():
+            workspace = ""
+        else:
+            identity = self._workspace_identity(workspace_value)
+            workspace = identity.path if identity is not None else self._workspace_path(workspace_value)
+            if isinstance(workspace_value, dict) and identity is None:
+                errors.append("workspace identity must have a valid id, name, and path")
+        if not workspace:
             errors.append("workspace must be a non-empty path")
         else:
             workspace_path = Path(workspace)
