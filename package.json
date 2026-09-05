@@ -12,6 +12,7 @@
     "test": "vitest run",
     "diagnose:conversation-routing": "npm run build && node dist/src/cli.js diagnose-conversation-routing",
     "diagnose:review-delivery": "npm run build && node dist/src/cli.js diagnose-review-delivery",
+    "diagnose:review-delivery-browser": "npm run build && node dist/src/cli.js diagnose-review-delivery-browser",
     "diagnose:browser-router": "npm run build && node dist/src/cli.js diagnose-browser-router",
     "diagnose:browser-worker": "npm run build && node dist/src/cli.js diagnose-browser-worker",
     "diagnose:review-context": "npm run build && node dist/src/cli.js diagnose-review-context",

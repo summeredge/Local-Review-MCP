@@ -7,7 +7,7 @@ export interface ReviewDeliveryRequest {
   readonly review_request_id: string;
   readonly routing_id: string;
   readonly conversation_id: string;
-  readonly message: string;
+  readonly message?: string;
   readonly execution_id?: string;
 }
 

@@ -2,9 +2,9 @@
 
 ## Scope
 
-Task22 adds the internal boundary between a persisted Review Delivery and a
-future browser implementation. It does not open a browser, contact ChatGPT,
-access the network, or implement Playwright, Selenium, or CDP behavior.
+Task23.4 connects a persisted Review Delivery to the independent Browser
+Worker. It navigates to a Conversation only; it does not send Review content,
+interact with page elements, or implement the ChatGPT Interaction Layer.
 
 ```text
 Codex
@@ -25,13 +25,16 @@ Review Delivery
 Browser Router
   |
   v
-Review Delivery Adapter
+Browser Worker Delivery Adapter
   |
   v
-Browser Driver
+Browser Worker Client
   |
   v
-ChatGPT Conversation
+Conversation Navigator
+  |
+  v
+ChatGPT Conversation Navigation
 ```
 
 The responsibilities stay separate:
@@ -42,7 +45,9 @@ The responsibilities stay separate:
 | Review Delivery | Stores the state and attempt count for one logical delivery. |
 | Review Delivery Adapter | Abstracts delivery to an external target. |
 | Browser Router | Resolves routing and delivery, builds the request, and writes delivery state. |
-| Browser Driver | Future boundary for opening a Conversation and sending text. |
+| Browser Worker Delivery Adapter | Maps `NavigationResult` to Delivery success or failure. |
+| Browser Worker Client | Sends `POST /conversation/navigate` to the configured Worker URL. |
+| Conversation Navigator | Runs inside Browser Worker and navigates to the Conversation URL. |
 | Review Completion | Independent signal that ChatGPT actually finished the Review. |
 
 `Workspace` is not a Conversation. Conversation identity comes from the
@@ -69,7 +74,7 @@ interface ReviewDeliveryRequest {
   review_request_id: string;
   routing_id: string;
   conversation_id: string;
-  message: string;
+  message?: string;
   execution_id?: string;
 }
 
@@ -86,10 +91,11 @@ interface ReviewDeliveryAdapter {
 }
 ```
 
-The adapter knows only the contract. It has no dependency on a browser
-library. `BrowserDeliveryAdapter` is the current implementation: it wraps a
-`BrowserDeliveryDriver`, validates the Conversation target, and maps driver
-failures to the adapter result.
+The adapter knows only the contract and does not depend on Playwright.
+`BrowserWorkerDeliveryAdapter` calls `BrowserWorkerClient.navigate()` with
+`request.conversation_id`. The client request contains only
+`{ conversationId }`; the optional message is reserved for the later
+ChatGPT Interaction Layer.
 
 ## Browser Router
 
@@ -108,7 +114,8 @@ It performs this sequence:
    validate its task, request, routing, and Conversation fields.
 4. Return a `delivered` record immediately without calling the adapter again.
 5. For `pending` or `failed`, call `beginDeliveryAttempt()`.
-6. Build a small Review message and call the injected adapter.
+6. Call the injected adapter with the routed identity fields; the current
+   adapter uses only `conversation_id`.
 7. Call `markDelivered()` or `markFailed()` on the existing service.
 
 The Router never creates or rewrites `workspace_id`, `routing_id`, or
@@ -127,56 +134,48 @@ https://chatgpt.com/c/<conversation_id>
 Empty values, full URLs, external hosts, slashes, dots, query strings, and
 path traversal values are rejected. Calling the helper does not open the URL.
 
-The Router and Adapter validate the ID before invoking the Driver. The Driver
-still receives the logical `conversation_id`; the future Driver can decide how
-to use the validated target.
+The Router validates the ID before invoking the Adapter. The Browser Worker
+Client sends the logical `conversationId` to the Worker; only the Worker-side
+Conversation Navigator constructs the ChatGPT URL and navigates to it.
 
-## Browser Driver boundary
+## Browser Worker Client
 
-`src/delivery/browser-delivery-driver.ts` defines the replaceable boundary:
+`src/browser-worker-client/browser-worker-client.ts` is the LRM-to-Worker
+communication boundary:
 
 ```typescript
-interface BrowserDeliveryDriver {
-  openConversation(conversationId: string): Promise<void>;
-  sendMessage(
-    conversationId: string,
-    message: string,
-  ): Promise<BrowserDeliveryResult>;
+interface BrowserWorkerClientConfig {
+  baseUrl: string;
+  timeoutMs?: number;
 }
+
+client.navigate(conversationId)
+  -> POST /conversation/navigate { conversationId }
+  -> NavigationResult
 ```
 
-`MockBrowserDeliveryDriver` is used by tests and diagnostics. It records the
-Conversation IDs and messages it receives, but performs no browser or network
-operation. The real browser Driver is deferred to Task23.
+The default base URL is `http://127.0.0.1:12081`. Transport, HTTP, timeout,
+and invalid-response failures are returned as `BrowserWorkerClientError` and
+then mapped by `BrowserWorkerDeliveryAdapter` to a failed Delivery.
 
-The defined driver codes and retry policy are:
+The navigation failure codes and retry policy are:
 
 | Code | Retryable |
 | --- | --- |
 | `BROWSER_NOT_AVAILABLE` | yes |
 | `DELIVERY_TIMEOUT` | yes |
-| `SEND_FAILED` | yes |
-| `CONVERSATION_NOT_FOUND` | no |
-| `AUTH_REQUIRED` | no |
+| `BROWSER_NAVIGATION_FAILED` | yes |
+| `BROWSER_WORKER_HTTP_ERROR` | HTTP 5xx only |
+| `BROWSER_WORKER_INVALID_RESPONSE` | no |
+| `BROWSER_WORKER_CONFIG_ERROR` | no |
 
 The Router does not run a retry loop or scheduler. A retryable failed Delivery
 can be attempted later through the same Router. A non-retryable failure is
 recorded and is not retried automatically.
 
-## Review message
-
-`src/delivery/review-message.ts` owns the initial message. It includes the
-`workspace_id`, `task_id`, and `review_request_id`, with `execution_id` and
-`routing_id` when available:
-
-```text
-请 Review 当前任务。请使用 Local Review MCP 读取
-workspace_id=... task_id=... review_request_id=...
-对应 Workspace，并基于当前 Review Context、Git 状态和未提交 diff 检查本次修改。
-```
-
-The message contains identifiers only. It does not contain a diff, source
-files, or an execution log; ChatGPT reads those through LRM MCP as needed.
+Review content construction and sending are deferred to Task23.5. The current
+request may retain the optional `message` field for that later adapter, but it
+is not sent to the Browser Worker.
 
 ## State writeback and completion
 
@@ -187,33 +186,33 @@ pending -> delivering -> delivered
                     \-> failed -> delivering
 ```
 
-It never duplicates the state machine. A successful adapter result writes
-`ReviewDelivery.status = "delivered"` and synchronizes a pending
-`ReviewRequest.status` to `"requested"`. It never sets the Review Request to
-`"completed"`.
+It never duplicates the state machine. A `NAVIGATED` adapter result writes
+`ReviewDelivery.status = "delivered"`; a `FAILED` result writes
+`ReviewDelivery.status = "failed"` and records the error. It does not update
+`ReviewRequest.status`, because navigation is not Review submission.
 
 ```text
-message successfully delivered
+Browser Worker returned NAVIGATED
         |
         v
 ReviewDelivery.status = delivered
-ReviewRequest.status = requested
         |
         v
-independent Review completion signal
+Task23.5 Review interaction/completion signal
         |
         v
 ReviewRequest.status = completed
 ```
 
-The page being visible, a message being present in an input, or an HTTP
-success response is not a Review completion signal.
+Conversation navigation or an HTTP success response is not Review submission
+or completion.
 
 ## Idempotency and identity
 
 The existing `routing_id` association remains the logical Delivery key. A
 second Router call for a delivered record returns that record without calling
-the Adapter or Driver. `conversation_id` is not used as an idempotency key.
+the Adapter or Browser Worker. `conversation_id` is not used as an idempotency
+key.
 
 Every Router call validates the complete chain:
 
@@ -245,17 +244,17 @@ browser automation.
 ## Diagnostic command
 
 ```powershell
-npm run diagnose:browser-router
+npm run diagnose:review-delivery-browser
 ```
 
 The command builds a temporary Task -> Execution -> Review Request -> Routing
--> Delivery chain, invokes `BrowserRouter` with
-`MockBrowserDeliveryDriver`, prints the final status, and removes the
-temporary directory in `finally`:
+-> Delivery chain, invokes `BrowserRouter` with a local mock Browser Worker,
+prints the final status, and removes the temporary directory in `finally`:
 
 ```json
 {
   "conversation_id": "example-conversation",
+  "browser_worker_status": "NAVIGATED",
   "delivery_status": "delivered",
   "attempt_count": 1
 }

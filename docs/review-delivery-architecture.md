@@ -2,11 +2,11 @@
 
 ## Scope
 
-Review Delivery records the internal attempt to deliver one Review Request to
-the Conversation selected by Conversation Routing. It provides the contract
-and persistence boundary for a future Browser Router or ChatGPT Delivery
-Adapter. It does not open a browser, call ChatGPT, send a message, or decide
-whether the review itself is complete.
+Review Delivery records the internal attempt to navigate to the Conversation
+selected by Conversation Routing. The Browser Router invokes a delivery
+adapter, which calls the independent Browser Worker over HTTP. This task does
+not send Review content, interact with page elements, or decide whether the
+review itself is complete.
 
 ```text
 Codex completes a task
@@ -24,10 +24,16 @@ Conversation Routing
 Review Delivery
         |
         v
-future Delivery Adapter
+Browser Worker Delivery Adapter
         |
         v
-target ChatGPT Conversation
+Browser Worker Client
+        |
+        v
+Conversation Navigator
+        |
+        v
+ChatGPT Conversation Navigation
 ```
 
 The boundaries are deliberately separate:
@@ -36,8 +42,9 @@ The boundaries are deliberately separate:
 * **Conversation Routing** says which Conversation should receive that request.
 * **Review Delivery** records whether that logical delivery is pending, in
   progress, delivered, or failed, including its attempts and last error.
-* **Delivery Adapter** is the future implementation that performs the actual
-  external delivery.
+* **Delivery Adapter** maps the Browser Worker navigation result to the
+  persisted Delivery state.
+* **Browser Worker Client** is the only LRM-to-Worker HTTP boundary.
 
 `Workspace` is not a `Conversation`. The relationship is:
 
@@ -80,11 +87,12 @@ interface ReviewDeliveryAdapter {
 ```
 
 `ReviewDeliveryRequest` carries the delivery id plus
-`conversation_id`, `workspace_id`, `task_id`, `review_request_id`,
-`routing_id`, and the small Review message. `ReviewDeliveryResult` distinguishes
-successful delivery from a failed result and marks the failure as retryable or
-non-retryable. The Router and browser-independent Adapter boundary are
-documented in `docs/review-delivery-adapter.md`.
+`conversation_id`, `workspace_id`, `task_id`, `review_request_id`, and
+`routing_id`, plus an optional future Review message. The current Browser
+Worker adapter sends only `conversationId` to `/conversation/navigate`.
+`ReviewDeliveryResult` distinguishes successful navigation from a failed result
+and marks the failure as retryable or non-retryable. The Router and adapter
+boundary are documented in `docs/review-delivery-adapter.md`.
 
 ## Lifecycle and retry semantics
 
@@ -110,8 +118,7 @@ returns the existing record without sending anything again.
 
 Delivery success means only:
 
-> The Review Request was successfully handed to the target Conversation by a
-> future adapter.
+> The Browser Worker successfully navigated to the target Conversation.
 
 It does **not** mean that ChatGPT has finished reviewing the request.
 
@@ -185,19 +192,17 @@ Request, Routing, or Review Projection APIs.
 
 ## Review completion boundary
 
-The future flow is:
+The current navigation flow is:
 
 ```text
-Delivery Adapter
+Browser Worker returned NAVIGATED
         |
         v
-message successfully delivered
-        |
-        v
-ReviewRequest.status = requested
+ReviewDelivery.status = delivered
 ```
 
-Only a separate completion signal may represent the actual review result:
+Only a later Review interaction/completion signal may represent the actual
+review result:
 
 ```text
 ChatGPT review actually completes
@@ -209,9 +214,8 @@ independent completion signal/listener
 ReviewRequest.status = completed
 ```
 
-Page visibility, text appearing in an input box, or an HTTP success response
-must not be treated as review completion. This task defines that boundary but
-does not implement the completion listener or update Review Request status.
+Page navigation or an HTTP success response must not be treated as Review
+submission or completion. This task does not update Review Request status.
 
 ## C2C reference review
 
@@ -237,16 +241,16 @@ Workspace-to-Conversation long-term binding.
 
 ## Diagnostic command
 
-The diagnostic command builds a temporary chain:
+The Browser Worker integration diagnostic builds a temporary chain:
 
 ```text
 Task -> Execution -> Review Request -> Conversation Routing -> Review Delivery
 ```
 
-and prints the final `delivered` JSON record:
+and uses a local mock Browser Worker to print the final `delivered` JSON record:
 
 ```powershell
-npm run diagnose:review-delivery
+npm run diagnose:review-delivery-browser
 ```
 
 The command uses a temporary storage root and removes it in a `finally` block.

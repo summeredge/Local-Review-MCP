@@ -7,9 +7,9 @@ or manage the worker lifecycle.
 ```text
 MCP Runtime (data layer)
         |
-Review Delivery Adapter (future integration)
+Review Delivery Adapter
         |
-Browser Worker Client (future integration)
+Browser Worker Client
         |
 localhost HTTP API
         |
@@ -64,15 +64,18 @@ persistent context is created, and the current authentication status:
 }
 ```
 
-Other business endpoints, including delivery, are not implemented.
+The `POST /conversation/navigate` endpoint accepts `{ conversationId }` and
+returns the `NavigationResult` from `ConversationNavigator`. Review Delivery
+uses this endpoint through `BrowserWorkerClient`; it does not send Review
+content.
 
 The worker launches headless Chromium through
-`chromium.launchPersistentContext()` but does not open a business page. The
-profile directory is owned by the Browser Worker and may contain browser
-managed state; this task does not inspect, import, or process cookies, tokens,
-or login information. An explicit stop closes the persistent context, then its
-browser, then the HTTP server. A failed start records `last_error` and is not
-automatically retried.
+`chromium.launchPersistentContext()` but does not open a Conversation until a
+navigation request arrives. The profile directory is owned by the Browser
+Worker and may contain browser managed state; this task does not inspect,
+import, or process cookies, tokens, or login information. An explicit stop
+closes the persistent context, then its browser, then the HTTP server. A failed
+start records `last_error` and is not automatically retried.
 
 ## Diagnostic command
 
@@ -105,8 +108,7 @@ C2C Session, Agent, Conversation, Project, or state-machine concepts.
 
 ## Deliberate exclusions
 
-This task does not implement ChatGPT login, business-page navigation,
-Conversation operations, message sending, Review Delivery integration, or any
-Session concept. `authStatus` is currently always `UNKNOWN`; login and
-authentication detection belong to later tasks and must not be inferred from a
-healthy worker response.
+This task does not implement ChatGPT login, Conversation content operations,
+message sending, DOM automation, or any Session concept. `authStatus` is
+currently always `UNKNOWN`; login and authentication detection belong to later
+tasks and must not be inferred from a healthy worker response.

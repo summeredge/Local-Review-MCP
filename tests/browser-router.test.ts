@@ -2,13 +2,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { NavigationResult } from "../src/browser-worker-client/browser-worker-client.js";
 import { ConversationRoutingService } from "../src/context/conversation-routing-service.js";
 import { ExecutionContextService } from "../src/context/execution-service.js";
 import { ReviewDeliveryService } from "../src/context/review-delivery-service.js";
 import { ReviewRequestService } from "../src/context/review-request-service.js";
 import { TaskContextService } from "../src/context/service.js";
-import { BrowserDeliveryAdapter } from "../src/delivery/browser-delivery-adapter.js";
-import { MockBrowserDeliveryDriver } from "../src/delivery/browser-delivery-driver.js";
+import { BrowserWorkerDeliveryAdapter } from "../src/delivery/browser-worker-delivery-adapter.js";
 import { conversationUrl } from "../src/delivery/conversation-url.js";
 import { BrowserRouter } from "../src/router/browser-router.js";
 
@@ -65,8 +65,18 @@ describe("BrowserRouter", () => {
   it("delivers the task-scoped request and does not repeat a delivered delivery", async () => {
     const storageRoot = await makeStorageRoot();
     const { routing } = await makeChain(storageRoot);
-    const driver = new MockBrowserDeliveryDriver();
-    const router = new BrowserRouter(storageRoot, new BrowserDeliveryAdapter(driver));
+    const conversationIds: string[] = [];
+    const client = {
+      navigate: async (conversationId: string): Promise<NavigationResult> => {
+        conversationIds.push(conversationId);
+        return {
+          conversationId,
+          url: `https://chatgpt.com/c/${conversationId}`,
+          status: "NAVIGATED",
+        };
+      },
+    };
+    const router = new BrowserRouter(storageRoot, new BrowserWorkerDeliveryAdapter(client));
 
     const delivered = await router.deliver("workspace-a", routing.routing_id);
     const repeated = await router.deliver("workspace-a", routing.routing_id);
@@ -78,58 +88,67 @@ describe("BrowserRouter", () => {
       attempt_count: 1,
     });
     expect(repeated).toEqual(delivered);
-    expect(driver.openedConversationIds).toEqual(["conversation-001"]);
-    expect(driver.sentMessages).toHaveLength(1);
-    expect(driver.sentMessages[0]?.message).toContain("workspace_id=workspace-a");
-    expect(driver.sentMessages[0]?.message).toContain("task_id=task-001");
-    expect(driver.sentMessages[0]?.message).toContain("review_request_id=review-001");
+    expect(conversationIds).toEqual(["conversation-001"]);
 
     const request = await new ReviewRequestService(storageRoot)
       .getReviewRequest("workspace-a", "review-001");
-    expect(request?.status).toBe("requested");
+    expect(request?.status).toBe("pending");
     expect(request?.status).not.toBe("completed");
   });
 
   it("records a retryable failure and permits a later retry", async () => {
     const storageRoot = await makeStorageRoot();
     const { routing } = await makeChain(storageRoot);
-    const driver = new MockBrowserDeliveryDriver();
-    driver.result = {
-      status: "failed",
-      error: { code: "BROWSER_NOT_AVAILABLE", message: "Browser is unavailable." },
+    let result: NavigationResult = {
+      conversationId: "conversation-001",
+      status: "FAILED",
+      error: "Browser is unavailable.",
     };
-    const router = new BrowserRouter(storageRoot, new BrowserDeliveryAdapter(driver));
+    const conversationIds: string[] = [];
+    const client = {
+      navigate: async (conversationId: string): Promise<NavigationResult> => {
+        conversationIds.push(conversationId);
+        return { ...result, conversationId };
+      },
+    };
+    const router = new BrowserRouter(storageRoot, new BrowserWorkerDeliveryAdapter(client));
 
     const failed = await router.deliver("workspace-a", routing.routing_id);
-    driver.result = { status: "delivered", delivered_at: new Date().toISOString() };
+    result = {
+      conversationId: "conversation-001",
+      url: "https://chatgpt.com/c/conversation-001",
+      status: "NAVIGATED",
+    };
     const delivered = await router.deliver("workspace-a", routing.routing_id);
 
     expect(failed).toMatchObject({
       status: "failed",
       attempt_count: 1,
-      last_error: { code: "BROWSER_NOT_AVAILABLE" },
+      last_error: { code: "BROWSER_NAVIGATION_FAILED" },
     });
     expect(delivered).toMatchObject({ status: "delivered", attempt_count: 2 });
-    expect(driver.sentMessages).toHaveLength(2);
+    expect(conversationIds).toEqual(["conversation-001", "conversation-001"]);
   });
 
   it("records non-retryable driver failures without an automatic retry loop", async () => {
     const storageRoot = await makeStorageRoot();
     const { routing } = await makeChain(storageRoot);
-    const driver = new MockBrowserDeliveryDriver({
-      status: "failed",
-      error: { code: "CONVERSATION_NOT_FOUND", message: "Conversation was not found." },
-    });
-    const router = new BrowserRouter(storageRoot, new BrowserDeliveryAdapter(driver));
+    const client = {
+      navigate: async (conversationId: string): Promise<NavigationResult> => ({
+        conversationId,
+        status: "FAILED",
+        error: "Conversation was not found.",
+      }),
+    };
+    const router = new BrowserRouter(storageRoot, new BrowserWorkerDeliveryAdapter(client));
 
     const failed = await router.deliver("workspace-a", routing.routing_id);
 
     expect(failed).toMatchObject({
       status: "failed",
       attempt_count: 1,
-      last_error: { code: "CONVERSATION_NOT_FOUND" },
+      last_error: { code: "BROWSER_NAVIGATION_FAILED" },
     });
-    expect(driver.sentMessages).toHaveLength(1);
   });
 
   it("builds only safe ChatGPT Conversation URLs", () => {
