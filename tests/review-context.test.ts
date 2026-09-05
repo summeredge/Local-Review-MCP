@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { createAppContext } from "../src/app.js";
 import { createMcpServer } from "../src/mcp/server.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
 
@@ -65,18 +66,67 @@ async function callTool(
   return client.callTool({ name, arguments: arguments_ });
 }
 
-function resultJson(result: Awaited<ReturnType<Client["callTool"]>>): Record<string, unknown> {
-  const content = result.content;
+function toolText(result: unknown): string {
+  const content = (result as { content?: unknown }).content;
   if (!Array.isArray(content) || typeof content[0] !== "object" || content[0] === null
     || typeof (content[0] as { text?: unknown }).text !== "string") {
     throw new Error("tool did not return text content");
   }
-  const parsed = JSON.parse((content[0] as { text: string }).text) as Record<string, unknown>;
+  return (content[0] as { text: string }).text;
+}
+
+function resultJson(result: Awaited<ReturnType<Client["callTool"]>>): Record<string, unknown> {
+  const parsed = JSON.parse(toolText(result)) as Record<string, unknown>;
   expect(result.structuredContent).toEqual(parsed);
   return parsed;
 }
 
 describe("Review context tools", () => {
+  it("uses the current runtime registry identity across workspace tools", async () => {
+    const workspace = await makeWorkspace("runtime-registry");
+    await initRepository(workspace, { "README.md": "runtime\n" });
+    const runtimeIdentity = {
+      id: "0ee5a4a43938",
+      name: "Local-Review-MCP",
+      path: workspace,
+    } as const;
+    const context = createAppContext({
+      host: "127.0.0.1",
+      port: 12080,
+      workspace,
+      workspaceIdentity: runtimeIdentity,
+      workspaces: [runtimeIdentity],
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "runtime-registry-test", version: "0.1.0" });
+    clients.push(client);
+    await Promise.all([
+      createMcpServer(context).connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    const listed = resultJson(await client.callTool({ name: "workspace_list", arguments: {} }));
+    const info = resultJson(await client.callTool({ name: "workspace_info", arguments: {} }));
+    const summary = resultJson(await client.callTool({ name: "review_summary", arguments: {} }));
+
+    expect(info.workspace_id).toBe(summary.workspace_id);
+    expect((listed.workspaces as Array<{ id: string }>)[0]?.id).toBe(summary.workspace_id);
+    expect(summary.workspace_id).toBe(runtimeIdentity.id);
+
+    const stale = await client.callTool({
+      name: "review_summary",
+      arguments: { workspace_id: "026e562c5692" },
+    });
+    expect(stale.isError).toBe(true);
+    expect(JSON.parse(toolText(stale))).toEqual({
+      error: "UNKNOWN_WORKSPACE_ID",
+      message: "Unknown workspace_id",
+    });
+  });
+
   it("returns workspace, branch, status, and diff summaries", async () => {
     const workspace = await makeWorkspace("summary");
     await initRepository(workspace, {

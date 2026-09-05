@@ -8,7 +8,7 @@ import { GitService } from "../git/service.js";
 import type { GitDiffResponse, GitStatusResponse } from "../git/types.js";
 import { validateWorkspaceIdentityConsistency } from "../workspace/identity.js";
 import { WorkspaceManager, WorkspacePathError } from "../workspace/manager.js";
-import { WorkspaceRegistry, type WorkspaceSelection } from "../workspace/registry.js";
+import type { WorkspaceRegistry, WorkspaceSelection } from "../workspace/registry.js";
 import { searchText } from "../workspace/search.js";
 import { containsNullByte } from "../workspace/text.js";
 import { structuredResponse } from "./respond.js";
@@ -36,7 +36,7 @@ import {
 
 export interface McpRuntimeContext {
   readonly workspace?: WorkspaceManager;
-  readonly registry?: WorkspaceRegistry;
+  readonly registry: WorkspaceRegistry;
 }
 
 export const V01_TOOL_NAMES = [
@@ -425,8 +425,7 @@ async function executionOutput(workspace: WorkspaceManager): Promise<ExecutionOu
 }
 
 export function createMcpServer(context: McpRuntimeContext): McpServer {
-  const registry = context.registry
-    ?? (context.workspace === undefined ? undefined : WorkspaceRegistry.fromManager(context.workspace));
+  const registry = context.registry;
   if (registry === undefined) throw new Error("Workspace registry is required.");
   if (context.workspace !== undefined) {
     validateWorkspaceIdentityConsistency(registry.active, context.workspace.identity);

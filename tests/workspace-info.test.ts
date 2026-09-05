@@ -6,6 +6,7 @@ import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMcpServer } from "../src/mcp/server.js";
 import { WorkspaceManager } from "../src/workspace/manager.js";
+import { WorkspaceRegistry } from "../src/workspace/registry.js";
 
 const clients: Client[] = [];
 const temporaryDirectories: string[] = [];
@@ -29,7 +30,7 @@ async function callWorkspaceInfo(workspace: string, arguments_: Record<string, u
   const client = new Client({ name: "workspace-info-test", version: "0.1.0" });
   clients.push(client);
   await Promise.all([
-    createMcpServer({ workspace: new WorkspaceManager(workspace) }).connect(serverTransport),
+    createMcpServer({ registry: WorkspaceRegistry.fromManager(new WorkspaceManager(workspace)) }).connect(serverTransport),
     client.connect(clientTransport),
   ]);
   return client.callTool({ name: "workspace_info", arguments: arguments_ });

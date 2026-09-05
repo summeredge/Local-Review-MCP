@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMcpServer } from "../src/mcp/server.js";
 import { WorkspaceManager } from "../src/workspace/manager.js";
+import { WorkspaceRegistry } from "../src/workspace/registry.js";
 import { EXPECTED_REGISTERED_TOOL_NAMES } from "./fixtures/v01-tools.js";
 
 const clients: Client[] = [];
@@ -21,7 +22,7 @@ describe("MCP tool registry", () => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-registry-"));
     temporaryDirectories.push(workspace);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const server = createMcpServer({ workspace: new WorkspaceManager(workspace) });
+    const server = createMcpServer({ registry: WorkspaceRegistry.fromManager(new WorkspaceManager(workspace)) });
     const client = new Client({ name: "registry-test", version: "0.1.0" });
     clients.push(client);
 

@@ -7,6 +7,7 @@ import { startApp } from "../src/app.js";
 import { createHttpServer, MAX_MCP_REQUEST_BYTES } from "../src/mcp/http.js";
 import type { ResolvedSettings } from "../src/config/settings.js";
 import type { WorkspaceManager } from "../src/workspace/manager.js";
+import { WorkspaceRegistry } from "../src/workspace/registry.js";
 
 const runningServers: Server[] = [];
 const temporaryDirectories: string[] = [];
@@ -103,6 +104,7 @@ describe("MCP HTTP request body limit", () => {
 
   it("returns 413 and never invokes the MCP handler for an oversized body", async () => {
     let handlerAccesses = 0;
+    const registryWorkspace = await makeWorkspace();
     const workspace = new Proxy({} as WorkspaceManager, {
       get() {
         handlerAccesses += 1;
@@ -116,7 +118,14 @@ describe("MCP HTTP request body limit", () => {
       auth: { token: "test-token" },
       remote: { enabled: false, endpoint: "" },
       supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
-    } satisfies ResolvedSettings, { workspace });
+    } satisfies ResolvedSettings, {
+      workspace,
+      registry: new WorkspaceRegistry([{
+        id: "body-limit",
+        name: "Body Limit",
+        path: registryWorkspace,
+      }]),
+    });
     runningServers.push(server);
     const port = await listen(server);
     const body = oversizedBody();

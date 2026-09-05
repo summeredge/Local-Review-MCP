@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MAX_DIFF_BYTES } from "../../src/git/service.js";
 import { createMcpServer } from "../../src/mcp/server.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
+import { WorkspaceRegistry } from "../../src/workspace/registry.js";
 
 const runProcess = promisify(execFile);
 const clients: Client[] = [];
@@ -76,7 +77,7 @@ async function callTool(
   const client = new Client({ name: "git-tools-test", version: "0.1.0" });
   clients.push(client);
   await Promise.all([
-    createMcpServer({ workspace: new WorkspaceManager(workspace) }).connect(serverTransport),
+    createMcpServer({ registry: WorkspaceRegistry.fromManager(new WorkspaceManager(workspace)) }).connect(serverTransport),
     client.connect(clientTransport),
   ]);
   return client.callTool({ name, arguments: arguments_ });

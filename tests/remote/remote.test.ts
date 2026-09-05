@@ -12,6 +12,7 @@ import type { ResolvedSettings } from "../../src/config/settings.js";
 import { TunnelManager } from "../../src/tunnel/manager.js";
 import type { TunnelProvider, TunnelStatus } from "../../src/tunnel/types.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
+import { WorkspaceRegistry } from "../../src/workspace/registry.js";
 import { EXPECTED_REGISTERED_TOOL_NAMES } from "../fixtures/v01-tools.js";
 
 const runProcess = promisify(execFile);
@@ -69,10 +70,12 @@ async function startRemoteServer(
   provider: TunnelProvider = readyProvider(),
 ): Promise<{ port: number; context: AppContext }> {
   const settings = remoteSettings(workspace);
+  const workspaceManager = new WorkspaceManager(workspace);
   const context: AppContext = {
     settings,
     tunnel: new TunnelManager(provider, true),
-    workspace: new WorkspaceManager(workspace),
+    workspace: workspaceManager,
+    registry: WorkspaceRegistry.fromManager(workspaceManager),
   };
   const server = await startApp(settings, context);
   runningServers.push(server);

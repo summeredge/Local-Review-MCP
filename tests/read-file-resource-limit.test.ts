@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMcpServer, MAX_READ_SCAN_BYTES } from "../src/mcp/server.js";
 import { WorkspaceManager } from "../src/workspace/manager.js";
+import { WorkspaceRegistry } from "../src/workspace/registry.js";
 
 const clients: Client[] = [];
 const temporaryDirectories: string[] = [];
@@ -29,7 +30,7 @@ async function callReadFile(workspace: string, arguments_: Record<string, unknow
   const client = new Client({ name: "read-file-limit-test", version: "0.1.0" });
   clients.push(client);
   await Promise.all([
-    createMcpServer({ workspace: new WorkspaceManager(workspace) }).connect(serverTransport),
+    createMcpServer({ registry: WorkspaceRegistry.fromManager(new WorkspaceManager(workspace)) }).connect(serverTransport),
     client.connect(clientTransport),
   ]);
   return client.callTool({ name: "read_file", arguments: arguments_ });
