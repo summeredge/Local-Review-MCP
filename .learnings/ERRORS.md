@@ -1,5 +1,38 @@
 # Errors
 
+## [ERR-20260905-002] Browser Worker profile path sandbox permission
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+Browser Worker 测试和诊断使用默认的本机 Profile 根目录；受限 sandbox 无法创建该目录，导致 Playwright 启动和 mock context 测试分别返回 `spawn EPERM` 与 `mkdir EPERM`。
+
+### 错误信息
+
+```text
+browserType.launchPersistentContext: spawn EPERM
+EPERM: operation not permitted, mkdir '...\\LocalReviewMCP\\browser-worker\\profiles\\...'
+```
+
+### 上下文
+
+- 执行了 `npm test` 与 `npx vitest run tests/conversation-navigator.test.ts`
+- 失败只发生在受限 sandbox；允许访问本机 Profile 路径后同一测试通过
+
+### 建议修复
+
+在受限环境中运行 Browser Worker 测试时，为 Profile 根目录提供可写临时目录，或申请最小范围的本机目录访问；不要把 Codex bundled runtime 当作项目运行时。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
 ## [ERR-20260904-002] Vitest unsupported Jest parallel flag
 
 **Priority**: low

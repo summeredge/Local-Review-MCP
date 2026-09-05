@@ -1,11 +1,13 @@
-import { createServer, type Server, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { type Browser, type BrowserContext } from "playwright";
+import { z } from "zod";
 import {
   BROWSER_WORKER_SERVICE,
   BROWSER_WORKER_VERSION,
   resolveBrowserWorkerConfig,
   type BrowserWorkerConfigInput,
 } from "./config.js";
+import { ConversationNavigator } from "./navigation/conversation-navigator.js";
 import { BrowserProfileManager, type PersistentContextLauncher } from "./profile/manager.js";
 
 export type BrowserWorkerStatus = "stopped" | "starting" | "ready" | "failed";
@@ -24,6 +26,19 @@ export interface BrowserWorkerOptions extends BrowserWorkerConfigInput {
   readonly launchPersistentContext?: PersistentContextLauncher;
 }
 
+export const MAX_CONVERSATION_NAVIGATION_REQUEST_BYTES = 16 * 1024;
+
+const conversationNavigationRequestSchema = z.object({
+  conversationId: z.string().min(1).max(256),
+}).strict();
+
+class ConversationNavigationBodyTooLargeError extends Error {
+  public constructor() {
+    super("Conversation navigation request body exceeds the maximum allowed size.");
+    this.name = "ConversationNavigationBodyTooLargeError";
+  }
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message.length > 0) return error.message.slice(0, 4000);
   return String(error).slice(0, 4000);
@@ -35,6 +50,30 @@ function sendJson(response: ServerResponse, statusCode: number, body: unknown): 
   response.setHeader("content-type", "application/json; charset=utf-8");
   response.setHeader("content-length", Buffer.byteLength(payload));
   response.end(payload);
+}
+
+async function parseJsonBody(request: IncomingMessage): Promise<unknown> {
+  const contentLength = request.headers["content-length"];
+  if (typeof contentLength === "string"
+    && Number.isFinite(Number(contentLength))
+    && Number(contentLength) > MAX_CONVERSATION_NAVIGATION_REQUEST_BYTES) {
+    request.resume();
+    throw new ConversationNavigationBodyTooLargeError();
+  }
+
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+    if (totalBytes > MAX_CONVERSATION_NAVIGATION_REQUEST_BYTES) {
+      request.resume();
+      throw new ConversationNavigationBodyTooLargeError();
+    }
+    chunks.push(buffer);
+  }
+  if (chunks.length === 0) return undefined;
+  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
 }
 
 function closeServer(server: Server): Promise<void> {
@@ -64,6 +103,7 @@ export class BrowserWorker {
   private readonly host: string;
   private readonly configuredPort: number;
   private readonly profileManager: BrowserProfileManager;
+  private readonly conversationNavigator: ConversationNavigator;
   private readonly createdAt = new Date().toISOString();
   private stateValue: BrowserWorkerState = {
     status: "stopped",
@@ -83,6 +123,7 @@ export class BrowserWorker {
         ? undefined
         : async (): Promise<BrowserContext> => (await legacyLauncher()).newContext());
     this.profileManager = new BrowserProfileManager(config.profile, launchContext);
+    this.conversationNavigator = new ConversationNavigator(this.profileManager);
   }
 
   public get state(): BrowserWorkerState {
@@ -142,7 +183,7 @@ export class BrowserWorker {
   }
 
   private handleRequest(
-    request: import("node:http").IncomingMessage,
+    request: IncomingMessage,
     response: ServerResponse,
   ): void {
     const path = request.url?.split("?", 1)[0] ?? "/";
@@ -152,6 +193,17 @@ export class BrowserWorker {
         sendJson(response, 405, { error: "method_not_allowed" });
         return;
       }
+    }
+
+    if (path === "/conversation/navigate" && request.method !== "POST") {
+      request.resume();
+      sendJson(response, 405, { error: "method_not_allowed" });
+      return;
+    }
+
+    if (request.method === "POST" && path === "/conversation/navigate") {
+      void this.handleConversationNavigation(request, response);
+      return;
     }
 
     if (request.method === "GET" && path === "/health") {
@@ -180,6 +232,43 @@ export class BrowserWorker {
 
     request.resume();
     sendJson(response, 404, { error: "not_found" });
+  }
+
+  private async handleConversationNavigation(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    let body: unknown;
+    try {
+      body = await parseJsonBody(request);
+    } catch (error: unknown) {
+      sendJson(response, error instanceof ConversationNavigationBodyTooLargeError ? 413 : 400, {
+        status: "FAILED",
+        error: error instanceof ConversationNavigationBodyTooLargeError
+          ? "conversation navigation request is too large"
+          : "invalid_json_body",
+      });
+      return;
+    }
+
+    const parsed = conversationNavigationRequestSchema.safeParse(body);
+    if (!parsed.success) {
+      sendJson(response, 400, {
+        status: "FAILED",
+        error: "conversationId must be a non-empty string.",
+      });
+      return;
+    }
+
+    try {
+      const result = await this.conversationNavigator.navigate(parsed.data.conversationId);
+      sendJson(response, result.status === "FAILED" && result.url === undefined ? 400 : 200, result);
+    } catch (error: unknown) {
+      sendJson(response, 500, {
+        status: "FAILED",
+        error: errorMessage(error),
+      });
+    }
   }
 
   private setState(status: BrowserWorkerStatus, lastError?: string): void {

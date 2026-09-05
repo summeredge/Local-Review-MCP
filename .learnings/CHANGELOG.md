@@ -3,6 +3,8 @@
 <!-- SCHEMA: {"ts":"ISO-8601","action":"add|promote|extract|resolve","type":"learning|error|feature","id":"entry ID","summary":"≤100字","target":"晋升目标(可选)"} -->
 
 ```jsonl
+{"ts":"2026-09-05T21:30:00+08:00","action":"add","type":"error","id":"ERR-20260905-002","summary":"Browser Worker 默认 Profile 目录受 sandbox 权限限制；提升目录访问后测试通过"}
+{"ts":"2026-09-05T21:30:00+08:00","action":"add","type":"learning","id":"LRN-20260905-001","summary":"Navigator 用 mock Page 验证导航，但保留 Profile Manager 生命周期边界"}
 {"ts":"2026-09-05T11:24:00+08:00","action":"add","type":"error","id":"ERR-20260905-001","summary":"当前 checkout 的 Git smoke test 受 sandbox 用户与仓库所有者不一致的 safe.directory 检查阻断"}
 {"ts":"2026-09-04T18:13:47+08:00","action":"add","type":"error","id":"ERR-20260904-002","summary":"Vitest 不支持 Jest 的 --runInBand；按 package.json 脚本执行 npm test"}
 {"ts":"2026-09-04T18:13:47+08:00","action":"add","type":"learning","id":"LRN-20260904-001","summary":"Task Context 独立存储并保持与 Workspace、MCP、C2C Session 解耦"}

@@ -1,5 +1,26 @@
 # Learnings
 
+## [LRN-20260905-001] Browser Worker 导航测试应 mock 页面但保留 Profile 边界
+
+**Priority**: low
+**Status**: resolved
+**Area**: infra
+
+### 内容
+
+Conversation Navigator 可以通过注入 `PersistentContextLauncher` 使用 mock `BrowserContext` 和 `Page`，从而验证 URL、`page.goto()` 和失败状态而不访问 ChatGPT；但 `BrowserProfileManager` 仍会先创建受控 Profile 目录，这是生命周期契约的一部分。受限 sandbox 无法写默认本机目录时，应在验证层提升该目录访问，而不是为测试绕过 Profile Manager。
+
+### 建议修复
+
+保持生产调用链为 `BrowserWorker → BrowserProfileManager → Persistent Browser Context → ConversationNavigator → Page.goto()`；诊断和单元测试只替换 launcher/page，并单独确认 Profile 路径权限。
+
+### 元数据
+
+- Source: task_review
+- See Also: none
+
+---
+
 ## [LRN-20260904-001] Task Context 保持独立于 Workspace 与 MCP
 
 **Priority**: medium
