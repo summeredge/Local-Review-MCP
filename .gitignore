@@ -7,3 +7,6 @@ dist/
 *.token
 config.production.json
 config.production.backup-*.json
+__pycache__/
+*.pyc
+LocalReviewLauncher/launcher.config.json

@@ -1,5 +1,13 @@
 {
   "workspace": "C:\\Users\\shaoy\\Documents\\Local-Review-MCP",
   "configFile": "config.production.json",
-  "autoStart": false
+  "autoStart": false,
+  "active_workspace_id": "0ee5a4a43938",
+  "workspaces": [
+    {
+      "id": "0ee5a4a43938",
+      "name": "Local-Review-MCP",
+      "path": "C:\\Users\\shaoy\\Documents\\Local-Review-MCP"
+    }
+  ]
 }
