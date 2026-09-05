@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMcpServer } from "../src/mcp/server.js";
+import { WorkspaceManager, WorkspacePathError } from "../src/workspace/manager.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
 
 const clients: Client[] = [];
@@ -166,5 +167,27 @@ describe("Workspace Registry", () => {
         path: workspace,
       },
     })).toThrow("active workspace identity");
+  });
+
+  it("rejects a runtime workspace identity that differs from the registry", async () => {
+    const workspace = await makeWorkspace("runtime-mismatch", "workspace\n");
+    const registry = new WorkspaceRegistry([{
+      id: "registry-id",
+      name: "Registry Workspace",
+      path: workspace,
+    }]);
+    const runtime = new WorkspaceManager(workspace, {
+      id: "runtime-id",
+      name: "Runtime Workspace",
+      path: workspace,
+    });
+
+    try {
+      createMcpServer({ registry, workspace: runtime });
+      expect.unreachable("expected workspace identity mismatch");
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(WorkspacePathError);
+      expect((error as WorkspacePathError).code).toBe("WORKSPACE_IDENTITY_MISMATCH");
+    }
   });
 });

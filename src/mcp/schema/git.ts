@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { workspaceRelativePathSchema } from "./common.js";
+import { workspaceIdSchema, workspaceRelativePathSchema } from "./common.js";
 
 export const gitChangeStatusSchema = z.enum([
   "modified",
@@ -18,11 +18,13 @@ export const gitStatusEntryOutputSchema = z.object({
 });
 
 export const gitStatusOutputSchema = z.object({
+  workspace_id: workspaceIdSchema,
   branch: z.string().nullable(),
   entries: z.array(gitStatusEntryOutputSchema),
 });
 
 export const gitDiffOutputSchema = z.object({
+  workspace_id: workspaceIdSchema,
   path: workspaceRelativePathSchema,
   stat: z.boolean(),
   diff: z.string(),

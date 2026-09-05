@@ -1,3 +1,5 @@
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { WorkspacePathError } from "./path.js";
 import type { WorkspaceIdentity } from "./types.js";
 
@@ -22,4 +24,33 @@ export function validateWorkspaceIdentity(value: unknown): WorkspaceIdentity {
     name: raw.name.trim(),
     path: raw.path.trim(),
   };
+}
+
+function comparablePath(value: string): string {
+  const normalized = value.replaceAll("\\", "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+export function canonicalPathForComparison(value: string): string {
+  try {
+    return comparablePath(realpathSync.native(resolve(value)));
+  } catch {
+    return comparablePath(resolve(value));
+  }
+}
+
+export function validateWorkspaceIdentityConsistency(
+  registryIdentity: WorkspaceIdentity,
+  runtimeIdentity: WorkspaceIdentity,
+): void {
+  const registry = validateWorkspaceIdentity(registryIdentity);
+  const runtime = validateWorkspaceIdentity(runtimeIdentity);
+  if (registry.id !== runtime.id
+    || registry.name !== runtime.name
+    || canonicalPathForComparison(registry.path) !== canonicalPathForComparison(runtime.path)) {
+    throw new WorkspacePathError(
+      "WORKSPACE_IDENTITY_MISMATCH",
+      "WORKSPACE_IDENTITY_MISMATCH: Workspace identity does not match the runtime registry.",
+    );
+  }
 }

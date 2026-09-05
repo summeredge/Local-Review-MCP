@@ -6,6 +6,7 @@ import { z } from "zod";
 import { GitError } from "../git/errors.js";
 import { GitService } from "../git/service.js";
 import type { GitDiffResponse, GitStatusResponse } from "../git/types.js";
+import { validateWorkspaceIdentityConsistency } from "../workspace/identity.js";
 import { WorkspaceManager, WorkspacePathError } from "../workspace/manager.js";
 import { WorkspaceRegistry, type WorkspaceSelection } from "../workspace/registry.js";
 import { searchText } from "../workspace/search.js";
@@ -427,6 +428,9 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   const registry = context.registry
     ?? (context.workspace === undefined ? undefined : WorkspaceRegistry.fromManager(context.workspace));
   if (registry === undefined) throw new Error("Workspace registry is required.");
+  if (context.workspace !== undefined) {
+    validateWorkspaceIdentityConsistency(registry.active, context.workspace.identity);
+  }
   const server = new McpServer({ name: "local-review-mcp", version: "0.1.0" });
 
   server.registerTool(
@@ -514,7 +518,11 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return structuredResponse(gitStatusOutputSchema, await new GitService(registry.resolve(input.workspace_id).manager).status());
+        const selection = registry.resolve(input.workspace_id);
+        return structuredResponse(gitStatusOutputSchema, {
+          workspace_id: selection.id,
+          ...(await new GitService(selection.manager).status()),
+        });
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -531,10 +539,14 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input) => {
       try {
-        return structuredResponse(gitDiffOutputSchema, await new GitService(registry.resolve(input.workspace_id).manager).diff({
-          path: input.path,
-          stat: input.stat,
-        }));
+        const selection = registry.resolve(input.workspace_id);
+        return structuredResponse(gitDiffOutputSchema, {
+          workspace_id: selection.id,
+          ...(await new GitService(selection.manager).diff({
+            path: input.path,
+            stat: input.stat,
+          })),
+        });
       } catch (error: unknown) {
         return toToolError(error);
       }

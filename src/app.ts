@@ -4,6 +4,7 @@ import { endpoint, localOrigin, type ResolvedSettings } from "./config/settings.
 import { isPortInUse, startHttpServer, type HttpServerOptions } from "./mcp/http.js";
 import { REGISTERED_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
+import { validateWorkspaceIdentityConsistency } from "./workspace/identity.js";
 import { WorkspaceManager } from "./workspace/manager.js";
 import { WorkspaceRegistry } from "./workspace/registry.js";
 
@@ -18,15 +19,25 @@ export function createAppContext(
   settings: ResolvedSettings,
   environment: NodeJS.ProcessEnv = process.env,
 ): AppContext {
+  const runtimeIdentity = settings.workspaceIdentity;
+  if (runtimeIdentity !== undefined) {
+    validateWorkspaceIdentityConsistency(runtimeIdentity, {
+      ...runtimeIdentity,
+      path: settings.workspace,
+    });
+  }
   const registry = settings.workspaces !== undefined
-    ? new WorkspaceRegistry(settings.workspaces, settings.workspaceIdentity === undefined
+    ? new WorkspaceRegistry(settings.workspaces, runtimeIdentity === undefined
       ? { activeWorkspacePath: settings.workspace }
-      : { activeWorkspaceIdentity: settings.workspaceIdentity })
-    : settings.workspaceIdentity === undefined
+      : { activeWorkspaceIdentity: runtimeIdentity })
+    : runtimeIdentity === undefined
       ? WorkspaceRegistry.fromManager(new WorkspaceManager(settings.workspace))
-      : new WorkspaceRegistry([settings.workspaceIdentity], {
-        activeWorkspaceId: settings.workspaceIdentity.id,
+      : new WorkspaceRegistry([runtimeIdentity], {
+        activeWorkspaceId: runtimeIdentity.id,
       });
+  if (runtimeIdentity !== undefined) {
+    validateWorkspaceIdentityConsistency(registry.active, runtimeIdentity);
+  }
   return {
     settings,
     tunnel: createTunnelManager(settings.remote, {

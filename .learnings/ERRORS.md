@@ -34,6 +34,30 @@ CACError: Unknown option `--runInBand`
 
 ---
 
+## [ERR-20260905-001] Current checkout Git ownership during runtime smoke test
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+The runtime smoke test against the current checkout was rejected by Git's
+`safe.directory` ownership check because the repository owner and the sandbox
+process user differ.
+
+### 建议修复
+
+Use a temporary test repository owned by the test process for Git behavior
+checks; do not change global Git configuration just for a read-only smoke test.
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
 ## [ERR-20260904-001] Launcher project venv execution permission
 
 **Priority**: medium

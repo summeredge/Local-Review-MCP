@@ -131,7 +131,7 @@ the runtime does not add write, exec, shell, commit, or push operations.
 
 - Purpose: Return the Git status for an authorized workspace repository.
 - Input: `{ "workspace_id"?: string }`
-- Output: `{ "branch": string|null, "entries": [{ "path": string, "index": string, "worktree": string, "status": "modified"|"added"|"deleted"|"renamed"|"untracked", "original_path"?: string }] }`
+- Output: `{ "workspace_id": string, "branch": string|null, "entries": [{ "path": string, "index": string, "worktree": string, "status": "modified"|"added"|"deleted"|"renamed"|"untracked", "original_path"?: string }] }`
 - Workspace scope: selected workspace Git repository.
 - Permission: authenticated read-only Git status. Git arguments are not
   caller-controlled and no Git mutation is performed.
@@ -142,7 +142,7 @@ the runtime does not add write, exec, shell, commit, or push operations.
 - Input: `{ "workspace_id"?: string, "path"?: string, "stat"?: boolean }`
 
   Defaults: `path="."`, `stat=false`.
-- Output: `{ "path": string, "stat": boolean, "diff": string, "files": string[], "binary": boolean, "binary_paths"?: string[] }`
+- Output: `{ "workspace_id": string, "path": string, "stat": boolean, "diff": string, "files": string[], "binary": boolean, "binary_paths"?: string[] }`
 - Workspace scope: selected workspace repository and optional relative path.
 - Permission: authenticated read-only bounded Git diff. The existing Git
   service validates repository and path containment and performs no mutation.

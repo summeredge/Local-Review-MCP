@@ -91,13 +91,21 @@ describe("Review context tools", () => {
     const registry = new WorkspaceRegistry([
       { id: "data-project", name: "DataProject", path: workspace },
     ]);
+    const listed = resultJson(await callTool(registry, "workspace_list"));
     const result = resultJson(await callTool(registry, "review_summary"));
 
     const info = resultJson(await callTool(registry, "workspace_info"));
+    const status = resultJson(await callTool(registry, "git_status"));
+    const diff = resultJson(await callTool(registry, "git_diff"));
+    expect(listed).toEqual({
+      workspaces: [{ id: "data-project", name: "DataProject" }],
+    });
     expect(info).toMatchObject({
       workspace_id: result.workspace_id,
       workspace_name: result.workspace_name,
     });
+    expect(status.workspace_id).toBe(result.workspace_id);
+    expect(diff.workspace_id).toBe(result.workspace_id);
 
     expect(result).toEqual({
       workspace_id: "data-project",

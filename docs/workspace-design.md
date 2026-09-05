@@ -41,8 +41,9 @@ The shared context schema is:
 ```
 
 `workspace_info` and `review_summary` extend this context with their existing
-fields. The existing `git_status` and `git_diff` response shapes remain
-unchanged; their selected workspace is determined by the request scope.
+fields. `git_status` and `git_diff` include the selected `workspace_id`; their
+workspace is determined by the same registry selection used by every other
+workspace-scoped tool.
 
 ## Workspace ID lifecycle
 
@@ -97,6 +98,11 @@ MCP Runtime
 
 An explicit `workspace_id` selects another registered workspace for one tool
 call. Omitting it preserves the existing active-workspace fallback.
+
+At runtime, the active registry identity and the runtime workspace identity are
+validated as `{ id, name, path }`. A mismatch fails with
+`WORKSPACE_IDENTITY_MISMATCH`; it is never repaired by deriving an ID from a
+path or by silently selecting another record.
 
 ## Security boundary
 

@@ -1,6 +1,8 @@
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
-import { validateWorkspaceIdentity } from "./identity.js";
+import {
+  canonicalPathForComparison,
+  validateWorkspaceIdentity,
+  validateWorkspaceIdentityConsistency,
+} from "./identity.js";
 import { WorkspaceManager, WorkspacePathError } from "./manager.js";
 import type { WorkspaceIdentity, WorkspaceRegistryEntry, WorkspaceSummary } from "./types.js";
 
@@ -21,14 +23,6 @@ function registryInvalid(message = "Workspace registry is invalid."): WorkspaceP
 function comparablePath(value: string): string {
   const normalized = value.replaceAll("\\", "/");
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
-
-function canonicalPathForComparison(value: string): string {
-  try {
-    return comparablePath(realpathSync.native(resolve(value)));
-  } catch {
-    return comparablePath(resolve(value));
-  }
 }
 
 export class WorkspaceRegistry {
@@ -75,10 +69,22 @@ export class WorkspaceRegistry {
       : validateWorkspaceIdentity(resolvedOptions.activeWorkspaceIdentity);
     if (activeIdentity !== undefined) {
       const selected = this.recordsById.get(activeIdentity.id);
-      if (selected === undefined
-        || selected.name !== activeIdentity.name
-        || canonicalPathForComparison(selected.path) !== canonicalPathForComparison(activeIdentity.path)) {
-        throw registryInvalid("The active workspace identity does not match the registry.");
+      if (selected === undefined) {
+        throw new WorkspacePathError(
+          "WORKSPACE_IDENTITY_MISMATCH",
+          "WORKSPACE_IDENTITY_MISMATCH: The active workspace identity does not match the registry.",
+        );
+      }
+      try {
+        validateWorkspaceIdentityConsistency(selected, activeIdentity);
+      } catch (error: unknown) {
+        if (error instanceof WorkspacePathError && error.code === "WORKSPACE_IDENTITY_MISMATCH") {
+          throw new WorkspacePathError(
+            "WORKSPACE_IDENTITY_MISMATCH",
+            "WORKSPACE_IDENTITY_MISMATCH: The active workspace identity does not match the registry.",
+          );
+        }
+        throw error;
       }
       activeWorkspaceId = activeIdentity.id;
     }
@@ -90,7 +96,10 @@ export class WorkspaceRegistry {
       activeWorkspaceId = records.find((record) =>
         comparablePath(record.manager.canonicalRoot) === activePath)?.id;
       if (activeWorkspaceId === undefined) {
-        throw registryInvalid("The active workspace path is not registered.");
+        throw new WorkspacePathError(
+          "WORKSPACE_IDENTITY_MISMATCH",
+          "WORKSPACE_IDENTITY_MISMATCH: The active workspace path is not registered.",
+        );
       }
     }
     this.activeWorkspaceId = activeWorkspaceId ?? records[0]!.id;

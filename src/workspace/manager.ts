@@ -211,4 +211,5 @@ export {
 } from "./path.js";
 export type { WorkspaceErrorCode } from "./path.js";
 export { validateWorkspaceIdentity } from "./identity.js";
+export { validateWorkspaceIdentityConsistency } from "./identity.js";
 export type { WorkspaceIdentity } from "./types.js";
