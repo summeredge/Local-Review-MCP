@@ -7,6 +7,9 @@ export interface BrowserWorkerDiagnosticResult {
   readonly service: typeof BROWSER_WORKER_SERVICE;
   readonly status: "ready";
   readonly playwright: true;
+  readonly profile: string;
+  readonly context: "created";
+  readonly authStatus: "UNKNOWN";
 }
 
 async function findFreePort(): Promise<number> {
@@ -76,7 +79,7 @@ async function stopChild(child: ChildProcess): Promise<void> {
 export async function generateBrowserWorkerExample(): Promise<BrowserWorkerDiagnosticResult> {
   const port = await findFreePort();
   const entry = fileURLToPath(new URL("./cli.js", import.meta.url));
-  const child = spawn(process.execPath, [entry, "--port", String(port)], {
+  const child = spawn(process.execPath, [entry, "--port", String(port), "--profile", "diagnostic"], {
     shell: false,
     windowsHide: true,
     stdio: ["ignore", "ignore", "pipe"],
@@ -87,10 +90,19 @@ export async function generateBrowserWorkerExample(): Promise<BrowserWorkerDiagn
     if (info?.browser !== "chromium" || info.playwright !== true) {
       throw new Error("Browser Worker info check failed.");
     }
+    const profile = await fetchJson(`http://127.0.0.1:${port}/profile`);
+    if (profile?.profile !== "diagnostic"
+      || profile.context !== "created"
+      || profile.authStatus !== "UNKNOWN") {
+      throw new Error("Browser Worker profile check failed.");
+    }
     return {
       service: BROWSER_WORKER_SERVICE,
       status: "ready",
       playwright: true,
+      profile: "diagnostic",
+      context: "created",
+      authStatus: "UNKNOWN",
     };
   } finally {
     await stopChild(child);

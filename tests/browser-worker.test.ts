@@ -24,6 +24,12 @@ describe("Browser Worker", () => {
     });
     const info = await fetch(`http://127.0.0.1:${worker.port}/info`);
     await expect(info.json()).resolves.toEqual({ browser: "chromium", playwright: true });
+    const profile = await fetch(`http://127.0.0.1:${worker.port}/profile`);
+    await expect(profile.json()).resolves.toEqual({
+      profile: "default",
+      context: "created",
+      authStatus: "UNKNOWN",
+    });
     await expect(fetch(`http://127.0.0.1:${worker.port}/delivery`, { method: "POST" }))
       .resolves.toMatchObject({ status: 404 });
 
@@ -35,14 +41,12 @@ describe("Browser Worker", () => {
     const worker = new BrowserWorker({ port: 0 });
     workers.push(worker);
     await worker.start();
-    const browser = worker.browserInstance;
-    if (browser === undefined) throw new Error("Browser Worker did not expose its running browser.");
+    const context = worker.contextInstance;
+    if (context === undefined) throw new Error("Browser Worker did not expose its persistent context.");
 
-    const context = await browser.newContext();
     const page = await context.newPage();
     await page.setContent("<!doctype html><title>local test page</title>");
     await expect(page.title()).resolves.toBe("local test page");
-    await context.close();
   }, 30_000);
 
   it("records a startup failure and does not restart automatically", async () => {

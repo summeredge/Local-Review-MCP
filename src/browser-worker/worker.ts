@@ -1,11 +1,12 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
-import { chromium, type Browser } from "playwright";
+import { type Browser, type BrowserContext } from "playwright";
 import {
   BROWSER_WORKER_SERVICE,
   BROWSER_WORKER_VERSION,
   resolveBrowserWorkerConfig,
   type BrowserWorkerConfigInput,
 } from "./config.js";
+import { BrowserProfileManager, type PersistentContextLauncher } from "./profile/manager.js";
 
 export type BrowserWorkerStatus = "stopped" | "starting" | "ready" | "failed";
 
@@ -20,6 +21,7 @@ export type BrowserLauncher = () => Promise<Browser>;
 
 export interface BrowserWorkerOptions extends BrowserWorkerConfigInput {
   readonly launchBrowser?: BrowserLauncher;
+  readonly launchPersistentContext?: PersistentContextLauncher;
 }
 
 function errorMessage(error: unknown): string {
@@ -61,14 +63,13 @@ function listenServer(server: Server, host: string, port: number): Promise<void>
 export class BrowserWorker {
   private readonly host: string;
   private readonly configuredPort: number;
-  private readonly launchBrowser: BrowserLauncher;
+  private readonly profileManager: BrowserProfileManager;
   private readonly createdAt = new Date().toISOString();
   private stateValue: BrowserWorkerState = {
     status: "stopped",
     browser: "chromium",
     created_at: this.createdAt,
   };
-  private browserValue: Browser | undefined;
   private server: Server | undefined;
   private starting: Promise<BrowserWorkerState> | undefined;
 
@@ -76,7 +77,12 @@ export class BrowserWorker {
     const config = resolveBrowserWorkerConfig(options);
     this.host = config.host;
     this.configuredPort = config.port;
-    this.launchBrowser = options.launchBrowser ?? (() => chromium.launch({ headless: true }));
+    const legacyLauncher = options.launchBrowser;
+    const launchContext = options.launchPersistentContext
+      ?? (legacyLauncher === undefined
+        ? undefined
+        : async (): Promise<BrowserContext> => (await legacyLauncher()).newContext());
+    this.profileManager = new BrowserProfileManager(config.profile, launchContext);
   }
 
   public get state(): BrowserWorkerState {
@@ -89,7 +95,11 @@ export class BrowserWorker {
   }
 
   public get browserInstance(): Browser | undefined {
-    return this.browserValue;
+    return this.profileManager.browserInstance;
+  }
+
+  public get contextInstance(): BrowserContext | undefined {
+    return this.profileManager.contextInstance;
   }
 
   public start(): Promise<BrowserWorkerState> {
@@ -114,8 +124,8 @@ export class BrowserWorker {
   private async startInternal(): Promise<BrowserWorkerState> {
     console.log("Browser Worker starting");
     try {
-      this.browserValue = await this.launchBrowser();
-      console.log("Playwright initialized");
+      await this.profileManager.initialize();
+      console.log("Browser Profile initialized");
       this.server = createServer((request, response) => this.handleRequest(request, response));
       await listenServer(this.server, this.host, this.configuredPort);
       this.setState("ready");
@@ -136,7 +146,7 @@ export class BrowserWorker {
     response: ServerResponse,
   ): void {
     const path = request.url?.split("?", 1)[0] ?? "/";
-    if (path === "/health" || path === "/info") {
+    if (path === "/health" || path === "/info" || path === "/profile") {
       if (request.method !== "GET") {
         request.resume();
         sendJson(response, 405, { error: "method_not_allowed" });
@@ -163,6 +173,11 @@ export class BrowserWorker {
       return;
     }
 
+    if (request.method === "GET" && path === "/profile") {
+      sendJson(response, 200, this.profileManager.state);
+      return;
+    }
+
     request.resume();
     sendJson(response, 404, { error: "not_found" });
   }
@@ -177,12 +192,10 @@ export class BrowserWorker {
   }
 
   private async closeResources(): Promise<void> {
+    await this.profileManager.close();
+
     const server = this.server;
     this.server = undefined;
     if (server !== undefined) await closeServer(server).catch(() => undefined);
-
-    const browser = this.browserValue;
-    this.browserValue = undefined;
-    if (browser !== undefined) await browser.close().catch(() => undefined);
   }
 }

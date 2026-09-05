@@ -4,6 +4,7 @@ import { BrowserWorker } from "./worker.js";
 interface BrowserWorkerCliOptions {
   readonly host?: string;
   readonly port?: number;
+  readonly profileName?: string;
 }
 
 function requiredValue(args: readonly string[], index: number, option: string): string {
@@ -13,7 +14,7 @@ function requiredValue(args: readonly string[], index: number, option: string): 
 }
 
 function parseArgs(args: readonly string[]): BrowserWorkerCliOptions {
-  const options: { host?: string; port?: number } = {};
+  const options: { host?: string; port?: number; profileName?: string } = {};
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--host") {
@@ -21,6 +22,9 @@ function parseArgs(args: readonly string[]): BrowserWorkerCliOptions {
       index += 1;
     } else if (arg === "--port") {
       options.port = Number(requiredValue(args, index, arg));
+      index += 1;
+    } else if (arg === "--profile") {
+      options.profileName = requiredValue(args, index, arg);
       index += 1;
     } else {
       throw new Error(`Unknown Browser Worker option: ${arg}`);
