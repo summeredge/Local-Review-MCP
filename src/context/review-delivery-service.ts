@@ -20,8 +20,10 @@ import {
 import {
   createReviewDeliveryInputSchema,
   markReviewDeliveryFailedInputSchema,
+  reviewDeliveryTimestampSchema,
   reviewDeliverySchema,
 } from "./review-delivery-schema.js";
+import { conversationRoutingIdSchema } from "./conversation-routing-schema.js";
 import { workspaceIdSchema } from "./schema.js";
 
 function errorCode(error: unknown): string | undefined {
@@ -120,6 +122,17 @@ export class ReviewDeliveryService {
     }
   }
 
+  public async getDeliveryByRouting(
+    workspaceId: string,
+    routingId: string,
+  ): Promise<ReviewDelivery | null> {
+    this.validateRuntimeIdentity(workspaceId, this.runtimeIdentity);
+    return this.findDeliveryByRouting(
+      workspaceId,
+      conversationRoutingIdSchema.parse(routingId),
+    );
+  }
+
   public async beginDeliveryAttempt(
     workspaceId: string,
     deliveryId: string,
@@ -143,6 +156,7 @@ export class ReviewDeliveryService {
   public async markDelivered(
     workspaceId: string,
     deliveryId: string,
+    deliveredAt?: string,
   ): Promise<ReviewDelivery> {
     const current = await this.requiredDelivery(workspaceId, deliveryId);
     await this.validateDelivery(current, this.runtimeIdentity);
@@ -151,12 +165,12 @@ export class ReviewDeliveryService {
     }
 
     const { last_error: _lastError, delivered_at: _previousDeliveredAt, ...base } = current;
-    const deliveredAt = new Date().toISOString();
+    const timestamp = reviewDeliveryTimestampSchema.parse(deliveredAt ?? new Date().toISOString());
     const next = reviewDeliverySchema.parse({
       ...base,
       status: "delivered",
-      updated_at: deliveredAt,
-      delivered_at: deliveredAt,
+      updated_at: timestamp,
+      delivered_at: timestamp,
     });
     return this.saveUpdatedDelivery(next);
   }

@@ -34,27 +34,11 @@ export interface CreateReviewDeliveryInput {
   readonly conversation_id: string;
 }
 
-export interface ReviewDeliveryRequest {
-  readonly delivery_id: string;
-  readonly workspace_id: string;
-  readonly task_id: string;
-  readonly review_request_id: string;
-  readonly routing_id: string;
-  readonly conversation_id: string;
-}
-
-export type ReviewDeliveryResult =
-  | { readonly status: "delivered" }
-  | {
-    readonly status: "failed";
-    readonly retryable: boolean;
-    readonly code?: string;
-    readonly message: string;
-  };
-
-export interface ReviewDeliveryAdapter {
-  deliver(request: ReviewDeliveryRequest): Promise<ReviewDeliveryResult>;
-}
+export type {
+  ReviewDeliveryAdapter,
+  ReviewDeliveryRequest,
+  ReviewDeliveryResult,
+} from "../delivery/review-delivery-adapter.js";
 
 export const REVIEW_DELIVERIES_DIRECTORY = join(TASK_DIRECTORY, "review_deliveries");
 

@@ -47,7 +47,8 @@ Workspace -> Task -> Review Request -> Routing -> Conversation
 
 ## Data model
 
-`src/context/review-delivery.ts` defines the model and future adapter contract:
+`src/context/review-delivery.ts` defines the model and re-exports the adapter
+contract used by Task22:
 
 ```typescript
 interface ReviewDelivery {
@@ -70,7 +71,7 @@ The Zod schema is strict and also enforces lifecycle invariants: pending has
 no attempts, an active or terminal delivery has at least one attempt, failed
 has `last_error`, and delivered has `delivered_at`.
 
-The future adapter boundary is intentionally small:
+The adapter boundary is intentionally small:
 
 ```typescript
 interface ReviewDeliveryAdapter {
@@ -79,10 +80,11 @@ interface ReviewDeliveryAdapter {
 ```
 
 `ReviewDeliveryRequest` carries the delivery id plus
-`conversation_id`, `workspace_id`, `task_id`, `review_request_id`, and
-`routing_id`. `ReviewDeliveryResult` distinguishes successful delivery from a
-failed result and marks the failure as retryable or non-retryable. No adapter
-implementation is included in this task.
+`conversation_id`, `workspace_id`, `task_id`, `review_request_id`,
+`routing_id`, and the small Review message. `ReviewDeliveryResult` distinguishes
+successful delivery from a failed result and marks the failure as retryable or
+non-retryable. The Router and browser-independent Adapter boundary are
+documented in `docs/review-delivery-adapter.md`.
 
 ## Lifecycle and retry semantics
 
@@ -171,6 +173,7 @@ The service is internal and exposes only:
 ```text
 createDelivery(input)
 getDelivery(workspace_id, delivery_id)
+getDeliveryByRouting(workspace_id, routing_id)
 beginDeliveryAttempt(workspace_id, delivery_id)
 markDelivered(workspace_id, delivery_id)
 markFailed(workspace_id, delivery_id, error)

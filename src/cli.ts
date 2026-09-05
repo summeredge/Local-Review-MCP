@@ -3,6 +3,7 @@ import { createAppContext, startApp, startupMessage } from "./app.js";
 import { generateConversationRoutingExample } from "./context/conversation-routing-diagnostic.js";
 import { generateReviewDeliveryExample } from "./context/review-delivery-diagnostic.js";
 import { generateReviewContextExample } from "./context/review-context-diagnostic.js";
+import { generateBrowserRouterExample } from "./router/browser-router-diagnostic.js";
 import { registeredMcpToolsMessage } from "./mcp/server.js";
 import { createStartupManager } from "./supervisor/startup.js";
 import { createSupervisor } from "./supervisor/supervisor.js";
@@ -36,6 +37,8 @@ try {
     console.log(JSON.stringify(await generateReviewContextExample(identity), null, 2));
   } else if (argv[0] === "diagnose-review-delivery") {
     console.log(JSON.stringify(await generateReviewDeliveryExample(), null, 2));
+  } else if (argv[0] === "diagnose-browser-router") {
+    console.log(JSON.stringify(await generateBrowserRouterExample(), null, 2));
   } else if (argv[0] === "diagnose-conversation-routing") {
     const diagnosticArgs = argv.slice(1);
     const diagnosticCli = parseCliArgs(diagnosticArgs);

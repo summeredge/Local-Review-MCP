@@ -19,7 +19,7 @@ export const reviewDeliveryStatusSchema = z.enum([
   "failed",
 ]);
 
-const timestampSchema = z.string().datetime({ offset: true });
+export const reviewDeliveryTimestampSchema = z.string().datetime({ offset: true });
 
 export const reviewDeliveryErrorSchema = z.object({
   code: z.string().min(1).max(128).optional(),
@@ -36,9 +36,9 @@ export const reviewDeliverySchema = z.object({
   status: reviewDeliveryStatusSchema,
   attempt_count: z.number().int().nonnegative(),
   last_error: reviewDeliveryErrorSchema.optional(),
-  created_at: timestampSchema,
-  updated_at: timestampSchema,
-  delivered_at: timestampSchema.optional(),
+  created_at: reviewDeliveryTimestampSchema,
+  updated_at: reviewDeliveryTimestampSchema,
+  delivered_at: reviewDeliveryTimestampSchema.optional(),
 }).strict().superRefine((delivery, context) => {
   if (delivery.status === "pending" && delivery.attempt_count !== 0) {
     context.addIssue({
