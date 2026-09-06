@@ -4,6 +4,7 @@ import { generateConversationRoutingExample } from "./context/conversation-routi
 import { generateReviewDeliveryExample } from "./context/review-delivery-diagnostic.js";
 import { generateReviewContextExample } from "./context/review-context-diagnostic.js";
 import { generateReviewVerdictExample } from "./control/review-verdict-diagnostic.js";
+import { generateLoopDecisionExample } from "./control/loop-decision-diagnostic.js";
 import {
   generateBrowserRouterExample,
   generateReviewDeliveryBrowserExample,
@@ -56,6 +57,8 @@ try {
     console.log(JSON.stringify(await generateReviewCompletionExample(), null, 2));
   } else if (argv[0] === "diagnose-review-verdict") {
     console.log(JSON.stringify(generateReviewVerdictExample(), null, 2));
+  } else if (argv[0] === "diagnose-loop-decision") {
+    console.log(JSON.stringify(generateLoopDecisionExample(), null, 2));
   } else if (argv[0] === "diagnose-conversation-routing") {
     const diagnosticArgs = argv.slice(1);
     const diagnosticCli = parseCliArgs(diagnosticArgs);

@@ -24,6 +24,7 @@ import {
   reviewDeliverySchema,
 } from "./review-delivery-schema.js";
 import { conversationRoutingIdSchema } from "./conversation-routing-schema.js";
+import { reviewRequestIdSchema } from "./review-schema.js";
 import { workspaceIdSchema } from "./schema.js";
 
 function errorCode(error: unknown): string | undefined {
@@ -130,6 +131,17 @@ export class ReviewDeliveryService {
     return this.findDeliveryByRouting(
       workspaceId,
       conversationRoutingIdSchema.parse(routingId),
+    );
+  }
+
+  public async getDeliveryByReviewRequest(
+    workspaceId: string,
+    reviewRequestId: string,
+  ): Promise<ReviewDelivery | null> {
+    this.validateRuntimeIdentity(workspaceId, this.runtimeIdentity);
+    return this.findDeliveryByReviewRequest(
+      workspaceId,
+      reviewRequestIdSchema.parse(reviewRequestId),
     );
   }
 
@@ -245,6 +257,28 @@ export class ReviewDeliveryService {
       const deliveryId = entry.name.slice(0, -".json".length);
       const delivery = await this.getDelivery(workspaceId, deliveryId);
       if (delivery?.routing_id === routingId) return delivery;
+    }
+    return null;
+  }
+
+  private async findDeliveryByReviewRequest(
+    workspaceId: string,
+    reviewRequestId: string,
+  ): Promise<ReviewDelivery | null> {
+    const directory = reviewDeliveriesDirectory(this.storageRoot, workspaceId);
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error: unknown) {
+      if (errorCode(error) === "ENOENT") return null;
+      throw new Error("Review deliveries could not be inspected.", { cause: error });
+    }
+
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const deliveryId = entry.name.slice(0, -".json".length);
+      const delivery = await this.getDelivery(workspaceId, deliveryId);
+      if (delivery?.review_request_id === reviewRequestId) return delivery;
     }
     return null;
   }

@@ -1,0 +1,214 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { ConversationRoutingService } from "../src/context/conversation-routing-service.js";
+import { ExecutionContextService } from "../src/context/execution-service.js";
+import { ReviewDeliveryService } from "../src/context/review-delivery-service.js";
+import { ReviewRequestService } from "../src/context/review-request-service.js";
+import { ReviewResultService } from "../src/context/review-result-service.js";
+import type { ReviewResult } from "../src/context/review-result.js";
+import { TaskContextService } from "../src/context/service.js";
+import {
+  LoopController,
+  LoopControllerIdentityError,
+  type LoopControllerFacts,
+} from "../src/control/loop-controller.js";
+import { ReviewVerdictParser } from "../src/control/review-verdict-parser.js";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {
+    recursive: true,
+    force: true,
+  })));
+});
+
+async function makeStorageRoot(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "local-review-mcp-loop-controller-test-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+async function makeDeliveredChain(storageRoot: string) {
+  const task = await new TaskContextService(storageRoot).createTaskContext({
+    task_id: "task-001",
+    workspace_id: "workspace-a",
+    status: "reviewing",
+  });
+  const execution = await new ExecutionContextService(storageRoot).createExecutionContext({
+    execution_id: "execution-001",
+    task_id: task.task_id,
+    workspace_id: task.workspace_id,
+  });
+  const request = await new ReviewRequestService(storageRoot).createReviewRequest({
+    review_request_id: "review-001",
+    task_id: task.task_id,
+    execution_id: execution.execution_id,
+    workspace_id: task.workspace_id,
+  });
+  const routing = await new ConversationRoutingService(storageRoot).createRouting({
+    routing_id: "routing-001",
+    workspace_id: task.workspace_id,
+    task_id: task.task_id,
+    review_request_id: request.review_request_id,
+    conversation_id: "conversation-001",
+  });
+  const deliveries = new ReviewDeliveryService(storageRoot);
+  const pending = await deliveries.createDelivery({
+    workspace_id: routing.workspace_id,
+    task_id: routing.task_id,
+    review_request_id: routing.review_request_id,
+    routing_id: routing.routing_id,
+    conversation_id: routing.conversation_id,
+  });
+  await deliveries.beginDeliveryAttempt(task.workspace_id, pending.delivery_id);
+  const delivery = await deliveries.markDelivered(task.workspace_id, pending.delivery_id);
+  return { task, execution, request, delivery };
+}
+
+function verdictContent(
+  reviewRequestId: string,
+  decision: "APPROVE" | "ITERATE" | "HUMAN_REQUIRED",
+): string {
+  const payload = {
+    schema_version: 1,
+    review_request_id: reviewRequestId,
+    decision,
+    summary: `${decision} summary`,
+    ...(decision === "ITERATE" ? {
+      iteration: {
+        goal: "Fix the blocking issue.",
+        requirements: ["Keep the change inside the current task."],
+        acceptance_criteria: ["The blocking issue is fixed."],
+      },
+    } : {}),
+  };
+  return `<lrm-review-result>${JSON.stringify(payload)}</lrm-review-result>`;
+}
+
+async function createResult(
+  storageRoot: string,
+  status: ReviewResult["status"],
+  content?: string,
+): Promise<ReviewResult> {
+  const { request, delivery } = await makeDeliveredChain(storageRoot);
+  return new ReviewResultService(storageRoot).createReviewResult({
+    review_request_id: request.review_request_id,
+    delivery_id: delivery.delivery_id,
+    workspace_id: request.workspace_id,
+    status,
+    ...(content === undefined ? { error: "review did not complete" } : { content }),
+  });
+}
+
+describe("LoopController", () => {
+  it("maps an APPROVE verdict to COMPLETE", async () => {
+    const storageRoot = await makeStorageRoot();
+    const result = await createResult(storageRoot, "COMPLETED", verdictContent("review-001", "APPROVE"));
+
+    await expect(new LoopController(storageRoot).evaluate("workspace-a", "review-001"))
+      .resolves.toMatchObject({
+        action: "COMPLETE",
+        reason_code: "REVIEW_APPROVED",
+        review_result_id: result.result_id,
+      });
+  });
+
+  it("maps ITERATE and keeps the verdict iteration unchanged", async () => {
+    const storageRoot = await makeStorageRoot();
+    const { task, execution, request, delivery } = await makeDeliveredChain(storageRoot);
+    const result = await new ReviewResultService(storageRoot).createReviewResult({
+      review_request_id: request.review_request_id,
+      delivery_id: delivery.delivery_id,
+      workspace_id: request.workspace_id,
+      status: "COMPLETED",
+      content: verdictContent(request.review_request_id, "ITERATE"),
+    });
+    const verdict = new ReviewVerdictParser().parse(result);
+    const before = JSON.stringify(verdict);
+    const facts: LoopControllerFacts = {
+      task,
+      execution,
+      review_request: request,
+      review_delivery: delivery,
+      review_result: result,
+      review_verdict: verdict,
+    };
+
+    const decision = new LoopController(storageRoot).decide(facts);
+
+    expect(decision).toMatchObject({
+      action: "ITERATE",
+      reason_code: "REVIEW_REQUIRES_ITERATION",
+      review_result_id: result.result_id,
+    });
+    expect(JSON.stringify(verdict)).toBe(before);
+    expect(verdict.iteration?.goal).toBe("Fix the blocking issue.");
+  });
+
+  it("maps HUMAN_REQUIRED to HUMAN_REQUIRED", async () => {
+    const storageRoot = await makeStorageRoot();
+    await createResult(storageRoot, "COMPLETED", verdictContent("review-001", "HUMAN_REQUIRED"));
+
+    await expect(new LoopController(storageRoot).evaluate("workspace-a", "review-001"))
+      .resolves.toMatchObject({
+        action: "HUMAN_REQUIRED",
+        reason_code: "REVIEW_REQUIRES_HUMAN",
+      });
+  });
+
+  it("maps TIMEOUT and FAILED to RETRY_REVIEW", async () => {
+    const timeoutRoot = await makeStorageRoot();
+    await createResult(timeoutRoot, "TIMEOUT");
+    await expect(new LoopController(timeoutRoot).evaluate("workspace-a", "review-001"))
+      .resolves.toMatchObject({ action: "RETRY_REVIEW", reason_code: "REVIEW_TIMEOUT" });
+
+    const failedRoot = await makeStorageRoot();
+    await createResult(failedRoot, "FAILED");
+    await expect(new LoopController(failedRoot).evaluate("workspace-a", "review-001"))
+      .resolves.toMatchObject({ action: "RETRY_REVIEW", reason_code: "REVIEW_FAILED" });
+  });
+
+  it("retries a completed result with an invalid verdict", async () => {
+    const storageRoot = await makeStorageRoot();
+    await createResult(storageRoot, "COMPLETED", "The review has no machine-readable verdict.");
+
+    await expect(new LoopController(storageRoot).evaluate("workspace-a", "review-001"))
+      .resolves.toMatchObject({ action: "RETRY_REVIEW", reason_code: "REVIEW_VERDICT_INVALID" });
+  });
+
+  it("waits when delivery exists but no ReviewResult exists", async () => {
+    const storageRoot = await makeStorageRoot();
+    await makeDeliveredChain(storageRoot);
+
+    const decision = await new LoopController(storageRoot).evaluate("workspace-a", "review-001");
+    expect(decision).toMatchObject({ action: "WAIT", reason_code: "REVIEW_PENDING" });
+    expect(decision).not.toHaveProperty("review_result_id");
+  });
+
+  it("rejects mismatched identity chains", async () => {
+    const storageRoot = await makeStorageRoot();
+    const { task, execution, request, delivery } = await makeDeliveredChain(storageRoot);
+    const result = await new ReviewResultService(storageRoot).createReviewResult({
+      review_request_id: request.review_request_id,
+      delivery_id: delivery.delivery_id,
+      workspace_id: request.workspace_id,
+      status: "TIMEOUT",
+      error: "review timed out",
+    });
+    const facts: LoopControllerFacts = {
+      task: { ...task, workspace_id: "workspace-b" },
+      execution,
+      review_request: request,
+      review_delivery: delivery,
+      review_result: result,
+    };
+
+    expect(() => new LoopController(storageRoot).decide(facts))
+      .toThrow(LoopControllerIdentityError);
+    expect(() => new LoopController(storageRoot).decide(facts))
+      .toThrow(/LOOP_IDENTITY_MISMATCH/);
+  });
+});
