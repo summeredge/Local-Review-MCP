@@ -1,13 +1,22 @@
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import { readFile, stat } from "node:fs/promises";
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { GitError } from "./errors.js";
-import type { GitDiffOptions, GitDiffResponse, GitStatusEntry, GitStatusResponse } from "./types.js";
+import type {
+  GitDiffOptions,
+  GitDiffResponse,
+  GitStatusEntry,
+  GitStatusResponse,
+  ReviewSnapshot,
+} from "./types.js";
 import { isContainedPath, normalizeRemotePath } from "../workspace/path.js";
 import type { ResolvedWorkspacePath, WorkspaceManager } from "../workspace/manager.js";
 
 export const MAX_DIFF_BYTES = 4 * 1024 * 1024;
 export const MAX_DIFF_FILES = 500;
+export const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
 
 const MAX_STATUS_BYTES = MAX_DIFF_BYTES;
 const MAX_REPOSITORY_ROOT_BYTES = 64 * 1024;
@@ -174,6 +183,15 @@ function removeBinarySections(value: string): string {
     .join("");
 }
 
+function hashRecord(hash: ReturnType<typeof createHash>, label: string, value: Buffer): void {
+  hash.update(`${label}\0${value.length}\0`, "utf8");
+  hash.update(value);
+}
+
+function sortPaths(paths: readonly string[]): string[] {
+  return [...paths].sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+}
+
 export class GitService {
   private readonly workspace: WorkspaceManager;
   private readonly gitPath: string;
@@ -261,11 +279,15 @@ export class GitService {
     }
   }
 
-  private async changedFiles(scope: ResolvedWorkspacePath): Promise<string[]> {
+  private async changedFiles(
+    scope: ResolvedWorkspacePath,
+    cached = false,
+  ): Promise<string[]> {
     const scopeArgs = scope.relativePath === "." ? [] : [literalPath(scope.relativePath)];
     const output = await this.run([
       ...BASE_GIT_ARGS,
       "diff",
+      ...(cached ? ["--cached"] : []),
       "--name-only",
       "-z",
       "--no-renames",
@@ -290,6 +312,77 @@ export class GitService {
     const output = await this.run([...BASE_GIT_ARGS, "branch", "--show-current"], 4096);
     const value = output.toString("utf8").trim();
     return value === "" ? null : value;
+  }
+
+  private async head(): Promise<string> {
+    const output = await this.run([...BASE_GIT_ARGS, "rev-parse", "--verify", "HEAD"], 4096);
+    const value = output.toString("utf8").trim();
+    if (!/^[0-9a-f]+$/u.test(value)) throw new GitError("GIT_COMMAND_FAILED");
+    return value;
+  }
+
+  private async snapshotDiff(cached: boolean, paths: readonly string[]): Promise<Buffer> {
+    if (paths.length === 0) return Buffer.alloc(0);
+    return this.run([
+      ...BASE_GIT_ARGS,
+      "diff",
+      ...(cached ? ["--cached"] : []),
+      "--binary",
+      "--full-index",
+      "--no-renames",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-color",
+      "--",
+      ...paths.map(literalPath),
+    ], MAX_DIFF_BYTES, "SNAPSHOT_TOO_LARGE");
+  }
+
+  private async untrackedFiles(): Promise<string[]> {
+    const output = await this.run([
+      ...BASE_GIT_ARGS,
+      "ls-files",
+      "--others",
+      "--exclude-standard",
+      "--full-name",
+      "-z",
+      "--",
+    ], MAX_SNAPSHOT_BYTES, "SNAPSHOT_TOO_LARGE");
+    const files = new Set<string>();
+    for (const rawPath of nulSeparated(output)) {
+      const safePath = this.safeGitPath(rawPath, {
+        absolutePath: this.workspace.canonicalRoot,
+        relativePath: ".",
+      });
+      if (safePath !== undefined) files.add(safePath);
+      if (files.size > MAX_DIFF_FILES) throw new GitError("SNAPSHOT_TOO_LARGE");
+    }
+    return [...files].sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+  }
+
+  private async hashUntracked(
+    hash: ReturnType<typeof createHash>,
+    paths: readonly string[],
+  ): Promise<void> {
+    let bytes = 0;
+    for (const path of paths) {
+      let contents: Buffer;
+      try {
+        const resolved = this.workspace.resolveExisting(path);
+        const details = await stat(resolved.absolutePath);
+        if (!details.isFile() || details.size > MAX_DIFF_BYTES) {
+          throw new GitError("SNAPSHOT_TOO_LARGE");
+        }
+        contents = await readFile(resolved.absolutePath);
+      } catch (error: unknown) {
+        if (error instanceof GitError) throw error;
+        throw new GitError("GIT_COMMAND_FAILED");
+      }
+      bytes += Buffer.byteLength(path, "utf8") + contents.length;
+      if (bytes > MAX_SNAPSHOT_BYTES) throw new GitError("SNAPSHOT_TOO_LARGE");
+      hashRecord(hash, "untracked-path", Buffer.from(path, "utf8"));
+      hashRecord(hash, "untracked-content", contents);
+    }
   }
 
   private parseStatus(output: Buffer): GitStatusEntry[] {
@@ -361,6 +454,36 @@ export class GitService {
       files,
       binary: binary.length > 0,
       ...(binary.length === 0 ? {} : { binary_paths: binary }),
+    };
+  }
+
+  public async snapshot(): Promise<ReviewSnapshot> {
+    await this.assertRepository();
+    const scope = this.workspace.resolvePath(".");
+    const [branch, head, stagedPaths, unstagedPaths, untracked] = await Promise.all([
+      this.branch(),
+      this.head(),
+      this.changedFiles(scope, true),
+      this.changedFiles(scope, false),
+      this.untrackedFiles(),
+    ]);
+    const orderedStagedPaths = sortPaths(stagedPaths);
+    const orderedUnstagedPaths = sortPaths(unstagedPaths);
+    if (orderedStagedPaths.length + orderedUnstagedPaths.length + untracked.length > MAX_DIFF_FILES) {
+      throw new GitError("SNAPSHOT_TOO_LARGE");
+    }
+    const [staged, unstaged] = await Promise.all([
+      this.snapshotDiff(true, orderedStagedPaths),
+      this.snapshotDiff(false, orderedUnstagedPaths),
+    ]);
+    const hash = createHash("sha256");
+    hashRecord(hash, "staged", staged);
+    hashRecord(hash, "unstaged", unstaged);
+    await this.hashUntracked(hash, untracked);
+    return {
+      branch,
+      head,
+      diff_sha256: hash.digest("hex"),
     };
   }
 }

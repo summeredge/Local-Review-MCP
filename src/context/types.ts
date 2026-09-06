@@ -80,6 +80,7 @@ export interface ReviewRequestContext {
   readonly status: ReviewRequestStatus;
   readonly created_at: string;
   readonly updated_at: string;
+  readonly review_snapshot?: import("../git/types.js").ReviewSnapshot;
 }
 
 export interface CreateReviewRequestInput {
@@ -89,6 +90,7 @@ export interface CreateReviewRequestInput {
   readonly workspace_id: string;
   readonly conversation_id?: string;
   readonly status?: ReviewRequestStatus;
+  readonly review_snapshot?: import("../git/types.js").ReviewSnapshot;
 }
 
 export interface UpdateReviewRequestInput {

@@ -6,6 +6,7 @@ import { ConversationRoutingService } from "../src/context/conversation-routing-
 import { ExecutionContextService } from "../src/context/execution-service.js";
 import { ReviewDeliveryService } from "../src/context/review-delivery-service.js";
 import { ReviewRequestService } from "../src/context/review-request-service.js";
+import type { ReviewSnapshotProvider } from "../src/context/review-request-snapshot.js";
 import { ReviewResultService } from "../src/context/review-result-service.js";
 import type { ReviewResult } from "../src/context/review-result.js";
 import { TaskContextService } from "../src/context/service.js";
@@ -15,6 +16,16 @@ import {
   type LoopControllerFacts,
 } from "../src/control/loop-controller.js";
 import { ReviewVerdictParser } from "../src/control/review-verdict-parser.js";
+import type { ReviewSnapshot } from "../src/git/types.js";
+
+const matchingSnapshot: ReviewSnapshot = {
+  branch: "main",
+  head: "0123456789abcdef0123456789abcdef01234567",
+  diff_sha256: "a".repeat(64),
+};
+const matchingProvider: ReviewSnapshotProvider = {
+  capture: async () => matchingSnapshot,
+};
 
 const temporaryDirectories: string[] = [];
 
@@ -31,7 +42,10 @@ async function makeStorageRoot(): Promise<string> {
   return directory;
 }
 
-async function makeDeliveredChain(storageRoot: string) {
+async function makeDeliveredChain(
+  storageRoot: string,
+  reviewSnapshot: ReviewSnapshot | null = matchingSnapshot,
+) {
   const task = await new TaskContextService(storageRoot).createTaskContext({
     task_id: "task-001",
     workspace_id: "workspace-a",
@@ -47,6 +61,7 @@ async function makeDeliveredChain(storageRoot: string) {
     task_id: task.task_id,
     execution_id: execution.execution_id,
     workspace_id: task.workspace_id,
+    ...(reviewSnapshot === null ? {} : { review_snapshot: reviewSnapshot }),
   });
   const routing = await new ConversationRoutingService(storageRoot).createRouting({
     routing_id: "routing-001",
@@ -108,7 +123,9 @@ describe("LoopController", () => {
     const storageRoot = await makeStorageRoot();
     const result = await createResult(storageRoot, "COMPLETED", verdictContent("review-001", "APPROVE"));
 
-    await expect(new LoopController(storageRoot).evaluate("workspace-a", "review-001"))
+    await expect(new LoopController(storageRoot, undefined, {
+      reviewSnapshotProvider: matchingProvider,
+    }).evaluate("workspace-a", "review-001"))
       .resolves.toMatchObject({
         action: "COMPLETE",
         reason_code: "REVIEW_APPROVED",
@@ -135,6 +152,7 @@ describe("LoopController", () => {
       review_delivery: delivery,
       review_result: result,
       review_verdict: verdict,
+      current_review_snapshot: matchingSnapshot,
     };
 
     const decision = new LoopController(storageRoot).decide(facts);
@@ -152,7 +170,9 @@ describe("LoopController", () => {
     const storageRoot = await makeStorageRoot();
     await createResult(storageRoot, "COMPLETED", verdictContent("review-001", "HUMAN_REQUIRED"));
 
-    await expect(new LoopController(storageRoot).evaluate("workspace-a", "review-001"))
+    await expect(new LoopController(storageRoot, undefined, {
+      reviewSnapshotProvider: matchingProvider,
+    }).evaluate("workspace-a", "review-001"))
       .resolves.toMatchObject({
         action: "HUMAN_REQUIRED",
         reason_code: "REVIEW_REQUIRES_HUMAN",
@@ -175,8 +195,100 @@ describe("LoopController", () => {
     const storageRoot = await makeStorageRoot();
     await createResult(storageRoot, "COMPLETED", "The review has no machine-readable verdict.");
 
-    await expect(new LoopController(storageRoot).evaluate("workspace-a", "review-001"))
+    await expect(new LoopController(storageRoot, undefined, {
+      reviewSnapshotProvider: matchingProvider,
+    }).evaluate("workspace-a", "review-001"))
       .resolves.toMatchObject({ action: "RETRY_REVIEW", reason_code: "REVIEW_VERDICT_INVALID" });
+  });
+
+  it("returns STALE_REVIEW when the diff fingerprint changes", async () => {
+    const storageRoot = await makeStorageRoot();
+    const result = await createResult(storageRoot, "COMPLETED", verdictContent("review-001", "APPROVE"));
+    const provider: ReviewSnapshotProvider = {
+      capture: async () => ({ ...matchingSnapshot, diff_sha256: "b".repeat(64) }),
+    };
+
+    await expect(new LoopController(storageRoot, undefined, {
+      reviewSnapshotProvider: provider,
+    }).evaluate("workspace-a", "review-001"))
+      .resolves.toMatchObject({
+        action: "RETRY_REVIEW",
+        reason_code: "STALE_REVIEW",
+        review_result_id: result.result_id,
+      });
+    await expect(new LoopController(storageRoot, undefined, {
+      reviewSnapshotProvider: provider,
+    }).evaluate("workspace-a", "review-001"))
+      .resolves.not.toMatchObject({ action: "COMPLETE" });
+  });
+
+  it("returns STALE_REVIEW when head changes", async () => {
+    const storageRoot = await makeStorageRoot();
+    await createResult(storageRoot, "COMPLETED", verdictContent("review-001", "APPROVE"));
+    const provider: ReviewSnapshotProvider = {
+      capture: async () => ({ ...matchingSnapshot, head: "f".repeat(40) }),
+    };
+
+    await expect(new LoopController(storageRoot, undefined, {
+      reviewSnapshotProvider: provider,
+    }).evaluate("workspace-a", "review-001"))
+      .resolves.toMatchObject({ action: "RETRY_REVIEW", reason_code: "STALE_REVIEW" });
+  });
+
+  it("returns STALE_REVIEW when branch changes", async () => {
+    const storageRoot = await makeStorageRoot();
+    await createResult(storageRoot, "COMPLETED", verdictContent("review-001", "APPROVE"));
+    const provider: ReviewSnapshotProvider = {
+      capture: async () => ({ ...matchingSnapshot, branch: "feature" }),
+    };
+
+    await expect(new LoopController(storageRoot, undefined, {
+      reviewSnapshotProvider: provider,
+    }).evaluate("workspace-a", "review-001"))
+      .resolves.toMatchObject({ action: "RETRY_REVIEW", reason_code: "STALE_REVIEW" });
+  });
+
+  it("does not map a stale ITERATE verdict to ITERATE", async () => {
+    const storageRoot = await makeStorageRoot();
+    await createResult(storageRoot, "COMPLETED", verdictContent("review-001", "ITERATE"));
+    const provider: ReviewSnapshotProvider = {
+      capture: async () => ({ ...matchingSnapshot, diff_sha256: "c".repeat(64) }),
+    };
+
+    await expect(new LoopController(storageRoot, undefined, {
+      reviewSnapshotProvider: provider,
+    }).evaluate("workspace-a", "review-001"))
+      .resolves.toMatchObject({ action: "RETRY_REVIEW", reason_code: "STALE_REVIEW" });
+  });
+
+  it("returns REVIEW_SNAPSHOT_MISSING for historical completed requests", async () => {
+    const storageRoot = await makeStorageRoot();
+    const { request, delivery } = await makeDeliveredChain(storageRoot, null);
+    await new ReviewResultService(storageRoot).createReviewResult({
+      review_request_id: request.review_request_id,
+      delivery_id: delivery.delivery_id,
+      workspace_id: request.workspace_id,
+      status: "COMPLETED",
+      content: verdictContent(request.review_request_id, "APPROVE"),
+    });
+
+    await expect(new LoopController(storageRoot, undefined, {
+      reviewSnapshotProvider: matchingProvider,
+    }).evaluate("workspace-a", "review-001"))
+      .resolves.toMatchObject({ action: "RETRY_REVIEW", reason_code: "REVIEW_SNAPSHOT_MISSING" });
+  });
+
+  it("returns REVIEW_SNAPSHOT_UNAVAILABLE when provider capture fails", async () => {
+    const storageRoot = await makeStorageRoot();
+    await createResult(storageRoot, "COMPLETED", verdictContent("review-001", "APPROVE"));
+    const failingProvider: ReviewSnapshotProvider = {
+      capture: async () => { throw new Error("snapshot capture failed"); },
+    };
+
+    await expect(new LoopController(storageRoot, undefined, {
+      reviewSnapshotProvider: failingProvider,
+    }).evaluate("workspace-a", "review-001"))
+      .resolves.toMatchObject({ action: "RETRY_REVIEW", reason_code: "REVIEW_SNAPSHOT_UNAVAILABLE" });
   });
 
   it("waits when delivery exists but no ReviewResult exists", async () => {

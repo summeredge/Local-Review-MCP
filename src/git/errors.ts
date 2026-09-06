@@ -4,6 +4,7 @@ export const GIT_ERROR_CODES = [
   "GIT_COMMAND_FAILED",
   "DIFF_TOO_LARGE",
   "BINARY_DIFF",
+  "SNAPSHOT_TOO_LARGE",
 ] as const;
 
 export type GitErrorCode = typeof GIT_ERROR_CODES[number];

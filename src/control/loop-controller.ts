@@ -3,6 +3,7 @@ import { ExecutionContextService } from "../context/execution-service.js";
 import { ReviewDeliveryService } from "../context/review-delivery-service.js";
 import type { ReviewDelivery } from "../context/review-delivery.js";
 import { ReviewRequestService } from "../context/review-request-service.js";
+import type { ReviewSnapshotProvider } from "../context/review-request-snapshot.js";
 import { ReviewResultService } from "../context/review-result-service.js";
 import type { ReviewResult } from "../context/review-result.js";
 import { TaskContextService } from "../context/service.js";
@@ -20,6 +21,7 @@ import type { ReviewVerdict } from "./review-verdict.js";
 import { createLoopDecisionId } from "./loop-decision.js";
 import { loopDecisionSchema } from "./loop-decision-schema.js";
 import type { LoopDecision } from "./loop-decision.js";
+import { sameReviewSnapshot, type ReviewSnapshot } from "../git/types.js";
 
 export interface LoopControllerFacts {
   readonly task: TaskContext;
@@ -28,6 +30,11 @@ export interface LoopControllerFacts {
   readonly review_delivery?: ReviewDelivery | null;
   readonly review_result?: ReviewResult | null;
   readonly review_verdict?: ReviewVerdict;
+  readonly current_review_snapshot?: ReviewSnapshot;
+}
+
+export interface LoopControllerOptions {
+  readonly reviewSnapshotProvider?: ReviewSnapshotProvider;
 }
 
 export class LoopControllerIdentityError extends Error {
@@ -49,16 +56,19 @@ export class LoopController {
   private readonly reviewRequests: ReviewRequestService;
   private readonly deliveries: ReviewDeliveryService;
   private readonly results: ReviewResultService;
+  private readonly reviewSnapshotProvider?: ReviewSnapshotProvider;
 
   public constructor(
     storageRoot = defaultTaskContextStorageRoot(),
     private readonly parser: Pick<ReviewVerdictParser, "parse"> = new ReviewVerdictParser(),
+    options: LoopControllerOptions = {},
   ) {
     this.tasks = new TaskContextService(storageRoot);
     this.executions = new ExecutionContextService(storageRoot);
     this.reviewRequests = new ReviewRequestService(storageRoot);
     this.deliveries = new ReviewDeliveryService(storageRoot);
     this.results = new ReviewResultService(storageRoot);
+    this.reviewSnapshotProvider = options.reviewSnapshotProvider;
   }
 
   public async evaluate(workspaceId: string, reviewRequestId: string): Promise<LoopDecision> {
@@ -89,12 +99,22 @@ export class LoopController {
       : await this.deliveries.getDelivery(workspaceId, reviewResult.delivery_id);
     if (reviewDelivery !== null) await this.deliveries.validateDelivery(reviewDelivery);
 
+    let currentReviewSnapshot: LoopControllerFacts["current_review_snapshot"];
+    if (reviewResult?.status === "COMPLETED" && reviewRequest.review_snapshot !== undefined) {
+      try {
+        currentReviewSnapshot = await this.reviewSnapshotProvider?.capture(workspaceId);
+      } catch {
+        currentReviewSnapshot = undefined;
+      }
+    }
+
     return this.decide({
       task,
       execution,
       review_request: reviewRequest,
       review_delivery: reviewDelivery,
       review_result: reviewResult,
+      ...(currentReviewSnapshot === undefined ? {} : { current_review_snapshot: currentReviewSnapshot }),
     });
   }
 
@@ -122,6 +142,32 @@ export class LoopController {
         "RETRY_REVIEW",
         "REVIEW_FAILED",
         "Review completion failed; the review should be retried.",
+      );
+    }
+
+    const originalReviewSnapshot = facts.review_request.review_snapshot;
+    if (originalReviewSnapshot === undefined) {
+      return this.createDecision(
+        facts,
+        "RETRY_REVIEW",
+        "REVIEW_SNAPSHOT_MISSING",
+        "The completed review has no workspace snapshot; the review must be retried.",
+      );
+    }
+    if (facts.current_review_snapshot === undefined) {
+      return this.createDecision(
+        facts,
+        "RETRY_REVIEW",
+        "REVIEW_SNAPSHOT_UNAVAILABLE",
+        "The current workspace snapshot could not be captured; the review must be retried.",
+      );
+    }
+    if (!sameReviewSnapshot(originalReviewSnapshot, facts.current_review_snapshot)) {
+      return this.createDecision(
+        facts,
+        "RETRY_REVIEW",
+        "STALE_REVIEW",
+        "The workspace changed after the review was created; the review must be retried.",
       );
     }
 

@@ -1,8 +1,10 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { ReviewRequestSnapshotCoordinator, type ReviewSnapshotProvider } from "../src/context/review-request-snapshot.js";
 import { ReviewRequestService } from "../src/context/review-request-service.js";
+import type { ReviewSnapshot } from "../src/git/types.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -18,6 +20,12 @@ async function makeStorageRoot(): Promise<string> {
   temporaryDirectories.push(directory);
   return directory;
 }
+
+const reviewSnapshot: ReviewSnapshot = {
+  branch: "main",
+  head: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  diff_sha256: "a".repeat(64),
+};
 
 describe("ReviewRequestService", () => {
   it("creates a review request in pending status and persists it", async () => {
@@ -124,5 +132,71 @@ describe("ReviewRequestService", () => {
     expect((await service.listReviewRequests("workspace-a"))
       .map(({ review_request_id }) => review_request_id))
       .toEqual(["review-001", "review-002"]);
+  });
+
+  it("persists an immutable review snapshot and preserves it across updates", async () => {
+    const storageRoot = await makeStorageRoot();
+    const service = new ReviewRequestService(storageRoot);
+    const created = await service.createReviewRequest({
+      review_request_id: "review-snapshot-001",
+      task_id: "task-001",
+      execution_id: "exec-001",
+      workspace_id: "workspace-a",
+      review_snapshot: reviewSnapshot,
+    });
+
+    expect(created.review_snapshot).toEqual(reviewSnapshot);
+    expect(JSON.parse(await readFile(
+      join(
+        storageRoot,
+        ".task",
+        "review_requests",
+        "workspace-a",
+        "review-snapshot-001.json",
+      ),
+      "utf8",
+    ))).toMatchObject({ review_snapshot: reviewSnapshot });
+
+    const updated = await service.updateReviewRequest("workspace-a", "review-snapshot-001", {
+      status: "completed",
+    });
+    expect(updated.review_snapshot).toEqual(reviewSnapshot);
+  });
+
+  it("rejects an invalid review snapshot", async () => {
+    const service = new ReviewRequestService(await makeStorageRoot());
+    await expect(service.createReviewRequest({
+      review_request_id: "review-invalid-snapshot",
+      task_id: "task-001",
+      execution_id: "exec-001",
+      workspace_id: "workspace-a",
+      review_snapshot: {
+        branch: "main",
+        head: "",
+        diff_sha256: "not-a-sha256",
+      },
+    })).rejects.toThrow();
+  });
+
+  it("captures a snapshot before creating a ReviewRequest through the coordinator", async () => {
+    const storageRoot = await makeStorageRoot();
+    const service = new ReviewRequestService(storageRoot);
+    const calls: string[] = [];
+    const provider: ReviewSnapshotProvider = {
+      capture: async () => {
+        calls.push("capture");
+        return reviewSnapshot;
+      },
+    };
+    const coordinator = new ReviewRequestSnapshotCoordinator(service, provider);
+
+    const request = await coordinator.createReviewRequest({
+      review_request_id: "review-coordinated-001",
+      task_id: "task-001",
+      execution_id: "exec-001",
+      workspace_id: "workspace-a",
+    });
+    expect(calls).toEqual(["capture"]);
+    expect(request.review_snapshot).toEqual(reviewSnapshot);
   });
 });

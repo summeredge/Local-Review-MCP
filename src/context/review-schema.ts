@@ -18,6 +18,13 @@ export const reviewRequestIdSchema = z.string()
 
 export const reviewRequestStatusSchema = z.enum(REVIEW_REQUEST_STATUSES);
 const timestampSchema = z.string().datetime({ offset: true });
+const sha256HexSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+
+export const reviewSnapshotSchema = z.object({
+  branch: z.string().nullable(),
+  head: z.string().min(1),
+  diff_sha256: sha256HexSchema,
+}).strict();
 
 export const reviewRequestContextSchema = z.object({
   review_request_id: reviewRequestIdSchema,
@@ -28,6 +35,7 @@ export const reviewRequestContextSchema = z.object({
   status: reviewRequestStatusSchema,
   created_at: timestampSchema,
   updated_at: timestampSchema,
+  review_snapshot: reviewSnapshotSchema.optional(),
 }).strict();
 
 export const createReviewRequestInputSchema = z.object({
@@ -37,6 +45,7 @@ export const createReviewRequestInputSchema = z.object({
   workspace_id: workspaceIdSchema,
   conversation_id: conversationIdSchema.optional(),
   status: reviewRequestStatusSchema.default("pending"),
+  review_snapshot: reviewSnapshotSchema.optional(),
 }).strict();
 
 export const updateReviewRequestInputSchema = z.object({

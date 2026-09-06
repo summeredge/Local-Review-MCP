@@ -49,6 +49,7 @@ export class ReviewRequestService {
       status: parsed.status,
       created_at: timestamp,
       updated_at: timestamp,
+      ...(parsed.review_snapshot === undefined ? {} : { review_snapshot: parsed.review_snapshot }),
     });
     const directory = reviewRequestsDirectory(this.storageRoot, context.workspace_id);
     await mkdir(directory, { recursive: true, mode: 0o700 });

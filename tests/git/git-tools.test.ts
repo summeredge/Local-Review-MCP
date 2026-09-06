@@ -6,10 +6,11 @@ import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { MAX_DIFF_BYTES } from "../../src/git/service.js";
+import { GitService, MAX_DIFF_BYTES } from "../../src/git/service.js";
 import { createMcpServer } from "../../src/mcp/server.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
+import type { ReviewSnapshot } from "../../src/git/types.js";
 
 const runProcess = promisify(execFile);
 const clients: Client[] = [];
@@ -21,6 +22,101 @@ afterEach(async () => {
     recursive: true,
     force: true,
   })));
+});
+describe("GitService review snapshot", () => {
+  it("is deterministic for a clean repository", async () => {
+    const workspace = await makeWorkspace();
+    await initRepository(workspace, { "app.txt": "hello\n" });
+
+    const first = await snapshot(workspace);
+    const second = await snapshot(workspace);
+
+    expect(first).toEqual(second);
+    expect(first.branch).toBe("main");
+    expect(first.head).toMatch(/^[0-9a-f]{40}$/u);
+    expect(first.diff_sha256).toMatch(/^[0-9a-f]{64}$/u);
+  });
+
+  it("changes the fingerprint for unstaged tracked content", async () => {
+    const workspace = await makeWorkspace();
+    await initRepository(workspace, { "app.txt": "before\n" });
+    const clean = await snapshot(workspace);
+
+    await writeFile(join(workspace, "app.txt"), "after\n");
+
+    expect((await snapshot(workspace)).diff_sha256).not.toBe(clean.diff_sha256);
+  });
+
+  it("changes the fingerprint for staged tracked content", async () => {
+    const workspace = await makeWorkspace();
+    await initRepository(workspace, { "app.txt": "before\n" });
+    const clean = await snapshot(workspace);
+
+    await writeFile(join(workspace, "app.txt"), "staged\n");
+    await git(workspace, "add", "app.txt");
+
+    expect((await snapshot(workspace)).diff_sha256).not.toBe(clean.diff_sha256);
+  });
+
+  it("changes the fingerprint when both index and worktree versions change", async () => {
+    const workspace = await makeWorkspace();
+    await initRepository(workspace, { "app.txt": "before\n" });
+    const clean = await snapshot(workspace);
+
+    await writeFile(join(workspace, "app.txt"), "staged\n");
+    await git(workspace, "add", "app.txt");
+    await writeFile(join(workspace, "app.txt"), "worktree\n");
+
+    const snapshotWithBoth = await snapshot(workspace);
+    expect(snapshotWithBoth.diff_sha256).not.toBe(clean.diff_sha256);
+
+    await writeFile(join(workspace, "app.txt"), "worktree-2\n");
+    expect((await snapshot(workspace)).diff_sha256).not.toBe(snapshotWithBoth.diff_sha256);
+  });
+
+  it("changes the fingerprint for untracked paths and their contents", async () => {
+    const workspace = await makeWorkspace();
+    await initRepository(workspace, { "tracked.txt": "tracked\n" });
+    const clean = await snapshot(workspace);
+
+    await mkdir(join(workspace, "src"), { recursive: true });
+    await writeFile(join(workspace, "src", "untracked.txt"), "one\n");
+    const added = await snapshot(workspace);
+    expect(added.diff_sha256).not.toBe(clean.diff_sha256);
+
+    await writeFile(join(workspace, "src", "untracked.txt"), "two\n");
+    expect((await snapshot(workspace)).diff_sha256).not.toBe(added.diff_sha256);
+  });
+
+  it("ignores ignored files in the fingerprint", async () => {
+    const workspace = await makeWorkspace();
+    await initRepository(workspace, {
+      "app.txt": "tracked\n",
+      ".gitignore": "ignored.txt\n",
+    });
+    const clean = await snapshot(workspace);
+
+    await writeFile(join(workspace, "ignored.txt"), "ignored content\n");
+
+    expect((await snapshot(workspace)).diff_sha256).toBe(clean.diff_sha256);
+  });
+
+  it("changes head and detects branch changes", async () => {
+    const workspace = await makeWorkspace();
+    await initRepository(workspace, { "app.txt": "first\n" });
+    const before = await snapshot(workspace);
+    await git(workspace, "checkout", "-b", "feature");
+    await writeFile(join(workspace, "app.txt"), "second\n");
+    await git(workspace, "add", "app.txt");
+    await git(workspace, "commit", "-m", "second");
+
+    const after = await snapshot(workspace);
+    expect(after.branch).toBe("feature");
+    expect(after.head).not.toBe(before.head);
+
+    await git(workspace, "checkout", "main");
+    expect((await snapshot(workspace)).branch).toBe("main");
+  });
 });
 
 async function makeWorkspace(): Promise<string> {
@@ -51,6 +147,14 @@ async function initRepository(workspace: string, files: Record<string, string>):
   }
   await git(workspace, "add", ".");
   await git(workspace, "commit", "-m", "initial");
+}
+
+function snapshotService(workspace: string): GitService {
+  return new GitService(new WorkspaceManager(workspace));
+}
+
+async function snapshot(workspace: string): Promise<ReviewSnapshot> {
+  return snapshotService(workspace).snapshot();
 }
 
 function toolText(result: unknown): string {
