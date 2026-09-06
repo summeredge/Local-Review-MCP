@@ -65,6 +65,7 @@ export interface UpdateExecutionContextInput {
 export const REVIEW_REQUEST_STATUSES = [
   "pending",
   "requested",
+  "reviewing",
   "completed",
 ] as const;
 

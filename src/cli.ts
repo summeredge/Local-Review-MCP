@@ -50,6 +50,9 @@ try {
   } else if (argv[0] === "diagnose-review-submission") {
     const { generateReviewSubmissionExample } = await import("./browser-worker/review-submission-diagnostic.js");
     console.log(JSON.stringify(await generateReviewSubmissionExample(), null, 2));
+  } else if (argv[0] === "diagnose-review-completion") {
+    const { generateReviewCompletionExample } = await import("./browser-worker/review-completion-diagnostic.js");
+    console.log(JSON.stringify(await generateReviewCompletionExample(), null, 2));
   } else if (argv[0] === "diagnose-conversation-routing") {
     const diagnosticArgs = argv.slice(1);
     const diagnosticCli = parseCliArgs(diagnosticArgs);

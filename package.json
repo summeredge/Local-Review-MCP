@@ -16,6 +16,7 @@
     "diagnose:browser-router": "npm run build && node dist/src/cli.js diagnose-browser-router",
     "diagnose:browser-worker": "npm run build && node dist/src/cli.js diagnose-browser-worker",
     "diagnose:review-submission": "npm run build && node dist/src/cli.js diagnose-review-submission",
+    "diagnose:review-completion": "npm run build && node dist/src/cli.js diagnose-review-completion",
     "diagnose:review-context": "npm run build && node dist/src/cli.js diagnose-review-context",
     "start:browser-worker": "npm run build && node dist/src/browser-worker/cli.js",
     "start": "node dist/src/cli.js"

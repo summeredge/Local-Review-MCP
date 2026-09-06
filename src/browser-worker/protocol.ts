@@ -21,3 +21,21 @@ export interface BrowserDeliveryResult {
   readonly status: BrowserDeliveryStatus;
   readonly error?: string;
 }
+
+export const BROWSER_COMPLETION_STATUSES = ["COMPLETED", "TIMEOUT", "FAILED"] as const;
+export type BrowserCompletionStatus = typeof BROWSER_COMPLETION_STATUSES[number];
+
+export type BrowserCompletionResult =
+  | {
+    readonly conversationId: string;
+    readonly url?: string;
+    readonly status: "COMPLETED";
+    readonly content: string;
+    readonly extractedAt: string;
+  }
+  | {
+    readonly conversationId: string;
+    readonly url?: string;
+    readonly status: Exclude<BrowserCompletionStatus, "COMPLETED">;
+    readonly error: string;
+  };

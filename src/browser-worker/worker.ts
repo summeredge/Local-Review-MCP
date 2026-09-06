@@ -7,10 +7,13 @@ import {
   resolveBrowserWorkerConfig,
   type BrowserWorkerConfigInput,
 } from "./config.js";
+import { ChatGPTCompletionDetector } from "./completion/detector.js";
+import type { ReviewCompletionDetector, ReviewResultExtractor } from "./completion/types.js";
+import { ChatGPTResultExtractor } from "./completion/extractor.js";
 import { ChatGPTInteraction } from "./interaction/chatgpt-interaction.js";
 import { conversationUrl, ConversationNavigator } from "./navigation/conversation-navigator.js";
 import type { NavigationSessionResult } from "./navigation/conversation-navigator.js";
-import type { BrowserDeliveryResult } from "./protocol.js";
+import type { BrowserCompletionResult, BrowserDeliveryResult } from "./protocol.js";
 import { BrowserProfileManager, type PersistentContextLauncher } from "./profile/manager.js";
 
 export type BrowserWorkerStatus = "stopped" | "starting" | "ready" | "failed";
@@ -28,10 +31,15 @@ export interface BrowserWorkerOptions extends BrowserWorkerConfigInput {
   readonly launchBrowser?: BrowserLauncher;
   readonly launchPersistentContext?: PersistentContextLauncher;
   readonly interaction?: Pick<ChatGPTInteraction, "submitMessage">;
+  readonly completionDetector?: ReviewCompletionDetector;
+  readonly resultExtractor?: ReviewResultExtractor;
+  readonly completionTimeoutMs?: number;
+  readonly completionPollIntervalMs?: number;
 }
 
 export const MAX_CONVERSATION_NAVIGATION_REQUEST_BYTES = 16 * 1024;
 export const MAX_CONVERSATION_DELIVERY_REQUEST_BYTES = 128 * 1024;
+export const MAX_CONVERSATION_COMPLETION_REQUEST_BYTES = 16 * 1024;
 
 const conversationNavigationRequestSchema = z.object({
   conversationId: z.string().min(1).max(256),
@@ -40,6 +48,10 @@ const conversationNavigationRequestSchema = z.object({
 const conversationDeliveryRequestSchema = z.object({
   conversationId: z.string().min(1).max(256),
   message: z.string().min(1).max(64 * 1024),
+}).strict();
+
+const conversationCompletionRequestSchema = z.object({
+  conversationId: z.string().min(1).max(256),
 }).strict();
 
 class RequestBodyTooLargeError extends Error {
@@ -122,6 +134,20 @@ function navigationFailureResult(
   };
 }
 
+function completionFailureResult(
+  conversationId: string,
+  status: Exclude<BrowserCompletionResult["status"], "COMPLETED">,
+  error: string,
+  url?: string,
+): BrowserCompletionResult {
+  return {
+    conversationId,
+    ...(url === undefined ? {} : { url }),
+    status,
+    error,
+  };
+}
+
 function listenServer(server: Server, host: string, port: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const onError = (error: Error): void => {
@@ -144,6 +170,8 @@ export class BrowserWorker {
   private readonly profileManager: BrowserProfileManager;
   private readonly conversationNavigator: ConversationNavigator;
   private readonly interaction: Pick<ChatGPTInteraction, "submitMessage">;
+  private readonly completionDetector: ReviewCompletionDetector;
+  private readonly resultExtractor: ReviewResultExtractor;
   private readonly createdAt = new Date().toISOString();
   private stateValue: BrowserWorkerState = {
     status: "stopped",
@@ -165,6 +193,11 @@ export class BrowserWorker {
     this.profileManager = new BrowserProfileManager(config.profile, launchContext);
     this.conversationNavigator = new ConversationNavigator(this.profileManager);
     this.interaction = options.interaction ?? new ChatGPTInteraction();
+    this.completionDetector = options.completionDetector ?? new ChatGPTCompletionDetector({
+      timeoutMs: options.completionTimeoutMs,
+      pollIntervalMs: options.completionPollIntervalMs,
+    });
+    this.resultExtractor = options.resultExtractor ?? new ChatGPTResultExtractor();
   }
 
   public get state(): BrowserWorkerState {
@@ -236,7 +269,9 @@ export class BrowserWorker {
       }
     }
 
-    if ((path === "/conversation/navigate" || path === "/conversation/deliver")
+    if ((path === "/conversation/navigate"
+      || path === "/conversation/deliver"
+      || path === "/conversation/completion")
       && request.method !== "POST") {
       request.resume();
       sendJson(response, 405, { error: "method_not_allowed" });
@@ -250,6 +285,11 @@ export class BrowserWorker {
 
     if (request.method === "POST" && path === "/conversation/deliver") {
       void this.handleConversationDelivery(request, response);
+      return;
+    }
+
+    if (request.method === "POST" && path === "/conversation/completion") {
+      void this.handleConversationCompletion(request, response);
       return;
     }
 
@@ -401,6 +441,103 @@ export class BrowserWorker {
         await navigation.page.close().catch(() => undefined);
       }
     }
+  }
+
+  private async handleConversationCompletion(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    let body: unknown;
+    try {
+      body = await parseJsonBody(request, MAX_CONVERSATION_COMPLETION_REQUEST_BYTES);
+    } catch (error: unknown) {
+      sendJson(response, error instanceof RequestBodyTooLargeError ? 413 : 400, {
+        status: "FAILED",
+        error: error instanceof RequestBodyTooLargeError
+          ? "conversation completion request is too large"
+          : "invalid_json_body",
+      });
+      return;
+    }
+
+    const parsed = conversationCompletionRequestSchema.safeParse(body);
+    if (!parsed.success) {
+      sendJson(response, 400, {
+        status: "FAILED",
+        error: "conversationId must be a non-empty string.",
+      });
+      return;
+    }
+
+    let navigation: NavigationSessionResult;
+    try {
+      navigation = await this.conversationNavigator.navigate(parsed.data.conversationId);
+    } catch (error: unknown) {
+      sendJson(response, 500, completionFailureResult(
+        parsed.data.conversationId,
+        "FAILED",
+        errorMessage(error),
+      ));
+      return;
+    }
+
+    if (navigation.status === "FAILED") {
+      if (navigation.failureCode === "AUTH_REQUIRED") {
+        this.profileManager.setAuthStatus("AUTH_REQUIRED");
+      }
+      const result = completionFailureResult(
+        parsed.data.conversationId,
+        "FAILED",
+        navigation.error ?? "Conversation navigation failed.",
+        navigation.url,
+      );
+      sendJson(response, navigation.url === undefined ? 400 : 200, result);
+      return;
+    }
+
+    let result: BrowserCompletionResult;
+    try {
+      const detected = await this.completionDetector.waitForCompletion(navigation.page);
+      if (detected.status === "COMPLETED") {
+        const extracted = await this.resultExtractor.extract(navigation.page);
+        if (extracted.status !== "COMPLETED" || extracted.content.trim() === "") {
+          throw new Error("ChatGPT assistant response extraction returned no content.");
+        }
+        result = {
+          conversationId: parsed.data.conversationId,
+          url: navigation.url,
+          status: "COMPLETED",
+          content: extracted.content,
+          extractedAt: extracted.extractedAt,
+        };
+      } else if (detected.status === "TIMEOUT" || detected.status === "FAILED") {
+        result = completionFailureResult(
+          parsed.data.conversationId,
+          detected.status,
+          detected.error,
+          navigation.url,
+        );
+      } else {
+        result = completionFailureResult(
+          parsed.data.conversationId,
+          "FAILED",
+          "Completion detector returned a non-terminal state.",
+          navigation.url,
+        );
+      }
+    } catch (error: unknown) {
+      result = completionFailureResult(
+        parsed.data.conversationId,
+        "FAILED",
+        errorMessage(error),
+        navigation.url,
+      );
+    } finally {
+      if (typeof navigation.page.close === "function") {
+        await navigation.page.close().catch(() => undefined);
+      }
+    }
+    sendJson(response, 200, result);
   }
 
   private updateAuthStatus(status: BrowserDeliveryResult["status"]): void {
