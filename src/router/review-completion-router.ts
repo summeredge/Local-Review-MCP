@@ -99,7 +99,10 @@ export class ReviewCompletionRouter {
 
     let completion: BrowserCompletionResult;
     try {
-      completion = await this.client.collectCompletion(routing.conversation_id);
+      completion = await this.client.collectCompletion(
+        routing.conversation_id,
+        request.review_request_id,
+      );
     } catch (error: unknown) {
       completion = {
         conversationId: routing.conversation_id,

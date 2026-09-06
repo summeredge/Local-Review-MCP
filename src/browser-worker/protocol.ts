@@ -22,6 +22,11 @@ export interface BrowserDeliveryResult {
   readonly error?: string;
 }
 
+export interface BrowserCompletionRequest {
+  readonly conversationId: string;
+  readonly reviewRequestId: string;
+}
+
 export const BROWSER_COMPLETION_STATUSES = ["COMPLETED", "TIMEOUT", "FAILED"] as const;
 export type BrowserCompletionStatus = typeof BROWSER_COMPLETION_STATUSES[number];
 

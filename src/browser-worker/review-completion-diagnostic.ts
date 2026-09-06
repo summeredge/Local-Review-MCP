@@ -11,6 +11,11 @@ import { TaskContextService } from "../context/service.js";
 import { BrowserWorkerDeliveryAdapter } from "../delivery/browser-worker-delivery-adapter.js";
 import { BrowserRouter } from "../router/browser-router.js";
 import { ReviewCompletionRouter } from "../router/review-completion-router.js";
+import {
+  CHATGPT_ASSISTANT_MESSAGE_SELECTOR,
+  CHATGPT_CONVERSATION_MESSAGE_SELECTOR,
+  CHATGPT_USER_MESSAGE_SELECTOR,
+} from "./selectors/chatgpt.js";
 import type { ReviewCompletionDetector, ReviewResultExtractor } from "./completion/types.js";
 import { defaultBrowserProfileRoot } from "./config.js";
 import { BrowserWorker } from "./worker.js";
@@ -27,9 +32,18 @@ export interface ReviewCompletionDiagnosticResult {
 }
 
 class DiagnosticPage {
-  public mode: DiagnosticMode = "success";
+  public constructor(
+    public mode: DiagnosticMode = "success",
+    initialMessages: DiagnosticMessage[] = [
+      { role: "user", text: "Historical review request" },
+      { role: "assistant", text: "Historical review result" },
+    ],
+  ) {
+    this.messages = [...initialMessages];
+  }
+
   private message = "";
-  private users = 0;
+  private readonly messages: DiagnosticMessage[];
 
   private readonly input = {
     count: async (): Promise<number> => 1,
@@ -45,22 +59,31 @@ class DiagnosticPage {
     isVisible: async (): Promise<boolean> => true,
     isEnabled: async (): Promise<boolean> => true,
     click: async (): Promise<void> => {
+      if (this.mode !== "success") return;
+      this.messages.push({ role: "user", text: this.message });
       this.message = "";
-      this.users += 1;
+      this.messages.push({
+        role: "assistant",
+        text: "Review result from the diagnostic assistant.",
+      });
     },
   };
 
-  private readonly assistant = {
-    count: async (): Promise<number> => this.mode === "success" && this.users === 0 ? 0 : 1,
-    nth: (): { innerText: () => Promise<string>; textContent: () => Promise<string> } => ({
-      innerText: async (): Promise<string> => this.mode === "missing"
-        ? ""
-        : "Review result from the diagnostic assistant.",
-      textContent: async (): Promise<string> => this.mode === "missing"
-        ? ""
-        : "Review result from the diagnostic assistant.",
-    }),
-  };
+  private messageLocator(role?: MessageRole): DiagnosticMessageLocator {
+    return new DiagnosticMessageLocator(this, role);
+  }
+
+  public messageIndexes(role?: MessageRole): number[] {
+    return this.messages
+      .map((message, index) => role === undefined || message.role === role ? index : -1)
+      .filter((index) => index >= 0);
+  }
+
+  public messageAt(index: number): DiagnosticMessage {
+    const message = this.messages[index];
+    if (message === undefined) throw new Error("Diagnostic message was not found.");
+    return message;
+  }
 
   public async goto(): Promise<null> { return null; }
 
@@ -69,15 +92,16 @@ class DiagnosticPage {
   }
 
   public locator(selector: string): unknown {
-    if (selector === '[data-message-author-role="user"]') {
-      return { count: async (): Promise<number> => this.users };
+    if (selector === CHATGPT_CONVERSATION_MESSAGE_SELECTOR) return this.messageLocator();
+    if (selector === CHATGPT_USER_MESSAGE_SELECTOR) return this.messageLocator("user");
+    if (selector === CHATGPT_ASSISTANT_MESSAGE_SELECTOR) return this.messageLocator("assistant");
+    if (selector.includes("aria-busy")) {
+      return new DiagnosticMessageLocator(this, "assistant", undefined, true);
     }
-    if (selector === '[data-message-author-role="assistant"]') return this.assistant;
-    if (selector.includes("aria-busy") || selector.includes("stop-button")
-      || selector.includes("Stop generating")) {
+    if (selector.includes("stop-button") || selector.includes("Stop generating")) {
       return {
-        count: async (): Promise<number> => this.mode === "timeout" ? 1 : 0,
-        isVisible: async (): Promise<boolean> => true,
+        count: async (): Promise<number> => 0,
+        isVisible: async (): Promise<boolean> => false,
       };
     }
     if (selector.includes("/login") || selector.includes("login-button")) {
@@ -90,6 +114,54 @@ class DiagnosticPage {
   }
 
   public async close(): Promise<void> {}
+}
+
+type MessageRole = "user" | "assistant";
+
+interface DiagnosticMessage {
+  readonly role: MessageRole;
+  readonly text: string;
+  readonly generating?: boolean;
+}
+
+class DiagnosticMessageLocator {
+  public constructor(
+    private readonly page: DiagnosticPage,
+    private readonly role?: MessageRole,
+    private readonly index?: number,
+    private readonly generatingOnly = false,
+  ) {}
+
+  private indexes(): number[] {
+    if (this.generatingOnly) {
+      return this.page.messageIndexes("assistant")
+        .filter((index) => this.page.messageAt(index).generating === true);
+    }
+    return this.page.messageIndexes(this.role);
+  }
+
+  private message(): DiagnosticMessage {
+    if (this.index === undefined) throw new Error("Diagnostic message is not selected.");
+    return this.page.messageAt(this.index);
+  }
+
+  public async count(): Promise<number> { return this.indexes().length; }
+
+  public nth(index: number): DiagnosticMessageLocator {
+    return new DiagnosticMessageLocator(this.page, this.role, this.indexes()[index], this.generatingOnly);
+  }
+
+  public async isVisible(): Promise<boolean> { return true; }
+
+  public async getAttribute(name: string): Promise<string | null> {
+    const message = this.message();
+    if (name === "data-message-author-role") return message.role;
+    if (name === "aria-busy") return message.generating === true ? "true" : null;
+    return null;
+  }
+
+  public async innerText(): Promise<string> { return this.message().text; }
+  public async textContent(): Promise<string> { return this.message().text; }
 }
 
 async function createChain(storageRoot: string) {
@@ -155,7 +227,10 @@ async function postCompletion(worker: BrowserWorker): Promise<Record<string, unk
   const response = await fetch(`http://127.0.0.1:${worker.port}/conversation/completion`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ conversationId: "diagnostic-conversation" }),
+    body: JSON.stringify({
+      conversationId: "diagnostic-conversation",
+      reviewRequestId: "diagnostic-review",
+    }),
   });
   return await response.json() as Record<string, unknown>;
 }
@@ -179,13 +254,22 @@ export async function generateReviewCompletionExample(): Promise<ReviewCompletio
     const stored = await new ReviewCompletionRouter(storageRoot, client)
       .collect("diagnostic-workspace", routing.routing_id);
 
-    page.mode = "timeout";
-    const timeout = await postCompletion(worker);
+    const timeoutPage = new DiagnosticPage("timeout", [
+      { role: "user", text: "Historical review request" },
+      { role: "assistant", text: "Historical review result" },
+      { role: "user", text: "Review this change.\nreview_request_id: diagnostic-review" },
+    ]);
+    const timeoutWorker = await startWorker(timeoutPage, "diagnostic-completion-timeout");
+    workers.push({ worker: timeoutWorker, profile: "diagnostic-completion-timeout" });
+    const timeout = await postCompletion(timeoutWorker);
 
-    const missingPage = new DiagnosticPage();
-    missingPage.mode = "missing";
+    const missingPage = new DiagnosticPage("missing", [
+      { role: "user", text: "Historical review request" },
+      { role: "assistant", text: "Historical review result" },
+      { role: "user", text: "Review this change.\nreview_request_id: diagnostic-review" },
+    ]);
     const immediateDetector: ReviewCompletionDetector = {
-      waitForCompletion: async () => ({ status: "COMPLETED" }),
+      waitForCompletion: async () => ({ status: "COMPLETED", assistantMessageIndex: 3 }),
     };
     const missingWorker = await startWorker(missingPage, "diagnostic-completion-missing", {
       completionDetector: immediateDetector,

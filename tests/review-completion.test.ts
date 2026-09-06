@@ -4,11 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Page } from "playwright";
-import {
-  ChatGPTCompletionDetector,
-} from "../src/browser-worker/completion/detector.js";
+import { ChatGPTCompletionDetector } from "../src/browser-worker/completion/detector.js";
 import { ChatGPTResultExtractor } from "../src/browser-worker/completion/extractor.js";
-import { CHATGPT_ASSISTANT_MESSAGE_SELECTOR } from "../src/browser-worker/selectors/chatgpt.js";
+import {
+  CHATGPT_ASSISTANT_MESSAGE_SELECTOR,
+  CHATGPT_CONVERSATION_MESSAGE_SELECTOR,
+  CHATGPT_USER_MESSAGE_SELECTOR,
+} from "../src/browser-worker/selectors/chatgpt.js";
 import { BrowserWorkerClient } from "../src/browser-worker-client/browser-worker-client.js";
 import { ConversationRoutingService } from "../src/context/conversation-routing-service.js";
 import { ExecutionContextService } from "../src/context/execution-service.js";
@@ -27,39 +29,86 @@ afterEach(async () => {
   })));
 });
 
-class TextLocator {
-  public constructor(
-    private readonly text: () => string,
-    private readonly matches = 1,
-    private readonly visible = false,
-  ) {}
+type MessageRole = "user" | "assistant";
 
-  public async count(): Promise<number> { return this.matches; }
-  public nth(): TextLocator { return this; }
-  public async isVisible(): Promise<boolean> { return this.visible; }
-  public async innerText(): Promise<string> { return this.text(); }
-  public async textContent(): Promise<string> { return this.text(); }
+interface FakeMessage {
+  readonly role: MessageRole;
+  readonly text: string;
+  readonly generating?: boolean;
 }
 
-function makePage(options: {
-  readonly count?: () => number;
-  readonly text?: () => string;
-  readonly generating?: () => boolean;
-} = {}): Page {
-  const count = options.count ?? (() => 1);
-  const text = options.text ?? (() => "Review result");
-  const generating = options.generating ?? (() => false);
-  return {
-    locator: (selector: string): TextLocator => {
-      if (selector === CHATGPT_ASSISTANT_MESSAGE_SELECTOR) {
-        return new TextLocator(text, count(), true);
-      }
-      if (selector.includes("stop-button") || selector.includes("Stop generating")) {
-        return new TextLocator(() => "", generating() ? 1 : 0, true);
-      }
-      return new TextLocator(() => "", 0);
-    },
-  } as unknown as Page;
+class FakeConversationPage {
+  public constructor(
+    public readonly messages: FakeMessage[],
+    public readonly generating = false,
+  ) {}
+
+  public locator(selector: string): FakeLocator {
+    if (selector === CHATGPT_CONVERSATION_MESSAGE_SELECTOR) return new FakeLocator(this);
+    if (selector === CHATGPT_USER_MESSAGE_SELECTOR) return new FakeLocator(this, "user");
+    if (selector === CHATGPT_ASSISTANT_MESSAGE_SELECTOR) return new FakeLocator(this, "assistant");
+    if (selector.includes("stop-button") || selector.includes("Stop generating")) {
+      return new FakeLocator(this, undefined, undefined, true);
+    }
+    return new FakeLocator(this, undefined, undefined, false, true);
+  }
+}
+
+class FakeLocator {
+  public constructor(
+    private readonly page: FakeConversationPage,
+    private readonly role?: MessageRole,
+    private readonly index?: number,
+    private readonly generatingLocator = false,
+    private readonly emptyLocator = false,
+  ) {}
+
+  private indexes(): number[] {
+    if (this.generatingLocator) return this.page.generating ? [0] : [];
+    if (this.emptyLocator) return [];
+    return this.page.messages
+      .map((message, index) => this.role === undefined || message.role === this.role ? index : -1)
+      .filter((index) => index >= 0);
+  }
+
+  private message(): FakeMessage {
+    const message = this.index === undefined ? undefined : this.page.messages[this.index];
+    if (message === undefined) throw new Error("fake message is not selected");
+    return message;
+  }
+
+  public async count(): Promise<number> { return this.indexes().length; }
+
+  public nth(index: number): FakeLocator {
+    return new FakeLocator(
+      this.page,
+      this.role,
+      this.indexes()[index],
+      this.generatingLocator,
+      this.emptyLocator,
+    );
+  }
+
+  public async isVisible(): Promise<boolean> { return true; }
+
+  public async getAttribute(name: string): Promise<string | null> {
+    if (this.generatingLocator || this.emptyLocator) return null;
+    const message = this.message();
+    if (name === "data-message-author-role") return message.role;
+    if (name === "aria-busy") return message.generating === true ? "true" : null;
+    return null;
+  }
+
+  public async innerText(): Promise<string> { return this.generatingLocator ? "" : this.message().text; }
+  public async textContent(): Promise<string> { return this.generatingLocator ? "" : this.message().text; }
+}
+
+function makePage(messages: FakeMessage[], generating = false): Page {
+  return new FakeConversationPage(messages, generating) as unknown as Page;
+}
+
+function reviewMessage(reviewRequestId: string): string {
+  return `Review this change.\nreview_request_id: ${reviewRequestId}\nPlease review it.`;
 }
 
 async function makeStorageRoot(): Promise<string> {
@@ -106,53 +155,89 @@ async function makeDeliveredChain(storageRoot: string) {
 }
 
 describe("Review completion detector", () => {
-  it("detects an assistant response after it appears", async () => {
-    let polls = 0;
-    const page = makePage({
-      count: () => polls++ === 0 ? 0 : 1,
-    });
-
-    await expect(new ChatGPTCompletionDetector({ timeoutMs: 100, pollIntervalMs: 1 })
-      .waitForCompletion(page)).resolves.toEqual({ status: "COMPLETED" });
-  });
-
-  it("waits for an assistant response to become stable", async () => {
-    let reads = 0;
-    const page = makePage({ text: () => reads++ === 0 ? "draft" : "final" });
-
-    await expect(new ChatGPTCompletionDetector({ timeoutMs: 100, pollIntervalMs: 1 })
-      .waitForCompletion(page)).resolves.toEqual({ status: "COMPLETED" });
-  });
-
-  it("times out while the assistant response is still generating", async () => {
-    let reads = 0;
-    const page = makePage({
-      text: () => `draft-${reads++}`,
-      generating: () => true,
-    });
+  it("ignores a historical assistant response when the current request has no response", async () => {
+    const page = makePage([
+      { role: "user", text: "old request" },
+      { role: "assistant", text: "old response" },
+      { role: "user", text: reviewMessage("review-001") },
+    ]);
 
     await expect(new ChatGPTCompletionDetector({ timeoutMs: 10, pollIntervalMs: 1 })
-      .waitForCompletion(page)).resolves.toMatchObject({ status: "TIMEOUT" });
+      .waitForCompletion(page, { reviewRequestId: "review-001" }))
+      .resolves.toMatchObject({ status: "TIMEOUT" });
+  });
+
+  it("times out without falling back to history when the request message is absent", async () => {
+    const page = makePage([
+      { role: "user", text: "old request" },
+      { role: "assistant", text: "old response" },
+    ]);
+
+    await expect(new ChatGPTCompletionDetector({ timeoutMs: 10, pollIntervalMs: 1 })
+      .waitForCompletion(page, { reviewRequestId: "review-001" }))
+      .resolves.toMatchObject({ status: "TIMEOUT" });
+  });
+
+  it("does not complete while the correlated response is generating", async () => {
+    const page = makePage([
+      { role: "user", text: "old request" },
+      { role: "assistant", text: "old response" },
+      { role: "user", text: reviewMessage("review-001") },
+      { role: "assistant", text: "partial response", generating: true },
+    ], true);
+
+    await expect(new ChatGPTCompletionDetector({ timeoutMs: 10, pollIntervalMs: 1 })
+      .waitForCompletion(page, { reviewRequestId: "review-001" }))
+      .resolves.toMatchObject({ status: "TIMEOUT" });
+  });
+
+  it("returns the ordered index of the correlated assistant response", async () => {
+    const page = makePage([
+      { role: "user", text: "old request" },
+      { role: "assistant", text: "old response" },
+      { role: "user", text: reviewMessage("review-a") },
+      { role: "assistant", text: "review A result" },
+      { role: "user", text: reviewMessage("review-b") },
+      { role: "assistant", text: "review B result" },
+    ]);
+
+    const detected = await new ChatGPTCompletionDetector({ timeoutMs: 100, pollIntervalMs: 1 })
+      .waitForCompletion(page, { reviewRequestId: "review-b" });
+    expect(detected).toEqual({ status: "COMPLETED", assistantMessageIndex: 5 });
   });
 });
 
 describe("Review result extractor", () => {
-  it("extracts only the latest assistant message", async () => {
-    const page = {
-      locator: (selector: string): TextLocator => selector === CHATGPT_ASSISTANT_MESSAGE_SELECTOR
-        ? new TextLocator(() => "latest review", 2, true)
-        : new TextLocator(() => "", 0),
-    } as unknown as Page;
+  it("extracts only the correlated assistant response", async () => {
+    const page = makePage([
+      { role: "user", text: "old request" },
+      { role: "assistant", text: "old response" },
+      { role: "user", text: reviewMessage("review-001") },
+      { role: "assistant", text: "current review result" },
+    ]);
 
-    await expect(new ChatGPTResultExtractor().extract(page)).resolves.toMatchObject({
+    const detected = await new ChatGPTCompletionDetector({ timeoutMs: 100, pollIntervalMs: 1 })
+      .waitForCompletion(page, { reviewRequestId: "review-001" });
+    if (detected.status !== "COMPLETED") throw new Error("expected a completed response");
+    await expect(new ChatGPTResultExtractor().extract(page, {
+      reviewRequestId: "review-001",
+      assistantMessageIndex: detected.assistantMessageIndex,
+    })).resolves.toMatchObject({
       status: "COMPLETED",
-      content: "latest review",
+      content: "current review result",
     });
   });
 
-  it("rejects an empty assistant response", async () => {
-    await expect(new ChatGPTResultExtractor().extract(makePage({ text: () => "" })))
-      .rejects.toThrow("assistant response was empty");
+  it("rejects an empty correlated assistant response", async () => {
+    const page = makePage([
+      { role: "user", text: reviewMessage("review-001") },
+      { role: "assistant", text: "" },
+    ]);
+
+    await expect(new ChatGPTResultExtractor().extract(page, {
+      reviewRequestId: "review-001",
+      assistantMessageIndex: 1,
+    })).rejects.toThrow("assistant response was empty");
   });
 });
 
@@ -193,13 +278,15 @@ describe("ReviewResultService", () => {
 });
 
 describe("ReviewCompletionRouter", () => {
-  it("collects, stores, completes the request, and is idempotent", async () => {
+  it("passes the request identity, stores the result, and is idempotent", async () => {
     const storageRoot = await makeStorageRoot();
     const { request, routing, delivery } = await makeDeliveredChain(storageRoot);
     let calls = 0;
+    let requestedReviewId = "";
     const router = new ReviewCompletionRouter(storageRoot, {
-      collectCompletion: async (conversationId: string) => {
+      collectCompletion: async (conversationId: string, reviewRequestId: string) => {
         calls += 1;
+        requestedReviewId = reviewRequestId;
         return {
           conversationId,
           status: "COMPLETED" as const,
@@ -220,6 +307,7 @@ describe("ReviewCompletionRouter", () => {
     });
     expect(second).toEqual(first);
     expect(calls).toBe(1);
+    expect(requestedReviewId).toBe(request.review_request_id);
     await expect(new ReviewRequestService(storageRoot)
       .getReviewRequest("workspace-a", request.review_request_id))
       .resolves.toMatchObject({ status: "completed" });
@@ -230,7 +318,7 @@ describe("ReviewCompletionRouter", () => {
     const { request, routing } = await makeDeliveredChain(storageRoot);
     let timedOut = true;
     const router = new ReviewCompletionRouter(storageRoot, {
-      collectCompletion: async (conversationId: string) => timedOut
+      collectCompletion: async (conversationId: string, _reviewRequestId: string) => timedOut
         ? {
           conversationId,
           status: "TIMEOUT" as const,
@@ -260,13 +348,17 @@ describe("ReviewCompletionRouter", () => {
 });
 
 describe("BrowserWorkerClient completion API", () => {
-  it("posts a conversation ID and validates a completed result", async () => {
+  it("posts both conversation and review request identities", async () => {
+    let requestBody: unknown;
+    let requestPath: string | undefined;
     const listener = createServer(async (request, response) => {
+      requestPath = request.url;
       const chunks: Buffer[] = [];
       for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
       response.setHeader("content-type", "application/json");
       response.end(JSON.stringify({
-        conversationId: JSON.parse(Buffer.concat(chunks).toString("utf8")).conversationId,
+        conversationId: "conversation-001",
         status: "COMPLETED",
         content: "review result",
         extractedAt: new Date().toISOString(),
@@ -280,10 +372,15 @@ describe("BrowserWorkerClient completion API", () => {
       await expect(new BrowserWorkerClient({
         baseUrl: `http://127.0.0.1:${address.port}`,
         completionTimeoutMs: 1000,
-      }).collectCompletion("conversation-001")).resolves.toMatchObject({
+      }).collectCompletion("conversation-001", "review-001")).resolves.toMatchObject({
         conversationId: "conversation-001",
         status: "COMPLETED",
         content: "review result",
+      });
+      expect(requestPath).toBe("/conversation/completion");
+      expect(requestBody).toEqual({
+        conversationId: "conversation-001",
+        reviewRequestId: "review-001",
       });
     } finally {
       await new Promise<void>((resolve) => listener.close(() => resolve()));

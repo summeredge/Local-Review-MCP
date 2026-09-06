@@ -237,10 +237,13 @@ export class BrowserWorkerClient {
     );
   }
 
-  public async collectCompletion(conversationId: string): Promise<BrowserCompletionResult> {
+  public async collectCompletion(
+    conversationId: string,
+    reviewRequestId: string,
+  ): Promise<BrowserCompletionResult> {
     return this.post(
       this.completionEndpoint,
-      { conversationId },
+      { conversationId, reviewRequestId },
       browserCompletionResultSchema,
       conversationId,
       "completion",

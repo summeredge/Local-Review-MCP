@@ -52,6 +52,7 @@ const conversationDeliveryRequestSchema = z.object({
 
 const conversationCompletionRequestSchema = z.object({
   conversationId: z.string().min(1).max(256),
+  reviewRequestId: z.string().min(1).max(128),
 }).strict();
 
 class RequestBodyTooLargeError extends Error {
@@ -342,7 +343,7 @@ export class BrowserWorker {
     if (!parsed.success) {
       sendJson(response, 400, {
         status: "FAILED",
-        error: "conversationId must be a non-empty string.",
+        error: "conversationId and reviewRequestId must be non-empty strings.",
       });
       return;
     }
@@ -497,9 +498,14 @@ export class BrowserWorker {
 
     let result: BrowserCompletionResult;
     try {
-      const detected = await this.completionDetector.waitForCompletion(navigation.page);
+      const detected = await this.completionDetector.waitForCompletion(navigation.page, {
+        reviewRequestId: parsed.data.reviewRequestId,
+      });
       if (detected.status === "COMPLETED") {
-        const extracted = await this.resultExtractor.extract(navigation.page);
+        const extracted = await this.resultExtractor.extract(navigation.page, {
+          reviewRequestId: parsed.data.reviewRequestId,
+          assistantMessageIndex: detected.assistantMessageIndex,
+        });
         if (extracted.status !== "COMPLETED" || extracted.content.trim() === "") {
           throw new Error("ChatGPT assistant response extraction returned no content.");
         }

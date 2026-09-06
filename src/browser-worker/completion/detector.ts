@@ -1,9 +1,13 @@
 import type { Locator, Page } from "playwright";
 import {
-  CHATGPT_ASSISTANT_MESSAGE_SELECTOR,
+  CHATGPT_CONVERSATION_MESSAGE_SELECTOR,
   CHATGPT_GENERATING_SELECTORS,
 } from "../selectors/chatgpt.js";
-import type { CompletionResult, ReviewCompletionDetector } from "./types.js";
+import type {
+  CompletionResult,
+  ReviewCompletionDetector,
+  ReviewCompletionOptions,
+} from "./types.js";
 
 export const DEFAULT_COMPLETION_TIMEOUT_MS = 30_000;
 export const DEFAULT_COMPLETION_POLL_INTERVAL_MS = 250;
@@ -12,6 +16,13 @@ const COMPLETION_STABLE_POLLS = 2;
 export interface ReviewCompletionDetectorOptions {
   readonly timeoutMs?: number;
   readonly pollIntervalMs?: number;
+}
+
+interface ConversationMessage {
+  readonly index: number;
+  readonly role: "user" | "assistant";
+  readonly text: string;
+  readonly locator: Locator;
 }
 
 function timingOption(
@@ -39,6 +50,44 @@ async function readText(locator: Locator): Promise<string> {
   }
 }
 
+async function readAttribute(locator: Locator, name: string): Promise<string | null> {
+  return locator.getAttribute(name);
+}
+
+async function readConversationMessages(page: Page): Promise<ConversationMessage[]> {
+  const messages = page.locator(CHATGPT_CONVERSATION_MESSAGE_SELECTOR);
+  const count = await messages.count();
+  const result: ConversationMessage[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const locator = messages.nth(index);
+    const role = await readAttribute(locator, "data-message-author-role");
+    if (role !== "user" && role !== "assistant") continue;
+    result.push({ index, role, text: await readText(locator), locator });
+  }
+  return result;
+}
+
+function isReviewRequestMessage(text: string, reviewRequestId: string): boolean {
+  const anchor = `review_request_id: ${reviewRequestId}`;
+  return text.split(/\r?\n/u).some((line) => line.trim() === anchor);
+}
+
+function targetAssistant(
+  messages: readonly ConversationMessage[],
+  reviewRequestId: string,
+): { readonly request: ConversationMessage | undefined; readonly response: ConversationMessage | undefined } {
+  const request = messages.find(
+    (message) => message.role === "user" && isReviewRequestMessage(message.text, reviewRequestId),
+  );
+  if (request === undefined) return { request, response: undefined };
+  return {
+    request,
+    response: messages.find(
+      (message) => message.index > request.index && message.role === "assistant",
+    ),
+  };
+}
+
 async function hasVisibleMatch(page: Page, selectors: readonly string[]): Promise<boolean> {
   for (const selector of selectors) {
     const matches = page.locator(selector);
@@ -51,11 +100,9 @@ async function hasVisibleMatch(page: Page, selectors: readonly string[]): Promis
   return false;
 }
 
-async function latestAssistantText(page: Page): Promise<string | undefined> {
-  const messages = page.locator(CHATGPT_ASSISTANT_MESSAGE_SELECTOR);
-  const count = await messages.count();
-  if (count === 0) return undefined;
-  return readText(messages.nth(count - 1));
+async function isGenerating(page: Page, response: ConversationMessage): Promise<boolean> {
+  if (await readAttribute(response.locator, "aria-busy") === "true") return true;
+  return hasVisibleMatch(page, CHATGPT_GENERATING_SELECTORS);
 }
 
 export class ChatGPTCompletionDetector implements ReviewCompletionDetector {
@@ -72,23 +119,39 @@ export class ChatGPTCompletionDetector implements ReviewCompletionDetector {
     );
   }
 
-  public async waitForCompletion(page: Page): Promise<CompletionResult> {
+  public async waitForCompletion(
+    page: Page,
+    options: ReviewCompletionOptions,
+  ): Promise<CompletionResult> {
     const deadline = Date.now() + this.timeoutMs;
     let previousText: string | undefined;
     let stablePolls = 0;
-    let assistantSeen = false;
+    let requestSeen = false;
+    let responseSeen = false;
 
     do {
       try {
-        const text = await latestAssistantText(page);
-        assistantSeen ||= text !== undefined;
-        const generating = await hasVisibleMatch(page, CHATGPT_GENERATING_SELECTORS);
-        if (text !== undefined && text !== "" && !generating) {
-          stablePolls = text === previousText ? stablePolls + 1 : 1;
-          previousText = text;
-          if (stablePolls >= COMPLETION_STABLE_POLLS) return { status: "COMPLETED" };
+        const messages = await readConversationMessages(page);
+        const target = targetAssistant(messages, options.reviewRequestId);
+        requestSeen ||= target.request !== undefined;
+        responseSeen ||= target.response !== undefined;
+        if (target.response !== undefined) {
+          const generating = await isGenerating(page, target.response);
+          if (target.response.text !== "" && !generating) {
+            stablePolls = target.response.text === previousText ? stablePolls + 1 : 1;
+            previousText = target.response.text;
+            if (stablePolls >= COMPLETION_STABLE_POLLS) {
+              return {
+                status: "COMPLETED",
+                assistantMessageIndex: target.response.index,
+              };
+            }
+          } else {
+            previousText = target.response.text;
+            stablePolls = 0;
+          }
         } else {
-          previousText = text;
+          previousText = undefined;
           stablePolls = 0;
         }
       } catch (error: unknown) {
@@ -96,7 +159,7 @@ export class ChatGPTCompletionDetector implements ReviewCompletionDetector {
           status: "FAILED",
           error: error instanceof Error && error.message.length > 0
             ? error.message.slice(0, 4000)
-            : "ChatGPT assistant response could not be inspected.",
+            : "ChatGPT conversation messages could not be inspected.",
         };
       }
 
@@ -107,11 +170,20 @@ export class ChatGPTCompletionDetector implements ReviewCompletionDetector {
 
     return {
       status: "TIMEOUT",
-      error: assistantSeen
-        ? "ChatGPT assistant response did not finish before the timeout."
-        : "ChatGPT assistant response did not appear before the timeout.",
+      error: !requestSeen
+        ? "Review request message did not appear before the timeout."
+        : !responseSeen
+          ? "Assistant response for the review request did not appear before the timeout."
+          : "Assistant response for the review request did not finish before the timeout.",
     };
   }
 }
 
-export type { CompletionResult, ReviewCompletionDetector } from "./types.js";
+export {
+  CHATGPT_CONVERSATION_MESSAGE_SELECTOR,
+} from "../selectors/chatgpt.js";
+export type {
+  CompletionResult,
+  ReviewCompletionDetector,
+  ReviewCompletionOptions,
+} from "./types.js";
