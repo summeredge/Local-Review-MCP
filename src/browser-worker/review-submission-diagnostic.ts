@@ -1,6 +1,15 @@
 import type { BrowserContext, Page } from "playwright";
-import { rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BrowserWorkerClient } from "../browser-worker-client/browser-worker-client.js";
+import { ConversationRoutingService } from "../context/conversation-routing-service.js";
+import { ExecutionContextService } from "../context/execution-service.js";
+import { ReviewDeliveryService } from "../context/review-delivery-service.js";
+import { ReviewRequestService } from "../context/review-request-service.js";
+import { TaskContextService } from "../context/service.js";
+import { BrowserWorkerDeliveryAdapter } from "../delivery/browser-worker-delivery-adapter.js";
+import { BrowserRouter } from "../router/browser-router.js";
 import { BrowserWorker } from "./worker.js";
 import { defaultBrowserProfileRoot } from "./config.js";
 import { ChatGPTInteraction } from "./interaction/chatgpt-interaction.js";
@@ -19,6 +28,15 @@ class DiagnosticPage {
   public mode: DiagnosticMode = "submitted";
   private message = "";
   private users = 0;
+  private readonly submittedMessages: string[] = [];
+
+  public get submittedMessageCount(): number {
+    return this.submittedMessages.length;
+  }
+
+  public get lastSubmittedMessage(): string | undefined {
+    return this.submittedMessages.at(-1);
+  }
 
   private readonly input = {
     count: async (): Promise<number> => this.mode === "missing" ? 0 : 1,
@@ -35,6 +53,7 @@ class DiagnosticPage {
     isEnabled: async (): Promise<boolean> => true,
     click: async (): Promise<void> => {
       if (this.mode === "submitted") {
+        this.submittedMessages.push(this.message);
         this.message = "";
         this.users += 1;
       }
@@ -68,6 +87,39 @@ class DiagnosticPage {
   public async close(): Promise<void> {}
 }
 
+async function createDeliveryChain(storageRoot: string): Promise<void> {
+  await new TaskContextService(storageRoot).createTaskContext({
+    task_id: "diagnostic-task",
+    workspace_id: "diagnostic-workspace",
+    status: "reviewing",
+  });
+  await new ExecutionContextService(storageRoot).createExecutionContext({
+    execution_id: "diagnostic-execution",
+    task_id: "diagnostic-task",
+    workspace_id: "diagnostic-workspace",
+  });
+  await new ReviewRequestService(storageRoot).createReviewRequest({
+    review_request_id: "diagnostic-review",
+    task_id: "diagnostic-task",
+    execution_id: "diagnostic-execution",
+    workspace_id: "diagnostic-workspace",
+  });
+  const routing = await new ConversationRoutingService(storageRoot).createRouting({
+    routing_id: "diagnostic-routing",
+    workspace_id: "diagnostic-workspace",
+    task_id: "diagnostic-task",
+    review_request_id: "diagnostic-review",
+    conversation_id: "diagnostic-conversation",
+  });
+  await new ReviewDeliveryService(storageRoot).createDelivery({
+    workspace_id: routing.workspace_id,
+    task_id: routing.task_id,
+    review_request_id: routing.review_request_id,
+    routing_id: routing.routing_id,
+    conversation_id: routing.conversation_id,
+  });
+}
+
 async function post(worker: BrowserWorker, body: unknown): Promise<Record<string, unknown>> {
   const response = await fetch(`http://127.0.0.1:${worker.port}/conversation/deliver`, {
     method: "POST",
@@ -78,6 +130,7 @@ async function post(worker: BrowserWorker, body: unknown): Promise<Record<string
 }
 
 export async function generateReviewSubmissionExample(): Promise<ReviewSubmissionDiagnosticResult> {
+  const storageRoot = await mkdtemp(join(tmpdir(), "local-review-mcp-review-submission-"));
   const mockPage = new DiagnosticPage();
   const page = mockPage as unknown as Page;
   const context = {
@@ -94,10 +147,26 @@ export async function generateReviewSubmissionExample(): Promise<ReviewSubmissio
 
   try {
     await worker.start();
-    const submitted = await post(worker, {
-      conversationId: "diagnostic-conversation",
-      message: "请 review 这次修改。\n中文 message",
-    });
+    await createDeliveryChain(storageRoot);
+    const router = new BrowserRouter(
+      storageRoot,
+      new BrowserWorkerDeliveryAdapter(new BrowserWorkerClient({
+        baseUrl: `http://127.0.0.1:${worker.port}`,
+      })),
+    );
+    const delivered = await router.deliver("diagnostic-workspace", "diagnostic-routing");
+    const repeated = await router.deliver("diagnostic-workspace", "diagnostic-routing");
+    const reviewRequest = await new ReviewRequestService(storageRoot)
+      .getReviewRequest("diagnostic-workspace", "diagnostic-review");
+    if (delivered.status !== "delivered"
+      || repeated.status !== "delivered"
+      || repeated.attempt_count !== 1
+      || mockPage.submittedMessageCount !== 1
+      || !mockPage.lastSubmittedMessage?.includes("review_request_id: diagnostic-review")
+      || reviewRequest?.status !== "pending") {
+      throw new Error("Review submission diagnostic did not verify the full delivery chain.");
+    }
+
     mockPage.mode = "auth";
     const authRequired = await post(worker, {
       conversationId: "diagnostic-conversation",
@@ -119,8 +188,7 @@ export async function generateReviewSubmissionExample(): Promise<ReviewSubmissio
       message: "review",
     });
 
-    if (submitted.status !== "SUBMITTED"
-      || authRequired.status !== "AUTH_REQUIRED"
+    if (authRequired.status !== "AUTH_REQUIRED"
       || conversationNotFound.status !== "CONVERSATION_NOT_FOUND"
       || composerNotFound.status !== "COMPOSER_NOT_FOUND"
       || submitFailed.status !== "SUBMIT_FAILED") {
@@ -139,5 +207,6 @@ export async function generateReviewSubmissionExample(): Promise<ReviewSubmissio
       recursive: true,
       force: true,
     });
+    await rm(storageRoot, { recursive: true, force: true });
   }
 }

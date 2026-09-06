@@ -50,8 +50,8 @@ The responsibilities stay separate:
 | Conversation Routing | Says where a Review Request should go. |
 | Review Delivery | Stores the state and attempt count for one logical delivery. |
 | Review Delivery Adapter | Abstracts delivery to an external target. |
-| Browser Router | Resolves routing and delivery, builds the request, and writes delivery state. |
-| Browser Worker Delivery Adapter | Maps confirmed `SUBMITTED` or typed Worker failures to Delivery state. |
+| Browser Router | Resolves routing and delivery, passes the routed request, and writes delivery state. |
+| Browser Worker Delivery Adapter | Builds the default Delivery message and maps confirmed `SUBMITTED` or typed Worker failures to Delivery state. |
 | Browser Worker Client | Sends `POST /conversation/deliver` to the configured Worker URL. |
 | Conversation Navigator | Runs inside Browser Worker, navigates to the Conversation URL, and returns the open Page to the Worker lifecycle. |
 | ChatGPT Interaction Layer | Locates the Composer, fills the Review message, clicks Send, and confirms submission. |
@@ -100,7 +100,8 @@ interface ReviewDeliveryAdapter {
 
 The adapter knows only the contract and does not depend on Playwright.
 `BrowserWorkerDeliveryAdapter` calls `BrowserWorkerClient.deliver()` with
-`request.conversation_id` and `request.message`. The client request contains
+`request.conversation_id` and the supplied `request.message`, or builds the
+lightweight Delivery message when it is omitted. The client request contains
 only the HTTP payload and no DOM logic.
 
 ## Browser Router
@@ -182,10 +183,10 @@ The Router does not run a retry loop or scheduler. A retryable failed Delivery
 can be attempted later through the same Router. A non-retryable failure is
 recorded and is not retried automatically.
 
-The Router builds a lightweight message containing `workspace_id`, `task_id`,
-`execution_id` when present, `review_request_id`, and `routing_id`. It asks
-ChatGPT to use Local Review MCP for Workspace, Review Context, Git status, and
-uncommitted diff reads; it does not embed the diff or source files.
+The Delivery layer builds a lightweight message containing `workspace_id`,
+`task_id`, `execution_id` when present, `review_request_id`, and `routing_id`.
+It asks ChatGPT to use Local Review MCP for Workspace, Review Context, Git
+status, and uncommitted diff reads; it does not embed the diff or source files.
 
 ## State writeback and completion
 

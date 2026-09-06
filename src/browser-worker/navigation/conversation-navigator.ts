@@ -34,7 +34,7 @@ function isAuthenticationUrl(value: string): boolean {
   try {
     const url = new URL(value);
     return url.hostname === "auth.openai.com"
-      || /\/(?:auth\/login|login)(?:\/|$)/iu.test(url.pathname);
+      || /\/(?:auth\/login|login|log-in)(?:\/|$)/iu.test(url.pathname);
   } catch {
     return false;
   }

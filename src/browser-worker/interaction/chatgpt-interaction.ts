@@ -12,9 +12,11 @@ export const DEFAULT_SUBMISSION_CONFIRMATION_POLL_MS = 50;
 const AUTHENTICATION_SELECTORS = [
   'a[href*="/auth/login"]',
   'a[href*="/login"]',
+  'a[href*="/log-in"]',
   '[data-testid="login-button"]',
   'button[data-testid="login-button"]',
   'form[action*="/login"]',
+  'form[action*="/log-in"]',
 ] as const;
 
 export type ChatGPTInteractionResult =
@@ -70,7 +72,7 @@ function isAuthenticationUrl(value: string): boolean {
   try {
     const url = new URL(value);
     return url.hostname === "auth.openai.com"
-      || /\/(?:auth\/login|login)(?:\/|$)/iu.test(url.pathname);
+      || /\/(?:auth\/login|login|log-in)(?:\/|$)/iu.test(url.pathname);
   } catch {
     return false;
   }

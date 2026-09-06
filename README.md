@@ -263,8 +263,8 @@ npm test
 npm run build
 ```
 
-The Browser Worker review-submission diagnostic uses a mock Page and does not
-require a ChatGPT login:
+The Browser Worker review-submission diagnostic drives the complete local
+Review Delivery chain with a mock Page and does not require a ChatGPT login:
 
 ```powershell
 npm run diagnose:review-submission

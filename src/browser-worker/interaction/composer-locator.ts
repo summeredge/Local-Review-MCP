@@ -43,7 +43,7 @@ async function firstUsable(
     }
     const count = await matches.count().catch(() => 0);
     for (let index = 0; index < count; index += 1) {
-      const candidate = index === 0 ? matches : matches.nth(index);
+      const candidate = count === 1 ? matches : matches.nth(index);
       if (!await candidate.isVisible().catch(() => false)) continue;
       if (requireEditable && !await candidate.isEditable().catch(() => false)) continue;
       return candidate;

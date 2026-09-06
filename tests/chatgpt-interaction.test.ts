@@ -3,7 +3,7 @@ import type { Locator, Page } from "playwright";
 import { ChatGPTInteraction } from "../src/browser-worker/interaction/chatgpt-interaction.js";
 import { ComposerLocator } from "../src/browser-worker/interaction/composer-locator.js";
 
-type PageMode = "submitted" | "submit-failed" | "missing" | "auth" | "no-send";
+type PageMode = "submitted" | "submit-failed" | "missing" | "auth" | "auth-log-in" | "no-send";
 
 class FakeLocator {
   public value = "";
@@ -47,14 +47,17 @@ class FakePage {
   }
 
   public url(): string {
-    return this.mode === "auth"
-      ? "https://chatgpt.com/auth/login"
+    return this.mode === "auth" || this.mode === "auth-log-in"
+      ? this.mode === "auth-log-in"
+        ? "https://auth.openai.com/log-in"
+        : "https://chatgpt.com/auth/login"
       : "https://chatgpt.com/c/conversation-001";
   }
 
   public locator(selector: string): FakeLocator {
     if (selector === '[data-message-author-role="user"]') return this.userMessages;
     if (selector.includes("/auth/login") || selector.includes("/login")
+      || selector.includes("/log-in")
       || selector.includes("login-button")) {
       this.auth.matches = this.mode === "auth" ? 1 : 0;
       return this.auth;
@@ -91,6 +94,8 @@ describe("ChatGPTInteraction", () => {
   it("reports authentication and missing composer states", async () => {
     await expect(new ChatGPTInteraction().submitMessage(page("auth"), "review"))
       .resolves.toMatchObject({ status: "AUTH_REQUIRED" });
+    await expect(new ChatGPTInteraction().submitMessage(page("auth-log-in"), "review"))
+      .resolves.toMatchObject({ status: "AUTH_REQUIRED" });
     await expect(new ChatGPTInteraction().submitMessage(page("missing"), "review"))
       .resolves.toMatchObject({ status: "COMPOSER_NOT_FOUND" });
     await expect(new ChatGPTInteraction().submitMessage(page("no-send"), "review"))
@@ -107,5 +112,27 @@ describe("ChatGPTInteraction", () => {
     const fake = new FakePage("submitted");
     await expect(new ComposerLocator().locate(fake as unknown as Page))
       .resolves.toMatchObject({ status: "READY" });
+  });
+
+  it("narrows a multi-match composer locator before returning it", async () => {
+    const first = new FakeLocator();
+    const second = new FakeLocator();
+    const multi = {
+      count: async (): Promise<number> => 2,
+      nth: (index: number): FakeLocator => index === 0 ? first : second,
+    };
+    const send = new FakeLocator();
+    const fakePage = {
+      locator: (selector: string): unknown => selector.startsWith("textarea")
+        ? multi
+        : selector.startsWith("button")
+          ? send
+          : { count: async (): Promise<number> => 0 },
+    };
+
+    const located = await new ComposerLocator().locate(fakePage as unknown as Page);
+
+    expect(located.status).toBe("READY");
+    if (located.status === "READY") expect(located.input).toBe(first);
   });
 });

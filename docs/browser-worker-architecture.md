@@ -94,8 +94,10 @@ The command starts the compiled worker in a child process using the managed
 prints the ready result, and stops the child in a `finally` block. It does not
 use the production configuration or access an external website.
 
-The submission-only diagnostic uses a mock Page and exercises
-`/conversation/deliver` without a ChatGPT account:
+The submission diagnostic uses a mock Page, drives the Browser Router through
+the real local Worker endpoint, verifies `ReviewDelivery = delivered` without
+changing `ReviewRequest = pending`, and then exercises the typed failure cases
+without a ChatGPT account:
 
 ```powershell
 npm run diagnose:review-submission

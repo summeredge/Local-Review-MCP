@@ -96,6 +96,22 @@ describe("ConversationNavigator", () => {
       status: "FAILED",
       error: "Conversation was not found.",
     });
+
+    const authPage = {
+      goto: vi.fn(async (): Promise<null> => null),
+      url: vi.fn(() => "https://auth.openai.com/log-in"),
+      close: vi.fn(async (): Promise<void> => undefined),
+    } as unknown as Page;
+    const authNavigator = new ConversationNavigator({
+      initialize: async (): Promise<BrowserContext> => makeContext(authPage),
+    });
+
+    await expect(authNavigator.navigate("conversation-auth")).resolves.toMatchObject({
+      conversationId: "conversation-auth",
+      status: "FAILED",
+      failureCode: "AUTH_REQUIRED",
+    });
+    expect(authPage.close).toHaveBeenCalledOnce();
   });
 });
 
