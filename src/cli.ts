@@ -3,6 +3,7 @@ import { createAppContext, startApp, startupMessage } from "./app.js";
 import { generateConversationRoutingExample } from "./context/conversation-routing-diagnostic.js";
 import { generateReviewDeliveryExample } from "./context/review-delivery-diagnostic.js";
 import { generateReviewContextExample } from "./context/review-context-diagnostic.js";
+import { generateReviewVerdictExample } from "./control/review-verdict-diagnostic.js";
 import {
   generateBrowserRouterExample,
   generateReviewDeliveryBrowserExample,
@@ -53,6 +54,8 @@ try {
   } else if (argv[0] === "diagnose-review-completion") {
     const { generateReviewCompletionExample } = await import("./browser-worker/review-completion-diagnostic.js");
     console.log(JSON.stringify(await generateReviewCompletionExample(), null, 2));
+  } else if (argv[0] === "diagnose-review-verdict") {
+    console.log(JSON.stringify(generateReviewVerdictExample(), null, 2));
   } else if (argv[0] === "diagnose-conversation-routing") {
     const diagnosticArgs = argv.slice(1);
     const diagnosticCli = parseCliArgs(diagnosticArgs);
