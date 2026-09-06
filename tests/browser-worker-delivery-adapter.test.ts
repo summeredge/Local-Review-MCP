@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { NavigationResult } from "../src/browser-worker-client/browser-worker-client.js";
+import type { BrowserDeliveryResult } from "../src/browser-worker-client/browser-worker-client.js";
 import { BrowserWorkerClientError } from "../src/browser-worker-client/browser-worker-client.js";
 import { BrowserWorkerDeliveryAdapter } from "../src/delivery/browser-worker-delivery-adapter.js";
 import type { ReviewDeliveryRequest } from "../src/delivery/review-delivery-adapter.js";
@@ -15,15 +15,15 @@ const request: ReviewDeliveryRequest = {
 };
 
 describe("BrowserWorkerDeliveryAdapter", () => {
-  it("maps NAVIGATED to delivered and routes only the conversation ID", async () => {
-    const conversationIds: string[] = [];
+  it("maps only SUBMITTED to delivered and sends the review message", async () => {
+    const requests: Array<{ conversationId: string; message: string }> = [];
     const client = {
-      navigate: async (conversationId: string): Promise<NavigationResult> => {
-        conversationIds.push(conversationId);
+      deliver: async (conversationId: string, message: string): Promise<BrowserDeliveryResult> => {
+        requests.push({ conversationId, message });
         return {
           conversationId,
           url: `https://chatgpt.com/c/${conversationId}`,
-          status: "NAVIGATED",
+          status: "SUBMITTED",
         };
       },
     };
@@ -32,15 +32,18 @@ describe("BrowserWorkerDeliveryAdapter", () => {
 
     expect(result).toMatchObject({ status: "delivered" });
     expect(result.status === "delivered" && Number.isNaN(Date.parse(result.delivered_at))).toBe(false);
-    expect(conversationIds).toEqual(["conversation-001"]);
+    expect(requests).toEqual([{
+      conversationId: "conversation-001",
+      message: "must not be sent by the navigation-only adapter",
+    }]);
   });
 
-  it("maps a FAILED navigation result to failed", async () => {
+  it("maps a non-submitted delivery result to failed", async () => {
     const client = {
-      navigate: async (conversationId: string): Promise<NavigationResult> => ({
+      deliver: async (conversationId: string): Promise<BrowserDeliveryResult> => ({
         conversationId,
-        status: "FAILED",
-        error: "conversation navigation failed",
+        status: "COMPOSER_NOT_FOUND",
+        error: "conversation composer missing",
       }),
     };
 
@@ -48,15 +51,32 @@ describe("BrowserWorkerDeliveryAdapter", () => {
       status: "failed",
       retryable: true,
       error: {
-        code: "BROWSER_NAVIGATION_FAILED",
-        message: "conversation navigation failed",
+        code: "COMPOSER_NOT_FOUND",
+        message: "conversation composer missing",
       },
     });
   });
 
+  it("keeps authentication and missing conversations non-retryable", async () => {
+    for (const status of ["AUTH_REQUIRED", "CONVERSATION_NOT_FOUND"] as const) {
+      const client = {
+        deliver: async (conversationId: string): Promise<BrowserDeliveryResult> => ({
+          conversationId,
+          status,
+          error: status === "AUTH_REQUIRED"
+            ? "ChatGPT authentication is required."
+            : "Conversation was not found.",
+        }),
+      };
+
+      await expect(new BrowserWorkerDeliveryAdapter(client).deliver(request))
+        .resolves.toMatchObject({ status: "failed", retryable: false, error: { code: status } });
+    }
+  });
+
   it("maps Browser Worker transport failures without claiming delivery", async () => {
     const client = {
-      navigate: async (): Promise<NavigationResult> => {
+      deliver: async (): Promise<BrowserDeliveryResult> => {
         throw new BrowserWorkerClientError("TIMEOUT", "Browser Worker request timed out.");
       },
     };

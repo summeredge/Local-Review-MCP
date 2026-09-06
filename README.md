@@ -263,6 +263,13 @@ npm test
 npm run build
 ```
 
+The Browser Worker review-submission diagnostic uses a mock Page and does not
+require a ChatGPT login:
+
+```powershell
+npm run diagnose:review-submission
+```
+
 To probe an already deployed HTTPS endpoint with the optional remote test,
 provide `LOCAL_REVIEW_MCP_REMOTE_URL` and
 `LOCAL_REVIEW_MCP_REMOTE_TOKEN` only in the process environment before running

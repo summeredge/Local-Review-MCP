@@ -2,11 +2,11 @@
 
 ## Scope
 
-Review Delivery records the internal attempt to navigate to the Conversation
-selected by Conversation Routing. The Browser Router invokes a delivery
-adapter, which calls the independent Browser Worker over HTTP. This task does
-not send Review content, interact with page elements, or decide whether the
-review itself is complete.
+Review Delivery records the internal attempt to submit a Review request to the
+Conversation selected by Conversation Routing. The Browser Router invokes a
+delivery adapter, which calls the independent Browser Worker over HTTP. This
+task does not read the ChatGPT reply or decide whether the review itself is
+complete.
 
 ```text
 Codex completes a task
@@ -33,7 +33,13 @@ Browser Worker Client
 Conversation Navigator
         |
         v
-ChatGPT Conversation Navigation
+ChatGPT Conversation Page
+        |
+        v
+ChatGPT Interaction Layer
+        |
+        v
+Confirmed Review Message Submission
 ```
 
 The boundaries are deliberately separate:
@@ -42,9 +48,10 @@ The boundaries are deliberately separate:
 * **Conversation Routing** says which Conversation should receive that request.
 * **Review Delivery** records whether that logical delivery is pending, in
   progress, delivered, or failed, including its attempts and last error.
-* **Delivery Adapter** maps the Browser Worker navigation result to the
+* **Delivery Adapter** maps the Browser Worker submission result to the
   persisted Delivery state.
-* **Browser Worker Client** is the only LRM-to-Worker HTTP boundary.
+* **Browser Worker Client** is the only LRM-to-Worker HTTP boundary; it has no
+  Playwright or DOM dependency.
 
 `Workspace` is not a `Conversation`. The relationship is:
 
@@ -55,7 +62,7 @@ Workspace -> Task -> Review Request -> Routing -> Conversation
 ## Data model
 
 `src/context/review-delivery.ts` defines the model and re-exports the adapter
-contract used by Task22:
+contract:
 
 ```typescript
 interface ReviewDelivery {
@@ -88,9 +95,8 @@ interface ReviewDeliveryAdapter {
 
 `ReviewDeliveryRequest` carries the delivery id plus
 `conversation_id`, `workspace_id`, `task_id`, `review_request_id`, and
-`routing_id`, plus an optional future Review message. The current Browser
-Worker adapter sends only `conversationId` to `/conversation/navigate`.
-`ReviewDeliveryResult` distinguishes successful navigation from a failed result
+`routing_id`, plus the lightweight Review message built by the Delivery layer.
+`ReviewDeliveryResult` distinguishes confirmed submission from a failed result
 and marks the failure as retryable or non-retryable. The Router and adapter
 boundary are documented in `docs/review-delivery-adapter.md`.
 
@@ -118,7 +124,8 @@ returns the existing record without sending anything again.
 
 Delivery success means only:
 
-> The Browser Worker successfully navigated to the target Conversation.
+> The Browser Worker confirmed that the Review message was accepted by the
+> target Conversation.
 
 It does **not** mean that ChatGPT has finished reviewing the request.
 
@@ -192,17 +199,16 @@ Request, Routing, or Review Projection APIs.
 
 ## Review completion boundary
 
-The current navigation flow is:
+The current submission flow is:
 
 ```text
-Browser Worker returned NAVIGATED
+Browser Worker returned SUBMITTED
         |
         v
 ReviewDelivery.status = delivered
 ```
 
-Only a later Review interaction/completion signal may represent the actual
-review result:
+Only a later Review completion signal may represent the actual review result:
 
 ```text
 ChatGPT review actually completes
@@ -214,8 +220,9 @@ independent completion signal/listener
 ReviewRequest.status = completed
 ```
 
-Page navigation or an HTTP success response must not be treated as Review
-submission or completion. This task does not update Review Request status.
+Page navigation, composer fill, a Send click, or an HTTP success response must
+not be treated as confirmed submission or completion. This task does not
+update Review Request status.
 
 ## C2C reference review
 

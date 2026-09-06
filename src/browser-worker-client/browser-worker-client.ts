@@ -3,9 +3,14 @@ import {
   DEFAULT_BROWSER_WORKER_HOST,
   DEFAULT_BROWSER_WORKER_PORT,
 } from "../browser-worker/config.js";
-import type { NavigationResult } from "../browser-worker/navigation/conversation-navigator.js";
+import {
+  BROWSER_DELIVERY_STATUSES,
+  type BrowserDeliveryResult,
+  type NavigationResult,
+} from "../browser-worker/protocol.js";
 
 export type { NavigationResult };
+export type { BrowserDeliveryResult };
 
 export const DEFAULT_BROWSER_WORKER_BASE_URL =
   `http://${DEFAULT_BROWSER_WORKER_HOST}:${DEFAULT_BROWSER_WORKER_PORT}` as const;
@@ -64,6 +69,28 @@ const navigationResultSchema = z.object({
   }
 });
 
+const browserDeliveryResultSchema = z.object({
+  conversationId: z.string().min(1).max(256),
+  url: z.string().url().optional(),
+  status: z.enum(BROWSER_DELIVERY_STATUSES),
+  error: z.string().min(1).max(4000).optional(),
+}).strict().superRefine((result, context) => {
+  if (result.status === "SUBMITTED" && result.error !== undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["error"],
+      message: "SUBMITTED responses must not include error",
+    });
+  }
+  if (result.status !== "SUBMITTED" && result.error === undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["error"],
+      message: "failed delivery responses must include error",
+    });
+  }
+});
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message.length > 0) return error.message.slice(0, 4000);
   return String(error).slice(0, 4000);
@@ -116,6 +143,7 @@ function responseErrorMessage(statusCode: number, body: unknown): string {
 
 export class BrowserWorkerClient {
   private readonly endpoint: string;
+  private readonly deliveryEndpoint: string;
   private readonly timeoutMs: number;
 
   public constructor(
@@ -123,10 +151,32 @@ export class BrowserWorkerClient {
   ) {
     const baseUrl = parseBaseUrl(config.baseUrl);
     this.endpoint = new URL("/conversation/navigate", baseUrl).toString();
+    this.deliveryEndpoint = new URL("/conversation/deliver", baseUrl).toString();
     this.timeoutMs = parseTimeout(config.timeoutMs ?? DEFAULT_BROWSER_WORKER_TIMEOUT_MS);
   }
 
   public async navigate(conversationId: string): Promise<NavigationResult> {
+    return this.post(this.endpoint, { conversationId }, navigationResultSchema, conversationId,
+      "navigation");
+  }
+
+  public async deliver(conversationId: string, message: string): Promise<BrowserDeliveryResult> {
+    return this.post(
+      this.deliveryEndpoint,
+      { conversationId, message },
+      browserDeliveryResultSchema,
+      conversationId,
+      "delivery",
+    );
+  }
+
+  private async post<T extends { readonly conversationId: string }>(
+    endpoint: string,
+    requestBody: unknown,
+    schema: z.ZodType<T>,
+    conversationId: string,
+    responseKind: "navigation" | "delivery",
+  ): Promise<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     timer.unref();
@@ -134,10 +184,10 @@ export class BrowserWorkerClient {
     try {
       let response: Response;
       try {
-        response = await fetch(this.endpoint, {
+        response = await fetch(endpoint, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ conversationId }),
+          body: JSON.stringify(requestBody),
           signal: controller.signal,
         });
       } catch (error: unknown) {
@@ -175,7 +225,7 @@ export class BrowserWorkerClient {
         }
         throw new BrowserWorkerClientError(
           "INVALID_RESPONSE",
-          "Browser Worker returned an invalid JSON response.",
+          `Browser Worker returned an invalid ${responseKind} JSON response.`,
           { cause: error },
         );
       }
@@ -188,13 +238,13 @@ export class BrowserWorkerClient {
         );
       }
 
-      const parsed = navigationResultSchema.safeParse(body);
+      const parsed = schema.safeParse(body);
       if (!parsed.success || parsed.data.conversationId !== conversationId) {
         throw new BrowserWorkerClientError(
           "INVALID_RESPONSE",
           parsed.success && parsed.data.conversationId !== conversationId
-            ? "Browser Worker navigation response does not match the requested conversation."
-            : "Browser Worker returned an invalid navigation response.",
+            ? `Browser Worker ${responseKind} response does not match the requested conversation.`
+            : `Browser Worker returned an invalid ${responseKind} response.`,
         );
       }
       return parsed.data;

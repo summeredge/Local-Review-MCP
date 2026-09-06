@@ -2,9 +2,9 @@
 
 ## Scope
 
-Task23.4 connects a persisted Review Delivery to the independent Browser
-Worker. It navigates to a Conversation only; it does not send Review content,
-interact with page elements, or implement the ChatGPT Interaction Layer.
+Task23.5 connects a persisted Review Delivery to the independent Browser
+Worker and submits the Review message. Browser DOM interaction remains inside
+the Browser Worker Interaction Layer.
 
 ```text
 Codex
@@ -32,9 +32,15 @@ Browser Worker Client
   |
   v
 Conversation Navigator
-  |
-  v
-ChatGPT Conversation Navigation
+        |
+        v
+ChatGPT Conversation Page
+        |
+        v
+ChatGPT Interaction Layer
+        |
+        v
+Confirmed Review Message Submission
 ```
 
 The responsibilities stay separate:
@@ -45,9 +51,10 @@ The responsibilities stay separate:
 | Review Delivery | Stores the state and attempt count for one logical delivery. |
 | Review Delivery Adapter | Abstracts delivery to an external target. |
 | Browser Router | Resolves routing and delivery, builds the request, and writes delivery state. |
-| Browser Worker Delivery Adapter | Maps `NavigationResult` to Delivery success or failure. |
-| Browser Worker Client | Sends `POST /conversation/navigate` to the configured Worker URL. |
-| Conversation Navigator | Runs inside Browser Worker and navigates to the Conversation URL. |
+| Browser Worker Delivery Adapter | Maps confirmed `SUBMITTED` or typed Worker failures to Delivery state. |
+| Browser Worker Client | Sends `POST /conversation/deliver` to the configured Worker URL. |
+| Conversation Navigator | Runs inside Browser Worker, navigates to the Conversation URL, and returns the open Page to the Worker lifecycle. |
+| ChatGPT Interaction Layer | Locates the Composer, fills the Review message, clicks Send, and confirms submission. |
 | Review Completion | Independent signal that ChatGPT actually finished the Review. |
 
 `Workspace` is not a Conversation. Conversation identity comes from the
@@ -92,10 +99,9 @@ interface ReviewDeliveryAdapter {
 ```
 
 The adapter knows only the contract and does not depend on Playwright.
-`BrowserWorkerDeliveryAdapter` calls `BrowserWorkerClient.navigate()` with
-`request.conversation_id`. The client request contains only
-`{ conversationId }`; the optional message is reserved for the later
-ChatGPT Interaction Layer.
+`BrowserWorkerDeliveryAdapter` calls `BrowserWorkerClient.deliver()` with
+`request.conversation_id` and `request.message`. The client request contains
+only the HTTP payload and no DOM logic.
 
 ## Browser Router
 
@@ -114,8 +120,8 @@ It performs this sequence:
    validate its task, request, routing, and Conversation fields.
 4. Return a `delivered` record immediately without calling the adapter again.
 5. For `pending` or `failed`, call `beginDeliveryAttempt()`.
-6. Call the injected adapter with the routed identity fields; the current
-   adapter uses only `conversation_id`.
+6. Call the injected adapter with the routed identity fields and the built
+   lightweight Review message.
 7. Call `markDelivered()` or `markFailed()` on the existing service.
 
 The Router never creates or rewrites `workspace_id`, `routing_id`, or
@@ -149,22 +155,25 @@ interface BrowserWorkerClientConfig {
   timeoutMs?: number;
 }
 
-client.navigate(conversationId)
-  -> POST /conversation/navigate { conversationId }
-  -> NavigationResult
+client.deliver(conversationId, message)
+  -> POST /conversation/deliver { conversationId, message }
+  -> BrowserDeliveryResult
 ```
 
 The default base URL is `http://127.0.0.1:12081`. Transport, HTTP, timeout,
 and invalid-response failures are returned as `BrowserWorkerClientError` and
 then mapped by `BrowserWorkerDeliveryAdapter` to a failed Delivery.
 
-The navigation failure codes and retry policy are:
+The Browser Worker failure codes and retry policy are:
 
 | Code | Retryable |
 | --- | --- |
+| `AUTH_REQUIRED` | no |
+| `CONVERSATION_NOT_FOUND` | no |
+| `COMPOSER_NOT_FOUND` | yes |
+| `SUBMIT_FAILED` | yes |
 | `BROWSER_NOT_AVAILABLE` | yes |
 | `DELIVERY_TIMEOUT` | yes |
-| `BROWSER_NAVIGATION_FAILED` | yes |
 | `BROWSER_WORKER_HTTP_ERROR` | HTTP 5xx only |
 | `BROWSER_WORKER_INVALID_RESPONSE` | no |
 | `BROWSER_WORKER_CONFIG_ERROR` | no |
@@ -173,9 +182,10 @@ The Router does not run a retry loop or scheduler. A retryable failed Delivery
 can be attempted later through the same Router. A non-retryable failure is
 recorded and is not retried automatically.
 
-Review content construction and sending are deferred to Task23.5. The current
-request may retain the optional `message` field for that later adapter, but it
-is not sent to the Browser Worker.
+The Router builds a lightweight message containing `workspace_id`, `task_id`,
+`execution_id` when present, `review_request_id`, and `routing_id`. It asks
+ChatGPT to use Local Review MCP for Workspace, Review Context, Git status, and
+uncommitted diff reads; it does not embed the diff or source files.
 
 ## State writeback and completion
 
@@ -186,26 +196,26 @@ pending -> delivering -> delivered
                     \-> failed -> delivering
 ```
 
-It never duplicates the state machine. A `NAVIGATED` adapter result writes
-`ReviewDelivery.status = "delivered"`; a `FAILED` result writes
-`ReviewDelivery.status = "failed"` and records the error. It does not update
-`ReviewRequest.status`, because navigation is not Review submission.
+It never duplicates the state machine. Only a confirmed `SUBMITTED` adapter
+result writes `ReviewDelivery.status = "delivered"`; a typed Worker failure
+writes `ReviewDelivery.status = "failed"` and records the error. It does not
+update `ReviewRequest.status`, because submission is not Review completion.
 
 ```text
-Browser Worker returned NAVIGATED
+Browser Worker returned SUBMITTED
         |
         v
 ReviewDelivery.status = delivered
         |
         v
-Task23.5 Review interaction/completion signal
+Later Review completion signal
         |
         v
 ReviewRequest.status = completed
 ```
 
-Conversation navigation or an HTTP success response is not Review submission
-or completion.
+Conversation navigation, Composer fill, a Send click, or an HTTP success
+response is not confirmed submission or completion.
 
 ## Idempotency and identity
 
@@ -254,7 +264,7 @@ prints the final status, and removes the temporary directory in `finally`:
 ```json
 {
   "conversation_id": "example-conversation",
-  "browser_worker_status": "NAVIGATED",
+  "browser_worker_status": "SUBMITTED",
   "delivery_status": "delivered",
   "attempt_count": 1
 }

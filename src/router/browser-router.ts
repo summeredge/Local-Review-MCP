@@ -11,6 +11,7 @@ import type {
 } from "../delivery/review-delivery-adapter.js";
 import { BrowserWorkerClient } from "../browser-worker-client/browser-worker-client.js";
 import { BrowserWorkerDeliveryAdapter } from "../delivery/browser-worker-delivery-adapter.js";
+import { buildReviewMessage } from "../delivery/review-message.js";
 
 export class BrowserRouter {
   private readonly routings: ConversationRoutingService;
@@ -49,6 +50,13 @@ export class BrowserRouter {
       routing_id: attempt.routing_id,
       conversation_id: attempt.conversation_id,
       ...(routing.execution_id === undefined ? {} : { execution_id: routing.execution_id }),
+      message: buildReviewMessage({
+        workspace_id: attempt.workspace_id,
+        task_id: attempt.task_id,
+        review_request_id: attempt.review_request_id,
+        routing_id: attempt.routing_id,
+        ...(routing.execution_id === undefined ? {} : { execution_id: routing.execution_id }),
+      }),
     };
 
     let result: ReviewDeliveryResult;

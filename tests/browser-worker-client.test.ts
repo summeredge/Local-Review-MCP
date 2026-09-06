@@ -4,6 +4,7 @@ import {
   BrowserWorkerClient,
   BrowserWorkerClientError,
 } from "../src/browser-worker-client/browser-worker-client.js";
+import type { BrowserDeliveryResult } from "../src/browser-worker/protocol.js";
 
 const servers: Server[] = [];
 
@@ -79,6 +80,42 @@ describe("BrowserWorkerClient", () => {
       .resolves.toMatchObject({ status: "FAILED", error: "navigation failed" });
   });
 
+  it("posts the conversation ID and message to the delivery endpoint", async () => {
+    let requestBody: unknown;
+    const { baseUrl } = await startServer((response, body) => {
+      requestBody = body;
+      sendJson(response, 200, {
+        conversationId: "conversation-001",
+        url: "https://chatgpt.com/c/conversation-001",
+        status: "SUBMITTED",
+      } satisfies BrowserDeliveryResult);
+    });
+
+    await expect(new BrowserWorkerClient({ baseUrl }).deliver("conversation-001", "中文\nreview message"))
+      .resolves.toMatchObject({ conversationId: "conversation-001", status: "SUBMITTED" });
+    expect(requestBody).toEqual({
+      conversationId: "conversation-001",
+      message: "中文\nreview message",
+    });
+  });
+
+  it("returns typed delivery failures from an HTTP-success response", async () => {
+    const { baseUrl } = await startServer((response) => {
+      sendJson(response, 200, {
+        conversationId: "conversation-001",
+        status: "AUTH_REQUIRED",
+        error: "ChatGPT authentication is required.",
+      });
+    });
+
+    await expect(new BrowserWorkerClient({ baseUrl }).deliver("conversation-001", "review"))
+      .resolves.toEqual({
+        conversationId: "conversation-001",
+        status: "AUTH_REQUIRED",
+        error: "ChatGPT authentication is required.",
+      });
+  });
+
   it("wraps non-success HTTP responses", async () => {
     const { baseUrl } = await startServer((response) => {
       sendJson(response, 503, { error: "worker unavailable" });
@@ -113,5 +150,26 @@ describe("BrowserWorkerClient", () => {
 
     await expect(new BrowserWorkerClient({ baseUrl }).navigate("conversation-001"))
       .rejects.toMatchObject({ name: "BrowserWorkerClientError", code: "INVALID_RESPONSE" });
+  });
+
+  it("rejects an invalid delivery response", async () => {
+    const { baseUrl } = await startServer((response) => {
+      sendJson(response, 200, { conversationId: "conversation-001", status: "SUBMITTED", error: "oops" });
+    });
+
+    await expect(new BrowserWorkerClient({ baseUrl }).deliver("conversation-001", "review"))
+      .rejects.toMatchObject({ name: "BrowserWorkerClientError", code: "INVALID_RESPONSE" });
+  });
+
+  it("wraps a delivery request timeout", async () => {
+    const { baseUrl } = await startServer((response) => {
+      setTimeout(() => sendJson(response, 200, {
+        conversationId: "conversation-001",
+        status: "SUBMITTED",
+      }), 200);
+    });
+
+    await expect(new BrowserWorkerClient({ baseUrl, timeoutMs: 20 }).deliver("conversation-001", "review"))
+      .rejects.toMatchObject({ name: "BrowserWorkerClientError", code: "TIMEOUT" });
   });
 });

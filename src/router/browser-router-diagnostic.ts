@@ -14,7 +14,7 @@ import { BrowserRouter } from "./browser-router.js";
 
 export interface BrowserRouterDiagnosticResult {
   readonly conversation_id: string;
-  readonly browser_worker_status: "NAVIGATED";
+  readonly browser_worker_status: "SUBMITTED";
   readonly delivery_status: "delivered";
   readonly attempt_count: number;
 }
@@ -23,6 +23,7 @@ interface MockBrowserWorker {
   readonly server: Server;
   readonly baseUrl: string;
   readonly conversationIds: string[];
+  readonly messages: string[];
 }
 
 function sendJson(response: ServerResponse, statusCode: number, body: unknown): void {
@@ -40,8 +41,9 @@ async function readBody(request: IncomingMessage): Promise<unknown> {
 
 async function startMockBrowserWorker(): Promise<MockBrowserWorker> {
   const conversationIds: string[] = [];
+  const messages: string[] = [];
   const server = createServer((request, response) => {
-    if (request.method !== "POST" || request.url?.split("?", 1)[0] !== "/conversation/navigate") {
+    if (request.method !== "POST" || request.url?.split("?", 1)[0] !== "/conversation/deliver") {
       request.resume();
       sendJson(response, 404, { error: "not_found" });
       return;
@@ -54,19 +56,23 @@ async function startMockBrowserWorker(): Promise<MockBrowserWorker> {
       }
       const record = body as Record<string, unknown>;
       const conversationId = record.conversationId;
-      if (Object.keys(record).length !== 1 || !Object.hasOwn(record, "conversationId")) {
-        sendJson(response, 400, { error: "conversationId_only" });
+      const message = record.message;
+      if (Object.keys(record).length !== 2
+        || !Object.hasOwn(record, "conversationId")
+        || !Object.hasOwn(record, "message")) {
+        sendJson(response, 400, { error: "conversationId_and_message_required" });
         return;
       }
-      if (typeof conversationId !== "string") {
-        sendJson(response, 400, { error: "invalid_conversation_id" });
+      if (typeof conversationId !== "string" || typeof message !== "string") {
+        sendJson(response, 400, { error: "invalid_delivery_request" });
         return;
       }
       conversationIds.push(conversationId);
+      messages.push(message);
       sendJson(response, 200, {
         conversationId,
         url: conversationUrl(conversationId),
-        status: "NAVIGATED",
+        status: "SUBMITTED",
       });
     }).catch(() => sendJson(response, 400, { error: "invalid_json_body" }));
   });
@@ -80,7 +86,7 @@ async function startMockBrowserWorker(): Promise<MockBrowserWorker> {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     throw new Error("Mock Browser Worker has no listening port.");
   }
-  return { server, baseUrl: `http://127.0.0.1:${address.port}`, conversationIds };
+  return { server, baseUrl: `http://127.0.0.1:${address.port}`, conversationIds, messages };
 }
 
 async function closeMockBrowserWorker(mock: MockBrowserWorker): Promise<void> {
@@ -134,12 +140,14 @@ export async function generateReviewDeliveryBrowserExample(): Promise<BrowserRou
       || final.conversation_id !== "example-conversation"
       || mock.conversationIds.length !== 1
       || mock.conversationIds[0] !== "example-conversation"
+      || mock.messages.length !== 1
+      || !mock.messages[0]?.includes("review_request_id: example-review")
       || reviewRequest?.status !== "pending") {
       throw new Error("Review delivery Browser Worker diagnostic did not preserve the requested boundary.");
     }
     return {
       conversation_id: final.conversation_id,
-      browser_worker_status: "NAVIGATED",
+      browser_worker_status: "SUBMITTED",
       delivery_status: final.status,
       attempt_count: final.attempt_count,
     };

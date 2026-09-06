@@ -64,10 +64,16 @@ persistent context is created, and the current authentication status:
 }
 ```
 
-The `POST /conversation/navigate` endpoint accepts `{ conversationId }` and
-returns the `NavigationResult` from `ConversationNavigator`. Review Delivery
-uses this endpoint through `BrowserWorkerClient`; it does not send Review
-content.
+The diagnostic `POST /conversation/navigate` endpoint accepts
+`{ conversationId }` and returns the serializable `NavigationResult` from
+`ConversationNavigator`.
+
+The Review Delivery `POST /conversation/deliver` endpoint accepts
+`{ conversationId, message }`. It navigates once, keeps the resulting Page open
+for the Interaction Layer, fills and submits the message, confirms that the
+page accepted it, then closes the Page. Its result is `SUBMITTED`,
+`AUTH_REQUIRED`, `CONVERSATION_NOT_FOUND`, `COMPOSER_NOT_FOUND`, or
+`SUBMIT_FAILED`.
 
 The worker launches headless Chromium through
 `chromium.launchPersistentContext()` but does not open a Conversation until a
@@ -88,6 +94,13 @@ The command starts the compiled worker in a child process using the managed
 prints the ready result, and stops the child in a `finally` block. It does not
 use the production configuration or access an external website.
 
+The submission-only diagnostic uses a mock Page and exercises
+`/conversation/deliver` without a ChatGPT account:
+
+```powershell
+npm run diagnose:review-submission
+```
+
 ## C2C reference review
 
 Before implementing this skeleton, the local C2C checkout at
@@ -106,9 +119,16 @@ The useful patterns were:
 This task applies those process and health boundaries only. It does not import
 C2C Session, Agent, Conversation, Project, or state-machine concepts.
 
-## Deliberate exclusions
+## Interaction and authentication
 
-This task does not implement ChatGPT login, Conversation content operations,
-message sending, DOM automation, or any Session concept. `authStatus` is
-currently always `UNKNOWN`; login and authentication detection belong to later
-tasks and must not be inferred from a healthy worker response.
+`src/browser-worker/interaction/` owns the concentrated Composer selectors and
+ChatGPT page operations. It uses semantic attributes such as `data-testid`,
+ARIA labels, `textarea`, and `contenteditable`; it does not expose page text,
+cookies, or tokens. A successful submit clears the Composer or adds a new user
+message node. A login URL or visible login control returns `AUTH_REQUIRED`.
+
+`authStatus` remains `UNKNOWN` until an interaction observes a known state;
+successful submission sets it to `READY`, and a known login page sets it to
+`AUTH_REQUIRED`. The worker never fills credentials, imports cookies, or
+creates a Session model. Review reply collection and completion remain outside
+this task.

@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { NavigationResult } from "../src/browser-worker-client/browser-worker-client.js";
+import type { BrowserDeliveryResult } from "../src/browser-worker-client/browser-worker-client.js";
 import { ConversationRoutingService } from "../src/context/conversation-routing-service.js";
 import { ExecutionContextService } from "../src/context/execution-service.js";
 import { ReviewDeliveryService } from "../src/context/review-delivery-service.js";
@@ -65,14 +65,14 @@ describe("BrowserRouter", () => {
   it("delivers the task-scoped request and does not repeat a delivered delivery", async () => {
     const storageRoot = await makeStorageRoot();
     const { routing } = await makeChain(storageRoot);
-    const conversationIds: string[] = [];
+    const requests: Array<{ conversationId: string; message: string }> = [];
     const client = {
-      navigate: async (conversationId: string): Promise<NavigationResult> => {
-        conversationIds.push(conversationId);
+      deliver: async (conversationId: string, message: string): Promise<BrowserDeliveryResult> => {
+        requests.push({ conversationId, message });
         return {
           conversationId,
           url: `https://chatgpt.com/c/${conversationId}`,
-          status: "NAVIGATED",
+          status: "SUBMITTED",
         };
       },
     };
@@ -88,7 +88,9 @@ describe("BrowserRouter", () => {
       attempt_count: 1,
     });
     expect(repeated).toEqual(delivered);
-    expect(conversationIds).toEqual(["conversation-001"]);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ conversationId: "conversation-001" });
+    expect(requests[0]?.message).toContain("review_request_id: review-001");
 
     const request = await new ReviewRequestService(storageRoot)
       .getReviewRequest("workspace-a", "review-001");
@@ -99,14 +101,14 @@ describe("BrowserRouter", () => {
   it("records a retryable failure and permits a later retry", async () => {
     const storageRoot = await makeStorageRoot();
     const { routing } = await makeChain(storageRoot);
-    let result: NavigationResult = {
+    let result: BrowserDeliveryResult = {
       conversationId: "conversation-001",
-      status: "FAILED",
+      status: "SUBMIT_FAILED",
       error: "Browser is unavailable.",
     };
     const conversationIds: string[] = [];
     const client = {
-      navigate: async (conversationId: string): Promise<NavigationResult> => {
+      deliver: async (conversationId: string): Promise<BrowserDeliveryResult> => {
         conversationIds.push(conversationId);
         return { ...result, conversationId };
       },
@@ -117,14 +119,14 @@ describe("BrowserRouter", () => {
     result = {
       conversationId: "conversation-001",
       url: "https://chatgpt.com/c/conversation-001",
-      status: "NAVIGATED",
+      status: "SUBMITTED",
     };
     const delivered = await router.deliver("workspace-a", routing.routing_id);
 
     expect(failed).toMatchObject({
       status: "failed",
       attempt_count: 1,
-      last_error: { code: "BROWSER_NAVIGATION_FAILED" },
+      last_error: { code: "SUBMIT_FAILED" },
     });
     expect(delivered).toMatchObject({ status: "delivered", attempt_count: 2 });
     expect(conversationIds).toEqual(["conversation-001", "conversation-001"]);
@@ -134,9 +136,9 @@ describe("BrowserRouter", () => {
     const storageRoot = await makeStorageRoot();
     const { routing } = await makeChain(storageRoot);
     const client = {
-      navigate: async (conversationId: string): Promise<NavigationResult> => ({
+      deliver: async (conversationId: string): Promise<BrowserDeliveryResult> => ({
         conversationId,
-        status: "FAILED",
+        status: "CONVERSATION_NOT_FOUND",
         error: "Conversation was not found.",
       }),
     };
@@ -147,7 +149,7 @@ describe("BrowserRouter", () => {
     expect(failed).toMatchObject({
       status: "failed",
       attempt_count: 1,
-      last_error: { code: "BROWSER_NAVIGATION_FAILED" },
+      last_error: { code: "CONVERSATION_NOT_FOUND" },
     });
   });
 

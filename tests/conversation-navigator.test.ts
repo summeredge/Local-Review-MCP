@@ -52,13 +52,17 @@ describe("ConversationNavigator", () => {
     const initialize = vi.fn(async (): Promise<BrowserContext> => context);
     const navigator = new ConversationNavigator({ initialize });
 
-    await expect(navigator.navigate("conversation-001")).resolves.toEqual({
+    const result = await navigator.navigate("conversation-001");
+    expect(result).toMatchObject({
       conversationId: "conversation-001",
       url: "https://chatgpt.com/c/conversation-001",
       status: "NAVIGATED",
     });
+    expect(result.status === "NAVIGATED" && result.page).toBe(page);
     expect(initialize).toHaveBeenCalledOnce();
     expect(page.goto).toHaveBeenCalledWith("https://chatgpt.com/c/conversation-001");
+    expect(page.close).not.toHaveBeenCalled();
+    if (result.status === "NAVIGATED") await result.page.close();
     expect(page.close).toHaveBeenCalledOnce();
   });
 
@@ -71,7 +75,7 @@ describe("ConversationNavigator", () => {
       initialize: async (): Promise<BrowserContext> => makeContext(browserFailurePage),
     });
 
-    await expect(browserFailure.navigate("conversation-failed")).resolves.toEqual({
+    await expect(browserFailure.navigate("conversation-failed")).resolves.toMatchObject({
       conversationId: "conversation-failed",
       url: "https://chatgpt.com/c/conversation-failed",
       status: "FAILED",
@@ -90,7 +94,7 @@ describe("ConversationNavigator", () => {
       conversationId: "conversation-missing",
       url: "https://chatgpt.com/c/conversation-missing",
       status: "FAILED",
-      error: "Conversation navigation returned HTTP 404.",
+      error: "Conversation was not found.",
     });
   });
 });

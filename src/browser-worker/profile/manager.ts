@@ -22,6 +22,7 @@ export class BrowserProfileManager {
   private contextValue: BrowserContext | undefined;
   private browserValue: Browser | undefined;
   private initializing: Promise<BrowserContext> | undefined;
+  private authStatusValue: BrowserAuthStatus = "UNKNOWN";
 
   public constructor(
     public readonly config: BrowserProfileConfig,
@@ -50,8 +51,12 @@ export class BrowserProfileManager {
     return {
       profile: this.profileName,
       context: this.contextValue === undefined ? "not_created" : "created",
-      authStatus: "UNKNOWN",
+      authStatus: this.authStatusValue,
     };
+  }
+
+  public setAuthStatus(status: BrowserAuthStatus): void {
+    this.authStatusValue = status;
   }
 
   public initialize(): Promise<BrowserContext> {
@@ -73,6 +78,7 @@ export class BrowserProfileManager {
     const browser = this.browserValue;
     this.contextValue = undefined;
     this.browserValue = undefined;
+    this.authStatusValue = "UNKNOWN";
     if (context !== undefined) await context.close().catch(() => undefined);
     if (browser !== undefined) await browser.close().catch(() => undefined);
   }

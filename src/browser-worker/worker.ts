@@ -7,7 +7,10 @@ import {
   resolveBrowserWorkerConfig,
   type BrowserWorkerConfigInput,
 } from "./config.js";
-import { ConversationNavigator } from "./navigation/conversation-navigator.js";
+import { ChatGPTInteraction } from "./interaction/chatgpt-interaction.js";
+import { conversationUrl, ConversationNavigator } from "./navigation/conversation-navigator.js";
+import type { NavigationSessionResult } from "./navigation/conversation-navigator.js";
+import type { BrowserDeliveryResult } from "./protocol.js";
 import { BrowserProfileManager, type PersistentContextLauncher } from "./profile/manager.js";
 
 export type BrowserWorkerStatus = "stopped" | "starting" | "ready" | "failed";
@@ -24,18 +27,25 @@ export type BrowserLauncher = () => Promise<Browser>;
 export interface BrowserWorkerOptions extends BrowserWorkerConfigInput {
   readonly launchBrowser?: BrowserLauncher;
   readonly launchPersistentContext?: PersistentContextLauncher;
+  readonly interaction?: Pick<ChatGPTInteraction, "submitMessage">;
 }
 
 export const MAX_CONVERSATION_NAVIGATION_REQUEST_BYTES = 16 * 1024;
+export const MAX_CONVERSATION_DELIVERY_REQUEST_BYTES = 128 * 1024;
 
 const conversationNavigationRequestSchema = z.object({
   conversationId: z.string().min(1).max(256),
 }).strict();
 
-class ConversationNavigationBodyTooLargeError extends Error {
+const conversationDeliveryRequestSchema = z.object({
+  conversationId: z.string().min(1).max(256),
+  message: z.string().min(1).max(64 * 1024),
+}).strict();
+
+class RequestBodyTooLargeError extends Error {
   public constructor() {
-    super("Conversation navigation request body exceeds the maximum allowed size.");
-    this.name = "ConversationNavigationBodyTooLargeError";
+    super("Browser Worker request body exceeds the maximum allowed size.");
+    this.name = "RequestBodyTooLargeError";
   }
 }
 
@@ -52,13 +62,16 @@ function sendJson(response: ServerResponse, statusCode: number, body: unknown): 
   response.end(payload);
 }
 
-async function parseJsonBody(request: IncomingMessage): Promise<unknown> {
+async function parseJsonBody(
+  request: IncomingMessage,
+  maxBytes: number,
+): Promise<unknown> {
   const contentLength = request.headers["content-length"];
   if (typeof contentLength === "string"
     && Number.isFinite(Number(contentLength))
-    && Number(contentLength) > MAX_CONVERSATION_NAVIGATION_REQUEST_BYTES) {
+    && Number(contentLength) > maxBytes) {
     request.resume();
-    throw new ConversationNavigationBodyTooLargeError();
+    throw new RequestBodyTooLargeError();
   }
 
   const chunks: Buffer[] = [];
@@ -66,9 +79,9 @@ async function parseJsonBody(request: IncomingMessage): Promise<unknown> {
   for await (const chunk of request) {
     const buffer = Buffer.from(chunk);
     totalBytes += buffer.byteLength;
-    if (totalBytes > MAX_CONVERSATION_NAVIGATION_REQUEST_BYTES) {
+    if (totalBytes > maxBytes) {
       request.resume();
-      throw new ConversationNavigationBodyTooLargeError();
+      throw new RequestBodyTooLargeError();
     }
     chunks.push(buffer);
   }
@@ -81,6 +94,32 @@ function closeServer(server: Server): Promise<void> {
   return new Promise((resolve) => {
     server.close(() => resolve());
   });
+}
+
+function navigationResponse(result: NavigationSessionResult): Record<string, unknown> {
+  if (result.status === "NAVIGATED") {
+    const { page: _page, ...response } = result;
+    return response;
+  }
+  const { failureCode: _failureCode, ...response } = result;
+  return response;
+}
+
+function navigationFailureResult(
+  conversationId: string,
+  result: Extract<NavigationSessionResult, { status: "FAILED" }>,
+): BrowserDeliveryResult {
+  const status = result.failureCode === "AUTH_REQUIRED"
+    ? "AUTH_REQUIRED"
+    : result.failureCode === "CONVERSATION_NOT_FOUND"
+      ? "CONVERSATION_NOT_FOUND"
+      : "SUBMIT_FAILED";
+  return {
+    conversationId,
+    ...(result.url === undefined ? {} : { url: result.url }),
+    status,
+    error: result.error ?? "Conversation navigation failed.",
+  };
 }
 
 function listenServer(server: Server, host: string, port: number): Promise<void> {
@@ -104,6 +143,7 @@ export class BrowserWorker {
   private readonly configuredPort: number;
   private readonly profileManager: BrowserProfileManager;
   private readonly conversationNavigator: ConversationNavigator;
+  private readonly interaction: Pick<ChatGPTInteraction, "submitMessage">;
   private readonly createdAt = new Date().toISOString();
   private stateValue: BrowserWorkerState = {
     status: "stopped",
@@ -124,6 +164,7 @@ export class BrowserWorker {
         : async (): Promise<BrowserContext> => (await legacyLauncher()).newContext());
     this.profileManager = new BrowserProfileManager(config.profile, launchContext);
     this.conversationNavigator = new ConversationNavigator(this.profileManager);
+    this.interaction = options.interaction ?? new ChatGPTInteraction();
   }
 
   public get state(): BrowserWorkerState {
@@ -195,7 +236,8 @@ export class BrowserWorker {
       }
     }
 
-    if (path === "/conversation/navigate" && request.method !== "POST") {
+    if ((path === "/conversation/navigate" || path === "/conversation/deliver")
+      && request.method !== "POST") {
       request.resume();
       sendJson(response, 405, { error: "method_not_allowed" });
       return;
@@ -203,6 +245,11 @@ export class BrowserWorker {
 
     if (request.method === "POST" && path === "/conversation/navigate") {
       void this.handleConversationNavigation(request, response);
+      return;
+    }
+
+    if (request.method === "POST" && path === "/conversation/deliver") {
+      void this.handleConversationDelivery(request, response);
       return;
     }
 
@@ -240,11 +287,11 @@ export class BrowserWorker {
   ): Promise<void> {
     let body: unknown;
     try {
-      body = await parseJsonBody(request);
+      body = await parseJsonBody(request, MAX_CONVERSATION_NAVIGATION_REQUEST_BYTES);
     } catch (error: unknown) {
-      sendJson(response, error instanceof ConversationNavigationBodyTooLargeError ? 413 : 400, {
+      sendJson(response, error instanceof RequestBodyTooLargeError ? 413 : 400, {
         status: "FAILED",
-        error: error instanceof ConversationNavigationBodyTooLargeError
+        error: error instanceof RequestBodyTooLargeError
           ? "conversation navigation request is too large"
           : "invalid_json_body",
       });
@@ -262,13 +309,103 @@ export class BrowserWorker {
 
     try {
       const result = await this.conversationNavigator.navigate(parsed.data.conversationId);
-      sendJson(response, result.status === "FAILED" && result.url === undefined ? 400 : 200, result);
+      const navigation = navigationResponse(result);
+      try {
+        sendJson(response, result.status === "FAILED" && result.url === undefined ? 400 : 200, navigation);
+      } finally {
+        if (result.status === "NAVIGATED" && typeof result.page.close === "function") {
+          await result.page.close().catch(() => undefined);
+        }
+      }
     } catch (error: unknown) {
       sendJson(response, 500, {
         status: "FAILED",
         error: errorMessage(error),
       });
     }
+  }
+
+  private async handleConversationDelivery(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    let body: unknown;
+    try {
+      body = await parseJsonBody(request, MAX_CONVERSATION_DELIVERY_REQUEST_BYTES);
+    } catch (error: unknown) {
+      sendJson(response, error instanceof RequestBodyTooLargeError ? 413 : 400, {
+        status: "SUBMIT_FAILED",
+        error: error instanceof RequestBodyTooLargeError
+          ? "conversation delivery request is too large"
+          : "invalid_json_body",
+      });
+      return;
+    }
+
+    const parsed = conversationDeliveryRequestSchema.safeParse(body);
+    if (!parsed.success) {
+      sendJson(response, 400, {
+        status: "SUBMIT_FAILED",
+        error: "conversationId and a non-empty message are required.",
+      });
+      return;
+    }
+
+    try {
+      conversationUrl(parsed.data.conversationId);
+    } catch {
+      sendJson(response, 400, {
+        status: "SUBMIT_FAILED",
+        error: "conversationId is invalid.",
+      });
+      return;
+    }
+
+    let navigation: NavigationSessionResult;
+    try {
+      navigation = await this.conversationNavigator.navigate(parsed.data.conversationId);
+    } catch (error: unknown) {
+      sendJson(response, 500, {
+        status: "SUBMIT_FAILED",
+        error: errorMessage(error),
+      });
+      return;
+    }
+
+    if (navigation.status === "FAILED") {
+      const result = navigationFailureResult(parsed.data.conversationId, navigation);
+      this.updateAuthStatus(result.status);
+      sendJson(response, 200, result);
+      return;
+    }
+
+    try {
+      const interaction = await this.interaction.submitMessage(navigation.page, parsed.data.message);
+      const result: BrowserDeliveryResult = {
+        conversationId: parsed.data.conversationId,
+        url: navigation.url,
+        ...interaction,
+      } as BrowserDeliveryResult;
+      this.updateAuthStatus(result.status);
+      sendJson(response, 200, result);
+    } catch {
+      this.profileManager.setAuthStatus("UNKNOWN");
+      sendJson(response, 200, {
+        conversationId: parsed.data.conversationId,
+        url: navigation.url,
+        status: "SUBMIT_FAILED",
+        error: "ChatGPT review message submission failed.",
+      });
+    } finally {
+      if (typeof navigation.page.close === "function") {
+        await navigation.page.close().catch(() => undefined);
+      }
+    }
+  }
+
+  private updateAuthStatus(status: BrowserDeliveryResult["status"]): void {
+    if (status === "AUTH_REQUIRED") this.profileManager.setAuthStatus("AUTH_REQUIRED");
+    if (status === "SUBMITTED") this.profileManager.setAuthStatus("READY");
   }
 
   private setState(status: BrowserWorkerStatus, lastError?: string): void {
