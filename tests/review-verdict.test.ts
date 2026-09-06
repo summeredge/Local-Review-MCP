@@ -21,13 +21,13 @@ function result(content: string, status: ReviewResult["status"] = "COMPLETED"): 
   };
 }
 
-function block(payload: Record<string, unknown>): string {
+function block(payload: Record<string, unknown>, trailing = ""): string {
   return [
     "Human-readable review.",
     "<lrm-review-result>",
     JSON.stringify(payload),
     "</lrm-review-result>",
-  ].join("\n");
+  ].join("\n") + trailing;
 }
 
 function iteratePayload(): Record<string, unknown> {
@@ -91,6 +91,21 @@ describe("ReviewVerdictParser", () => {
       "<lrm-review-result>{not json}</lrm-review-result>",
       "VERDICT_JSON_INVALID",
     );
+  });
+
+  it("requires the verdict block to be final except for whitespace", () => {
+    const approve = {
+      schema_version: 1,
+      review_request_id: "review-001",
+      decision: "APPROVE",
+      summary: "No blocking findings.",
+    };
+
+    expect(parser.parse(result(block(approve, "\n  \t\r\n")))).toMatchObject({
+      decision: "APPROVE",
+    });
+    expectCode(block(approve, "\nextra text"), "VERDICT_BLOCK_NOT_FINAL");
+    expectCode(block(approve, "\n```markdown\n"), "VERDICT_BLOCK_NOT_FINAL");
   });
 
   it("rejects invalid schema and decision combinations", () => {

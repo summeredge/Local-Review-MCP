@@ -9,6 +9,7 @@ export const REVIEW_VERDICT_PARSE_ERROR_CODES = [
   "REVIEW_RESULT_NOT_COMPLETED",
   "VERDICT_BLOCK_MISSING",
   "VERDICT_BLOCK_MULTIPLE",
+  "VERDICT_BLOCK_NOT_FINAL",
   "VERDICT_JSON_INVALID",
   "VERDICT_SCHEMA_INVALID",
   "REVIEW_REQUEST_MISMATCH",
@@ -68,6 +69,13 @@ export class ReviewVerdictParser {
       throw new ReviewVerdictParseError(
         "VERDICT_BLOCK_MISSING",
         "Review result does not contain one ordered verdict block.",
+      );
+    }
+    const closeTagEnd = end + REVIEW_VERDICT_CLOSE_TAG.length;
+    if (content.slice(closeTagEnd).trim() !== "") {
+      throw new ReviewVerdictParseError(
+        "VERDICT_BLOCK_NOT_FINAL",
+        "Verdict block must be the final non-whitespace content.",
       );
     }
 

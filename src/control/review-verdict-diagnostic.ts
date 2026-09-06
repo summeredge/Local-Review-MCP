@@ -8,6 +8,7 @@ export interface ReviewVerdictDiagnosticResult {
   readonly decision: "ITERATE";
   readonly review_request_id: string;
   readonly identity_mismatch: "REVIEW_REQUEST_MISMATCH";
+  readonly trailing_content: "VERDICT_BLOCK_NOT_FINAL";
 }
 
 function verdictContent(reviewRequestId: string): string {
@@ -47,18 +48,39 @@ export function generateReviewVerdictExample(): ReviewVerdictDiagnosticResult {
     throw new Error("Review verdict diagnostic did not parse the expected ITERATE verdict.");
   }
 
+  let identityMismatch: "REVIEW_REQUEST_MISMATCH" | undefined;
   try {
     parser.parse({ ...result, content: verdictContent("other-review") });
   } catch (error: unknown) {
     if (error instanceof ReviewVerdictParseError
       && error.code === "REVIEW_REQUEST_MISMATCH") {
-      return {
-        decision: verdict.decision,
-        review_request_id: verdict.review_request_id,
-        identity_mismatch: error.code,
-      };
+      identityMismatch = error.code;
+    } else {
+      throw error;
     }
-    throw error;
   }
-  throw new Error("Review verdict diagnostic did not reject an identity mismatch.");
+  if (identityMismatch === undefined) {
+    throw new Error("Review verdict diagnostic did not reject an identity mismatch.");
+  }
+
+  let trailingContent: "VERDICT_BLOCK_NOT_FINAL" | undefined;
+  try {
+    parser.parse({ ...result, content: `${verdictContent(result.review_request_id)}\ntrailing text` });
+  } catch (error: unknown) {
+    if (error instanceof ReviewVerdictParseError
+      && error.code === "VERDICT_BLOCK_NOT_FINAL") {
+      trailingContent = error.code;
+    } else {
+      throw error;
+    }
+  }
+  if (trailingContent === undefined) {
+    throw new Error("Review verdict diagnostic did not reject trailing content.");
+  }
+  return {
+    decision: verdict.decision,
+    review_request_id: verdict.review_request_id,
+    identity_mismatch: identityMismatch,
+    trailing_content: trailingContent,
+  };
 }
