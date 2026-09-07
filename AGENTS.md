@@ -1,82 +1,100 @@
 # AGENTS.md
 
-## C2C Reference Project
+## Reference Projects
 
-LRM 可参考本机 C2C 项目：
-C:\Users\shaoy\Documents\Codex\codex-with-chatgpt
+本地只读参考：
 
+* C2C: `C:\Users\shaoy\Documents\Codex\codex-with-chatgpt`
+* COS: `C:\Users\shaoy\Documents\Codex\chat-on-steroids`
 
-查阅 C2C 时：
-- 直接读取本地代码；
-- 优先理解已有实现和调用链；
-- 适用时复用或最小适配。
+实现新功能前，先检查相关参考实现、调用链和测试。
 
-## Reference Priority
+优先级：
 
-涉及以下功能时，优先检查 C2C 是否已有实现：
-
-- MCP Tool 注册
-- input/output schema
-- structuredContent / outputSchema
-- Zod Schema
-- Response helper
-- OAuth / PKCE
-- Workspace 管理
-- Process / Supervisor
-- Execution Output
-- Context 管理
-
-原则：
-
+```text
 已有成熟实现
->
-最小适配
->
-重新设计
+> 最小适配
+> 重新设计
+```
+
+### C2C
+
+优先参考：
+
+* MCP / Schema / structured output
+* OAuth / PKCE
+* Workspace / Context
+* Process / Supervisor
+* Execution Record
+* Task / Execution / iteration / checkpoint
+* ChatGPT Planning / Review 与 Codex Execution 协作
+
+### COS
+
+优先参考：
+
+* Local Control Bridge
+* Chrome Extension
+* `requestId → conversationId`
+* Browser identity / document / navigation epoch
+* durable command queue
+* claim / lease / authorize / ACK
+* restart / lost-ACK / duplicate-send protection
+* Dispatcher / Command Broker
+* Reliable Browser Delivery
+
+参考仓库只读，禁止修改。不要整体复制无关子系统。
+
+---
+
+## Implementation Path
+
+开发新能力时默认：
+
+1. 先读取 LRM 当前实现、调用链和测试；
+2. 按功能域检查 C2C / COS 是否已有成熟实现；
+3. 优先复用或最小适配，不无必要重构 LRM Core；
+4. 先完成最小可验证实现，再扩展自动化；
+5. Browser / Extension / Dispatcher / Codex execution 保持在 Control Plane；
+6. 修改后运行相关测试、typecheck、build 和 diagnostics。
 
 ---
 
 ## LRM Boundary
 
-LRM 定位：
+LRM Core 负责：
 
-Data Plane
-+
-Review Context
+* Workspace / Git 只读访问
+* Task / Execution / Review Context
+* Review / Loop 状态与控制逻辑
 
-负责：
+架构边界：
 
-- Workspace读取；
-- Git信息；
-- Review上下文。
+```text
+MCP
+= Read-only Data Plane
 
-不引入 C2C 的：
+Browser / Extension / Dispatcher / Codex execution
+= Control Plane
+```
 
-- Workspace ↔ Conversation绑定；
-- Session状态机；
-- Agent Control Plane；
-- Coding Agent执行能力。
+Control Plane 能力不得向 MCP Data Plane 渗透。
 
 ---
 
 ## Permission Boundary
 
-保持：
+职责固定：
 
-ChatGPT:
-规划 / Review
+```text
+ChatGPT → Planning / Review
+Codex   → Edit / Test / Git
+LRM MCP → Read-only Data Plane
+```
 
-Codex:
-修改 / 测试 / Git
+除非明确要求，MCP 不增加：
 
-LRM:
-只读数据访问
-
-
-除非明确要求，不增加：
-
-- write_file
-- exec
-- shell
-- git commit
-- git push
+* `write_file`
+* `exec` / `shell`
+* `git commit`
+* `git push`
