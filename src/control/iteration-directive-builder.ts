@@ -2,6 +2,11 @@ import { createIterationDirectiveId } from "./iteration-directive.js";
 import type { IterationDirective } from "./iteration-directive.js";
 import { iterationDirectiveSchema } from "./iteration-directive-schema.js";
 import type { LoopDecision } from "./loop-decision.js";
+import { loopDecisionSchema } from "./loop-decision-schema.js";
+import {
+  reviewVerdictIterationSchema,
+  reviewVerdictSchema,
+} from "./review-verdict-schema.js";
 import type { ReviewVerdict } from "./review-verdict.js";
 
 export const ITERATION_DIRECTIVE_BUILD_ERROR_CODES = [
@@ -11,6 +16,8 @@ export const ITERATION_DIRECTIVE_BUILD_ERROR_CODES = [
   "ITERATION_PAYLOAD_MISSING",
   "REVIEW_REQUEST_MISMATCH",
   "REVIEW_RESULT_ID_MISSING",
+  "LOOP_DECISION_SCHEMA_INVALID",
+  "REVIEW_VERDICT_SCHEMA_INVALID",
 ] as const;
 
 export type IterationDirectiveBuildErrorCode =
@@ -65,17 +72,39 @@ export class IterationDirectiveBuilder {
       );
     }
 
+    const parsedDecision = loopDecisionSchema.safeParse(decision);
+    if (!parsedDecision.success) {
+      throw new IterationDirectiveBuildError(
+        "LOOP_DECISION_SCHEMA_INVALID",
+        `Loop decision is invalid: ${parsedDecision.error.message}`,
+      );
+    }
+    const parsedIteration = reviewVerdictIterationSchema.safeParse(verdict.iteration);
+    if (!parsedIteration.success) {
+      throw new IterationDirectiveBuildError(
+        "ITERATION_PAYLOAD_MISSING",
+        `Iteration payload is invalid: ${parsedIteration.error.message}`,
+      );
+    }
+    const parsedVerdict = reviewVerdictSchema.safeParse(verdict);
+    if (!parsedVerdict.success) {
+      throw new IterationDirectiveBuildError(
+        "REVIEW_VERDICT_SCHEMA_INVALID",
+        `Review verdict is invalid: ${parsedVerdict.error.message}`,
+      );
+    }
+
     const directive = iterationDirectiveSchema.safeParse({
       directive_id: createIterationDirectiveId(),
-      workspace_id: decision.workspace_id,
-      task_id: decision.task_id,
-      source_execution_id: decision.execution_id,
-      review_request_id: decision.review_request_id,
-      review_result_id: decision.review_result_id,
-      loop_decision_id: decision.decision_id,
-      goal: verdict.iteration.goal,
-      requirements: [...verdict.iteration.requirements],
-      acceptance_criteria: [...verdict.iteration.acceptance_criteria],
+      workspace_id: parsedDecision.data.workspace_id,
+      task_id: parsedDecision.data.task_id,
+      source_execution_id: parsedDecision.data.execution_id,
+      review_request_id: parsedDecision.data.review_request_id,
+      review_result_id: parsedDecision.data.review_result_id,
+      loop_decision_id: parsedDecision.data.decision_id,
+      goal: parsedIteration.data.goal,
+      requirements: [...parsedIteration.data.requirements],
+      acceptance_criteria: [...parsedIteration.data.acceptance_criteria],
       created_at: new Date().toISOString(),
     });
     if (!directive.success) {
