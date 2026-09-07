@@ -5,6 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { startApp } from "../src/app.js";
+import { createHttpServer } from "../src/mcp/http.js";
+import { inboundRequestId } from "../src/mcp/inbound.js";
+import { WorkspaceRegistry } from "../src/workspace/registry.js";
 import { EXPECTED_REGISTERED_TOOL_NAMES } from "./fixtures/v01-tools.js";
 
 const runningServers: import("node:http").Server[] = [];
@@ -26,6 +29,16 @@ async function getFreePort(): Promise<number> {
   return port;
 }
 
+async function listen(server: import("node:http").Server): Promise<number> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("test server has no port");
+  return address.port;
+}
+
 function toolText(result: unknown): string {
   const content = (result as { content?: unknown }).content;
   if (!Array.isArray(content) || typeof content[0] !== "object" || content[0] === null
@@ -42,6 +55,56 @@ function structuredJson(result: unknown): Record<string, unknown> {
 }
 
 describe("MCP HTTP runtime", () => {
+  it("propagates the normalized request id into an MCP tool call", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-inbound-http-"));
+    temporaryDirectories.push(workspace);
+    const baseRegistry = new WorkspaceRegistry([{
+      id: "inbound-workspace",
+      name: "Inbound Workspace",
+      path: workspace,
+    }]);
+    const seen: Array<string | null> = [];
+    const registry = new Proxy(baseRegistry, {
+      get(target, property, receiver) {
+        if (property !== "resolve") return Reflect.get(target, property, receiver);
+        return (workspaceId?: string) => {
+          seen.push(inboundRequestId());
+          return target.resolve(workspaceId);
+        };
+      },
+    }) as WorkspaceRegistry;
+    const server = createHttpServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
+    }, { registry });
+    runningServers.push(server);
+    const port = await listen(server);
+    const client = new Client({ name: "inbound-http-test", version: "0.1.0" });
+    const transport = new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${port}/mcp`),
+      {
+        requestInit: {
+          headers: {
+            authorization: "Bearer test-token",
+            "x-request-id": "wfr_ingress/relay-hop",
+          },
+        },
+      },
+    );
+
+    await client.connect(transport);
+    const result = await client.callTool({ name: "workspace_info", arguments: {} });
+    expect(result.isError).not.toBe(true);
+    expect(JSON.stringify(result)).not.toContain("wfr_ingress");
+    expect(seen).toEqual(["wfr_ingress"]);
+    await client.close();
+    expect(inboundRequestId()).toBeNull();
+  });
+
   it("initializes, lists tools, and serves all workspace tools", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-http-"));
     temporaryDirectories.push(workspace);
