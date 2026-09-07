@@ -92,10 +92,13 @@ extension/fiber.js
 4. Invoke an LRM MCP tool such as `workspace_info` or `review_summary`.
 5. In the ChatGPT page model, confirm the resulting message contains
    `metadata.request_id`.
-6. Use the extension service-worker DevTools Network view to confirm a successful
+6. Run the existing MAIN-world fiber ask manually. This is a gate: `evidence` must
+   contain the exact `wfr_*` ID from this MCP request and the current conversation ID;
+   `evidence: []` fails the gate.
+7. Use the extension service-worker DevTools Network view to confirm a successful
    `POST /identity-evidence` with status `202`, or start the Bridge with an injected
    `onIdentityEvidence` sink in a test harness.
-7. Confirm the received value has exactly this shape:
+8. Confirm the received value has exactly this shape:
 
 ```json
 {

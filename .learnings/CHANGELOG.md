@@ -16,4 +16,6 @@
 {"ts":"2026-09-07T18:31:00+08:00","action":"add","type":"error","id":"ERR-20260907-001","summary":"npm 诊断脚本名带冒号，误用不带冒号名称会在执行前返回 Missing script"}
 {"ts":"2026-09-07T18:34:00+08:00","action":"add","type":"learning","id":"LRN-20260907-001","summary":"Bridge /hello 不带 protocol 自定义 header，避免 CORS preflight；POST 再发送 protocol header"}
 {"ts":"2026-09-07T18:41:00+08:00","action":"add","type":"error","id":"ERR-20260907-002","summary":"Windows PowerShell 下 rg 路径 glob 不展开；改用 rg -g '*.js' 目录过滤"}
+{"ts":"2026-09-07T18:45:00+08:00","action":"add","type":"learning","id":"LRN-20260907-002","summary":"真实 ChatGPT Fiber 需沿 bounded return 链读取 turn.messages，conversation.id 位于同级 props；identity 冲突时 fail closed"}
+{"ts":"2026-09-07T18:47:00+08:00","action":"add","type":"error","id":"ERR-20260907-003","summary":"computer-use 参考文档路径不存在；读取 skill 资源前应先确认目录结构"}
 ```

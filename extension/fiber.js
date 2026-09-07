@@ -26,7 +26,16 @@
       const props = at.memoizedProps;
       if (!props || typeof props !== 'object') continue;
       const turn = props.turn && typeof props.turn === 'object' ? props.turn : null;
-      const values = [props.clientThreadId, props.conversationId, turn?.clientThreadId, turn?.conversationId];
+      // Current ChatGPT turn fibers carry the conversation model beside `turn`; older
+      // shapes expose one of the flat/thread fields below. All readable identities must agree.
+      const conversation = props.conversation && typeof props.conversation === 'object' ? props.conversation : null;
+      const values = [
+        props.clientThreadId,
+        props.conversationId,
+        turn?.clientThreadId,
+        turn?.conversationId,
+        conversation?.id,
+      ];
       for (const value of values) {
         if (value === null || value === undefined) continue;
         if (typeof value !== 'string' || !CONVERSATION_ID.test(value)) return null;
@@ -65,6 +74,26 @@
     return ids;
   }
 
+  function turnsOf(sections) {
+    const groups = [];
+    for (let index = 0; index < sections.length; index += 1) {
+      const section = sections[index];
+      let turnId = null;
+      try {
+        const value = section && typeof section.getAttribute === 'function'
+          ? section.getAttribute('data-turn-id')
+          : null;
+        turnId = typeof value === 'string' && value.length > 0 ? value : null;
+      } catch {
+        turnId = null;
+      }
+      const previous = groups[groups.length - 1];
+      if (turnId && previous && previous.turnId === turnId) previous.sections.push(section);
+      else groups.push({ turnId, sections: [section] });
+    }
+    return groups;
+  }
+
   function scan(nonce) {
     const byRequest = new Map();
     const conflicts = new Set();
@@ -75,10 +104,12 @@
       sections = [];
     }
 
-    const first = Math.max(0, sections.length - MAX_TURNS);
-    for (let index = first; index < sections.length; index += 1) {
+    const turns = turnsOf(sections);
+    const first = Math.max(0, turns.length - MAX_TURNS);
+    for (let turnIndex = first; turnIndex < turns.length; turnIndex += 1) {
+      const turn = turns[turnIndex];
       try {
-        const fiber = fiberOf(sections[index]);
+        const fiber = fiberOf(turn.sections[0]);
         const conversationId = fiber ? conversationEvidenceOf(fiber) : null;
         const messages = fiber ? turnMessagesOf(fiber) : null;
         if (!conversationId || !messages) continue;
@@ -88,7 +119,7 @@
           else if (previous === undefined) byRequest.set(requestId, conversationId);
         }
       } catch {
-        // One unreadable branch must not turn into guessed identity evidence.
+        // One unreadable turn must not turn into guessed identity evidence.
       }
     }
 

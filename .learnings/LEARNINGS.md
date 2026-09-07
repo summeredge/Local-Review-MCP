@@ -1,5 +1,29 @@
 # Learnings
 
+## [LRN-20260907-002] 真实 ChatGPT Fiber 的会话身份位于 turn 同级 conversation
+
+**Priority**: high
+**Status**: resolved
+**Area**: tools
+
+### 内容
+
+真实 ChatGPT conversation-turn 的 section Fiber 需要沿 `return` 链到 turn-level
+model 才能读取 `turn.messages`；当前页面的会话身份位于同一 props 的
+`conversation.id`，而 flat/thread identity 字段可能不存在。
+
+### 建议修复
+
+沿 COS 的 bounded turn traversal 提取消息与全部可见 identity 字段，并在字段
+矛盾时 fail closed；不要从 DOM 或 tool row 推测 conversation/request identity。
+
+### 元数据
+
+- Source: task_review
+- See Also: none
+
+---
+
 ## [LRN-20260905-001] Browser Worker 导航测试应 mock 页面但保留 Profile 边界
 
 **Priority**: low

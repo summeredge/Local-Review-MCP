@@ -198,6 +198,33 @@ npm error Did you mean: npm run diagnose:conversation-routing
 
 ---
 
+## [ERR-20260907-003] computer-use 参考文档路径猜测
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+按记忆猜测 computer-use skill 的 `confirmations.md` 位于 skill 根目录，实际路径不存在；本任务不需要继续读取该文件。
+
+### 错误信息
+
+```text
+Get-Content: Cannot find path '...\\computer-use\\confirmations.md'
+```
+
+### 建议修复
+
+需要读取 skill 参考文档时先列出 skill 目录或使用已确认的引用路径，不要猜测文件位置。
+
+### 元数据
+
+- Reproducible: no
+- See Also: none
+
+---
+
 ## [ERR-20260907-002] rg Windows glob argument
 
 **Priority**: low

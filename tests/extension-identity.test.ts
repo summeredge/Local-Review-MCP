@@ -5,6 +5,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 const ORIGIN = "https://chatgpt.com";
 const CONVERSATION_A = "11111111-2222-3333-4444-555555555555";
 const CONVERSATION_B = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+const REAL_TURN_DEPTH = 30;
 
 let fiberSource = "";
 let contentSource = "";
@@ -54,14 +55,31 @@ function fiberSection(
   conversationId: unknown,
   messages: unknown[],
   extraProps: Record<string, unknown> = {},
+  turnId = "turn-1",
 ): Record<string, unknown> {
-  return {
-    __reactFiber$test: {
-      memoizedProps: {
-        turn: { messages, ...(typeof conversationId === "string" ? { conversationId } : {}) },
-        ...extraProps,
+  let returnFiber: Record<string, unknown> = {
+    memoizedProps: {
+      ...(typeof conversationId === "string" ? { conversation: { id: conversationId } } : {}),
+      turn: {
+        messages,
       },
       return: null,
+    },
+    return: null,
+  };
+  for (let depth = 0; depth < REAL_TURN_DEPTH; depth += 1) {
+    returnFiber = {
+      memoizedProps: { children: null },
+      return: returnFiber,
+    };
+  }
+  return {
+    getAttribute(name: string) {
+      return name === "data-turn-id" ? turnId : null;
+    },
+    __reactFiber$test: {
+      memoizedProps: { children: null, ...extraProps },
+      return: returnFiber,
     },
   };
 }
@@ -115,6 +133,18 @@ describe("MAIN-world Fiber identity evidence", () => {
     }]);
   });
 
+  it("follows the real section-to-turn Fiber traversal and groups split sections", () => {
+    const message = { metadata: { request_id: "wfr_deep_turn" } };
+    const reply = scanFiber([
+      fiberSection(CONVERSATION_A, [message], {}, "logical-turn"),
+      fiberSection(CONVERSATION_A, [message], {}, "logical-turn"),
+    ]);
+    expect(reply.evidence).toEqual([{
+      request_id: "wfr_deep_turn",
+      fiber_conversation_id: CONVERSATION_A,
+    }]);
+  });
+
   it("fails closed for missing/invalid request ids and unknown Fiber shapes", () => {
     expect(scanFiber([fiberSection(CONVERSATION_A, [
       { metadata: {} },
@@ -132,8 +162,8 @@ describe("MAIN-world Fiber identity evidence", () => {
 
   it("drops an id that appears under two different Fiber conversations", () => {
     const reply = scanFiber([
-      fiberSection(CONVERSATION_A, [{ metadata: { request_id: "wfr_same" } }]),
-      fiberSection(CONVERSATION_B, [{ metadata: { request_id: "wfr_same" } }]),
+      fiberSection(CONVERSATION_A, [{ metadata: { request_id: "wfr_same" } }], {}, "turn-a"),
+      fiberSection(CONVERSATION_B, [{ metadata: { request_id: "wfr_same" } }], {}, "turn-b"),
     ]);
     expect(reply.evidence).toEqual([]);
   });
