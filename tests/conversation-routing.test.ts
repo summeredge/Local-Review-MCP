@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -129,6 +129,97 @@ describe("ConversationRoutingService", () => {
       review_request: before.review_request,
     });
     expect(after.review_request).not.toHaveProperty("routing_id");
+  });
+
+  it("keeps legacy task and request conversation fields out of routing ownership", async () => {
+    const storageRoot = await makeStorageRoot();
+    await new TaskContextService(storageRoot).createTaskContext({
+      task_id: "task-001",
+      workspace_id: "workspace-a",
+      conversation_id: "task-conversation",
+    });
+    await new ExecutionContextService(storageRoot).createExecutionContext({
+      execution_id: "execution-001",
+      task_id: "task-001",
+      workspace_id: "workspace-a",
+    });
+    const requests = new ReviewRequestService(storageRoot);
+    await requests.createReviewRequest({
+      review_request_id: "review-001",
+      task_id: "task-001",
+      execution_id: "execution-001",
+      workspace_id: "workspace-a",
+      conversation_id: "request-conversation",
+    });
+    const service = new ConversationRoutingService(storageRoot);
+    const routing = await service.createRouting({
+      workspace_id: "workspace-a",
+      task_id: "task-001",
+      review_request_id: "review-001",
+      conversation_id: "routed-conversation",
+    });
+
+    await new TaskContextService(storageRoot).updateTaskContext("task-001", {
+      conversation_id: "changed-task-conversation",
+    });
+    await requests.updateReviewRequest("workspace-a", "review-001", {
+      conversation_id: "changed-request-conversation",
+    });
+
+    await expect(service.validateRouting(routing)).resolves.toBeUndefined();
+    expect((await service.getRouting("workspace-a", routing.routing_id))?.conversation_id)
+      .toBe("routed-conversation");
+  });
+
+  it("rejects a stored routing whose identity does not match its file", async () => {
+    const storageRoot = await makeStorageRoot();
+    await makeContexts(storageRoot);
+    const service = new ConversationRoutingService(storageRoot);
+    const routing = await service.createRouting({
+      routing_id: "routing-001",
+      workspace_id: "workspace-a",
+      task_id: "task-001",
+      review_request_id: "review-001",
+      conversation_id: "conversation-001",
+    });
+    await writeFile(
+      join(
+        storageRoot,
+        ".task",
+        "conversation_routings",
+        "workspace-a",
+        "routing-001.json",
+      ),
+      JSON.stringify({ ...routing, workspace_id: "workspace-b" }),
+    );
+
+    await expect(service.getRouting("workspace-a", "routing-001"))
+      .rejects.toThrow(/invalid/iu);
+  });
+
+  it("validates the review request execution for legacy routings without execution_id", async () => {
+    const storageRoot = await makeStorageRoot();
+    await makeContexts(storageRoot);
+    const service = new ConversationRoutingService(storageRoot);
+    const routing = await service.createRouting({
+      routing_id: "routing-001",
+      workspace_id: "workspace-a",
+      task_id: "task-001",
+      review_request_id: "review-001",
+      conversation_id: "conversation-001",
+    });
+    const legacyRouting = { ...routing, execution_id: undefined };
+
+    await expect(service.validateRouting(legacyRouting)).resolves.toBeUndefined();
+    await rm(join(
+      storageRoot,
+      ".task",
+      "executions",
+      "workspace-a",
+      "task-001",
+      "execution-001.json",
+    ));
+    await expect(service.validateRouting(legacyRouting)).rejects.toThrow(/execution context/iu);
   });
 
   it("generates a complete temporary diagnostic record", async () => {

@@ -84,7 +84,13 @@ export class ExecutionContextService {
     }
 
     try {
-      return executionContextSchema.parse(JSON.parse(contents) as unknown);
+      const execution = executionContextSchema.parse(JSON.parse(contents) as unknown);
+      if (execution.execution_id !== executionId
+        || execution.task_id !== taskId
+        || execution.workspace_id !== workspaceId) {
+        throw new Error("Execution context does not match the requested identity.");
+      }
+      return execution;
     } catch (error: unknown) {
       throw new Error(`Execution context "${executionId}" is invalid.`, { cause: error });
     }

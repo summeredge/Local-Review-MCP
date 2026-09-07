@@ -199,4 +199,22 @@ describe("ReviewRequestService", () => {
     expect(calls).toEqual(["capture"]);
     expect(request.review_snapshot).toEqual(reviewSnapshot);
   });
+
+  it("rejects a stored request whose identity does not match its file", async () => {
+    const storageRoot = await makeStorageRoot();
+    const service = new ReviewRequestService(storageRoot);
+    const created = await service.createReviewRequest({
+      review_request_id: "review-001",
+      task_id: "task-001",
+      execution_id: "exec-001",
+      workspace_id: "workspace-a",
+    });
+    await writeFile(
+      join(storageRoot, ".task", "review_requests", "workspace-a", "review-001.json"),
+      JSON.stringify({ ...created, review_request_id: "review-002" }),
+    );
+
+    await expect(service.getReviewRequest("workspace-a", "review-001"))
+      .rejects.toThrow(/invalid/iu);
+  });
 });

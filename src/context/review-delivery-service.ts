@@ -117,7 +117,11 @@ export class ReviewDeliveryService {
     }
 
     try {
-      return reviewDeliverySchema.parse(JSON.parse(contents) as unknown);
+      const delivery = reviewDeliverySchema.parse(JSON.parse(contents) as unknown);
+      if (delivery.delivery_id !== deliveryId || delivery.workspace_id !== workspaceId) {
+        throw new Error("Review delivery does not match the requested identity.");
+      }
+      return delivery;
     } catch (error: unknown) {
       throw new Error(`Review delivery "${deliveryId}" is invalid.`, { cause: error });
     }

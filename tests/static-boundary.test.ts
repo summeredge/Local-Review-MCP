@@ -31,4 +31,17 @@ describe("production static boundaries", () => {
     expect(occurrences).toHaveLength(1);
     expect(relative(projectDirectory, occurrences[0]).replaceAll("\\", "/")).toBe("src/config/settings.ts");
   });
+
+  it("keeps the Core Contract and neutral delivery adapter free of browser transports", async () => {
+    const files = [
+      ...(await Promise.all(["context", "control", "git"].map((directory) =>
+        findTypeScriptFiles(join(sourceDirectory, directory)))).then((groups) => groups.flat())),
+      join(sourceDirectory, "delivery", "review-delivery-adapter.ts"),
+    ];
+    const forbiddenImport = /(?:from|import)\s*(?:type\s+)?["'][^"']*(?:playwright|browser-worker|extension|dom|selector)/iu;
+
+    for (const path of files) {
+      expect(await readFile(path, "utf8")).not.toMatch(forbiddenImport);
+    }
+  });
 });

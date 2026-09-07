@@ -10,6 +10,7 @@ export type TaskStatus = typeof TASK_STATUSES[number];
 export interface TaskContext {
   readonly task_id: string;
   readonly workspace_id: string;
+  /** Compatibility metadata only; ConversationRouting owns review delivery routing. */
   readonly conversation_id?: string;
   readonly status: TaskStatus;
   readonly created_at: string;
@@ -76,6 +77,7 @@ export interface ReviewRequestContext {
   readonly task_id: string;
   readonly execution_id: string;
   readonly workspace_id: string;
+  /** Compatibility metadata only; ConversationRouting owns the formal review target. */
   readonly conversation_id?: string;
   readonly status: ReviewRequestStatus;
   readonly created_at: string;

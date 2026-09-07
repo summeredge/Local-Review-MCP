@@ -52,7 +52,10 @@ with `validateWorkspaceIdentityConsistency()`.
 `execution_id` is optional for review stages that do not have an execution.
 For the current Review Request Context, `createRouting()` derives it from the
 referenced review request and checks the execution, task, and workspace links.
-`conversation_id` is only stored; no conversation is created or contacted.
+`conversation_id` is the authoritative target for this Review Request's
+delivery. It is only stored here; no conversation is created or contacted.
+Optional `conversation_id` fields on Task and Review Request contexts remain
+compatibility metadata and never override this record.
 
 Routing records are persisted as strict, Zod-validated JSON under the
 application state directory:

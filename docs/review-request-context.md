@@ -32,6 +32,11 @@ Review Request Context represents:
 
 It does not represent LRM actively initiating a review.
 
+`ConversationRouting` is the authoritative record for the Conversation used
+by review delivery. The optional `conversation_id` retained on this context
+is compatibility metadata only; routing and delivery never derive or override
+their target from it.
+
 ## C2C reference review
 
 The local C2C project
@@ -68,9 +73,9 @@ interface ReviewRequestContext {
   `ExecutionContext.execution_id`: which Codex execution result needs review.
 - `workspace_id` is the stable ID supplied by the Workspace Registry and keeps
   review requests isolated between workspaces.
-- `conversation_id` is optional. It is a future routing target for Browser
-  Router to ChatGPT conversation and may be empty now; no workspace-conversation
-  or task-conversation binding is enforced.
+- `conversation_id` is optional compatibility metadata retained for existing
+  records. It is not a routing source; Browser Router resolves the formal
+  target through `ConversationRouting`.
 - `status` is a flat value only: `pending` (request created), `requested`
   (review request sent), `completed` (review done). No transition graph is
   enforced and failed/cancelled/timeout states are reserved for a future state

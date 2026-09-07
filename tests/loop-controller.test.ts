@@ -15,6 +15,7 @@ import {
   LoopControllerIdentityError,
   type LoopControllerFacts,
 } from "../src/control/loop-controller.js";
+import { IterationDirectiveBuilder } from "../src/control/iteration-directive-builder.js";
 import { ReviewVerdictParser } from "../src/control/review-verdict-parser.js";
 import type { ReviewSnapshot } from "../src/git/types.js";
 
@@ -164,6 +165,16 @@ describe("LoopController", () => {
     });
     expect(JSON.stringify(verdict)).toBe(before);
     expect(verdict.iteration?.goal).toBe("Fix the blocking issue.");
+
+    const directive = new IterationDirectiveBuilder().build(decision, verdict);
+    expect(directive).toMatchObject({
+      loop_decision_id: decision.decision_id,
+      workspace_id: task.workspace_id,
+      task_id: task.task_id,
+      source_execution_id: execution.execution_id,
+      review_request_id: request.review_request_id,
+      review_result_id: result.result_id,
+    });
   });
 
   it("maps HUMAN_REQUIRED to HUMAN_REQUIRED", async () => {
@@ -318,9 +329,20 @@ describe("LoopController", () => {
       review_result: result,
     };
 
-    expect(() => new LoopController(storageRoot).decide(facts))
-      .toThrow(LoopControllerIdentityError);
-    expect(() => new LoopController(storageRoot).decide(facts))
-      .toThrow(/LOOP_IDENTITY_MISMATCH/);
+    const cases: LoopControllerFacts[] = [
+      { ...facts, task: { ...task, workspace_id: "workspace-b" } },
+      { ...facts, task: { ...task, task_id: "task-002" } },
+      { ...facts, execution: { ...execution, execution_id: "execution-002" } },
+      { ...facts, review_request: { ...request, review_request_id: "review-002" } },
+      { ...facts, review_result: { ...result, review_request_id: "review-002" } },
+      { ...facts, review_result: { ...result, delivery_id: "delivery-002" } },
+    ];
+
+    for (const candidate of cases) {
+      expect(() => new LoopController(storageRoot).decide(candidate))
+        .toThrow(LoopControllerIdentityError);
+      expect(() => new LoopController(storageRoot).decide(candidate))
+        .toThrow(/LOOP_IDENTITY_MISMATCH/);
+    }
   });
 });

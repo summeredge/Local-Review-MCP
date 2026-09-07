@@ -106,7 +106,11 @@ export class ConversationRoutingService {
     }
 
     try {
-      return conversationRoutingSchema.parse(JSON.parse(contents) as unknown);
+      const routing = conversationRoutingSchema.parse(JSON.parse(contents) as unknown);
+      if (routing.routing_id !== routingId || routing.workspace_id !== workspaceId) {
+        throw new Error("Conversation routing does not match the requested identity.");
+      }
+      return routing;
     } catch (error: unknown) {
       throw new Error(`Conversation routing "${routingId}" is invalid.`, { cause: error });
     }
@@ -135,18 +139,18 @@ export class ConversationRoutingService {
     if (reviewRequest.workspace_id !== parsed.workspace_id) {
       throw workspaceMismatch("Review request does not belong to the routed workspace.");
     }
-    if (parsed.execution_id === undefined) return;
-    if (reviewRequest.execution_id !== parsed.execution_id) {
+    const executionId = parsed.execution_id ?? reviewRequest.execution_id;
+    if (parsed.execution_id !== undefined && reviewRequest.execution_id !== parsed.execution_id) {
       throw new Error("Conversation routing execution does not match the review request.");
     }
 
     const execution = await this.executions.getExecutionContext(
       parsed.workspace_id,
       parsed.task_id,
-      parsed.execution_id,
+      executionId,
     );
     if (execution === null) {
-      throw new Error(`Execution context "${parsed.execution_id}" was not found.`);
+      throw new Error(`Execution context "${executionId}" was not found.`);
     }
     if (execution.workspace_id !== parsed.workspace_id) {
       throw workspaceMismatch("Execution context does not belong to the routed workspace.");

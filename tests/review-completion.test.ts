@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -274,6 +274,32 @@ describe("ReviewResultService", () => {
       `${created.result_id}.json`,
     ), "utf8"))).toEqual(created);
     await expect(service.listReviewResults("workspace-a")).resolves.toHaveLength(1);
+  });
+
+  it("rejects a stored result whose identity does not match its file", async () => {
+    const storageRoot = await makeStorageRoot();
+    const { request, delivery } = await makeDeliveredChain(storageRoot);
+    const service = new ReviewResultService(storageRoot);
+    const result = await service.createReviewResult({
+      review_request_id: request.review_request_id,
+      delivery_id: delivery.delivery_id,
+      workspace_id: request.workspace_id,
+      status: "COMPLETED",
+      content: "review result",
+    });
+    await writeFile(
+      join(
+        storageRoot,
+        ".task",
+        "review_results",
+        "workspace-a",
+        result.result_id + ".json",
+      ),
+      JSON.stringify({ ...result, result_id: "result-002" }),
+    );
+
+    await expect(service.getReviewResult("workspace-a", result.result_id))
+      .rejects.toThrow(/invalid/iu);
   });
 });
 

@@ -9,7 +9,9 @@ runtime, and it is not an MCP tool in the V0.1 contract.
 The ownership boundaries are:
 
 ```text
-Workspace Registry -- workspace_id --> Task Context -- conversation_id? --> Conversation
+Workspace Registry -- workspace_id --> Task Context
+
+Task Context -- optional compatibility metadata --> conversation_id
 ```
 
 This is intentionally not:
@@ -40,8 +42,10 @@ interface TaskContext {
 - `workspace_id` is the stable ID supplied by the Workspace Registry. The
   service stores and validates its shape but does not resolve or mutate the
   registry.
-- `conversation_id` is optional. The service does not create conversations,
-  infer one from a workspace, or enforce a one-to-one binding.
+- `conversation_id` is optional compatibility metadata. The service does not
+  create conversations, infer one from a workspace, or enforce a one-to-one
+  binding. `ConversationRouting` is the authoritative review target and is
+  the only source used by Review Delivery.
 - `status` is a flat value only. The service does not enforce a transition
   graph or introduce an INIT/PLAN/EXECUTED/REVIEW/DONE state machine.
 - `created_at` and `updated_at` are ISO 8601 timestamps. Updates preserve the

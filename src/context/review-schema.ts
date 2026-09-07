@@ -7,6 +7,7 @@ import {
   workspaceIdSchema,
 } from "./schema.js";
 import { REVIEW_REQUEST_STATUSES } from "./types.js";
+import type { ReviewSnapshot } from "../git/types.js";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 
@@ -20,7 +21,7 @@ export const reviewRequestStatusSchema = z.enum(REVIEW_REQUEST_STATUSES);
 const timestampSchema = z.string().datetime({ offset: true });
 const sha256HexSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 
-export const reviewSnapshotSchema = z.object({
+export const reviewSnapshotSchema: z.ZodType<ReviewSnapshot> = z.object({
   branch: z.string().nullable(),
   head: z.string().min(1),
   diff_sha256: sha256HexSchema,

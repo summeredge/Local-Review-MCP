@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isReservedWindowsName } from "../workspace/path.js";
 import {
   executionIdSchema,
   taskIdSchema,
@@ -9,6 +10,14 @@ import { reviewRequestIdSchema } from "../context/review-schema.js";
 import { loopDecisionIdSchema } from "./loop-decision-schema.js";
 import type { IterationDirective } from "./iteration-directive.js";
 
+const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+
+export const iterationDirectiveIdSchema = z.string()
+  .min(1)
+  .max(128)
+  .regex(ID_PATTERN)
+  .refine((value) => !isReservedWindowsName(value), "directive_id is a reserved filename");
+
 const nonEmptyTextSchema = z.string().min(1).refine(
   (value) => value.trim().length > 0,
   "must contain non-whitespace text",
@@ -16,7 +25,7 @@ const nonEmptyTextSchema = z.string().min(1).refine(
 const timestampSchema = z.string().datetime({ offset: true });
 
 export const iterationDirectiveSchema: z.ZodType<IterationDirective> = z.object({
-  directive_id: loopDecisionIdSchema,
+  directive_id: iterationDirectiveIdSchema,
   workspace_id: workspaceIdSchema,
   task_id: taskIdSchema,
   source_execution_id: executionIdSchema,

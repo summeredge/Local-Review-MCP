@@ -1,11 +1,15 @@
 import { defaultTaskContextStorageRoot } from "../context/task.js";
 import { ExecutionContextService } from "../context/execution-service.js";
+import { executionContextSchema, taskContextSchema } from "../context/schema.js";
 import { ReviewDeliveryService } from "../context/review-delivery-service.js";
 import type { ReviewDelivery } from "../context/review-delivery.js";
+import { reviewDeliverySchema } from "../context/review-delivery-schema.js";
 import { ReviewRequestService } from "../context/review-request-service.js";
 import type { ReviewSnapshotProvider } from "../context/review-request-snapshot.js";
+import { reviewRequestContextSchema, reviewSnapshotSchema } from "../context/review-schema.js";
 import { ReviewResultService } from "../context/review-result-service.js";
 import type { ReviewResult } from "../context/review-result.js";
+import { reviewResultSchema } from "../context/review-result-schema.js";
 import { TaskContextService } from "../context/service.js";
 import type {
   ExecutionContext,
@@ -222,6 +226,22 @@ export class LoopController {
 
   private validateIdentity(facts: LoopControllerFacts): void {
     const { task, execution, review_request: reviewRequest } = facts;
+    try {
+      taskContextSchema.parse(task);
+      executionContextSchema.parse(execution);
+      reviewRequestContextSchema.parse(reviewRequest);
+      if (facts.review_delivery !== undefined && facts.review_delivery !== null) {
+        reviewDeliverySchema.parse(facts.review_delivery);
+      }
+      if (facts.review_result !== undefined && facts.review_result !== null) {
+        reviewResultSchema.parse(facts.review_result);
+      }
+      if (facts.current_review_snapshot !== undefined) {
+        reviewSnapshotSchema.parse(facts.current_review_snapshot);
+      }
+    } catch {
+      throw new LoopControllerIdentityError("Core identity facts do not satisfy their schemas.");
+    }
     if (reviewRequest.workspace_id !== task.workspace_id) {
       throw new LoopControllerIdentityError("ReviewRequest and Task belong to different workspaces.");
     }

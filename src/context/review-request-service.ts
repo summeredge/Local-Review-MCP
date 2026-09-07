@@ -86,7 +86,12 @@ export class ReviewRequestService {
     }
 
     try {
-      return reviewRequestContextSchema.parse(JSON.parse(contents) as unknown);
+      const request = reviewRequestContextSchema.parse(JSON.parse(contents) as unknown);
+      if (request.review_request_id !== reviewRequestId
+        || request.workspace_id !== workspaceId) {
+        throw new Error("Review request does not match the requested identity.");
+      }
+      return request;
     } catch (error: unknown) {
       throw new Error(`Review request "${reviewRequestId}" is invalid.`, { cause: error });
     }

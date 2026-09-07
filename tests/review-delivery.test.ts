@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -153,5 +153,31 @@ describe("ReviewDeliveryService", () => {
       status: "delivered",
       attempt_count: 1,
     });
+  });
+
+  it("rejects a stored delivery whose identity does not match its file", async () => {
+    const storageRoot = await makeStorageRoot();
+    const routing = await makeRouting(storageRoot);
+    const service = new ReviewDeliveryService(storageRoot);
+    const delivery = await service.createDelivery({
+      workspace_id: routing.workspace_id,
+      task_id: routing.task_id,
+      review_request_id: routing.review_request_id,
+      routing_id: routing.routing_id,
+      conversation_id: routing.conversation_id,
+    });
+    await writeFile(
+      join(
+        storageRoot,
+        ".task",
+        "review_deliveries",
+        "workspace-a",
+        delivery.delivery_id + ".json",
+      ),
+      JSON.stringify({ ...delivery, delivery_id: "delivery-002" }),
+    );
+
+    await expect(service.getDelivery("workspace-a", delivery.delivery_id))
+      .rejects.toThrow(/invalid/iu);
   });
 });

@@ -4,7 +4,11 @@ import {
   IterationDirectiveBuildError,
   IterationDirectiveBuilder,
 } from "../src/control/iteration-directive-builder.js";
+import {
+  iterationDirectiveIdSchema,
+} from "../src/control/iteration-directive-schema.js";
 import type { LoopDecision } from "../src/control/loop-decision.js";
+import { loopDecisionIdSchema } from "../src/control/loop-decision-schema.js";
 import type { ReviewVerdict } from "../src/control/review-verdict.js";
 
 const decision: LoopDecision = {
@@ -55,6 +59,11 @@ function expectBuildError(
 }
 
 describe("IterationDirectiveBuilder", () => {
+  it("uses a dedicated directive id schema", () => {
+    expect(iterationDirectiveIdSchema).not.toBe(loopDecisionIdSchema);
+    expect(iterationDirectiveIdSchema.safeParse("iteration-directive-001").success).toBe(true);
+  });
+
   it("builds an IterationDirective from a valid ITERATE pair", () => {
     const directive = builder.build(decision, verdict);
     expect(directive).toMatchObject({

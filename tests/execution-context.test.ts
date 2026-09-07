@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -127,5 +127,29 @@ describe("ExecutionContextService", () => {
       ?.workspace_id).toBe("workspace-a");
     expect((await service.getExecutionContext("workspace-b", "task-001", "exec-001"))
       ?.workspace_id).toBe("workspace-b");
+  });
+
+  it("rejects a stored execution whose chain does not match its file", async () => {
+    const storageRoot = await makeStorageRoot();
+    const service = new ExecutionContextService(storageRoot);
+    const created = await service.createExecutionContext({
+      execution_id: "exec-001",
+      task_id: "task-001",
+      workspace_id: "workspace-a",
+    });
+    await writeFile(
+      join(
+        storageRoot,
+        ".task",
+        "executions",
+        "workspace-a",
+        "task-001",
+        "exec-001.json",
+      ),
+      JSON.stringify({ ...created, task_id: "task-002" }),
+    );
+
+    await expect(service.getExecutionContext("workspace-a", "task-001", "exec-001"))
+      .rejects.toThrow(/invalid/iu);
   });
 });

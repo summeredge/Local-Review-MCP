@@ -130,7 +130,11 @@ export class ReviewResultService {
     }
 
     try {
-      return reviewResultSchema.parse(JSON.parse(contents) as unknown);
+      const result = reviewResultSchema.parse(JSON.parse(contents) as unknown);
+      if (result.result_id !== resultId || result.workspace_id !== workspaceId) {
+        throw new Error("Review result does not match the requested identity.");
+      }
+      return result;
     } catch (error: unknown) {
       throw new Error(`Review result "${resultId}" is invalid.`, { cause: error });
     }

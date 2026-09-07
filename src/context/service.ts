@@ -73,7 +73,11 @@ export class TaskContextService {
     }
 
     try {
-      return taskContextSchema.parse(JSON.parse(contents) as unknown);
+      const context = taskContextSchema.parse(JSON.parse(contents) as unknown);
+      if (context.task_id !== taskId) {
+        throw new Error("Task context does not match the requested identity.");
+      }
+      return context;
     } catch (error: unknown) {
       throw new Error(`Task context "${taskId}" is invalid.`, { cause: error });
     }

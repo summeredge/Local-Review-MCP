@@ -62,6 +62,11 @@ does not contain `title` or `description`, so those optional fields are
 omitted until the source context provides them. Full file contents, Git diff,
 test logs, and complete `execution_output` are not copied.
 
+The optional `review_request.conversation_id` is retained for compatibility
+with existing Review Request records. It is not the formal delivery target;
+`ConversationRouting.conversation_id` is authoritative and is the only value
+used by Review Delivery.
+
 `workspace_id` is validated and checked against every source context. A
 projection cannot combine a request, task, or execution from another
 workspace.

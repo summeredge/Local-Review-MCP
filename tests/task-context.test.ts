@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -96,5 +96,20 @@ describe("TaskContextService", () => {
       status: "completed",
       created_at: created.created_at,
     });
+  });
+
+  it("rejects a stored task whose id does not match its file", async () => {
+    const storageRoot = await makeStorageRoot();
+    const service = new TaskContextService(storageRoot);
+    const created = await service.createTaskContext({
+      task_id: "task-001",
+      workspace_id: "workspace-a",
+    });
+    await writeFile(
+      join(storageRoot, ".task", "contexts", "task-001.json"),
+      JSON.stringify({ ...created, task_id: "task-002" }),
+    );
+
+    await expect(service.getTaskContext("task-001")).rejects.toThrow(/invalid/iu);
   });
 });

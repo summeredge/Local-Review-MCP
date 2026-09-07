@@ -20,6 +20,7 @@ export interface ReviewContextProjection {
   readonly review_request: {
     readonly review_request_id: string;
     readonly status: string;
+    /** Compatibility metadata only; the formal target is ConversationRouting. */
     readonly conversation_id?: string;
   };
   readonly generated_at: string;
