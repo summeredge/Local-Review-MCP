@@ -19,6 +19,7 @@
     "diagnose:review-completion": "npm run build && node dist/src/cli.js diagnose-review-completion",
     "diagnose:review-verdict": "npm run build && node dist/src/cli.js diagnose-review-verdict",
     "diagnose:loop-decision": "npm run build && node dist/src/cli.js diagnose-loop-decision",
+    "diagnose:iteration-directive": "npm run build && node dist/src/cli.js diagnose-iteration-directive",
     "diagnose:review-snapshot": "npm run build && node dist/src/cli.js diagnose-review-snapshot",
     "diagnose:review-context": "npm run build && node dist/src/cli.js diagnose-review-context",
     "start:browser-worker": "npm run build && node dist/src/browser-worker/cli.js",

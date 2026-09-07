@@ -5,6 +5,7 @@ import { generateReviewDeliveryExample } from "./context/review-delivery-diagnos
 import { generateReviewContextExample } from "./context/review-context-diagnostic.js";
 import { generateReviewVerdictExample } from "./control/review-verdict-diagnostic.js";
 import { generateLoopDecisionExample } from "./control/loop-decision-diagnostic.js";
+import { generateIterationDirectiveExample } from "./control/iteration-directive-diagnostic.js";
 import { generateReviewSnapshotExample } from "./git/review-snapshot-diagnostic.js";
 import {
   generateBrowserRouterExample,
@@ -60,6 +61,8 @@ try {
     console.log(JSON.stringify(generateReviewVerdictExample(), null, 2));
   } else if (argv[0] === "diagnose-loop-decision") {
     console.log(JSON.stringify(generateLoopDecisionExample(), null, 2));
+  } else if (argv[0] === "diagnose-iteration-directive") {
+    console.log(JSON.stringify(generateIterationDirectiveExample(), null, 2));
   } else if (argv[0] === "diagnose-review-snapshot") {
     console.log(JSON.stringify(await generateReviewSnapshotExample(), null, 2));
   } else if (argv[0] === "diagnose-conversation-routing") {
