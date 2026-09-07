@@ -2,6 +2,10 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { APP_VERSION } from "../config/settings.js";
 import {
+  extensionIdentityEvidenceSchema,
+  type ExtensionIdentityEvidence,
+} from "./extension-identity.js";
+import {
   BRIDGE_PROTOCOL_HEADER,
   isCompatibleBridgeProtocol,
   LOCAL_CONTROL_BRIDGE_HOST,
@@ -14,6 +18,7 @@ import {
 
 export interface BridgeStartOptions {
   readonly ports?: readonly number[];
+  readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => void | Promise<void>;
 }
 
 export interface BridgeStatus {
@@ -29,6 +34,7 @@ let bridgeServer: Server | null = null;
 let activePort: number | null = null;
 let pairedOrigin: string | null = null;
 let bearerToken: string | null = null;
+let onIdentityEvidence: (evidence: ExtensionIdentityEvidence) => void | Promise<void> = () => undefined;
 let lifecycleQueue: Promise<void> = Promise.resolve();
 
 function enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -173,6 +179,32 @@ async function pair(request: IncomingMessage, response: ServerResponse, origin: 
   json(response, 200, { token: bearerToken }, origin);
 }
 
+async function receiveIdentityEvidence(
+  request: IncomingMessage,
+  response: ServerResponse,
+  origin: string,
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = await readJson(request);
+  } catch (error: unknown) {
+    if (error instanceof RequestBodyTooLargeError) {
+      json(response, 413, { error: "body_too_large" }, origin);
+      return;
+    }
+    json(response, 400, { error: "bad_request" }, origin);
+    return;
+  }
+
+  const parsed = extensionIdentityEvidenceSchema.safeParse(body);
+  if (!parsed.success) {
+    json(response, 400, { error: "invalid_identity_evidence" }, origin);
+    return;
+  }
+  await onIdentityEvidence(parsed.data);
+  json(response, 202, { accepted: true }, origin);
+}
+
 async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const url = new URL(request.url ?? "/", `http://${LOCAL_CONTROL_BRIDGE_HOST}`);
   const route = url.pathname;
@@ -196,7 +228,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     return;
   }
 
-  if (route !== "/pair" && route !== "/status") {
+  if (route !== "/pair" && route !== "/status" && route !== "/identity-evidence") {
     request.resume();
     json(response, 404, { error: "not_found" });
     return;
@@ -217,6 +249,10 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     return;
   }
   if (route === "/status" && request.method !== "GET") {
+    methodNotAllowed(request, response);
+    return;
+  }
+  if (route === "/identity-evidence" && request.method !== "POST") {
     methodNotAllowed(request, response);
     return;
   }
@@ -244,6 +280,10 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   if (!authorized(request, origin)) {
     request.resume();
     json(response, 401, { error: "unauthorized" }, origin);
+    return;
+  }
+  if (route === "/identity-evidence") {
+    await receiveIdentityEvidence(request, response, origin);
     return;
   }
   json(response, 200, {
@@ -330,6 +370,7 @@ async function startBridgeOnce(options: BridgeStartOptions): Promise<number | nu
 }
 
 export function startBridge(options: BridgeStartOptions = {}): Promise<number | null> {
+  onIdentityEvidence = options.onIdentityEvidence ?? (() => undefined);
   return enqueue(() => startBridgeOnce(options));
 }
 
@@ -340,6 +381,7 @@ export function stopBridge(): Promise<void> {
     activePort = null;
     pairedOrigin = null;
     bearerToken = null;
+    onIdentityEvidence = () => undefined;
     if (server !== null) await close(server);
   });
 }

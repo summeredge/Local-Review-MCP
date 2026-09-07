@@ -156,6 +156,48 @@ describe("Local Control Bridge protocol", () => {
     });
   });
 
+  it("authenticates identity evidence and delivers the exact payload to the sink", async () => {
+    await stopBridge();
+    const sink = vi.fn();
+    await expect(startBridge({ ports: [0], onIdentityEvidence: sink })).resolves.toBeGreaterThan(0);
+    const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+    const evidence = {
+      request_id: "wfr_abc123",
+      conversation_id: "11111111-2222-3333-4444-555555555555",
+      document_id: "chrome-document-id",
+      navigation_epoch: 2,
+    };
+
+    expect((await request("/identity-evidence", {
+      method: "POST",
+      protocol: null,
+      token,
+      body: evidence,
+    })).status).toBe(426);
+    expect((await request("/identity-evidence", {
+      method: "POST",
+      origin: ORIGIN_B,
+      token,
+      body: evidence,
+    })).status).toBe(403);
+    expect((await request("/identity-evidence", {
+      method: "POST",
+      token: "wrong-token",
+      body: evidence,
+    })).status).toBe(401);
+    expect((await request("/identity-evidence", {
+      method: "POST",
+      token,
+      body: { ...evidence, unexpected: true },
+    })).status).toBe(400);
+    expect(await request("/identity-evidence", { method: "POST", token, body: evidence })).toEqual({
+      status: 202,
+      body: { accepted: true },
+    });
+    expect(sink).toHaveBeenCalledOnce();
+    expect(sink).toHaveBeenCalledWith(evidence);
+  });
+
   it("bounds JSON bodies and returns stable route errors", async () => {
     const oversized = JSON.stringify({ padding: "x".repeat(MAX_BRIDGE_REQUEST_BYTES) });
     expect(Buffer.byteLength(oversized, "utf8")).toBeGreaterThan(MAX_BRIDGE_REQUEST_BYTES);

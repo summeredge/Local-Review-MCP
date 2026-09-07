@@ -97,3 +97,27 @@ ChatGPT Connector 的 DCR 请求可能同时声明 `authorization_code` 和
 - See Also: LRN-20260901-001
 
 ---
+
+## [LRN-20260907-001] Bridge hello discovery must stay preflight-free
+
+**Priority**: medium
+**Status**: resolved
+**Area**: tools
+
+### 内容
+
+LRM 的 `GET /hello` 是 protocol exception：它返回 protocol 用于 discovery，但不要求
+`x-lrm-bridge-protocol` 请求头。给这个 GET 添加自定义 header 会触发浏览器 CORS
+preflight，而当前 `/hello` 不处理 `OPTIONS`，导致真实扩展无法完成 discovery。
+
+### 建议修复
+
+扩展 discovery 对 `/hello` 只发送无自定义 header 的 GET，并严格检查响应中的
+`service` 与 `protocol`；`/pair` 和已认证 POST 再发送 protocol header。
+
+### 元数据
+
+- Source: task_review
+- See Also: none
+
+---

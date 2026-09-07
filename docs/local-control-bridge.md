@@ -3,7 +3,7 @@
 LRM runs two separate local HTTP servers:
 
 - MCP is the read-only Data Plane at the configured MCP endpoint.
-- Local Control Bridge is the loopback-only Control Plane used by a future Chrome extension.
+- Local Control Bridge is the loopback-only Control Plane used by the Extension Identity PoC.
 
 The Bridge binds only to `127.0.0.1` and tries these discovery ports in order:
 `12081`, `12082`, `12083`, `12084`, `12085`. If none is available, MCP still starts and the
@@ -20,10 +20,14 @@ except `GET /hello`.
   protocol header. It creates one 256-bit bearer token per process and binds it to that Origin.
 - `GET /status` requires the matching protocol, paired Origin, and
   `Authorization: Bearer <token>` header.
+- `POST /identity-evidence` uses the same protocol, paired Origin, and bearer gates. It accepts
+  strict `{ request_id, conversation_id, document_id, navigation_epoch }` evidence and passes it
+  to the injectable `onIdentityEvidence` sink.
 
 Bridge request bodies are capped at 64 KiB. Oversized JSON returns `413`; malformed JSON
 returns `400`. The token is held in process memory only and is independent of MCP auth/OAuth.
 
-This foundation has no `requestId` to `conversationId` correlation, browser evidence,
-navigation/document epochs, delivery queue, command route, filesystem access, shell execution,
-Git mutation, Codex execution, or Playwright/DOM control.
+The PoC route has no `requestId` to `conversationId` correlation, persistence, delivery queue,
+command route, filesystem access, shell execution, Git mutation, Codex execution, or
+Playwright/DOM control. Browser evidence is accepted only as an already-validated payload from
+the extension; the Bridge does not invent document identity.

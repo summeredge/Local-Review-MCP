@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Local Review MCP Extension Identity PoC",
+  "version": "0.1.0",
+  "description": "Captures exact ChatGPT browser identity evidence for Local Review MCP.",
+  "minimum_chrome_version": "106",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "http://127.0.0.1:12081/*",
+    "http://127.0.0.1:12082/*",
+    "http://127.0.0.1:12083/*",
+    "http://127.0.0.1:12084/*",
+    "http://127.0.0.1:12085/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "fiber.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    }
+  ]
+}

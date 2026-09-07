@@ -4,6 +4,7 @@ import { endpoint, localOrigin, type ResolvedSettings } from "./config/settings.
 import { isPortInUse, startHttpServer, type HttpServerOptions } from "./mcp/http.js";
 import { REGISTERED_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
 import { startBridge, stopBridge } from "./control-plane/bridge.js";
+import type { ExtensionIdentityEvidence } from "./control-plane/extension-identity.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { validateWorkspaceIdentityConsistency } from "./workspace/identity.js";
 import { WorkspaceManager } from "./workspace/manager.js";
@@ -16,6 +17,7 @@ export interface AppContext extends McpRuntimeContext {
 
 export interface AppStartOptions extends HttpServerOptions {
   readonly bridgePorts?: readonly number[];
+  readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => void | Promise<void>;
 }
 
 export function createAppContext(
@@ -61,7 +63,10 @@ export async function startApp(
   try {
     const server = await startHttpServer(settings, context, options);
     try {
-      const bridgePort = await startBridge({ ports: options.bridgePorts });
+      const bridgePort = await startBridge({
+        ports: options.bridgePorts,
+        onIdentityEvidence: options.onIdentityEvidence,
+      });
       if (bridgePort === null) {
         console.warn("Local Control Bridge unavailable; local MCP remains available");
       }

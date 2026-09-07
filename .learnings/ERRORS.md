@@ -163,3 +163,70 @@ Use the installed command's supported syntax and set
 - See Also: none
 
 ---
+
+## [ERR-20260907-001] npm diagnostic script name
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+误将 package.json 中带冒号的诊断脚本写成了不带冒号的名称，命令在执行前即返回
+`Missing script`。
+
+### 错误信息
+
+```text
+npm error Missing script: "diagnose-conversation-routing"
+npm error Did you mean: npm run diagnose:conversation-routing
+```
+
+### 上下文
+
+- 任务验证阶段执行了 `npm run diagnose-conversation-routing`、`npm run diagnose-review-delivery` 和 `npm run diagnose-review-verdict`
+- package.json 实际脚本名是 `diagnose:conversation-routing`、`diagnose:review-delivery` 和 `diagnose:review-verdict`
+
+### 建议修复
+
+执行诊断前先从 package.json 或 `npm run` 读取脚本名，保留脚本中的冒号。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
+## [ERR-20260907-002] rg Windows glob argument
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+在 PowerShell 中把 `extension/*.js` 直接作为 `rg` 路径传入时，`rg` 将其视为
+literal path，返回 Windows `os error 123`。
+
+### 错误信息
+
+```text
+rg: extension/*.js: 文件名、目录名或卷标语法不正确。 (os error 123)
+```
+
+### 上下文
+
+- 最终扩展边界扫描执行了 `rg ... extension/*.js extension/manifest.json`
+- 改为从目录扫描并用 `-g '*.js'` 过滤后通过
+
+### 建议修复
+
+Windows 下使用 `rg -g '*.js' <directory>`，不要依赖 shell 展开路径通配符。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---

@@ -13,4 +13,7 @@
 {"ts":"2026-09-01T21:40:00+08:00","action":"add","type":"error","id":"ERR-20260901-002","summary":"Windows agent-reach doctor 不支持 --json；Unicode 输出需显式 UTF-8"}
 {"ts":"2026-09-01T21:41:00+08:00","action":"add","type":"learning","id":"LRN-20260901-001","summary":"MCP OAuth discovery 需 path-specific metadata 与 401 resource_metadata 指针"}
 {"ts":"2026-09-01T22:50:00+08:00","action":"add","type":"learning","id":"LRN-20260901-002","summary":"DCR 可兼容额外 grant 声明，但注册与执行能力仍归一化为 authorization_code + PKCE"}
+{"ts":"2026-09-07T18:31:00+08:00","action":"add","type":"error","id":"ERR-20260907-001","summary":"npm 诊断脚本名带冒号，误用不带冒号名称会在执行前返回 Missing script"}
+{"ts":"2026-09-07T18:34:00+08:00","action":"add","type":"learning","id":"LRN-20260907-001","summary":"Bridge /hello 不带 protocol 自定义 header，避免 CORS preflight；POST 再发送 protocol header"}
+{"ts":"2026-09-07T18:41:00+08:00","action":"add","type":"error","id":"ERR-20260907-002","summary":"Windows PowerShell 下 rg 路径 glob 不展开；改用 rg -g '*.js' 目录过滤"}
 ```
