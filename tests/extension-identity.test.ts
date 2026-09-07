@@ -152,13 +152,19 @@ interface ContentHarness {
   readonly messages: Record<string, unknown>[];
   readonly setFiberEvidence: (conversationId: string) => void;
   readonly navigate: (conversationId: string) => void;
+  readonly navigatePath: (path: string) => void;
 }
 
-function loadContent(initialConversation: string, initialFiberConversation: string): ContentHarness {
+function loadContent(
+  initialConversation: string,
+  initialFiberConversation: string,
+  initialPath = `/c/${initialConversation}`,
+  requestId = "wfr_content",
+): ContentHarness {
   const listeners = new Map<string, Set<(event: Record<string, unknown>) => void>>();
   const messages: Record<string, unknown>[] = [];
   let fiberConversation = initialFiberConversation;
-  const location = { origin: ORIGIN, href: `${ORIGIN}/c/${initialConversation}` };
+  const location = { origin: ORIGIN, href: new URL(initialPath, ORIGIN).href };
   const window: PageWindow = {
     addEventListener(type, listener) {
       const entries = listeners.get(type) ?? new Set();
@@ -175,7 +181,7 @@ function loadContent(initialConversation: string, initialFiberConversation: stri
         source: "lrm-extension-identity-reply",
         nonce: (data as Record<string, unknown>).nonce,
         version: 1,
-        evidence: [{ request_id: "wfr_content", fiber_conversation_id: fiberConversation }],
+        evidence: [{ request_id: requestId, fiber_conversation_id: fiberConversation }],
       };
       for (const listener of listeners.get("message") ?? []) {
         listener({ source: window, origin: ORIGIN, data: reply });
@@ -214,6 +220,7 @@ function loadContent(initialConversation: string, initialFiberConversation: stri
     messages,
     setFiberEvidence: (conversationId) => { fiberConversation = conversationId; },
     navigate: (conversationId) => history.pushState({}, "", `/c/${conversationId}`),
+    navigatePath: (path) => history.pushState({}, "", path),
   };
 }
 
@@ -222,6 +229,51 @@ async function settleContent(): Promise<void> {
 }
 
 describe("content route ownership and navigation epochs", () => {
+  it("publishes Project identity evidence with the request id from Fiber metadata", async () => {
+    const harness = loadContent(
+      CONVERSATION_A,
+      CONVERSATION_A,
+      `/g/g-p-6a951d05cc448191a399974588cdcf2b/c/${CONVERSATION_A}`,
+      "wfr_project",
+    );
+    await settleContent();
+
+    expect(harness.messages.filter((message) => message.type === "identity_evidence")).toEqual([{
+      type: "identity_evidence",
+      request_id: "wfr_project",
+      conversation_id: CONVERSATION_A,
+      navigation_epoch: 0,
+    }]);
+  });
+
+  it("accepts only root and one-segment Project conversation routes", async () => {
+    for (const path of [
+      `/c/${CONVERSATION_A}`,
+      `/g/g-p-xxxxxxxx/c/${CONVERSATION_A}`,
+      `/g/g-xxxxxxxx/c/${CONVERSATION_A}`,
+    ]) {
+      const harness = loadContent(CONVERSATION_A, CONVERSATION_A, path);
+      await settleContent();
+      expect(harness.messages.filter((message) => message.type === "identity_evidence"), path)
+        .toHaveLength(1);
+    }
+
+    for (const path of [
+      "/",
+      "/c/",
+      `/share/c/${CONVERSATION_A}`,
+      `/foo/c/${CONVERSATION_A}`,
+      "/g/project/",
+      `/g/project/foo/c/${CONVERSATION_A}`,
+      "/g/project/c/",
+    ]) {
+      const harness = loadContent(CONVERSATION_A, CONVERSATION_A, path);
+      await settleContent();
+      expect(harness.messages.filter((message) => message.type === "identity_evidence"), path)
+        .toEqual([]);
+    }
+  });
+
   it("sends only Fiber evidence that equals the real /c route and advances A to B to A", async () => {
     const harness = loadContent(CONVERSATION_A, CONVERSATION_A);
     await settleContent();
@@ -241,6 +293,38 @@ describe("content route ownership and navigation epochs", () => {
     ]);
     expect(harness.messages.filter((message) => message.type === "register_document")
       .map((message) => message.navigation_epoch)).toEqual([0, 1, 2]);
+  });
+
+  it("advances Project route epochs from A to B to A", async () => {
+    const harness = loadContent(CONVERSATION_A, CONVERSATION_A, `/g/project/c/${CONVERSATION_A}`);
+    await settleContent();
+    harness.setFiberEvidence(CONVERSATION_B);
+    harness.navigatePath(`/g/project/c/${CONVERSATION_B}`);
+    await settleContent();
+    harness.setFiberEvidence(CONVERSATION_A);
+    harness.navigatePath(`/g/project/c/${CONVERSATION_A}`);
+    await settleContent();
+
+    expect(harness.messages.filter((message) => message.type === "identity_evidence")
+      .map((message) => [message.conversation_id, message.navigation_epoch])).toEqual([
+        [CONVERSATION_A, 0],
+        [CONVERSATION_B, 1],
+        [CONVERSATION_A, 2],
+      ]);
+  });
+
+  it("increments the epoch when switching from a root conversation to a Project", async () => {
+    const harness = loadContent(CONVERSATION_A, CONVERSATION_A);
+    await settleContent();
+    harness.setFiberEvidence(CONVERSATION_B);
+    harness.navigatePath(`/g/project/c/${CONVERSATION_B}`);
+    await settleContent();
+
+    expect(harness.messages.filter((message) => message.type === "identity_evidence")
+      .map((message) => [message.conversation_id, message.navigation_epoch])).toEqual([
+        [CONVERSATION_A, 0],
+        [CONVERSATION_B, 1],
+      ]);
   });
 
   it("does not publish a Fiber conversation that disagrees with the concrete route", async () => {

@@ -23,7 +23,7 @@
     try {
       const url = new URL(href);
       if (url.origin !== 'https://chatgpt.com' && url.origin !== 'https://chat.openai.com') return null;
-      const match = /^\/c\/([A-Za-z0-9][A-Za-z0-9_-]{0,255})\/?$/.exec(url.pathname);
+      const match = /^\/(?:g\/[^/]+\/)?c\/([A-Za-z0-9][A-Za-z0-9_-]{0,255})\/?$/.exec(url.pathname);
       return match ? match[1] : null;
     } catch {
       return null;

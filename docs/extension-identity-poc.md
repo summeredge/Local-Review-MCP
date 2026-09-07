@@ -16,7 +16,7 @@ message.metadata.request_id
         +
 Fiber conversation evidence
         +
-concrete URL /c/<conversation_id>
+concrete URL /c/<conversation_id> or /g/<project>/c/<conversation_id>
         +
 Chrome MessageSender.documentId
         +
@@ -32,9 +32,10 @@ It reads no prompt, assistant text, tool arguments, cookies, authorization, or f
 Fiber/message objects. Missing or conflicting Fiber conversation identities are dropped.
 
 `content.js` reads the real current URL and accepts an entry only when the Fiber
-conversation equals the concrete `/c/<id>` route. New Chat and non-`/c/<id>` routes
-produce no evidence. SPA route changes increment the document-local epoch, including
-`/c/A → /c/B → /c/A` becoming epochs `0 → 1 → 2`.
+conversation equals the concrete `/c/<id>` or `/g/<project>/c/<id>` route. The project
+segment must be exactly one path segment. New Chat and non-owner routes produce no evidence.
+SPA route changes increment the document-local epoch, including `/c/A → /c/B → /c/A` and
+`/g/project/c/A → /g/project/c/B → /g/project/c/A` becoming epochs `0 → 1 → 2`.
 
 `background.js` is the only component that calls the Bridge. It discovers ports
 `12081`–`12085`, checks `service === "local-review-control-bridge"` and `protocol === 1`,
@@ -83,7 +84,11 @@ extension/fiber.js
    `127.0.0.1:12081` through `127.0.0.1:12085`.
 2. Load the extension manually in Chrome or Edge as above.
 3. Open a concrete ChatGPT conversation:
-   `https://chatgpt.com/c/<conversation_id>`.
+
+   ```text
+   https://chatgpt.com/c/<conversation_id>
+   https://chatgpt.com/g/<project>/c/<conversation_id>
+   ```
 4. Invoke an LRM MCP tool such as `workspace_info` or `review_summary`.
 5. In the ChatGPT page model, confirm the resulting message contains
    `metadata.request_id`.
