@@ -44,4 +44,19 @@ describe("production static boundaries", () => {
       expect(await readFile(path, "utf8")).not.toMatch(forbiddenImport);
     }
   });
+
+  it("keeps the Bridge out of MCP and Core modules", async () => {
+    const files = [
+      ...(await Promise.all(["mcp", "context", "control", "git"].map((directory) =>
+        findTypeScriptFiles(join(sourceDirectory, directory)))).then((groups) => groups.flat())),
+    ];
+    const forbiddenBridgeImport = /(?:from|import)\s*(?:type\s+)?["'][^"']*control-plane[\\/]bridge[^"']*["']/iu;
+    for (const path of files) {
+      expect((await readFile(path, "utf8")).replaceAll("\\", "/")).not.toMatch(forbiddenBridgeImport);
+    }
+
+    const bridge = await readFile(join(sourceDirectory, "control-plane", "bridge.ts"), "utf8");
+    expect(bridge).not.toMatch(/(?:from|import)\s*(?:type\s+)?["'][^"']*\.\/[.\/]?(?:mcp|context|control|git)[\\/]/iu);
+    expect(bridge).not.toMatch(/\/(?:exec|command|send|events|correlations)\b/iu);
+  });
 });

@@ -1,0 +1,358 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { APP_VERSION } from "../config/settings.js";
+import {
+  BRIDGE_PROTOCOL_HEADER,
+  isCompatibleBridgeProtocol,
+  LOCAL_CONTROL_BRIDGE_HOST,
+  LOCAL_CONTROL_BRIDGE_PORTS,
+  LOCAL_CONTROL_BRIDGE_PROTOCOL,
+  LOCAL_CONTROL_BRIDGE_SERVICE,
+  MAX_BRIDGE_REQUEST_BYTES,
+  parseExtensionOrigin,
+} from "./bridge-protocol.js";
+
+export interface BridgeStartOptions {
+  readonly ports?: readonly number[];
+}
+
+export interface BridgeStatus {
+  readonly available: boolean;
+  readonly address: typeof LOCAL_CONTROL_BRIDGE_HOST;
+  readonly port: number | null;
+  readonly paired: boolean;
+}
+
+class RequestBodyTooLargeError extends Error {}
+
+let bridgeServer: Server | null = null;
+let activePort: number | null = null;
+let pairedOrigin: string | null = null;
+let bearerToken: string | null = null;
+let lifecycleQueue: Promise<void> = Promise.resolve();
+
+function enqueue<T>(operation: () => Promise<T>): Promise<T> {
+  const result = lifecycleQueue.then(operation, operation);
+  lifecycleQueue = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+function json(
+  response: ServerResponse,
+  status: number,
+  body: unknown,
+  origin: string | null = null,
+): void {
+  const payload = JSON.stringify(body);
+  const headers: Record<string, string> = {
+    "cache-control": "no-store",
+    "content-length": String(Buffer.byteLength(payload, "utf8")),
+    "content-type": "application/json",
+  };
+  if (origin !== null) {
+    headers["access-control-allow-origin"] = origin;
+    headers["access-control-allow-headers"] = `authorization, content-type, ${BRIDGE_PROTOCOL_HEADER}`;
+    headers["access-control-allow-methods"] = "GET, POST, OPTIONS";
+  }
+  response.writeHead(status, headers);
+  response.end(payload);
+}
+
+function empty(response: ServerResponse, status: number, origin: string): void {
+  response.writeHead(status, {
+    "access-control-allow-origin": origin,
+    "access-control-allow-headers": `authorization, content-type, ${BRIDGE_PROTOCOL_HEADER}`,
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-max-age": "600",
+    "cache-control": "no-store",
+  });
+  response.end();
+}
+
+function methodNotAllowed(request: IncomingMessage, response: ServerResponse): void {
+  request.resume();
+  json(response, 405, { error: "method_not_allowed" }, parseExtensionOrigin(request.headers.origin));
+}
+
+function incompatibleProtocol(response: ServerResponse, origin: string): void {
+  json(response, 426, {
+    error: "incompatible_protocol",
+    protocol: LOCAL_CONTROL_BRIDGE_PROTOCOL,
+  }, origin);
+}
+
+function forbiddenOrigin(request: IncomingMessage, response: ServerResponse): void {
+  request.resume();
+  json(response, 403, { error: "forbidden_origin" });
+}
+
+function safeEqual(left: string, right: string): boolean {
+  const leftBytes = Buffer.from(left, "utf8");
+  const rightBytes = Buffer.from(right, "utf8");
+  return leftBytes.length > 0
+    && leftBytes.length === rightBytes.length
+    && timingSafeEqual(leftBytes, rightBytes);
+}
+
+function authorized(request: IncomingMessage, origin: string): boolean {
+  const header = request.headers.authorization;
+  const token = typeof header === "string" && header.startsWith("Bearer ")
+    ? header.slice("Bearer ".length)
+    : "";
+  return pairedOrigin === origin && bearerToken !== null && safeEqual(token, bearerToken);
+}
+
+function readJson(request: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const contentLength = request.headers["content-length"];
+    if (typeof contentLength === "string"
+      && Number.isFinite(Number(contentLength))
+      && Number(contentLength) > MAX_BRIDGE_REQUEST_BYTES) {
+      request.resume();
+      reject(new RequestBodyTooLargeError());
+      return;
+    }
+
+    let settled = false;
+    let size = 0;
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer | string) => {
+      if (settled) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.byteLength;
+      if (size > MAX_BRIDGE_REQUEST_BYTES) {
+        settled = true;
+        chunks.length = 0;
+        request.resume();
+        reject(new RequestBodyTooLargeError());
+        return;
+      }
+      chunks.push(buffer);
+    });
+    request.once("end", () => {
+      if (settled) return;
+      settled = true;
+      if (chunks.length === 0) {
+        resolve(undefined);
+        return;
+      }
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      } catch {
+        reject(new Error("invalid_json"));
+      }
+    });
+    request.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+  });
+}
+
+async function pair(request: IncomingMessage, response: ServerResponse, origin: string): Promise<void> {
+  try {
+    await readJson(request);
+  } catch (error: unknown) {
+    if (error instanceof RequestBodyTooLargeError) {
+      json(response, 413, { error: "body_too_large" }, origin);
+      return;
+    }
+    json(response, 400, { error: "bad_request" }, origin);
+    return;
+  }
+
+  if (pairedOrigin !== null && pairedOrigin !== origin) {
+    json(response, 409, { error: "pairing_owned" }, origin);
+    return;
+  }
+  if (bearerToken === null) {
+    pairedOrigin = origin;
+    bearerToken = randomBytes(32).toString("base64url");
+  }
+  json(response, 200, { token: bearerToken }, origin);
+}
+
+async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const url = new URL(request.url ?? "/", `http://${LOCAL_CONTROL_BRIDGE_HOST}`);
+  const route = url.pathname;
+
+  if (route === "/hello") {
+    if (request.method !== "GET") {
+      methodNotAllowed(request, response);
+      return;
+    }
+    const origin = parseExtensionOrigin(request.headers.origin);
+    if (request.headers.origin !== undefined && origin === null) {
+      forbiddenOrigin(request, response);
+      return;
+    }
+    json(response, 200, {
+      service: LOCAL_CONTROL_BRIDGE_SERVICE,
+      protocol: LOCAL_CONTROL_BRIDGE_PROTOCOL,
+      version: APP_VERSION,
+      paired: pairedOrigin !== null && bearerToken !== null,
+    }, origin);
+    return;
+  }
+
+  if (route !== "/pair" && route !== "/status") {
+    request.resume();
+    json(response, 404, { error: "not_found" });
+    return;
+  }
+
+  if (request.method === "OPTIONS") {
+    const origin = parseExtensionOrigin(request.headers.origin);
+    if (origin === null) {
+      forbiddenOrigin(request, response);
+      return;
+    }
+    empty(response, 204, origin);
+    return;
+  }
+
+  if (route === "/pair" && request.method !== "POST") {
+    methodNotAllowed(request, response);
+    return;
+  }
+  if (route === "/status" && request.method !== "GET") {
+    methodNotAllowed(request, response);
+    return;
+  }
+
+  const origin = parseExtensionOrigin(request.headers.origin);
+  if (origin === null) {
+    forbiddenOrigin(request, response);
+    return;
+  }
+  if (!isCompatibleBridgeProtocol(request.headers[BRIDGE_PROTOCOL_HEADER])) {
+    incompatibleProtocol(response, origin);
+    return;
+  }
+
+  if (route === "/pair") {
+    await pair(request, response, origin);
+    return;
+  }
+
+  if (pairedOrigin !== origin) {
+    request.resume();
+    json(response, 403, { error: "forbidden_origin" }, origin);
+    return;
+  }
+  if (!authorized(request, origin)) {
+    request.resume();
+    json(response, 401, { error: "unauthorized" }, origin);
+    return;
+  }
+  json(response, 200, {
+    status: "ok",
+    protocol: LOCAL_CONTROL_BRIDGE_PROTOCOL,
+    version: APP_VERSION,
+    port: activePort,
+  }, origin);
+}
+
+function createBridgeServer(): Server {
+  const server = createServer((request, response) => {
+    void handle(request, response).catch(() => {
+      if (!response.headersSent) json(response, 500, { error: "internal_server_error" });
+      else response.destroy();
+    });
+  });
+  server.headersTimeout = 15_000;
+  server.requestTimeout = 15_000;
+  server.keepAliveTimeout = 5_000;
+  return server;
+}
+
+function listen(server: Server, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: NodeJS.ErrnoException): void => {
+      server.removeListener("listening", onListening);
+      reject(error);
+    };
+    const onListening = (): void => {
+      server.removeListener("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, LOCAL_CONTROL_BRIDGE_HOST);
+  });
+}
+
+function close(server: Server): Promise<void> {
+  if (!server.listening) return Promise.resolve();
+  server.closeAllConnections();
+  return new Promise((resolve) => server.close(() => resolve()));
+}
+
+function validPorts(ports: readonly number[]): readonly number[] {
+  for (const port of ports) {
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      throw new Error(`invalid bridge port: ${String(port)}`);
+    }
+  }
+  return ports;
+}
+
+async function startBridgeOnce(options: BridgeStartOptions): Promise<number | null> {
+  if (bridgeServer?.listening === true) return activePort;
+
+  const ports = validPorts(options.ports ?? LOCAL_CONTROL_BRIDGE_PORTS);
+  for (const candidate of ports) {
+    const server = createBridgeServer();
+    try {
+      await listen(server, candidate);
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        await close(server);
+        continue;
+      }
+      bridgeServer = server;
+      activePort = address.port;
+      server.once("close", () => {
+        if (bridgeServer === server) {
+          bridgeServer = null;
+          activePort = null;
+        }
+      });
+      return activePort;
+    } catch (error: unknown) {
+      await close(server);
+      if (error instanceof Error && (error as NodeJS.ErrnoException).code === "EADDRINUSE") continue;
+      throw error;
+    }
+  }
+  return null;
+}
+
+export function startBridge(options: BridgeStartOptions = {}): Promise<number | null> {
+  return enqueue(() => startBridgeOnce(options));
+}
+
+export function stopBridge(): Promise<void> {
+  return enqueue(async () => {
+    const server = bridgeServer;
+    bridgeServer = null;
+    activePort = null;
+    pairedOrigin = null;
+    bearerToken = null;
+    if (server !== null) await close(server);
+  });
+}
+
+export function bridgePort(): number | null {
+  return activePort;
+}
+
+export function bridgeStatus(): BridgeStatus {
+  return {
+    available: bridgeServer?.listening === true,
+    address: LOCAL_CONTROL_BRIDGE_HOST,
+    port: activePort,
+    paired: pairedOrigin !== null && bearerToken !== null,
+  };
+}

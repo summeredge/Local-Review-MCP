@@ -3,6 +3,7 @@ import { basename } from "node:path";
 import { endpoint, localOrigin, type ResolvedSettings } from "./config/settings.js";
 import { isPortInUse, startHttpServer, type HttpServerOptions } from "./mcp/http.js";
 import { REGISTERED_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
+import { startBridge, stopBridge } from "./control-plane/bridge.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { validateWorkspaceIdentityConsistency } from "./workspace/identity.js";
 import { WorkspaceManager } from "./workspace/manager.js";
@@ -13,7 +14,9 @@ export interface AppContext extends McpRuntimeContext {
   readonly tunnel: TunnelManager;
 }
 
-export type AppStartOptions = HttpServerOptions;
+export interface AppStartOptions extends HttpServerOptions {
+  readonly bridgePorts?: readonly number[];
+}
 
 export function createAppContext(
   settings: ResolvedSettings,
@@ -58,11 +61,22 @@ export async function startApp(
   try {
     const server = await startHttpServer(settings, context, options);
     try {
+      const bridgePort = await startBridge({ ports: options.bridgePorts });
+      if (bridgePort === null) {
+        console.warn("Local Control Bridge unavailable; local MCP remains available");
+      }
+    } catch {
+      console.warn("Local Control Bridge failed to start; local MCP remains available");
+    }
+    server.once("close", () => {
+      void stopBridge().catch(() => undefined);
+      void context.tunnel.stop().catch(() => undefined);
+    });
+    try {
       await context.tunnel.start();
     } catch {
       console.error("Tunnel failed to start; local MCP remains available");
     }
-    server.once("close", () => { void context.tunnel.stop().catch(() => undefined); });
     return server;
   } catch (error: unknown) {
     if (isPortInUse(error)) {
