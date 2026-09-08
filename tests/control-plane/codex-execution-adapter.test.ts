@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   CodexExecutionAdapter,
   codexExecutionLogPaths,
+  resolveCodexExecutable,
   type CodexProcess,
   type CodexProcessSpawnRequest,
 } from "../../src/control-plane/codex-execution-adapter.js";
@@ -76,6 +77,7 @@ describe("CodexExecutionAdapter", () => {
     const requests: CodexProcessSpawnRequest[] = [];
     const adapter = new CodexExecutionAdapter(fixture.registry, {
       storageRoot: fixture.storageRoot,
+      codexExecutable: "codex",
       processRunner: runnerFor(process, requests),
     });
 
@@ -261,10 +263,123 @@ describe("CodexExecutionAdapter", () => {
     process.stderr.end("warning\n");
     await new Promise<void>((resolve) => setImmediate(resolve));
 
-    const paths = codexExecutionLogPaths(fixture.storageRoot, "execution-007");
+    const paths = codexExecutionLogPaths(
+      fixture.storageRoot,
+      "workspace-a",
+      "task-001",
+      "execution-007",
+    );
     await expect(readFile(paths.stdout, "utf8")).resolves.toContain('{"type":"completed"}');
     await expect(readFile(paths.stderr, "utf8")).resolves.toContain("warning");
     expect(paths.stdout.startsWith(fixture.workspaceRoot)).toBe(false);
     expect(paths.stderr.startsWith(fixture.workspaceRoot)).toBe(false);
+  });
+
+  it("scopes logs by workspace and task even when execution ids repeat", async () => {
+    const storageRoot = await mkdtemp(join(tmpdir(), "local-review-mcp-codex-log-state-"));
+    const workspaceARoot = await mkdtemp(join(tmpdir(), "local-review-mcp-codex-log-a-"));
+    const workspaceBRoot = await mkdtemp(join(tmpdir(), "local-review-mcp-codex-log-b-"));
+    temporaryDirectories.push(storageRoot, workspaceARoot, workspaceBRoot);
+    const workspaces = [
+      { id: "workspace-a", name: "Workspace A", path: workspaceARoot },
+      { id: "workspace-b", name: "Workspace B", path: workspaceBRoot },
+    ];
+    const tasks = new TaskContextService(storageRoot);
+    await tasks.createTaskContext({ task_id: "task-a", workspace_id: "workspace-a" });
+    await tasks.createTaskContext({ task_id: "task-shared", workspace_id: "workspace-a" });
+    await tasks.createTaskContext({ task_id: "task-b", workspace_id: "workspace-b" });
+
+    const processes = [new FakeProcess(4201), new FakeProcess(4202), new FakeProcess(4203)];
+    const requests: CodexProcessSpawnRequest[] = [];
+    let processIndex = 0;
+    const adapter = new CodexExecutionAdapter(new WorkspaceRegistry(workspaces), {
+      storageRoot,
+      codexExecutable: "codex",
+      processRunner: (request) => {
+        requests.push(request);
+        const process = processes[processIndex++];
+        if (process === undefined) throw new Error("unexpected process count");
+        queueMicrotask(() => process.emit("spawn"));
+        return process;
+      },
+    });
+
+    const [resultA, resultA2, resultB] = await Promise.all([
+      adapter.start({
+        workspace_id: "workspace-a",
+        task_id: "task-a",
+        execution_id: "execution-same",
+        instruction: "workspace A",
+      }),
+      adapter.start({
+        workspace_id: "workspace-a",
+        task_id: "task-shared",
+        execution_id: "execution-same",
+        instruction: "workspace A task 2",
+      }),
+      adapter.start({
+        workspace_id: "workspace-b",
+        task_id: "task-b",
+        execution_id: "execution-same",
+        instruction: "workspace B",
+      }),
+    ]);
+    const processByPid = new Map(processes.map((process) => [process.pid, process]));
+    const processA = processByPid.get(resultA.process_id)!;
+    const processA2 = processByPid.get(resultA2.process_id)!;
+    const processB = processByPid.get(resultB.process_id)!;
+    processA.stdout.end('{"owner":"workspace-a/task-a"}\n');
+    processA2.stdout.end('{"owner":"workspace-a/task-shared"}\n');
+    processB.stdout.end('{"owner":"workspace-b/task-b"}\n');
+    processA.stderr.end("stderr-a\n");
+    processA2.stderr.end("stderr-a-task-2\n");
+    processB.stderr.end("stderr-b\n");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const pathsA = codexExecutionLogPaths(storageRoot, "workspace-a", "task-a", "execution-same");
+    const pathsA2 = codexExecutionLogPaths(storageRoot, "workspace-a", "task-shared", "execution-same");
+    const pathsB = codexExecutionLogPaths(storageRoot, "workspace-b", "task-b", "execution-same");
+    expect(pathsA.stdout).not.toBe(pathsA2.stdout);
+    expect(pathsA.stdout).not.toBe(pathsB.stdout);
+    expect(pathsA.stderr).not.toBe(pathsA2.stderr);
+    expect(pathsA.stderr).not.toBe(pathsB.stderr);
+    await expect(readFile(pathsA.stdout, "utf8")).resolves.toContain("workspace-a/task-a");
+    await expect(readFile(pathsA2.stdout, "utf8")).resolves.toContain("workspace-a/task-shared");
+    await expect(readFile(pathsB.stdout, "utf8")).resolves.toContain("workspace-b/task-b");
+    await expect(readFile(pathsA.stderr, "utf8")).resolves.toContain("stderr-a");
+    await expect(readFile(pathsA2.stderr, "utf8")).resolves.toContain("stderr-a-task-2");
+    await expect(readFile(pathsB.stderr, "utf8")).resolves.toContain("stderr-b");
+    expect(requests).toHaveLength(3);
+  });
+
+  it("resolves an explicit executable and the installed Windows native binary", async () => {
+    const localAppData = await mkdtemp(join(tmpdir(), "local-review-mcp-codex-install-"));
+    temporaryDirectories.push(localAppData);
+    const versionDirectory = join(localAppData, "OpenAI", "Codex", "bin", "test-version");
+    await mkdir(versionDirectory, { recursive: true });
+    const nativeExecutable = join(versionDirectory, "codex.exe");
+    const explicitExecutable = join(localAppData, "explicit-codex.exe");
+    await writeFile(nativeExecutable, "native");
+    await writeFile(explicitExecutable, "explicit");
+
+    expect(resolveCodexExecutable({
+      codexExecutable: explicitExecutable,
+      platform: "win32",
+      environment: { LOCALAPPDATA: localAppData, Path: "" },
+    })).toBe(explicitExecutable);
+    expect(resolveCodexExecutable({
+      platform: "win32",
+      environment: { LOCALAPPDATA: localAppData, Path: "" },
+    })).toBe(nativeExecutable);
+  });
+
+  it("fails clearly when no Windows Codex executable is resolvable", () => {
+    expect(() => resolveCodexExecutable({
+      platform: "win32",
+      environment: {
+        LOCALAPPDATA: join(tmpdir(), "local-review-mcp-codex-missing"),
+        Path: "",
+      },
+    })).toThrow(/Codex executable was not found/iu);
   });
 });
