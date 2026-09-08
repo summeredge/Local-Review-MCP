@@ -132,7 +132,19 @@ const deliverySchema = z.object({
 const stateSchema = z.object({
   schema_version: z.literal(STATE_VERSION),
   deliveries: z.array(deliverySchema).max(MAX_DELIVERIES),
-}).strict();
+}).strict().superRefine((value, context) => {
+  const ids = new Set<string>();
+  value.deliveries.forEach((delivery, index) => {
+    if (ids.has(delivery.delivery_id)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["deliveries", index, "delivery_id"],
+        message: "delivery id is duplicated",
+      });
+    }
+    ids.add(delivery.delivery_id);
+  });
+});
 
 function stateFile(storageRoot: string): string {
   return join(resolve(storageRoot), "control-plane", "extension-deliveries.json");
@@ -169,6 +181,7 @@ function sameReceipt(receipt: ExtensionDeliveryReceipt, ack: ExtensionDeliveryAc
 
 export class ExtensionDeliveryConflictError extends Error {}
 export class ExtensionDeliveryNotFoundError extends Error {}
+export class ExtensionDeliveryUnavailableError extends Error {}
 
 export class ExtensionDeliveryService {
   private readonly file: string;
@@ -188,10 +201,14 @@ export class ExtensionDeliveryService {
         raw = await readFile(this.file, "utf8");
       } catch (error: unknown) {
         if (error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT") return;
-        throw error;
+        throw new ExtensionDeliveryUnavailableError("extension delivery state could not be restored", { cause: error });
       }
-      const state = stateSchema.parse(JSON.parse(raw));
-      this.deliveries = new Map(state.deliveries.map((delivery) => [delivery.delivery_id, delivery]));
+      try {
+        const state = stateSchema.parse(JSON.parse(raw));
+        this.deliveries = new Map(state.deliveries.map((delivery) => [delivery.delivery_id, delivery]));
+      } catch (error: unknown) {
+        throw new ExtensionDeliveryUnavailableError("extension delivery state could not be restored", { cause: error });
+      }
     });
     return this.restorePromise;
   }
@@ -309,23 +326,43 @@ export class ExtensionDeliveryService {
   }
 
   public async awaitResult(deliveryId: string, timeoutMs: number): Promise<ExtensionDeliveryReceipt | null> {
-    const delivery = await this.get(deliveryId);
-    if (delivery?.receipt || timeoutMs <= 0) return delivery?.receipt ? clone(delivery.receipt) : null;
-    return new Promise((resolveWait) => {
-      const held = this.waiters.get(deliveryId) ?? new Set();
-      let timer: NodeJS.Timeout;
+    await this.restore();
+    const parsedDeliveryId = z.string().uuid().parse(deliveryId);
+    const registration = await this.exclusive<{
+      readonly receipt: ExtensionDeliveryReceipt | null;
+      readonly pending: Promise<ExtensionDeliveryReceipt | null> | null;
+    }>(() => {
+      const delivery = this.deliveries.get(parsedDeliveryId);
+      if (delivery?.receipt || timeoutMs <= 0) {
+        return Promise.resolve({
+          receipt: delivery?.receipt ? clone(delivery.receipt) : null,
+          pending: null,
+        });
+      }
+
+      let timer: NodeJS.Timeout | null = null;
+      let settled = false;
+      let resolveWait!: (receipt: ExtensionDeliveryReceipt | null) => void;
+      const pending = new Promise<ExtensionDeliveryReceipt | null>((resolveWaiter) => {
+        resolveWait = resolveWaiter;
+      });
+      const held = this.waiters.get(parsedDeliveryId) ?? new Set();
       const finish = (receipt: ExtensionDeliveryReceipt | null): void => {
-        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
         held.delete(onReceipt);
-        if (held.size === 0) this.waiters.delete(deliveryId);
+        if (held.size === 0) this.waiters.delete(parsedDeliveryId);
         resolveWait(receipt ? clone(receipt) : null);
       };
       const onReceipt = (receipt: ExtensionDeliveryReceipt): void => finish(receipt);
       held.add(onReceipt);
-      this.waiters.set(deliveryId, held);
+      this.waiters.set(parsedDeliveryId, held);
       timer = setTimeout(() => finish(null), timeoutMs);
       timer.unref?.();
+      return Promise.resolve({ receipt: null, pending });
     });
+    return registration.pending ?? registration.receipt;
   }
 
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {

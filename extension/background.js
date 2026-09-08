@@ -21,10 +21,13 @@
   let loaded = false;
   let loading = null;
   let stateQueue = Promise.resolve();
+  let deliveryStateQueue = Promise.resolve();
   let pairingPromise = null;
   let clientId = null;
   let deliveryAckOutbox = [];
   let deliveryInFlight = [];
+  let deliveryRecoveryBlocked = false;
+  let deliveryRecoveryWarningEmitted = false;
   let trustedUntil = 0;
 
   function validDeliveryOwner(entry) {
@@ -58,6 +61,24 @@
     return result;
   }
 
+  function serialDeliveryState(task) {
+    const result = deliveryStateQueue.then(task, task);
+    deliveryStateQueue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  function validStoredDeliveryEntries(value, validator, limit) {
+    if (!Array.isArray(value) || value.length > limit) return false;
+    const ids = new Set();
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(value, index) || !validator(value[index])) return false;
+      const id = value[index].delivery_id;
+      if (ids.has(id)) return false;
+      ids.add(id);
+    }
+    return true;
+  }
+
   async function load() {
     if (loaded) return;
     if (!loading) {
@@ -75,13 +96,33 @@
           clientId = typeof stored.extensionClientId === 'string' && DOCUMENT_ID.test(stored.extensionClientId)
             ? stored.extensionClientId
             : (globalThis.crypto?.randomUUID?.() || `client-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-          deliveryAckOutbox = Array.isArray(stored.deliveryAckOutbox)
-            ? stored.deliveryAckOutbox.filter(validStoredAck).slice(-200)
-            : [];
-          deliveryInFlight = Array.isArray(stored.deliveryInFlight)
-            ? stored.deliveryInFlight.filter(validStoredInFlight).slice(-100)
-            : [];
-          return chrome.storage.local.set({ extensionClientId: clientId, deliveryAckOutbox, deliveryInFlight })
+          const hasStoredAcks = Object.prototype.hasOwnProperty.call(stored, 'deliveryAckOutbox');
+          const hasStoredInFlight = Object.prototype.hasOwnProperty.call(stored, 'deliveryInFlight');
+          const storedAcks = stored.deliveryAckOutbox;
+          const storedInFlight = stored.deliveryInFlight;
+          const validAcks = !hasStoredAcks || validStoredDeliveryEntries(storedAcks, validStoredAck, 200);
+          const validInFlight = !hasStoredInFlight || validStoredDeliveryEntries(storedInFlight, validStoredInFlight, 100);
+          const ackIds = validAcks && hasStoredAcks ? new Set(storedAcks.map((entry) => entry.delivery_id)) : new Set();
+          const noOverlappingDelivery = !hasStoredAcks || !hasStoredInFlight || !validAcks || !validInFlight
+            || storedInFlight.every((entry) => !ackIds.has(entry.delivery_id));
+          deliveryRecoveryBlocked = !validAcks || !validInFlight || !noOverlappingDelivery;
+          if (deliveryRecoveryBlocked) {
+            if (!deliveryRecoveryWarningEmitted) {
+              console.warn('Extension delivery state is malformed; delivery recovery is blocked');
+              deliveryRecoveryWarningEmitted = true;
+            }
+            deliveryAckOutbox = [];
+            deliveryInFlight = [];
+          } else {
+            deliveryAckOutbox = hasStoredAcks ? storedAcks.slice() : [];
+            deliveryInFlight = hasStoredInFlight ? storedInFlight.slice() : [];
+          }
+          const initialState = { extensionClientId: clientId };
+          if (!deliveryRecoveryBlocked) {
+            initialState.deliveryAckOutbox = deliveryAckOutbox;
+            initialState.deliveryInFlight = deliveryInFlight;
+          }
+          return chrome.storage.local.set(initialState)
             .then(() => { loaded = true; });
         });
       loading = loading.catch((error) => {
@@ -106,13 +147,15 @@
   }
 
   async function commitDeliveryState(nextOutbox, nextInFlight) {
+    const persistedOutbox = nextOutbox.slice(-200);
+    const persistedInFlight = nextInFlight.slice(-100);
     await chrome.storage.local.set({
       extensionClientId: clientId,
-      deliveryAckOutbox: nextOutbox.slice(-200),
-      deliveryInFlight: nextInFlight.slice(-100)
+      deliveryAckOutbox: persistedOutbox,
+      deliveryInFlight: persistedInFlight
     });
-    deliveryAckOutbox = nextOutbox;
-    deliveryInFlight = nextInFlight;
+    deliveryAckOutbox = persistedOutbox;
+    deliveryInFlight = persistedInFlight;
   }
 
   function senderSource(sender) {
@@ -390,25 +433,29 @@
     return { ok: true, payload };
   }
 
+  async function flushDeliveryAcksUnsafe() {
+    await load();
+    if (deliveryRecoveryBlocked) return { ok: false, error: 'delivery_state_corrupt' };
+    for (const payload of [...deliveryAckOutbox]) {
+      const result = await postBridge('/delivery/ack', payload);
+      if (!result.ok) return result;
+      await commitDeliveryState(
+        deliveryAckOutbox.filter((candidate) => candidate.delivery_id !== payload.delivery_id),
+        deliveryInFlight
+      );
+    }
+    return { ok: true };
+  }
+
   function flushDeliveryAcks() {
     if (flushingDeliveryAcks) return flushingDeliveryAcks;
-    flushingDeliveryAcks = (async () => {
-      await load();
-      for (const payload of [...deliveryAckOutbox]) {
-        const result = await postBridge('/delivery/ack', payload);
-        if (!result.ok) return result;
-        await commitDeliveryState(
-          deliveryAckOutbox.filter((candidate) => candidate.delivery_id !== payload.delivery_id),
-          deliveryInFlight
-        );
-      }
-      return { ok: true };
-    })().finally(() => { flushingDeliveryAcks = null; });
+    flushingDeliveryAcks = flushDeliveryAcksUnsafe().finally(() => { flushingDeliveryAcks = null; });
     return flushingDeliveryAcks;
   }
 
   async function prepareDeliveryClaim() {
     await load();
+    if (deliveryRecoveryBlocked) return { ok: false, error: 'delivery_state_corrupt' };
     const now = Date.now();
     for (const entry of [...deliveryInFlight]) {
       if (entry.phase !== 'submitting' || entry.deadline > now) continue;
@@ -437,32 +484,35 @@
     }
     const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
     if (!authority.ok || authority.conversation_id !== conversationId) return { ok: false, error: 'wrong_conversation' };
-    const ready = await prepareDeliveryClaim();
-    if (!ready.ok) return ready;
-    if (ready.blocked) return { ok: true, command: null };
-    const claim = {
-      conversation_id: conversationId,
-      client_id: clientId,
-      document_id: source.documentId,
-      navigation_epoch: requested
-    };
-    const result = await postBridge('/delivery/claim', claim);
-    if (!result.ok) return result;
-    const command = result.data?.command;
-    if (command === null) return { ok: true, command: null };
-    if (!command || typeof command.delivery_id !== 'string' || !DELIVERY_ID.test(command.delivery_id)
-      || typeof command.message !== 'string' || command.message.length === 0 || command.message.length > 48 * 1024
-      || command.conversation_id !== conversationId || !Number.isSafeInteger(command.deadline)
-      || command.deadline <= Date.now()) {
-      return { ok: false, error: 'invalid_delivery_command' };
-    }
-    await commitDeliveryState(deliveryAckOutbox, [...deliveryInFlight, {
-      delivery_id: command.delivery_id,
-      ...claim,
-      deadline: command.deadline,
-      phase: 'claimed'
-    }]);
-    return { ok: true, command };
+    return serialDeliveryState(async () => {
+      if (deliveryRecoveryBlocked) return { ok: false, error: 'delivery_state_corrupt' };
+      const ready = await prepareDeliveryClaim();
+      if (!ready.ok) return ready;
+      if (ready.blocked) return { ok: true, command: null };
+      const claim = {
+        conversation_id: conversationId,
+        client_id: clientId,
+        document_id: source.documentId,
+        navigation_epoch: requested
+      };
+      const result = await postBridge('/delivery/claim', claim);
+      if (!result.ok) return result;
+      const command = result.data?.command;
+      if (command === null) return { ok: true, command: null };
+      if (!command || typeof command.delivery_id !== 'string' || !DELIVERY_ID.test(command.delivery_id)
+        || typeof command.message !== 'string' || command.message.length === 0 || command.message.length > 48 * 1024
+        || command.conversation_id !== conversationId || !Number.isSafeInteger(command.deadline)
+        || command.deadline <= Date.now()) {
+        return { ok: false, error: 'invalid_delivery_command' };
+      }
+      await commitDeliveryState(deliveryAckOutbox, [...deliveryInFlight, {
+        delivery_id: command.delivery_id,
+        ...claim,
+        deadline: command.deadline,
+        phase: 'claimed'
+      }]);
+      return { ok: true, command };
+    });
   }
 
   async function deliverySubmitStarted(message, sender) {
@@ -472,15 +522,18 @@
     if (!source || requested === null || !conversationId) return { ok: false, error: 'wrong_conversation' };
     const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
     if (!authority.ok || authority.conversation_id !== conversationId) return { ok: false, error: 'wrong_conversation' };
-    const entry = deliveryInFlight.find((candidate) => candidate.delivery_id === message.delivery_id);
-    if (!entry || entry.client_id !== clientId || entry.document_id !== source.documentId
-      || entry.navigation_epoch !== requested || entry.conversation_id !== conversationId) {
-      return { ok: false, error: 'delivery_not_owned' };
-    }
-    if (entry.deadline <= Date.now()) return { ok: false, error: 'delivery_lease_expired' };
-    await commitDeliveryState(deliveryAckOutbox, deliveryInFlight.map((candidate) =>
-      candidate === entry ? { ...entry, phase: 'submitting' } : candidate));
-    return { ok: true };
+    return serialDeliveryState(async () => {
+      if (deliveryRecoveryBlocked) return { ok: false, error: 'delivery_state_corrupt' };
+      const entry = deliveryInFlight.find((candidate) => candidate.delivery_id === message.delivery_id);
+      if (!entry || entry.client_id !== clientId || entry.document_id !== source.documentId
+        || entry.navigation_epoch !== requested || entry.conversation_id !== conversationId) {
+        return { ok: false, error: 'delivery_not_owned' };
+      }
+      if (entry.deadline <= Date.now()) return { ok: false, error: 'delivery_lease_expired' };
+      await commitDeliveryState(deliveryAckOutbox, deliveryInFlight.map((candidate) =>
+        candidate === entry ? { ...entry, phase: 'submitting' } : candidate));
+      return { ok: true };
+    });
   }
 
   async function receiveDeliveryAck(message, sender) {
@@ -490,27 +543,30 @@
     if (!source || requested === null || !conversationId) return { ok: false, error: 'wrong_conversation' };
     const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
     if (!authority.ok || authority.conversation_id !== conversationId) return { ok: false, error: 'wrong_conversation' };
-    const entry = deliveryInFlight.find((candidate) => candidate.delivery_id === message.delivery_id);
-    if (!entry) {
-      const queued = deliveryAckOutbox.find((candidate) => candidate.delivery_id === message.delivery_id);
-      if (!queued) return { ok: false, error: 'delivery_not_owned' };
-      return flushDeliveryAcks();
-    }
-    if (entry.client_id !== clientId || entry.document_id !== source.documentId
-      || entry.navigation_epoch !== requested || entry.conversation_id !== conversationId) {
-      return { ok: false, error: 'delivery_not_owned' };
-    }
-    let queued;
-    if (message.status === 'sent' && typeof message.message_id === 'string' && DOCUMENT_ID.test(message.message_id)) {
-      queued = await queueDeliveryAck(entry, 'sent', { message_id: message.message_id });
-    } else if ((message.status === 'not_sent' || message.status === 'ambiguous') && typeof message.error === 'string') {
-      queued = await queueDeliveryAck(entry, message.status, { error: message.error.slice(0, 500) });
-    } else {
-      return { ok: false, error: 'invalid_delivery_ack' };
-    }
-    if (!queued.ok) return queued;
-    const flushed = await flushDeliveryAcks();
-    return flushed.ok ? { ok: true, queued: deliveryAckOutbox.length > 0 } : flushed;
+    return serialDeliveryState(async () => {
+      if (deliveryRecoveryBlocked) return { ok: false, error: 'delivery_state_corrupt' };
+      const entry = deliveryInFlight.find((candidate) => candidate.delivery_id === message.delivery_id);
+      if (!entry) {
+        const queued = deliveryAckOutbox.find((candidate) => candidate.delivery_id === message.delivery_id);
+        if (!queued) return { ok: false, error: 'delivery_not_owned' };
+        return flushDeliveryAcks();
+      }
+      if (entry.client_id !== clientId || entry.document_id !== source.documentId
+        || entry.navigation_epoch !== requested || entry.conversation_id !== conversationId) {
+        return { ok: false, error: 'delivery_not_owned' };
+      }
+      let queued;
+      if (message.status === 'sent' && typeof message.message_id === 'string' && DOCUMENT_ID.test(message.message_id)) {
+        queued = await queueDeliveryAck(entry, 'sent', { message_id: message.message_id });
+      } else if ((message.status === 'not_sent' || message.status === 'ambiguous') && typeof message.error === 'string') {
+        queued = await queueDeliveryAck(entry, message.status, { error: message.error.slice(0, 500) });
+      } else {
+        return { ok: false, error: 'invalid_delivery_ack' };
+      }
+      if (!queued.ok) return queued;
+      const flushed = await flushDeliveryAcks();
+      return flushed.ok ? { ok: true, queued: deliveryAckOutbox.length > 0 } : flushed;
+    });
   }
 
   const handlers = {

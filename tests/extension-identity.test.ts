@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import * as vm from "node:vm";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 const ORIGIN = "https://chatgpt.com";
 const CONVERSATION_A = "11111111-2222-3333-4444-555555555555";
@@ -414,6 +414,32 @@ class Storage {
   }
 }
 
+class DeliveryWriteGateStorage extends Storage {
+  private deliveryWriteGate: Promise<void> | null = null;
+  private releaseDeliveryWriteGate: (() => void) | null = null;
+  private deliveryWriteStarted: (() => void) | null = null;
+
+  public armDeliveryWriteGate(): Promise<void> {
+    const started = new Promise<void>((resolve) => { this.deliveryWriteStarted = resolve; });
+    this.deliveryWriteGate = new Promise<void>((resolve) => { this.releaseDeliveryWriteGate = resolve; });
+    return started;
+  }
+
+  public releaseDeliveryWrite(): void {
+    this.releaseDeliveryWriteGate?.();
+  }
+
+  public override async set(values: Record<string, unknown>): Promise<void> {
+    const gate = this.deliveryWriteGate;
+    if (gate !== null && Object.prototype.hasOwnProperty.call(values, "deliveryInFlight")) {
+      this.deliveryWriteGate = null;
+      this.deliveryWriteStarted?.();
+      await gate;
+    }
+    await super.set(values);
+  }
+}
+
 interface FetchCall {
   readonly input: string;
   readonly init: Record<string, unknown>;
@@ -646,6 +672,209 @@ describe("Extension background identity authority", () => {
     expect(pairAttempts).toBe(1);
     expect(worker.calls.filter((call) => new URL(call.input).pathname === "/identity-evidence"))
       .toHaveLength(2);
+  });
+
+  it("serializes same-conversation claims so only one tab owns the delivery", async () => {
+    const storage = new Storage();
+    let claimCount = 0;
+    let releaseClaim!: () => void;
+    let claimStarted!: () => void;
+    const claimGate = new Promise<void>((resolve) => { releaseClaim = resolve; });
+    const started = new Promise<void>((resolve) => { claimStarted = resolve; });
+    const command = {
+      delivery_id: "62ca0d45-8b29-414a-bbe4-8e26c3aae911",
+      conversation_id: CONVERSATION_A,
+      message: "one owner",
+      deadline: Date.now() + 30_000,
+    };
+    const worker = loadBackground(storage, async (url) => {
+      if (url.pathname === "/hello") return response(200, bridgeHello);
+      if (url.pathname === "/pair") return response(200, { token: "paired-token" });
+      if (url.pathname === "/delivery/claim") {
+        claimCount += 1;
+        if (claimCount === 1) {
+          claimStarted();
+          await claimGate;
+        }
+        return response(200, { command });
+      }
+      return response(404, {});
+    });
+    const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-two", 8, url);
+
+    const first = worker.send({ type: "delivery_claim", conversation_id: CONVERSATION_A, navigation_epoch: 0 }, "document-one", 7, url);
+    await claimStarted;
+    const second = worker.send({ type: "delivery_claim", conversation_id: CONVERSATION_A, navigation_epoch: 0 }, "document-two", 8, url);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(claimCount).toBe(1);
+    releaseClaim();
+
+    await expect(first).resolves.toMatchObject({ ok: true, command });
+    await expect(second).resolves.toEqual({ ok: true, command: null });
+    expect(claimCount).toBe(1);
+    expect(storage.data.deliveryInFlight).toMatchObject([{ delivery_id: command.delivery_id }]);
+  });
+
+  it("serializes concurrent claim, submit, and ACK state mutations without losing entries", async () => {
+    const storage = new DeliveryWriteGateStorage({
+      extensionClientId: "client-one",
+      deliveryAckOutbox: [],
+      deliveryInFlight: [
+        {
+          delivery_id: "72ca0d45-8b29-414a-bbe4-8e26c3aae911",
+          conversation_id: CONVERSATION_A,
+          client_id: "client-one",
+          document_id: "document-one",
+          navigation_epoch: 0,
+          deadline: Date.now() + 30_000,
+          phase: "claimed",
+        },
+        {
+          delivery_id: "82ca0d45-8b29-414a-bbe4-8e26c3aae911",
+          conversation_id: CONVERSATION_B,
+          client_id: "client-one",
+          document_id: "document-two",
+          navigation_epoch: 0,
+          deadline: Date.now() + 30_000,
+          phase: "claimed",
+        },
+      ],
+    });
+    const commandA = {
+      delivery_id: "72ca0d45-8b29-414a-bbe4-8e26c3aae911",
+      conversation_id: CONVERSATION_A,
+      message: "first concurrent command",
+      deadline: Date.now() + 30_000,
+    };
+    const commandB = {
+      delivery_id: "82ca0d45-8b29-414a-bbe4-8e26c3aae911",
+      conversation_id: CONVERSATION_B,
+      message: "second concurrent command",
+      deadline: Date.now() + 30_000,
+    };
+    const worker = loadBackground(storage, async (url, init) => {
+      if (url.pathname === "/hello") return response(200, bridgeHello);
+      if (url.pathname === "/pair") return response(200, { token: "paired-token" });
+      if (url.pathname === "/delivery/claim") {
+        const body = JSON.parse(String(init.body)) as { conversation_id: string };
+        return response(200, { command: body.conversation_id === CONVERSATION_A ? commandA : commandB });
+      }
+      if (url.pathname === "/delivery/ack") return response(200, { accepted: "new" });
+      return response(404, {});
+    });
+    const urlA = `${ORIGIN}/c/${CONVERSATION_A}`;
+    const urlB = `${ORIGIN}/c/${CONVERSATION_B}`;
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, urlA);
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-two", 8, urlB);
+
+    let started = storage.armDeliveryWriteGate();
+    const submitA = worker.send({ type: "delivery_submit_started", delivery_id: commandA.delivery_id, navigation_epoch: 0 }, "document-one", 7, urlA);
+    await started;
+    const submitB = worker.send({ type: "delivery_submit_started", delivery_id: commandB.delivery_id, navigation_epoch: 0 }, "document-two", 8, urlB);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    storage.releaseDeliveryWrite();
+    await expect(Promise.all([submitA, submitB])).resolves.toEqual([{ ok: true }, { ok: true }]);
+    expect(storage.data.deliveryInFlight).toMatchObject([
+      { delivery_id: commandA.delivery_id, phase: "submitting" },
+      { delivery_id: commandB.delivery_id, phase: "submitting" },
+    ]);
+
+    started = storage.armDeliveryWriteGate();
+    const ackA = worker.send({
+      type: "delivery_ack",
+      delivery_id: commandA.delivery_id,
+      navigation_epoch: 0,
+      status: "sent",
+      message_id: "message-one",
+    }, "document-one", 7, urlA);
+    await started;
+    const ackB = worker.send({
+      type: "delivery_ack",
+      delivery_id: commandB.delivery_id,
+      navigation_epoch: 0,
+      status: "sent",
+      message_id: "message-two",
+    }, "document-two", 8, urlB);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    storage.releaseDeliveryWrite();
+    await expect(Promise.all([ackA, ackB])).resolves.toEqual([
+      { ok: true, queued: false },
+      { ok: true, queued: false },
+    ]);
+    expect(storage.data.deliveryAckOutbox).toEqual([]);
+    expect(storage.data.deliveryInFlight).toEqual([]);
+  });
+
+  it("fails closed on a malformed durable ACK outbox while identity still works", async () => {
+    const malformed = {
+      delivery_id: "92ca0d45-8b29-414a-bbe4-8e26c3aae911",
+      conversation_id: CONVERSATION_A,
+      client_id: "client-one",
+      document_id: "document-one",
+      navigation_epoch: 0,
+      status: "sent",
+      message_id: "message-one",
+      unexpected: true,
+    };
+    const storage = new Storage({ deliveryAckOutbox: [malformed], deliveryInFlight: [] });
+    let claimCalls = 0;
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const worker = loadBackground(storage, async (url) => {
+        if (url.pathname === "/hello") return response(200, bridgeHello);
+        if (url.pathname === "/pair") return response(200, { token: "paired-token" });
+        if (url.pathname === "/delivery/claim") {
+          claimCalls += 1;
+          return response(200, { command: null });
+        }
+        return response(202, { accepted: true });
+      });
+      const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+      await expect(worker.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url))
+        .resolves.toMatchObject({ ok: true });
+      await expect(worker.send(evidenceMessage(CONVERSATION_A, 0), "document-one", 7, url))
+        .resolves.toMatchObject({ ok: true });
+      await expect(worker.send({ type: "delivery_claim", conversation_id: CONVERSATION_A, navigation_epoch: 0 }, "document-one", 7, url))
+        .resolves.toEqual({ ok: false, error: "delivery_state_corrupt" });
+      expect(claimCalls).toBe(0);
+      expect(storage.data.deliveryAckOutbox).toEqual([malformed]);
+      expect(storage.writes.some((write) => Object.prototype.hasOwnProperty.call(write, "deliveryAckOutbox"))).toBe(false);
+      expect(warning).toHaveBeenCalledTimes(1);
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it("fails closed on a malformed in-flight entry without automatic resend", async () => {
+    const malformed = {
+      delivery_id: "a2ca0d45-8b29-414a-bbe4-8e26c3aae911",
+      conversation_id: CONVERSATION_A,
+      client_id: "client-one",
+      document_id: "document-one",
+      navigation_epoch: 0,
+      deadline: Date.now() - 1,
+      phase: "submitting",
+      unexpected: true,
+    };
+    const storage = new Storage({ deliveryAckOutbox: [], deliveryInFlight: [malformed] });
+    const routes: string[] = [];
+    const worker = loadBackground(storage, async (url) => {
+      routes.push(url.pathname);
+      if (url.pathname === "/hello") return response(200, bridgeHello);
+      if (url.pathname === "/pair") return response(200, { token: "paired-token" });
+      if (url.pathname === "/delivery/claim") return response(200, { command: null });
+      return response(202, { accepted: true });
+    });
+    const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);
+    await expect(worker.send({ type: "delivery_claim", conversation_id: CONVERSATION_A, navigation_epoch: 0 }, "document-one", 7, url))
+      .resolves.toEqual({ ok: false, error: "delivery_state_corrupt" });
+    expect(routes).not.toContain("/delivery/claim");
+    expect(routes).not.toContain("/delivery/ack");
+    expect(storage.data.deliveryInFlight).toEqual([malformed]);
+    expect(storage.writes.some((write) => Object.prototype.hasOwnProperty.call(write, "deliveryInFlight"))).toBe(false);
   });
 
   it("keeps the Bridge out of content and Fiber and leaves no Core correlation hook", () => {

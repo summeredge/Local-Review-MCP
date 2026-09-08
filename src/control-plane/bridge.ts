@@ -4,6 +4,7 @@ import { APP_VERSION } from "../config/settings.js";
 import {
   ExtensionDeliveryConflictError,
   ExtensionDeliveryNotFoundError,
+  ExtensionDeliveryUnavailableError,
   extensionDeliveryAckSchema,
   extensionDeliveryClaimSchema,
   type ExtensionDeliveryAck,
@@ -248,8 +249,16 @@ async function receiveDeliveryClaim(
     json(response, 400, { error: "invalid_delivery_claim" }, origin);
     return;
   }
-  const command = await claimExtensionDelivery(parsed.data);
-  json(response, 200, { command }, origin);
+  try {
+    const command = await claimExtensionDelivery(parsed.data);
+    json(response, 200, { command }, origin);
+  } catch (error: unknown) {
+    if (error instanceof ExtensionDeliveryUnavailableError) {
+      json(response, 503, { error: "delivery_unavailable" }, origin);
+      return;
+    }
+    throw error;
+  }
 }
 
 async function receiveDeliveryAck(
@@ -275,6 +284,10 @@ async function receiveDeliveryAck(
     const result = await ackExtensionDelivery(parsed.data);
     json(response, 200, result, origin);
   } catch (error: unknown) {
+    if (error instanceof ExtensionDeliveryUnavailableError) {
+      json(response, 503, { error: "delivery_unavailable" }, origin);
+      return;
+    }
     if (error instanceof ExtensionDeliveryConflictError) {
       json(response, 409, { error: "conflicting_delivery_ack" }, origin);
       return;

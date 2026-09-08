@@ -1,10 +1,11 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ExtensionDeliveryConflictError,
   ExtensionDeliveryService,
+  ExtensionDeliveryUnavailableError,
 } from "../../src/control-plane/extension-delivery.js";
 
 const roots: string[] = [];
@@ -113,5 +114,61 @@ describe("ExtensionDeliveryService", () => {
       status: status === "not_sent" ? "failed" : "ambiguous",
     });
     await expect(deliveries.claim(owner)).resolves.toBeNull();
+  });
+
+  it("does not miss a receipt committed between the initial check and waiter registration", async () => {
+    const { deliveries } = await service();
+    const queued = await deliveries.enqueue(conversation, "race-proof");
+    await deliveries.claim(owner);
+    const ack = {
+      ...owner,
+      delivery_id: queued.delivery_id,
+      status: "sent" as const,
+      message_id: "message-race",
+    };
+    const originalGet = deliveries.get.bind(deliveries);
+    let releaseGet!: () => void;
+    let checked!: () => void;
+    const getGate = new Promise<void>((resolve) => { releaseGet = resolve; });
+    const getChecked = new Promise<void>((resolve) => { checked = resolve; });
+    const getSpy = vi.spyOn(deliveries, "get").mockImplementation(async (deliveryId) => {
+      const result = await originalGet(deliveryId);
+      checked();
+      await getGate;
+      return result;
+    });
+
+    try {
+      const pending = deliveries.awaitResult(queued.delivery_id, 250);
+      await Promise.race([getChecked, new Promise<void>((resolve) => setTimeout(resolve, 25))]);
+      await deliveries.acknowledge(ack);
+      releaseGet();
+      await expect(pending).resolves.toMatchObject({
+        delivery_id: queued.delivery_id,
+        status: "delivered",
+        message_id: "message-race",
+      });
+    } finally {
+      releaseGet();
+      getSpy.mockRestore();
+    }
+  });
+
+  it("returns null after a real timeout when no receipt exists", async () => {
+    const { deliveries } = await service();
+    const queued = await deliveries.enqueue(conversation, "wait-for-nothing");
+    await expect(deliveries.awaitResult(queued.delivery_id, 10)).resolves.toBeNull();
+  });
+
+  it("keeps a corrupt durable state unavailable without replacing the file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lrm-extension-delivery-corrupt-"));
+    roots.push(root);
+    const file = join(root, "control-plane", "extension-deliveries.json");
+    await mkdir(join(root, "control-plane"), { recursive: true });
+    await writeFile(file, "{broken", "utf8");
+    const deliveries = new ExtensionDeliveryService(root);
+
+    await expect(deliveries.restore()).rejects.toBeInstanceOf(ExtensionDeliveryUnavailableError);
+    await expect(readFile(file, "utf8")).resolves.toBe("{broken");
   });
 });

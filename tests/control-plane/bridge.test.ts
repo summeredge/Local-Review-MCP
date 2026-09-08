@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -393,6 +393,72 @@ describe("Local Control Bridge app lifecycle", () => {
       );
     } finally {
       if (server !== null) await close(server);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps Bridge identity available when extension delivery state is corrupt", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-app-delivery-corrupt-"));
+    const deliveryFile = join(root, "control-plane", "extension-deliveries.json");
+    await mkdir(join(root, "control-plane"), { recursive: true });
+    await writeFile(deliveryFile, "{broken", "utf8");
+    const runtime = createAppContext(settings());
+    const context = {
+      ...runtime,
+      correlations: new ConversationCorrelationRegistry(root),
+      extensionDeliveries: new ExtensionDeliveryService(root),
+    };
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let server: Server | null = null;
+    try {
+      server = await startApp(settings(), context, { bridgePorts: [0] });
+      expect(server.listening).toBe(true);
+      expect(bridgeStatus().available).toBe(true);
+
+      expect(await request("/hello", { origin: null, protocol: null })).toMatchObject({ status: 200 });
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+      const evidence = {
+        request_id: "wfr_delivery_corrupt_app",
+        conversation_id: "conversation-delivery-corrupt",
+        document_id: "document-delivery-corrupt",
+        navigation_epoch: 0,
+      };
+      expect(await request("/identity-evidence", { method: "POST", token, body: evidence })).toEqual({
+        status: 202,
+        body: { accepted: true },
+      });
+      expect(context.correlations.correlation(evidence.request_id)?.conversation_id).toBe(evidence.conversation_id);
+
+      const owner = {
+        conversation_id: evidence.conversation_id,
+        client_id: "client-delivery-corrupt",
+        document_id: evidence.document_id,
+        navigation_epoch: evidence.navigation_epoch,
+      };
+      expect(await request("/delivery/claim", { method: "POST", token, body: owner })).toEqual({
+        status: 503,
+        body: { error: "delivery_unavailable" },
+      });
+      expect(await request("/delivery/ack", {
+        method: "POST",
+        token,
+        body: {
+          ...owner,
+          delivery_id: "b2ca0d45-8b29-414a-bbe4-8e26c3aae911",
+          status: "ambiguous",
+          error: "delivery unavailable",
+        },
+      })).toEqual({
+        status: 503,
+        body: { error: "delivery_unavailable" },
+      });
+      expect(await readFile(deliveryFile, "utf8")).toBe("{broken");
+      expect(warning).toHaveBeenCalledWith("Extension Delivery unavailable; durable state could not be restored");
+    } finally {
+      warning.mockRestore();
+      if (server !== null) await close(server);
+      await stopBridge();
       await rm(root, { recursive: true, force: true });
     }
   });

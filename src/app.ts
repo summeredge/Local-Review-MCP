@@ -5,7 +5,10 @@ import { isPortInUse, startHttpServer, type HttpServerOptions } from "./mcp/http
 import { REGISTERED_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
 import { startBridge, stopBridge } from "./control-plane/bridge.js";
 import { ConversationCorrelationRegistry } from "./control-plane/conversation-correlation.js";
-import { ExtensionDeliveryService } from "./control-plane/extension-delivery.js";
+import {
+  ExtensionDeliveryService,
+  ExtensionDeliveryUnavailableError,
+} from "./control-plane/extension-delivery.js";
 import type { ExtensionIdentityEvidence } from "./control-plane/extension-identity.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { validateWorkspaceIdentityConsistency } from "./workspace/identity.js";
@@ -71,15 +74,27 @@ export async function startApp(
     try {
       const extensionDeliveries = context.extensionDeliveries;
       await context.correlations.restore();
-      await extensionDeliveries.restore();
+      let deliveryAvailable = true;
+      try {
+        await extensionDeliveries.restore();
+      } catch {
+        deliveryAvailable = false;
+        console.warn("Extension Delivery unavailable; durable state could not be restored");
+      }
       const bridgePort = await startBridge({
         ports: options.bridgePorts,
         onIdentityEvidence: async (evidence) => {
           await context.correlations.observe(evidence);
           await options.onIdentityEvidence?.(evidence);
         },
-        claimExtensionDelivery: (claim) => extensionDeliveries.claim(claim),
-        ackExtensionDelivery: (ack) => extensionDeliveries.acknowledge(ack),
+        claimExtensionDelivery: async (claim) => {
+          if (!deliveryAvailable) throw new ExtensionDeliveryUnavailableError("extension delivery unavailable");
+          return extensionDeliveries.claim(claim);
+        },
+        ackExtensionDelivery: async (ack) => {
+          if (!deliveryAvailable) throw new ExtensionDeliveryUnavailableError("extension delivery unavailable");
+          return extensionDeliveries.acknowledge(ack);
+        },
       });
       if (bridgePort === null) {
         console.warn("Local Control Bridge unavailable; local MCP remains available");
