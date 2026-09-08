@@ -393,6 +393,7 @@ describe("content route ownership and navigation epochs", () => {
 
 class Storage {
   readonly data: Record<string, unknown>;
+  readonly writes: Record<string, unknown>[] = [];
 
   public constructor(initial: Record<string, unknown> = {}) {
     this.data = structuredClone(initial);
@@ -403,6 +404,7 @@ class Storage {
   }
 
   public async set(values: Record<string, unknown>): Promise<void> {
+    this.writes.push(structuredClone(values));
     Object.assign(this.data, structuredClone(values));
   }
 }
@@ -457,7 +459,7 @@ function loadBackground(
   };
 }
 
-const bridgeHello = { service: "local-review-control-bridge", protocol: 1 };
+const bridgeHello = { service: "local-review-control-bridge", protocol: 1, paired: true };
 const evidenceMessage = (conversationId: string, navigation_epoch: number, extra: Record<string, unknown> = {}) => ({
   type: "identity_evidence",
   request_id: UUID_REQUEST_ID,
@@ -513,6 +515,37 @@ describe("Extension background identity authority", () => {
     expect(JSON.parse(String(posted[2]!.init.body))).toMatchObject({ document_id: doc2, navigation_epoch: 0 });
   });
 
+  it("re-pairs before delivery when hello invalidates a cached token", async () => {
+    const storage = new Storage({ port: 12081, token: "stale-token" });
+    let paired = false;
+    const worker = loadBackground(storage, async (url) => {
+      if (url.pathname === "/hello") return response(200, { ...bridgeHello, paired });
+      if (url.pathname === "/pair") {
+        paired = true;
+        return response(200, { token: "fresh-token" });
+      }
+      return response(202, { accepted: true });
+    });
+
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    expect(await worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1")).toMatchObject({ ok: true });
+
+    expect(worker.calls.map((call) => `${String(call.init.method ?? "GET")} ${new URL(call.input).pathname}`)).toEqual([
+      "GET /hello",
+      "POST /pair",
+      "POST /identity-evidence",
+    ]);
+    expect((worker.calls[2]!.init.headers as Record<string, string>).authorization).toBe("Bearer fresh-token");
+    expect(storage.data).toMatchObject({ port: 12081, token: "fresh-token" });
+    expect(storage.writes.filter((write) => "token" in write)).toEqual([
+      { port: 12081, token: null },
+      { port: 12081, token: "fresh-token" },
+    ]);
+
+    expect(await worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1")).toMatchObject({ ok: true });
+    expect(storage.writes.filter((write) => "token" in write)).toHaveLength(2);
+  });
+
   it("clears a stale token after 401, re-pairs once, and retries", async () => {
     const storage = new Storage({ port: 12081, token: "stale-token" });
     let evidenceAttempts = 0;
@@ -535,6 +568,71 @@ describe("Extension background identity authority", () => {
     const posted = worker.calls.filter((call) => new URL(call.input).pathname === "/identity-evidence");
     expect((posted[0]!.init.headers as Record<string, string>).authorization).toBe("Bearer stale-token");
     expect((posted[1]!.init.headers as Record<string, string>).authorization).toBe("Bearer fresh-token");
+  });
+
+  it("fails closed on 403 while hello reports another pairing", async () => {
+    const storage = new Storage({ port: 12081, token: "stale-token" });
+    const worker = loadBackground(storage, async (url) => {
+      if (url.pathname === "/hello") return response(200, bridgeHello);
+      if (url.pathname === "/pair") throw new Error("must not pair");
+      return response(403, { error: "forbidden_origin" });
+    });
+
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    expect(await worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1"))
+      .toMatchObject({ ok: false, error: "bridge_http_403" });
+    expect(worker.calls.map((call) => new URL(call.input).pathname)).toEqual(["/hello", "/identity-evidence"]);
+    expect(storage.data.token).toBe("stale-token");
+  });
+
+  it("bounds unpaired recovery when the retried delivery returns 403", async () => {
+    const storage = new Storage({ port: 12081, token: "stale-token" });
+    const worker = loadBackground(storage, async (url) => {
+      if (url.pathname === "/hello") return response(200, { ...bridgeHello, paired: false });
+      if (url.pathname === "/pair") return response(200, { token: "fresh-token" });
+      return response(403, { error: "forbidden_origin" });
+    });
+
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    expect(await worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1"))
+      .toMatchObject({ ok: false, error: "bridge_http_403" });
+    expect(worker.calls.map((call) => new URL(call.input).pathname)).toEqual([
+      "/hello",
+      "/pair",
+      "/identity-evidence",
+    ]);
+  });
+
+  it("shares one recovery pairing across concurrent evidence", async () => {
+    const storage = new Storage({ port: 12081, token: "stale-token" });
+    let pairStarted!: () => void;
+    let releasePair!: () => void;
+    const started = new Promise<void>((resolve) => { pairStarted = resolve; });
+    const gate = new Promise<void>((resolve) => { releasePair = resolve; });
+    let pairAttempts = 0;
+    const worker = loadBackground(storage, async (url) => {
+      if (url.pathname === "/hello") return response(200, { ...bridgeHello, paired: false });
+      if (url.pathname === "/pair") {
+        pairAttempts += 1;
+        pairStarted();
+        await gate;
+        return response(200, { token: "fresh-token" });
+      }
+      return response(202, { accepted: true });
+    });
+
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    const deliveries = Promise.all([
+      worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1"),
+      worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1"),
+    ]);
+    await started;
+    releasePair();
+
+    expect(await deliveries).toEqual([expect.objectContaining({ ok: true }), expect.objectContaining({ ok: true })]);
+    expect(pairAttempts).toBe(1);
+    expect(worker.calls.filter((call) => new URL(call.input).pathname === "/identity-evidence"))
+      .toHaveLength(2);
   });
 
   it("keeps the Bridge out of content and Fiber and leaves no Core correlation hook", () => {

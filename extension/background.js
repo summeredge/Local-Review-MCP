@@ -18,6 +18,7 @@
   let loaded = false;
   let loading = null;
   let stateQueue = Promise.resolve();
+  let pairingPromise = null;
 
   function serialState(task) {
     const result = stateQueue.then(task, task);
@@ -151,12 +152,16 @@
     for (const candidate of PORTS) {
       const body = await hello(candidate);
       if (!body) continue;
-      port = candidate;
-      await persistBridge();
+      if (port !== candidate) {
+        port = candidate;
+        await persistBridge();
+      }
       return { port: candidate, body };
     }
-    port = null;
-    await persistBridge();
+    if (port !== null) {
+      port = null;
+      await persistBridge();
+    }
     return null;
   }
 
@@ -170,18 +175,40 @@
       });
       const body = await response.json().catch(() => null);
       if (!response.ok || !body || typeof body.token !== 'string' || body.token.length === 0) return false;
-      token = body.token;
-      await persistBridge();
+      if (token !== body.token) {
+        token = body.token;
+        await persistBridge();
+      }
       return true;
     } catch {
       return false;
     }
   }
 
+  function ensureCredential() {
+    if (pairingPromise) return pairingPromise;
+    const work = (async () => {
+      const found = await discover();
+      if (!found) return { ok: false, error: 'bridge_unavailable' };
+      if (found.body.paired === false && token !== null) {
+        token = null;
+        await persistBridge();
+      }
+      if (!token && !(await pair(found.port))) return { ok: false, error: 'pair_failed' };
+      return { ok: true, found };
+    })();
+    const tracked = work.finally(() => {
+      if (pairingPromise === tracked) pairingPromise = null;
+    });
+    pairingPromise = tracked;
+    return tracked;
+  }
+
   async function postEvidence(evidence, retried = false) {
-    const found = await discover();
-    if (!found) return { ok: false, error: 'bridge_unavailable' };
-    if (!token && !(await pair(found.port))) return { ok: false, error: 'pair_failed' };
+    const credential = await ensureCredential();
+    if (!credential.ok) return credential;
+    const found = credential.found;
+    const requestToken = token;
     try {
       const response = await fetchBounded(`http://127.0.0.1:${found.port}/identity-evidence`, {
         method: 'POST',
@@ -189,13 +216,15 @@
         headers: {
           'content-type': 'application/json',
           [PROTOCOL_HEADER]: String(PROTOCOL),
-          authorization: `Bearer ${token}`
+          authorization: `Bearer ${requestToken}`
         },
         body: JSON.stringify(evidence)
       });
       if (response.status === 401) {
-        token = null;
-        await persistBridge();
+        if (token === requestToken) {
+          token = null;
+          await persistBridge();
+        }
         if (retried) return { ok: false, error: 'not_paired' };
         return postEvidence(evidence, true);
       }

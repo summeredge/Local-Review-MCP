@@ -48,10 +48,16 @@ SPA route changes increment the document-local epoch, including `/c/A → /c/B �
 
 `background.js` is the only component that calls the Bridge. It discovers ports
 `12081`–`12085`, checks `service === "local-review-control-bridge"` and `protocol === 1`,
-pairs through `/pair`, and stores the bearer token in its extension-local storage. The
+pairs through `/pair`, and stores the bearer token in its extension-local storage. MV3
+`chrome.storage.local` survives service-worker suspension and extension reload, while the
+Bridge bearer token exists only in Bridge process memory. After a Bridge restart,
+`hello.paired === false` therefore invalidates any cached token but keeps the discovered
+port; the extension clears that stale credential, pairs once, and only then sends evidence.
+Concurrent evidence shares the same pairing attempt. The
 Bridge body always gets `sender.documentId`; a body-supplied document ID is ignored.
 Stale documents and lower epochs are rejected before transport. A single `401` clears
-the stored token, re-pairs, and retries once.
+the stored token, re-pairs, and retries once. A `403` after `hello.paired === true` fails
+closed and does not attempt to take pairing ownership from another Extension Origin.
 
 The Bridge validates all four required fields with a strict schema and passes the exact
 validated value to the injectable `onIdentityEvidence` sink. The default sink is a no-op,
