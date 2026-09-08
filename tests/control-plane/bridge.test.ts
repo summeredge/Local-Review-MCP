@@ -162,11 +162,12 @@ describe("Local Control Bridge protocol", () => {
     await expect(startBridge({ ports: [0], onIdentityEvidence: sink })).resolves.toBeGreaterThan(0);
     const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
     const evidence = {
-      request_id: "wfr_abc123",
+      request_id: "32ca0d45-8b29-414a-bbe4-8e26c3aae911",
       conversation_id: "11111111-2222-3333-4444-555555555555",
       document_id: "chrome-document-id",
       navigation_epoch: 2,
     };
+    const wfrEvidence = { ...evidence, request_id: "wfr_01a014bdd7cd7a15b6b533d3ce2b42f2" };
 
     expect((await request("/identity-evidence", {
       method: "POST",
@@ -194,8 +195,13 @@ describe("Local Control Bridge protocol", () => {
       status: 202,
       body: { accepted: true },
     });
-    expect(sink).toHaveBeenCalledOnce();
-    expect(sink).toHaveBeenCalledWith(evidence);
+    expect(await request("/identity-evidence", { method: "POST", token, body: wfrEvidence })).toEqual({
+      status: 202,
+      body: { accepted: true },
+    });
+    expect(sink).toHaveBeenCalledTimes(2);
+    expect(sink).toHaveBeenNthCalledWith(1, evidence);
+    expect(sink).toHaveBeenNthCalledWith(2, wfrEvidence);
   });
 
   it("bounds JSON bodies and returns stable route errors", async () => {

@@ -9,6 +9,15 @@ The MCP HTTP server keeps the existing `x-request-id` behavior in
 `src/mcp/inbound.ts`. ChatGPT's page model exposes the same normalized base ID at
 `message.metadata.request_id`.
 
+`request_id` is an opaque normalized identifier. Its concrete appearance is not protocol
+semantics: ChatGPT may expose a `wfr_*` value, a UUID value such as
+`32ca0d45-8b29-414a-bbe4-8e26c3aae911`, or another future value that satisfies the
+`[A-Za-z0-9_-]{1,100}` lexical boundary. LRM does not require a prefix, require a UUID, or
+infer identity from the ID's format. The browser-side authority is
+`message.metadata.request_id`; the MCP-side authority is the normalized value returned by
+`src/mcp/inbound.ts::requestIdFromHeader()` from `x-request-id`. Any future correlation must
+use exact string equality.
+
 The unpacked MV3 extension then performs this bounded flow:
 
 ```text
@@ -93,7 +102,8 @@ extension/fiber.js
 5. In the ChatGPT page model, confirm the resulting message contains
    `metadata.request_id`.
 6. Run the existing MAIN-world fiber ask manually. This is a gate: `evidence` must
-   contain the exact `wfr_*` ID from this MCP request and the current conversation ID;
+   contain the exact request ID exposed by `message.metadata.request_id` for the same MCP
+   request and the current conversation ID;
    `evidence: []` fails the gate.
 7. Use the extension service-worker DevTools Network view to confirm a successful
    `POST /identity-evidence` with status `202`, or start the Bridge with an injected
@@ -102,7 +112,7 @@ extension/fiber.js
 
 ```json
 {
-  "request_id": "wfr_...",
+  "request_id": "<exact-request-id>",
   "conversation_id": "...",
   "document_id": "...",
   "navigation_epoch": 0

@@ -5,6 +5,8 @@ import { beforeAll, describe, expect, it } from "vitest";
 const ORIGIN = "https://chatgpt.com";
 const CONVERSATION_A = "11111111-2222-3333-4444-555555555555";
 const CONVERSATION_B = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+const WFR_REQUEST_ID = "wfr_01a014bdd7cd7a15b6b533d3ce2b42f2";
+const UUID_REQUEST_ID = "32ca0d45-8b29-414a-bbe4-8e26c3aae911";
 const REAL_TURN_DEPTH = 30;
 
 let fiberSource = "";
@@ -124,12 +126,37 @@ describe("MAIN-world Fiber identity evidence", () => {
 
   it("allowlists metadata.request_id and the matching Fiber conversation", () => {
     const reply = scanFiber([fiberSection(CONVERSATION_A, [
-      { metadata: { request_id: "wfr_valid_1" }, content: { text: '{"args":{"secret":"no"}}' } },
+      { metadata: { request_id: WFR_REQUEST_ID }, content: { text: '{"args":{"secret":"no"}}' } },
       { metadata: { request_id: "invalid.id" } },
     ])]);
     expect(reply.evidence).toEqual([{
-      request_id: "wfr_valid_1",
+      request_id: WFR_REQUEST_ID,
       fiber_conversation_id: CONVERSATION_A,
+    }]);
+  });
+
+  it("preserves an opaque UUID request id from Fiber through content evidence", async () => {
+    const reply = scanFiber([fiberSection(CONVERSATION_A, [
+      { metadata: { request_id: UUID_REQUEST_ID } },
+    ])]);
+    const evidence = reply.evidence as Array<{ request_id: string; fiber_conversation_id: string }>;
+    expect(evidence).toEqual([{
+      request_id: UUID_REQUEST_ID,
+      fiber_conversation_id: CONVERSATION_A,
+    }]);
+
+    const harness = loadContent(
+      CONVERSATION_A,
+      CONVERSATION_A,
+      `/c/${CONVERSATION_A}`,
+      evidence[0]!.request_id,
+    );
+    await settleContent();
+    expect(harness.messages.filter((message) => message.type === "identity_evidence")).toEqual([{
+      type: "identity_evidence",
+      request_id: UUID_REQUEST_ID,
+      conversation_id: CONVERSATION_A,
+      navigation_epoch: 0,
     }]);
   });
 
@@ -433,7 +460,7 @@ function loadBackground(
 const bridgeHello = { service: "local-review-control-bridge", protocol: 1 };
 const evidenceMessage = (conversationId: string, navigation_epoch: number, extra: Record<string, unknown> = {}) => ({
   type: "identity_evidence",
-  request_id: "wfr_background",
+  request_id: UUID_REQUEST_ID,
   conversation_id: conversationId,
   navigation_epoch,
   ...extra,
@@ -456,6 +483,7 @@ describe("Extension background identity authority", () => {
     expect(calls.slice(0, 3)).toEqual(["12081/hello", "12082/hello", "12083/hello"]);
     expect(storage.data.token).toBe("paired-token");
     expect(new URL(worker.calls.at(-1)!.input).pathname).toBe("/identity-evidence");
+    expect(JSON.parse(String(worker.calls.at(-1)!.init.body))).toMatchObject({ request_id: UUID_REQUEST_ID });
   });
 
   it("uses sender.documentId and rejects stale epochs/documents across A to B to A", async () => {

@@ -6,6 +6,9 @@ describe("MCP inbound request id boundary", () => {
     expect(requestIdFromHeader("wfr_01a014bdd7cd7a15b6b533d3ce2b42f2/relay-suffix")).toBe(
       "wfr_01a014bdd7cd7a15b6b533d3ce2b42f2",
     );
+    expect(requestIdFromHeader("32ca0d45-8b29-414a-bbe4-8e26c3aae911/relay-suffix")).toBe(
+      "32ca0d45-8b29-414a-bbe4-8e26c3aae911",
+    );
     expect(requestIdFromHeader("  wfr_abc_123/relay-hop  ")).toBe("wfr_abc_123");
     expect(requestIdFromHeader(["wfr_only/a"])).toBe("wfr_only");
     expect(requestIdFromHeader(["wfr_first/a", "wfr_second/b"])).toBeNull();

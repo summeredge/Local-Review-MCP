@@ -5,15 +5,17 @@ import {
 } from "../../src/control-plane/extension-identity.js";
 
 const validEvidence = {
-  request_id: "wfr_abc123",
+  request_id: "32ca0d45-8b29-414a-bbe4-8e26c3aae911",
   conversation_id: "11111111-2222-3333-4444-555555555555",
   document_id: "chrome-document-id",
   navigation_epoch: 0,
 };
+const wfrEvidence = { ...validEvidence, request_id: "wfr_01a014bdd7cd7a15b6b533d3ce2b42f2" };
 
 describe("ExtensionIdentityEvidence schema", () => {
   it("accepts the four required identity fields and rejects unknown fields", () => {
     expect(extensionIdentityEvidenceSchema.parse(validEvidence)).toEqual(validEvidence);
+    expect(extensionIdentityEvidenceSchema.parse(wfrEvidence)).toEqual(wfrEvidence);
     expect(parseExtensionIdentityEvidence({ ...validEvidence, extra: true })).toBeNull();
   });
 
