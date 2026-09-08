@@ -1,7 +1,8 @@
 # Reliable Extension Delivery
 
 Reliable Extension Delivery is an independent Local Control Plane transport. It does not replace
-the existing Playwright `BrowserDeliveryAdapter`, alter `ReviewDelivery`, or add an MCP tool.
+the existing Playwright `BrowserDeliveryAdapter` or add an MCP tool. The Control Plane
+`DispatchCommandBroker` composes it with `ReviewDelivery` through an injected adapter.
 
 The related identities have separate owners:
 
@@ -12,10 +13,15 @@ The related identities have separate owners:
 
 ## Durable command and lease
 
-`ExtensionDeliveryService.enqueue(conversationId, message)` stores a versioned command in
+`ExtensionDeliveryService.enqueue(conversationId, message, logicalDeliveryId?)` stores a versioned command in
 `<LocalReviewMCP state root>/control-plane/extension-deliveries.json`. Writes are serialized and
 use a mode-`0600` temporary file followed by atomic rename; the containing directory is mode
 `0700`. State is bounded to 1,000 commands and never enters `.task/`.
+
+When supplied, `logicalDeliveryId` is the stable `ReviewDelivery.delivery_id`. A repeated enqueue
+with the same logical ID and exact target/message returns the original durable command; a changed
+target or message is rejected. Keyed terminal commands are retained when the bounded queue evicts
+legacy unkeyed commands, so a logical delivery cannot be remapped to a second physical command.
 
 An open content document pulls work through `POST /delivery/claim`. The background worker binds
 the claim to its stable `client_id`, Chrome's authoritative `MessageSender.documentId`, the exact

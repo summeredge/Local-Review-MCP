@@ -9,9 +9,8 @@ import type {
   ReviewDeliveryRequest,
   ReviewDeliveryResult,
 } from "../delivery/review-delivery-adapter.js";
-import { ExtensionDeliveryAdapter } from "../delivery/extension-delivery-adapter.js";
-import { DispatchCommandBroker } from "../control-plane/dispatch-command-broker.js";
-import { ExtensionDeliveryService } from "../control-plane/extension-delivery.js";
+import { BrowserWorkerClient } from "../browser-worker-client/browser-worker-client.js";
+import { BrowserWorkerDeliveryAdapter } from "../delivery/browser-worker-delivery-adapter.js";
 
 export class BrowserRouter {
   private readonly routings: ConversationRoutingService;
@@ -19,8 +18,8 @@ export class BrowserRouter {
 
   public constructor(
     storageRoot: string = defaultTaskContextStorageRoot(),
-    private readonly adapter: ReviewDeliveryAdapter = new ExtensionDeliveryAdapter(
-      new DispatchCommandBroker(new ExtensionDeliveryService(storageRoot)),
+    private readonly adapter: ReviewDeliveryAdapter = new BrowserWorkerDeliveryAdapter(
+      new BrowserWorkerClient(),
     ),
     runtimeIdentity?: WorkspaceIdentity,
   ) {

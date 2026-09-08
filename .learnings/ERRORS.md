@@ -1,5 +1,38 @@
 # Errors
 
+## [ERR-20260908-004] Restarted receipt comparison used JSON property order
+
+**Priority**: medium
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+重启后 Zod 恢复会按 schema 顺序重建 receipt；使用 `JSON.stringify` 比较
+同一 ACK 会把字段顺序变化误判为冲突，阻断 lost-ACK replay。
+
+### 错误信息
+
+```text
+Error: conflicting delivery receipt
+```
+
+### 上下文
+
+- Dispatch Command Broker 的 lost-ACK 重启回归测试
+- 第一次 ACK 已持久化，重启后的相同 ACK 被拒绝
+
+### 建议修复
+
+对 durable receipt 比较稳定字段和值，不比较 JSON 属性顺序。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
 ## [ERR-20260905-002] Browser Worker profile path sandbox permission
 
 **Priority**: low

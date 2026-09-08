@@ -23,4 +23,5 @@
 {"ts":"2026-09-08T11:42:00+08:00","action":"add","type":"error","id":"ERR-20260908-002","summary":"superRefine 返回 ZodEffects 后不能再 pick；为独立输入声明最小 schema"}
 {"ts":"2026-09-08T11:56:18+08:00","action":"add","type":"error","id":"ERR-20260908-003","summary":"Windows 全套 Vitest 并发触发超时和 EBUSY；失败文件以单 worker 重跑全部通过"}
 {"ts":"2026-09-08T12:11:09+08:00","action":"add","type":"learning","id":"LRN-20260908-002","summary":"浏览器 Send 前持久化 submitting，receipt 后先写 ACK outbox；无法确认则 ambiguous 不重发"}
+{"ts":"2026-09-08T18:10:00+08:00","action":"add","type":"error","id":"ERR-20260908-004","summary":"Zod 重启恢复重排 receipt 字段；JSON.stringify 误判相同 ACK 冲突"}
 ```

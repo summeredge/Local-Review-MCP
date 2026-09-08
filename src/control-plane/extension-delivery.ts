@@ -190,7 +190,15 @@ function receiptFor(ack: ExtensionDeliveryAck, completedAt: number): ExtensionDe
 
 function sameReceipt(receipt: ExtensionDeliveryReceipt, ack: ExtensionDeliveryAck): boolean {
   const candidate = receiptFor(ack, receipt.completed_at);
-  return JSON.stringify(receipt) === JSON.stringify(candidate);
+  return receipt.delivery_id === candidate.delivery_id
+    && receipt.conversation_id === candidate.conversation_id
+    && receipt.client_id === candidate.client_id
+    && receipt.document_id === candidate.document_id
+    && receipt.navigation_epoch === candidate.navigation_epoch
+    && receipt.status === candidate.status
+    && receipt.message_id === candidate.message_id
+    && receipt.error === candidate.error
+    && receipt.completed_at === candidate.completed_at;
 }
 
 export class ExtensionDeliveryConflictError extends Error {}

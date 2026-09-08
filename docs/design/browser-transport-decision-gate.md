@@ -480,9 +480,9 @@ contracts. The existing documentation still calls for one real Edge validation
 of the Extension send/receipt and ACK-recovery path; that is an operational
 readiness gate, not a reason to weaken the architecture decision.
 
-## Next stage: Step 9 — Dispatch Command Broker
+## Step 9 — Dispatch Command Broker
 
-Step 9 should implement the smallest Control Plane composition that turns the
+Step 9 implements the smallest Control Plane composition that turns the
 selected direction into a Review Delivery-capable transport:
 
 1. Define the durable logical-Delivery-to-command identity and its terminal
@@ -496,5 +496,9 @@ selected direction into a Review Delivery-capable transport:
 5. Add focused tests for multiple Conversations, stale documents, lost ACKs,
    ambiguous sends, corrupt state, and repeated logical Delivery requests.
 
-Until those contracts are implemented and verified, the current Playwright
-`BrowserRouter` path remains the only wired Review Delivery path.
+The implementation is in `src/control-plane/dispatch-command-broker.ts` and
+`src/delivery/extension-delivery-adapter.ts`. The current Playwright
+`BrowserRouter` default remains available; an Extension-backed Router uses the
+injected adapter and the same `ExtensionDeliveryService` instance as the
+Bridge. Completion remains Worker-based and no automatic Hybrid fallback is
+introduced.

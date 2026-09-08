@@ -1,5 +1,7 @@
-import { ExtensionDeliveryService } from "./extension-delivery.js";
-import type { ExtensionDeliveryReceipt } from "./extension-delivery.js";
+import {
+  ExtensionDeliveryService,
+  type ExtensionDeliveryReceipt,
+} from "./extension-delivery.js";
 import type { ReviewDeliveryRequest } from "../delivery/review-delivery-adapter.js";
 import { buildReviewMessage } from "../delivery/review-message.js";
 

@@ -72,7 +72,7 @@ interface ReviewDelivery {
   review_request_id: string;
   routing_id: string;
   conversation_id: string;
-  status: "pending" | "delivering" | "delivered" | "failed";
+  status: "pending" | "delivering" | "delivered" | "failed" | "ambiguous";
   attempt_count: number;
   last_error?: { code?: string; message: string };
   created_at: string;
@@ -83,7 +83,7 @@ interface ReviewDelivery {
 
 The Zod schema is strict and also enforces lifecycle invariants: pending has
 no attempts, an active or terminal delivery has at least one attempt, failed
-has `last_error`, and delivered has `delivered_at`.
+or ambiguous has `last_error`, and delivered has `delivered_at`.
 
 The adapter boundary is intentionally small:
 
@@ -96,8 +96,8 @@ interface ReviewDeliveryAdapter {
 `ReviewDeliveryRequest` carries the delivery id plus
 `conversation_id`, `workspace_id`, `task_id`, `review_request_id`, and
 `routing_id`, plus the lightweight Review message built by the Delivery layer.
-`ReviewDeliveryResult` distinguishes confirmed submission from a failed result
-and marks the failure as retryable or non-retryable. The Router and adapter
+`ReviewDeliveryResult` distinguishes confirmed submission, ordinary failed
+delivery, and an uncertain `ambiguous` terminal result. The Router and adapter
 boundary are documented in `docs/review-delivery-adapter.md`.
 
 ## Lifecycle and retry semantics
@@ -110,13 +110,16 @@ delivering -----> delivered
    |
    v
 failed ---------> delivering
+   \
+    ambiguous
 ```
 
 `beginDeliveryAttempt()` is only valid from `pending` or `failed`; it changes
 the status to `delivering` and increments `attempt_count`. `markFailed()` is
-only valid from `delivering` and records the failure. A later begin starts the
-next attempt. `markDelivered()` is only valid from `delivering` and records the
-delivery timestamp.
+only valid from `delivering` and records the failure. `markAmbiguous()` is also
+only valid from `delivering`, but its result is terminal and cannot be retried.
+A later begin starts the next attempt only from `failed`. `markDelivered()` is
+only valid from `delivering` and records the delivery timestamp.
 
 `delivered` is terminal for this internal record. A delivered record cannot
 start another attempt and a repeated `createDelivery()` for its `routing_id`
@@ -127,7 +130,9 @@ Delivery success means only:
 > The Browser Worker confirmed that the Review message was accepted by the
 > target Conversation.
 
-It does **not** mean that ChatGPT has finished reviewing the request.
+It does **not** mean that ChatGPT has finished reviewing the request. An
+Extension receipt without proof that the message was not sent is recorded as
+`ambiguous`, never as a retryable `failed` result.
 
 ## Idempotency
 

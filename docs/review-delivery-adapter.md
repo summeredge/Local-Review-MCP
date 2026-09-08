@@ -6,6 +6,11 @@ Task23.5 connects a persisted Review Delivery to the independent Browser
 Worker and submits the Review message. Browser DOM interaction remains inside
 the Browser Worker Interaction Layer.
 
+Step 9 adds an Extension-backed implementation behind the same adapter seam:
+`ReviewDelivery -> DispatchCommandBroker -> ExtensionDeliveryService`. The
+existing Playwright adapter remains the default Router transport and the
+completion path remains Worker-based.
+
 ```text
 Codex
   |
@@ -52,6 +57,8 @@ The responsibilities stay separate:
 | Review Delivery Adapter | Abstracts delivery to an external target. |
 | Browser Router | Resolves routing and delivery, passes the routed request, and writes delivery state. |
 | Browser Worker Delivery Adapter | Builds the default Delivery message and maps confirmed `SUBMITTED` or typed Worker failures to Delivery state. |
+| Extension Delivery Adapter | Maps durable Extension receipts, including terminal `ambiguous`, to Review Delivery results. |
+| Dispatch Command Broker | Uses `ReviewDelivery.delivery_id` as the durable command idempotency key, enqueues through `ExtensionDeliveryService`, and awaits its receipt. |
 | Browser Worker Client | Sends `POST /conversation/deliver` to the configured Worker URL. |
 | Conversation Navigator | Runs inside Browser Worker, navigates to the Conversation URL, and returns the open Page to the Worker lifecycle. |
 | ChatGPT Interaction Layer | Locates the Composer, fills the Review message, clicks Send, and confirms submission. |
@@ -91,6 +98,10 @@ type ReviewDeliveryResult =
       status: "failed";
       retryable: boolean;
       error: { code?: string; message: string };
+    }
+  | {
+      status: "ambiguous";
+      error: { code?: string; message: string };
     };
 
 interface ReviewDeliveryAdapter {
@@ -123,7 +134,8 @@ It performs this sequence:
 5. For `pending` or `failed`, call `beginDeliveryAttempt()`.
 6. Call the injected adapter with the routed identity fields and the built
    lightweight Review message.
-7. Call `markDelivered()` or `markFailed()` on the existing service.
+7. Call `markDelivered()`, `markFailed()`, or `markAmbiguous()` on the existing
+   service.
 
 The Router never creates or rewrites `workspace_id`, `routing_id`, or
 `conversation_id`. It accepts a Conversation ID, never an arbitrary URL.
@@ -195,12 +207,15 @@ The Router reuses the existing Review Delivery lifecycle:
 ```text
 pending -> delivering -> delivered
                     \-> failed -> delivering
+                    \-> ambiguous (terminal; no resend)
 ```
 
 It never duplicates the state machine. Only a confirmed `SUBMITTED` adapter
-result writes `ReviewDelivery.status = "delivered"`; a typed Worker failure
-writes `ReviewDelivery.status = "failed"` and records the error. It does not
-update `ReviewRequest.status`, because submission is not Review completion.
+result or durable Extension `delivered` receipt writes
+`ReviewDelivery.status = "delivered"`; a typed failure writes
+`ReviewDelivery.status = "failed"`, and an uncertain Extension receipt writes
+`ReviewDelivery.status = "ambiguous"`. It does not update
+`ReviewRequest.status`, because submission is not Review completion.
 
 ```text
 Browser Worker returned SUBMITTED
@@ -222,8 +237,9 @@ response is not confirmed submission or completion.
 
 The existing `routing_id` association remains the logical Delivery key. A
 second Router call for a delivered record returns that record without calling
-the Adapter or Browser Worker. `conversation_id` is not used as an idempotency
-key.
+the Adapter or Browser Worker. The Extension-backed adapter additionally uses
+the exact `ReviewDelivery.delivery_id` as its durable command key;
+`conversation_id` is not used as an idempotency key.
 
 Every Router call validates the complete chain:
 

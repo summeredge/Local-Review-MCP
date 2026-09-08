@@ -1,6 +1,4 @@
-import {
-  DispatchCommandBroker,
-} from "../control-plane/dispatch-command-broker.js";
+import { DispatchCommandBroker } from "../control-plane/dispatch-command-broker.js";
 import {
   ExtensionDeliveryConflictError,
   ExtensionDeliveryNotFoundError,
