@@ -47,6 +47,7 @@ export const executionIdSchema = z.string()
   .refine((value) => !isReservedWindowsName(value), "execution_id is a reserved filename");
 
 export const executionStatusSchema = z.enum(EXECUTION_STATUSES);
+const executionProcessIdSchema = z.number().int().positive();
 const executionCommandSchema = z.string().min(1).max(1000);
 const executionSummarySchema = z.string().min(1).max(4000);
 
@@ -55,6 +56,7 @@ export const executionContextSchema = z.object({
   task_id: taskIdSchema,
   workspace_id: workspaceIdSchema,
   status: executionStatusSchema,
+  process_id: executionProcessIdSchema.optional(),
   command: executionCommandSchema.optional(),
   started_at: timestampSchema,
   finished_at: timestampSchema.optional(),
@@ -66,12 +68,14 @@ export const createExecutionContextInputSchema = z.object({
   task_id: taskIdSchema,
   workspace_id: workspaceIdSchema,
   status: executionStatusSchema.default("running"),
+  process_id: executionProcessIdSchema.optional(),
   command: executionCommandSchema.optional(),
   summary: executionSummarySchema.optional(),
 }).strict();
 
 export const updateExecutionContextInputSchema = z.object({
   status: executionStatusSchema.optional(),
+  process_id: executionProcessIdSchema.optional(),
   command: executionCommandSchema.optional(),
   summary: executionSummarySchema.optional(),
 }).strict();

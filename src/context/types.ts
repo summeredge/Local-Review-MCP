@@ -42,6 +42,7 @@ export interface ExecutionContext {
   readonly task_id: string;
   readonly workspace_id: string;
   readonly status: ExecutionStatus;
+  readonly process_id?: number;
   readonly command?: string;
   readonly started_at: string;
   readonly finished_at?: string;
@@ -53,12 +54,14 @@ export interface CreateExecutionContextInput {
   readonly task_id: string;
   readonly workspace_id: string;
   readonly status?: ExecutionStatus;
+  readonly process_id?: number;
   readonly command?: string;
   readonly summary?: string;
 }
 
 export interface UpdateExecutionContextInput {
   readonly status?: ExecutionStatus;
+  readonly process_id?: number;
   readonly command?: string;
   readonly summary?: string;
 }

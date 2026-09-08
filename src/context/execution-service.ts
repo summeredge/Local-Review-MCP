@@ -42,6 +42,7 @@ export class ExecutionContextService {
       task_id: parsed.task_id,
       workspace_id: parsed.workspace_id,
       status: parsed.status,
+      ...(parsed.process_id === undefined ? {} : { process_id: parsed.process_id }),
       ...(parsed.command === undefined ? {} : { command: parsed.command }),
       started_at: timestamp,
       ...(parsed.summary === undefined ? {} : { summary: parsed.summary }),
@@ -111,6 +112,7 @@ export class ExecutionContextService {
     const next = executionContextSchema.parse({
       ...current,
       ...(parsed.status === undefined ? {} : { status: parsed.status }),
+      ...(parsed.process_id === undefined ? {} : { process_id: parsed.process_id }),
       ...(parsed.command === undefined ? {} : { command: parsed.command }),
       ...(parsed.summary === undefined ? {} : { summary: parsed.summary }),
       ...(parsed.status !== undefined && parsed.status !== "running"
