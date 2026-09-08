@@ -9,8 +9,9 @@ import type {
   ReviewDeliveryRequest,
   ReviewDeliveryResult,
 } from "../delivery/review-delivery-adapter.js";
-import { BrowserWorkerClient } from "../browser-worker-client/browser-worker-client.js";
-import { BrowserWorkerDeliveryAdapter } from "../delivery/browser-worker-delivery-adapter.js";
+import { ExtensionDeliveryAdapter } from "../delivery/extension-delivery-adapter.js";
+import { DispatchCommandBroker } from "../control-plane/dispatch-command-broker.js";
+import { ExtensionDeliveryService } from "../control-plane/extension-delivery.js";
 
 export class BrowserRouter {
   private readonly routings: ConversationRoutingService;
@@ -18,8 +19,8 @@ export class BrowserRouter {
 
   public constructor(
     storageRoot: string = defaultTaskContextStorageRoot(),
-    private readonly adapter: ReviewDeliveryAdapter = new BrowserWorkerDeliveryAdapter(
-      new BrowserWorkerClient(),
+    private readonly adapter: ReviewDeliveryAdapter = new ExtensionDeliveryAdapter(
+      new DispatchCommandBroker(new ExtensionDeliveryService(storageRoot)),
     ),
     runtimeIdentity?: WorkspaceIdentity,
   ) {
@@ -69,6 +70,9 @@ export class BrowserRouter {
         attempt.delivery_id,
         result.delivered_at,
       );
+    }
+    if (result.status === "ambiguous") {
+      return this.deliveries.markAmbiguous(workspaceId, attempt.delivery_id, result.error);
     }
     return this.deliveries.markFailed(workspaceId, attempt.delivery_id, result.error);
   }

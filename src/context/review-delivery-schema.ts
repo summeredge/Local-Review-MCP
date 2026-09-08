@@ -17,6 +17,7 @@ export const reviewDeliveryStatusSchema = z.enum([
   "delivering",
   "delivered",
   "failed",
+  "ambiguous",
 ]);
 
 export const reviewDeliveryTimestampSchema = z.string().datetime({ offset: true });
@@ -54,18 +55,18 @@ export const reviewDeliverySchema = z.object({
       message: "active deliveries must have at least one delivery attempt",
     });
   }
-  if (delivery.status === "failed" && delivery.last_error === undefined) {
+  if ((delivery.status === "failed" || delivery.status === "ambiguous") && delivery.last_error === undefined) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["last_error"],
-      message: "failed deliveries must record the last error",
+      message: "failed or ambiguous deliveries must record the last error",
     });
   }
-  if (delivery.status !== "failed" && delivery.last_error !== undefined) {
+  if (delivery.status !== "failed" && delivery.status !== "ambiguous" && delivery.last_error !== undefined) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["last_error"],
-      message: "only failed deliveries may record the last error",
+      message: "only failed or ambiguous deliveries may record the last error",
     });
   }
   if (delivery.status === "delivered" && delivery.delivered_at === undefined) {

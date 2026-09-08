@@ -20,6 +20,10 @@ export type ReviewDeliveryResult =
     readonly status: "failed";
     readonly retryable: boolean;
     readonly error: ReviewDeliveryError;
+  }
+  | {
+    readonly status: "ambiguous";
+    readonly error: ReviewDeliveryError;
   };
 
 export interface ReviewDeliveryAdapter {

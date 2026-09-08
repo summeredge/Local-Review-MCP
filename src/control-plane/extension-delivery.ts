@@ -13,6 +13,7 @@ const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const enqueueSchema = z.object({
   conversation_id: z.string().min(1).max(256).regex(CONVERSATION_ID),
   message: z.string().min(1).max(48 * 1024),
+  logical_delivery_id: z.string().min(1).max(128).optional(),
 }).strict();
 
 const ownerSchema = z.object({
@@ -63,6 +64,7 @@ export interface ExtensionDeliveryReceipt extends ExtensionDeliveryClaim {
 
 export interface ExtensionDelivery {
   readonly delivery_id: string;
+  readonly logical_delivery_id?: string;
   readonly conversation_id: string;
   readonly message: string;
   readonly created_at: number;
@@ -105,6 +107,7 @@ const receiptSchema = z.discriminatedUnion("status", [
 
 const deliverySchema = z.object({
   delivery_id: z.string().uuid(),
+  logical_delivery_id: z.string().min(1).max(128).optional(),
   conversation_id: z.string().min(1).max(256).regex(CONVERSATION_ID),
   message: z.string().min(1).max(48 * 1024),
   created_at: z.number().int().nonnegative().refine(Number.isSafeInteger),
@@ -134,6 +137,7 @@ const stateSchema = z.object({
   deliveries: z.array(deliverySchema).max(MAX_DELIVERIES),
 }).strict().superRefine((value, context) => {
   const ids = new Set<string>();
+  const logicalIds = new Set<string>();
   value.deliveries.forEach((delivery, index) => {
     if (ids.has(delivery.delivery_id)) {
       context.addIssue({
@@ -143,6 +147,16 @@ const stateSchema = z.object({
       });
     }
     ids.add(delivery.delivery_id);
+    if (delivery.logical_delivery_id !== undefined) {
+      if (logicalIds.has(delivery.logical_delivery_id)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["deliveries", index, "logical_delivery_id"],
+          message: "logical delivery id is duplicated",
+        });
+      }
+      logicalIds.add(delivery.logical_delivery_id);
+    }
   });
 });
 
@@ -213,16 +227,32 @@ export class ExtensionDeliveryService {
     return this.restorePromise;
   }
 
-  public async enqueue(conversationId: string, message: string): Promise<ExtensionDelivery> {
+  public async enqueue(
+    conversationId: string,
+    message: string,
+    logicalDeliveryId?: string,
+  ): Promise<ExtensionDelivery> {
     await this.restore();
     const parsed = enqueueSchema.parse({
       conversation_id: conversationId,
       message,
+      ...(logicalDeliveryId === undefined ? {} : { logical_delivery_id: logicalDeliveryId }),
     });
     return this.exclusive(async () => {
       const next = new Map(this.deliveries);
+      if (parsed.logical_delivery_id !== undefined) {
+        const existing = [...next.values()].find((delivery) =>
+          delivery.logical_delivery_id === parsed.logical_delivery_id);
+        if (existing !== undefined) {
+          if (existing.conversation_id !== parsed.conversation_id || existing.message !== parsed.message) {
+            throw new ExtensionDeliveryConflictError("logical delivery command already targets different content");
+          }
+          return clone(existing);
+        }
+      }
       while (next.size >= MAX_DELIVERIES) {
-        const terminal = [...next.values()].find((delivery) => delivery.receipt !== undefined);
+        const terminal = [...next.values()].find((delivery) =>
+          delivery.receipt !== undefined && delivery.logical_delivery_id === undefined);
         if (!terminal) throw new Error("extension delivery queue is full");
         next.delete(terminal.delivery_id);
       }

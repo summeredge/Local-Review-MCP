@@ -196,17 +196,34 @@ export class ReviewDeliveryService {
     deliveryId: string,
     error: ReviewDeliveryError,
   ): Promise<ReviewDelivery> {
+    return this.markTerminal(workspaceId, deliveryId, "failed", error);
+  }
+
+  public async markAmbiguous(
+    workspaceId: string,
+    deliveryId: string,
+    error: ReviewDeliveryError,
+  ): Promise<ReviewDelivery> {
+    return this.markTerminal(workspaceId, deliveryId, "ambiguous", error);
+  }
+
+  private async markTerminal(
+    workspaceId: string,
+    deliveryId: string,
+    status: "failed" | "ambiguous",
+    error: ReviewDeliveryError,
+  ): Promise<ReviewDelivery> {
     const current = await this.requiredDelivery(workspaceId, deliveryId);
     await this.validateDelivery(current, this.runtimeIdentity);
     if (current.status !== "delivering") {
-      throw new Error(`Review delivery cannot be marked failed from status "${current.status}".`);
+      throw new Error(`Review delivery cannot be marked ${status} from status "${current.status}".`);
     }
 
     const parsedError = markReviewDeliveryFailedInputSchema.parse(error);
     const { last_error: _previousError, delivered_at: _deliveredAt, ...base } = current;
     const next = reviewDeliverySchema.parse({
       ...base,
-      status: "failed",
+      status,
       last_error: parsedError,
       updated_at: new Date().toISOString(),
     });
