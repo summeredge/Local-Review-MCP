@@ -6,6 +6,8 @@ import {
   ExtensionDeliveryConflictError,
   ExtensionDeliveryService,
   ExtensionDeliveryUnavailableError,
+  type ExtensionDelivery,
+  type ExtensionDeliveryReceipt,
 } from "../../src/control-plane/extension-delivery.js";
 
 const roots: string[] = [];
@@ -16,6 +18,33 @@ const owner = {
   document_id: "document-one",
   navigation_epoch: 2,
 };
+
+type ExtensionDeliveryWaiter = (receipt: ExtensionDeliveryReceipt) => void;
+type ExtensionDeliveryInternals = {
+  waiters: Map<string, Set<ExtensionDeliveryWaiter>>;
+  persist(deliveries: Map<string, ExtensionDelivery>): Promise<void>;
+};
+
+class WaiterRegistrationProbe extends Map<string, Set<ExtensionDeliveryWaiter>> {
+  public registered = false;
+
+  public constructor(
+    private readonly target: string,
+    private readonly onRegistration: () => void,
+    source: Map<string, Set<ExtensionDeliveryWaiter>>,
+  ) {
+    super(source);
+  }
+
+  public override set(key: string, value: Set<ExtensionDeliveryWaiter>): this {
+    const result = super.set(key, value);
+    if (key === this.target) {
+      this.registered = true;
+      this.onRegistration();
+    }
+    return result;
+  }
+}
 
 async function service(): Promise<{ root: string; deliveries: ExtensionDeliveryService }> {
   const root = await mkdtemp(join(tmpdir(), "lrm-extension-delivery-"));
@@ -116,42 +145,92 @@ describe("ExtensionDeliveryService", () => {
     await expect(deliveries.claim(owner)).resolves.toBeNull();
   });
 
-  it("does not miss a receipt committed between the initial check and waiter registration", async () => {
+  it("returns a receipt when acknowledge reaches persistence before awaitResult registration", async () => {
     const { deliveries } = await service();
-    const queued = await deliveries.enqueue(conversation, "race-proof");
+    const queued = await deliveries.enqueue(conversation, "race-proof-ack-first");
     await deliveries.claim(owner);
     const ack = {
       ...owner,
       delivery_id: queued.delivery_id,
       status: "sent" as const,
-      message_id: "message-race",
+      message_id: "message-ack-first",
     };
-    const originalGet = deliveries.get.bind(deliveries);
-    let releaseGet!: () => void;
-    let checked!: () => void;
-    const getGate = new Promise<void>((resolve) => { releaseGet = resolve; });
-    const getChecked = new Promise<void>((resolve) => { checked = resolve; });
-    const getSpy = vi.spyOn(deliveries, "get").mockImplementation(async (deliveryId) => {
-      const result = await originalGet(deliveryId);
-      checked();
-      await getGate;
-      return result;
+    const internal = deliveries as unknown as ExtensionDeliveryInternals;
+    const probe = new WaiterRegistrationProbe(queued.delivery_id, () => undefined, internal.waiters);
+    internal.waiters = probe;
+    let releasePersist!: () => void;
+    let persistStarted!: () => void;
+    const persistGate = new Promise<void>((resolve) => { releasePersist = resolve; });
+    const persistEntered = new Promise<void>((resolve) => { persistStarted = resolve; });
+    const originalPersist = internal.persist.bind(deliveries);
+    const persistSpy = vi.spyOn(internal, "persist").mockImplementation(async (snapshot) => {
+      persistStarted();
+      await persistGate;
+      await originalPersist(snapshot);
     });
 
     try {
-      const pending = deliveries.awaitResult(queued.delivery_id, 250);
-      await Promise.race([getChecked, new Promise<void>((resolve) => setTimeout(resolve, 25))]);
-      await deliveries.acknowledge(ack);
-      releaseGet();
+      const acknowledged = deliveries.acknowledge(ack);
+      await persistEntered;
+      const pending = deliveries.awaitResult(queued.delivery_id, 1_000);
+      releasePersist();
+
+      await expect(acknowledged).resolves.toMatchObject({
+        accepted: "new",
+        receipt: {
+          delivery_id: queued.delivery_id,
+          status: "delivered",
+          message_id: "message-ack-first",
+        },
+      });
       await expect(pending).resolves.toMatchObject({
         delivery_id: queued.delivery_id,
         status: "delivered",
-        message_id: "message-race",
+        message_id: "message-ack-first",
       });
+      expect(probe.registered).toBe(false);
     } finally {
-      releaseGet();
-      getSpy.mockRestore();
+      releasePersist();
+      persistSpy.mockRestore();
     }
+  });
+
+  it("wakes a waiter when awaitResult registration reaches the queue before acknowledge", async () => {
+    const { deliveries } = await service();
+    const queued = await deliveries.enqueue(conversation, "race-proof-waiter-first");
+    await deliveries.claim(owner);
+    const ack = {
+      ...owner,
+      delivery_id: queued.delivery_id,
+      status: "sent" as const,
+      message_id: "message-waiter-first",
+    };
+    let registrationReached!: () => void;
+    const registration = new Promise<void>((resolve) => { registrationReached = resolve; });
+    const internal = deliveries as unknown as ExtensionDeliveryInternals;
+    internal.waiters = new WaiterRegistrationProbe(
+      queued.delivery_id,
+      registrationReached,
+      internal.waiters,
+    );
+
+    const pending = deliveries.awaitResult(queued.delivery_id, 1_000);
+    await registration;
+    const acknowledged = deliveries.acknowledge(ack);
+
+    await expect(acknowledged).resolves.toMatchObject({
+      accepted: "new",
+      receipt: {
+        delivery_id: queued.delivery_id,
+        status: "delivered",
+        message_id: "message-waiter-first",
+      },
+    });
+    await expect(pending).resolves.toMatchObject({
+      delivery_id: queued.delivery_id,
+      status: "delivered",
+      message_id: "message-waiter-first",
+    });
   });
 
   it("returns null after a real timeout when no receipt exists", async () => {
