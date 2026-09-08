@@ -4,6 +4,7 @@ import { endpoint, localOrigin, type ResolvedSettings } from "./config/settings.
 import { isPortInUse, startHttpServer, type HttpServerOptions } from "./mcp/http.js";
 import { REGISTERED_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
 import { startBridge, stopBridge } from "./control-plane/bridge.js";
+import { ConversationCorrelationRegistry } from "./control-plane/conversation-correlation.js";
 import type { ExtensionIdentityEvidence } from "./control-plane/extension-identity.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { validateWorkspaceIdentityConsistency } from "./workspace/identity.js";
@@ -13,6 +14,7 @@ import { WorkspaceRegistry } from "./workspace/registry.js";
 export interface AppContext extends McpRuntimeContext {
   readonly settings: ResolvedSettings;
   readonly tunnel: TunnelManager;
+  readonly correlations: ConversationCorrelationRegistry;
 }
 
 export interface AppStartOptions extends HttpServerOptions {
@@ -45,6 +47,7 @@ export function createAppContext(
   }
   return {
     settings,
+    correlations: new ConversationCorrelationRegistry(),
     tunnel: createTunnelManager(settings.remote, {
       localEndpoint: localOrigin(settings),
       authToken: settings.auth.token,
@@ -63,9 +66,13 @@ export async function startApp(
   try {
     const server = await startHttpServer(settings, context, options);
     try {
+      await context.correlations.restore();
       const bridgePort = await startBridge({
         ports: options.bridgePorts,
-        onIdentityEvidence: options.onIdentityEvidence,
+        onIdentityEvidence: async (evidence) => {
+          await context.correlations.observe(evidence);
+          await options.onIdentityEvidence?.(evidence);
+        },
       });
       if (bridgePort === null) {
         console.warn("Local Control Bridge unavailable; local MCP remains available");

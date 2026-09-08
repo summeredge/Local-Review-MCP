@@ -18,4 +18,5 @@
 {"ts":"2026-09-07T18:41:00+08:00","action":"add","type":"error","id":"ERR-20260907-002","summary":"Windows PowerShell 下 rg 路径 glob 不展开；改用 rg -g '*.js' 目录过滤"}
 {"ts":"2026-09-07T18:45:00+08:00","action":"add","type":"learning","id":"LRN-20260907-002","summary":"真实 ChatGPT Fiber 需沿 bounded return 链读取 turn.messages，conversation.id 位于同级 props；identity 冲突时 fail closed"}
 {"ts":"2026-09-07T18:47:00+08:00","action":"add","type":"error","id":"ERR-20260907-003","summary":"computer-use 参考文档路径不存在；读取 skill 资源前应先确认目录结构"}
+{"ts":"2026-09-08T09:49:00+08:00","action":"add","type":"learning","id":"LRN-20260908-001","summary":"exact waiter 测试需在目标 evidence 前断言 unrelated evidence 未唤醒，避免最终 lookup 掩盖假阳性"}
 ```

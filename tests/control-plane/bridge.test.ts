@@ -1,6 +1,9 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { startApp } from "../../src/app.js";
+import { createAppContext, startApp } from "../../src/app.js";
 import type { ResolvedSettings } from "../../src/config/settings.js";
 import {
   bridgePort,
@@ -8,6 +11,7 @@ import {
   startBridge,
   stopBridge,
 } from "../../src/control-plane/bridge.js";
+import { ConversationCorrelationRegistry } from "../../src/control-plane/conversation-correlation.js";
 import {
   LOCAL_CONTROL_BRIDGE_HOST,
   LOCAL_CONTROL_BRIDGE_PORTS,
@@ -289,6 +293,49 @@ describe("Local Control Bridge app lifecycle", () => {
     } finally {
       warning.mockRestore();
       await close(occupied);
+    }
+  });
+
+  it("routes accepted identity evidence into the production correlation registry", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-app-correlation-"));
+    await mkdir(join(root, "control-plane"), { recursive: true });
+    await writeFile(join(root, "control-plane", "request-correlations.json"), "{broken", "utf8");
+    const runtime = createAppContext(settings());
+    const context = {
+      ...runtime,
+      correlations: new ConversationCorrelationRegistry(root),
+    };
+    const observer = vi.fn();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let server: Server | null = null;
+    try {
+      server = await startApp(settings(), context, {
+        bridgePorts: [0],
+        onIdentityEvidence: observer,
+      });
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+      const evidence = {
+        request_id: "wfr_app_integration",
+        conversation_id: "conversation-app",
+        document_id: "document-app",
+        navigation_epoch: 3,
+      };
+
+      expect(await request("/identity-evidence", { method: "POST", token, body: evidence })).toEqual({
+        status: 202,
+        body: { accepted: true },
+      });
+      expect(context.correlations.correlation(evidence.request_id)?.conversation_id).toBe(
+        evidence.conversation_id,
+      );
+      expect(observer).toHaveBeenCalledWith(evidence);
+      expect(warning).toHaveBeenCalledWith(
+        "Conversation correlation state could not be restored; starting without restored proof",
+      );
+    } finally {
+      if (server !== null) await close(server);
+      await rm(root, { recursive: true, force: true });
     }
   });
 });

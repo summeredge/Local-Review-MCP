@@ -145,3 +145,27 @@ preflight，而当前 `/hello` 不处理 `OPTIONS`，导致真实扩展无法完
 - See Also: none
 
 ---
+
+## [LRN-20260908-001] Exact waiter tests must prove unrelated evidence does not resolve
+
+**Priority**: medium
+**Status**: resolved
+**Area**: infra
+
+### 内容
+
+测试 request-scoped late-evidence waiter 时，如果依次发送 R2、R1 后才断言 R1 的最终
+结果，即使 R2 错误地唤醒了 R1，随后写入的 R1 owner 也可能让最终 lookup 看起来正确，
+形成假阳性。
+
+### 建议修复
+
+在发送目标 R1 evidence 前，用 `Promise.race` 明确断言 R2 evidence 后 R1 waiter 仍为
+pending；再发送 R1 并断言返回 exact owner。
+
+### 元数据
+
+- Source: task_review
+- See Also: none
+
+---

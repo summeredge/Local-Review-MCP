@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { startApp, type AppContext } from "../../src/app.js";
+import { ConversationCorrelationRegistry } from "../../src/control-plane/conversation-correlation.js";
 import type { ResolvedSettings } from "../../src/config/settings.js";
 import { TunnelManager } from "../../src/tunnel/manager.js";
 import type { TunnelProvider, TunnelStatus } from "../../src/tunnel/types.js";
@@ -76,6 +77,7 @@ async function startRemoteServer(
     tunnel: new TunnelManager(provider, true),
     workspace: workspaceManager,
     registry: WorkspaceRegistry.fromManager(workspaceManager),
+    correlations: new ConversationCorrelationRegistry(workspace),
   };
   const server = await startApp(settings, context);
   runningServers.push(server);
