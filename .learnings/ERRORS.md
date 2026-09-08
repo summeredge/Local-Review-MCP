@@ -1,5 +1,38 @@
 # Errors
 
+## [ERR-20260908-005] 异步 execution context 直接覆盖造成截断 JSON
+
+**Priority**: medium
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+Completion close 回调更新 `ExecutionContext` 时，直接覆盖现有 JSON 文件会让并发读取短暂看到不完整内容。
+
+### 错误信息
+
+```text
+Error: Execution context "execution-close" is invalid.
+Caused by: SyntaxError: Unexpected end of JSON input
+```
+
+### 上下文
+
+- Codex execution completion close 集成测试
+- completion service 异步写入 terminal `ExecutionContext`
+
+### 建议修复
+
+更新 durable execution context 时先写同目录临时文件，再使用原子 `rename` 替换目标文件。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
 ## [ERR-20260908-004] Restarted receipt comparison used JSON property order
 
 **Priority**: medium

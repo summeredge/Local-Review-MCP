@@ -49,7 +49,8 @@ export const executionIdSchema = z.string()
 export const executionStatusSchema = z.enum(EXECUTION_STATUSES);
 const executionProcessIdSchema = z.number().int().positive();
 const executionCommandSchema = z.string().min(1).max(1000);
-const executionSummarySchema = z.string().min(1).max(4000);
+export const EXECUTION_SUMMARY_MAX_LENGTH = 4000;
+const executionSummarySchema = z.string().min(1).max(EXECUTION_SUMMARY_MAX_LENGTH);
 
 export const executionContextSchema = z.object({
   execution_id: executionIdSchema,

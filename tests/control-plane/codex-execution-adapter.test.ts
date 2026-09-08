@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CodexExecutionAdapter,
   codexExecutionLogPaths,
@@ -273,6 +273,56 @@ describe("CodexExecutionAdapter", () => {
     await expect(readFile(paths.stderr, "utf8")).resolves.toContain("warning");
     expect(paths.stdout.startsWith(fixture.workspaceRoot)).toBe(false);
     expect(paths.stderr.startsWith(fixture.workspaceRoot)).toBe(false);
+  });
+
+  it("records process exit after stream flush and reconciles completion asynchronously", async () => {
+    const fixture = await makeFixture();
+    const process = new FakeProcess(4106);
+    const adapter = new CodexExecutionAdapter(fixture.registry, {
+      storageRoot: fixture.storageRoot,
+      codexExecutable: "codex",
+      processRunner: runnerFor(process, []),
+    });
+
+    await adapter.start({
+      workspace_id: "workspace-a",
+      task_id: "task-001",
+      execution_id: "execution-close",
+      instruction: "complete asynchronously",
+    });
+    process.stdout.end(`${JSON.stringify({
+      type: "item.completed",
+      item: { id: "msg-1", type: "agent_message", text: "done" },
+    })}\n{"type":"turn.completed"}\n`);
+    process.stderr.end();
+    process.emit("close", 0, null);
+
+    await vi.waitFor(async () => {
+      const completed = await new ExecutionContextService(fixture.storageRoot).getExecutionContext(
+        "workspace-a",
+        "task-001",
+        "execution-close",
+      );
+      expect(completed).toMatchObject({ status: "passed", summary: "done", process_id: 4106 });
+    }, { timeout: 5000 });
+
+    const completed = await new ExecutionContextService(fixture.storageRoot).getExecutionContext(
+      "workspace-a",
+      "task-001",
+      "execution-close",
+    );
+    expect(completed).toMatchObject({ status: "passed", summary: "done", process_id: 4106 });
+    const paths = codexExecutionLogPaths(
+      fixture.storageRoot,
+      "workspace-a",
+      "task-001",
+      "execution-close",
+    );
+    expect(JSON.parse(await readFile(paths.exit, "utf8"))).toMatchObject({
+      process_id: 4106,
+      exit_code: 0,
+      signal: null,
+    });
   });
 
   it("scopes logs by workspace and task even when execution ids repeat", async () => {

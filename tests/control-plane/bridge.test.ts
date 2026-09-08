@@ -12,6 +12,7 @@ import {
   stopBridge,
 } from "../../src/control-plane/bridge.js";
 import { ConversationCorrelationRegistry } from "../../src/control-plane/conversation-correlation.js";
+import { CodexExecutionCompletionService } from "../../src/control-plane/codex-execution-completion.js";
 import { ExtensionDeliveryService } from "../../src/control-plane/extension-delivery.js";
 import {
   LOCAL_CONTROL_BRIDGE_HOST,
@@ -351,6 +352,26 @@ describe("Local Control Bridge app lifecycle", () => {
     } finally {
       warning.mockRestore();
       await close(occupied);
+    }
+  });
+
+  it("keeps MCP available when Codex completion recovery fails", async () => {
+    await stopBridge();
+    const completion = new CodexExecutionCompletionService();
+    vi.spyOn(completion, "recoverRunningExecutions").mockRejectedValue(new Error("corrupt"));
+    const runtime = createAppContext(settings());
+    const context = { ...runtime, codexExecutionCompletion: completion };
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let server: Server | null = null;
+    try {
+      server = await startApp(settings(), context, { bridgePorts: [0] });
+      expect(server.listening).toBe(true);
+      expect(warning).toHaveBeenCalledWith(
+        "Codex execution completion recovery failed; local MCP remains available",
+      );
+    } finally {
+      warning.mockRestore();
+      if (server !== null) await close(server);
     }
   });
 

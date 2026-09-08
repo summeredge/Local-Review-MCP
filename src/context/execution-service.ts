@@ -1,5 +1,6 @@
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { createExecutionId, executionFile, taskExecutionsDirectory } from "./execution.js";
 import {
   createExecutionContextInputSchema,
@@ -20,6 +21,17 @@ function errorCode(error: unknown): string | undefined {
 
 function json(context: ExecutionContext): string {
   return `${JSON.stringify(context, null, 2)}\n`;
+}
+
+async function writeExecutionContext(file: string, context: ExecutionContext): Promise<void> {
+  const temporary = join(dirname(file), `.execution-${process.pid}-${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporary, json(context), { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, file);
+    await chmod(file, 0o600).catch(() => undefined);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
 }
 
 export class ExecutionContextService {
@@ -120,10 +132,10 @@ export class ExecutionContextService {
         : {}),
     });
     try {
-      await writeFile(executionFile(this.storageRoot, workspaceId, taskId, executionId), json(next), {
-        encoding: "utf8",
-        mode: 0o600,
-      });
+      await writeExecutionContext(
+        executionFile(this.storageRoot, workspaceId, taskId, executionId),
+        next,
+      );
     } catch (error: unknown) {
       throw new Error("Execution context could not be saved.", { cause: error });
     }

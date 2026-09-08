@@ -9,6 +9,7 @@ import {
   ExtensionDeliveryService,
   ExtensionDeliveryUnavailableError,
 } from "./control-plane/extension-delivery.js";
+import { CodexExecutionCompletionService } from "./control-plane/codex-execution-completion.js";
 import type { ExtensionIdentityEvidence } from "./control-plane/extension-identity.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { validateWorkspaceIdentityConsistency } from "./workspace/identity.js";
@@ -20,6 +21,7 @@ export interface AppContext extends McpRuntimeContext {
   readonly tunnel: TunnelManager;
   readonly correlations: ConversationCorrelationRegistry;
   readonly extensionDeliveries: ExtensionDeliveryService;
+  readonly codexExecutionCompletion?: CodexExecutionCompletionService;
 }
 
 export interface AppStartOptions extends HttpServerOptions {
@@ -54,6 +56,7 @@ export function createAppContext(
     settings,
     correlations: new ConversationCorrelationRegistry(),
     extensionDeliveries: new ExtensionDeliveryService(),
+    codexExecutionCompletion: new CodexExecutionCompletionService(),
     tunnel: createTunnelManager(settings.remote, {
       localEndpoint: localOrigin(settings),
       authToken: settings.auth.token,
@@ -74,6 +77,12 @@ export async function startApp(
     try {
       const extensionDeliveries = context.extensionDeliveries;
       await context.correlations.restore();
+      try {
+        await (context.codexExecutionCompletion ?? new CodexExecutionCompletionService())
+          .recoverRunningExecutions();
+      } catch {
+        console.warn("Codex execution completion recovery failed; local MCP remains available");
+      }
       let deliveryAvailable = true;
       try {
         await extensionDeliveries.restore();

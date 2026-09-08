@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
 import { chmod, mkdir } from "node:fs/promises";
 import { createWriteStream, readdirSync, statSync, type WriteStream } from "node:fs";
-import { dirname, join, resolve, win32 as win32Path } from "node:path";
+import { dirname, resolve, win32 as win32Path } from "node:path";
 import type { Readable, Writable } from "node:stream";
+import { finished } from "node:stream/promises";
 import { z } from "zod";
 import { ExecutionContextService } from "../context/execution-service.js";
 import {
@@ -14,10 +15,20 @@ import { defaultTaskContextStorageRoot } from "../context/task.js";
 import { TaskContextService } from "../context/service.js";
 import type { ExecutionContext } from "../context/types.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
+import {
+  CodexExecutionCompletionService,
+  codexExecutionLogPaths,
+} from "./codex-execution-completion.js";
+import type { CodexExecutionLogPaths } from "./codex-execution-completion.js";
+
+export {
+  CODEX_EXECUTIONS_DIRECTORY,
+  codexExecutionLogPaths,
+} from "./codex-execution-completion.js";
+export type { CodexExecutionLogPaths } from "./codex-execution-completion.js";
 
 const CODEX_ARGS = ["exec", "--json", "-"] as const;
 const CODEX_COMMAND = "codex exec --json -";
-export const CODEX_EXECUTIONS_DIRECTORY = join("control-plane", "codex-executions");
 
 export interface CodexExecutionStartRequest {
   readonly workspace_id: string;
@@ -31,11 +42,6 @@ export interface CodexExecutionStartResult {
   readonly process_id: number;
   readonly started_at: string;
   readonly accepted: "new" | "existing";
-}
-
-export interface CodexExecutionLogPaths {
-  readonly stdout: string;
-  readonly stderr: string;
 }
 
 export interface CodexProcess {
@@ -66,6 +72,7 @@ export interface CodexExecutionAdapterOptions {
   readonly processRunner?: CodexProcessRunner;
   readonly codexExecutable?: string;
   readonly environment?: NodeJS.ProcessEnv;
+  readonly completionService?: CodexExecutionCompletionService;
 }
 
 export interface CodexExecutableResolutionOptions {
@@ -148,27 +155,6 @@ export function resolveCodexExecutable(
   return resolved;
 }
 
-export function codexExecutionLogPaths(
-  storageRoot: string,
-  workspaceId: string,
-  taskId: string,
-  executionId: string,
-): CodexExecutionLogPaths {
-  const safeWorkspaceId = workspaceIdSchema.parse(workspaceId);
-  const safeTaskId = taskIdSchema.parse(taskId);
-  const safeExecutionId = executionIdSchema.parse(executionId);
-  const directory = join(
-    resolve(storageRoot),
-    CODEX_EXECUTIONS_DIRECTORY,
-    safeWorkspaceId,
-    safeTaskId,
-  );
-  return {
-    stdout: join(directory, `${safeExecutionId}.jsonl`),
-    stderr: join(directory, `${safeExecutionId}.stderr.log`),
-  };
-}
-
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message !== "") return error.message;
   if (typeof error === "string" && error !== "") return error;
@@ -221,6 +207,21 @@ function attachLog(stream: Readable | null, log: WriteStream): void {
   stream.pipe(log);
 }
 
+function waitForClose(child: CodexProcess): Promise<{
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+}> {
+  return new Promise((resolveClose) => {
+    child.once("close", (code, signal) => resolveClose({ code, signal }));
+  });
+}
+
+async function flushLog(log: WriteStream): Promise<void> {
+  if (!log.writableEnded) log.end();
+  if (log.writableFinished || log.destroyed) return;
+  await finished(log).catch(() => undefined);
+}
+
 function waitForSpawn(child: CodexProcess): Promise<number> {
   return new Promise((resolveProcess, reject) => {
     let settled = false;
@@ -269,6 +270,7 @@ export class CodexExecutionAdapter {
   private readonly processRunner: CodexProcessRunner;
   private readonly environment: NodeJS.ProcessEnv;
   private readonly codexExecutableOverride: string | undefined;
+  private readonly completion: CodexExecutionCompletionService;
   private readonly inFlight = new Map<string, Promise<CodexExecutionStartResult>>();
   public readonly storageRoot: string;
 
@@ -292,6 +294,7 @@ export class CodexExecutionAdapter {
     ));
     this.environment = { ...process.env, ...(options.environment ?? {}) };
     this.codexExecutableOverride = options.codexExecutable?.trim() || undefined;
+    this.completion = options.completionService ?? new CodexExecutionCompletionService(this.storageRoot);
   }
 
   public async start(request: CodexExecutionStartRequest): Promise<CodexExecutionStartResult> {
@@ -368,6 +371,7 @@ export class CodexExecutionAdapter {
         cwd: workspace.manager.canonicalRoot,
         environment: this.environment,
       });
+      const close = waitForClose(child);
       attachLog(child.stdout, logStreams.stdout);
       attachLog(child.stderr, logStreams.stderr);
       const processId = await waitForSpawn(child);
@@ -379,6 +383,19 @@ export class CodexExecutionAdapter {
         request.execution_id,
         { process_id: processId },
       );
+      void close.then(async ({ code, signal }) => {
+        await Promise.all([flushLog(logStreams!.stdout), flushLog(logStreams!.stderr)]);
+        await this.completion.observeProcessExit({
+          workspace_id: request.workspace_id,
+          task_id: request.task_id,
+          execution_id: request.execution_id,
+          process_id: processId,
+          exit_code: code,
+          signal,
+        });
+      }).catch(() => {
+        console.warn("Codex execution completion observation failed; execution state unchanged");
+      });
       return result(execution, "new");
     } catch (error: unknown) {
       logStreams?.stdout.destroy();
