@@ -19,4 +19,8 @@
 {"ts":"2026-09-07T18:45:00+08:00","action":"add","type":"learning","id":"LRN-20260907-002","summary":"真实 ChatGPT Fiber 需沿 bounded return 链读取 turn.messages，conversation.id 位于同级 props；identity 冲突时 fail closed"}
 {"ts":"2026-09-07T18:47:00+08:00","action":"add","type":"error","id":"ERR-20260907-003","summary":"computer-use 参考文档路径不存在；读取 skill 资源前应先确认目录结构"}
 {"ts":"2026-09-08T09:49:00+08:00","action":"add","type":"learning","id":"LRN-20260908-001","summary":"exact waiter 测试需在目标 evidence 前断言 unrelated evidence 未唤醒，避免最终 lookup 掩盖假阳性"}
+{"ts":"2026-09-08T11:26:15+08:00","action":"add","type":"error","id":"ERR-20260908-001","summary":"技能路径不可跨根目录手工拼接；直接使用技能目录表中的绝对根路径"}
+{"ts":"2026-09-08T11:42:00+08:00","action":"add","type":"error","id":"ERR-20260908-002","summary":"superRefine 返回 ZodEffects 后不能再 pick；为独立输入声明最小 schema"}
+{"ts":"2026-09-08T11:56:18+08:00","action":"add","type":"error","id":"ERR-20260908-003","summary":"Windows 全套 Vitest 并发触发超时和 EBUSY；失败文件以单 worker 重跑全部通过"}
+{"ts":"2026-09-08T12:11:09+08:00","action":"add","type":"learning","id":"LRN-20260908-002","summary":"浏览器 Send 前持久化 submitting，receipt 后先写 ACK outbox；无法确认则 ambiguous 不重发"}
 ```

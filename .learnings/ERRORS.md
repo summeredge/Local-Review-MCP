@@ -33,6 +33,88 @@ EPERM: operation not permitted, mkdir '...\\LocalReviewMCP\\browser-worker\\prof
 
 ---
 
+## [ERR-20260908-001] 技能路径拼接错误
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+把两个技能根目录用 `..` 手工拼接，导致 `karpathy-guidelines/SKILL.md` 路径不存在。
+
+### 错误信息
+
+```text
+Get-Content: Cannot find path '...\agents\skills\karpathy-guidelines\SKILL.md'
+```
+
+### 建议修复
+
+直接使用技能目录表给出的根路径，不跨技能根目录拼接相对路径。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: ERR-20260907-003
+
+---
+
+## [ERR-20260908-002] ZodEffects 不支持 pick
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+对经过 `superRefine()` 的 Zod schema 调用 `pick()` 导致 TypeScript 类型检查失败。
+
+### 错误信息
+
+```text
+Property 'pick' does not exist on type 'ZodEffects<ZodObject<...>>'.
+```
+
+### 建议修复
+
+需要选取字段时在 `superRefine()` 前保留基础 object schema，或为独立输入声明最小 schema。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
+## [ERR-20260908-003] Windows 全套 Vitest 并发导致超时和 EBUSY
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+全套 Vitest 默认并发时，多个 Git/临时目录测试超过 5 秒并在清理时返回 EBUSY；同一批失败文件以单 worker 重跑全部通过。
+
+### 错误信息
+
+```text
+Test timed out in 5000ms
+EBUSY: resource busy or locked, rmdir '...\AppData\Local\Temp\local-review-mcp-...'
+```
+
+### 建议修复
+
+先用 `--maxWorkers=1` 原样重跑失败文件区分 Windows 并发资源争用与代码回归，不要直接修改测试超时。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
 ## [ERR-20260904-002] Vitest unsupported Jest parallel flag
 
 **Priority**: low

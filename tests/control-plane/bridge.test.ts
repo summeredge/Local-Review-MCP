@@ -12,6 +12,7 @@ import {
   stopBridge,
 } from "../../src/control-plane/bridge.js";
 import { ConversationCorrelationRegistry } from "../../src/control-plane/conversation-correlation.js";
+import { ExtensionDeliveryService } from "../../src/control-plane/extension-delivery.js";
 import {
   LOCAL_CONTROL_BRIDGE_HOST,
   LOCAL_CONTROL_BRIDGE_PORTS,
@@ -135,7 +136,7 @@ describe("Local Control Bridge protocol", () => {
 
   it("rejects missing and incompatible protocol headers", async () => {
     expect((await request("/pair", { method: "POST", protocol: null, body: {} })).status).toBe(426);
-    expect((await request("/pair", { method: "POST", protocol: "2", body: {} })).status).toBe(426);
+    expect((await request("/pair", { method: "POST", protocol: "1", body: {} })).status).toBe(426);
     expect((await request("/pair", { method: "POST", body: {} })).status).toBe(200);
   });
 
@@ -206,6 +207,63 @@ describe("Local Control Bridge protocol", () => {
     expect(sink).toHaveBeenCalledTimes(2);
     expect(sink).toHaveBeenNthCalledWith(1, evidence);
     expect(sink).toHaveBeenNthCalledWith(2, wfrEvidence);
+  });
+
+  it("validates and transports exact delivery claims and idempotent ACKs", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-bridge-delivery-"));
+    const deliveries = new ExtensionDeliveryService(root);
+    await deliveries.restore();
+    const queued = await deliveries.enqueue("conversation-one", "send exactly once");
+    await startBridge({
+      ports: [0],
+      claimExtensionDelivery: (claim) => deliveries.claim(claim),
+      ackExtensionDelivery: (ack) => deliveries.acknowledge(ack),
+    });
+    try {
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+      const owner = {
+        conversation_id: "conversation-one",
+        client_id: "client-one",
+        document_id: "document-one",
+        navigation_epoch: 4,
+      };
+      expect((await request("/delivery/claim", { method: "POST", token, body: { ...owner, extra: true } })).status)
+        .toBe(400);
+      const claimed = await request("/delivery/claim", { method: "POST", token, body: owner });
+      expect(claimed).toMatchObject({
+        status: 200,
+        body: { command: { delivery_id: queued.delivery_id, message: "send exactly once" } },
+      });
+      expect((await request("/delivery/claim", {
+        method: "POST",
+        token,
+        body: { ...owner, document_id: "document-two" },
+      })).body).toEqual({ command: null });
+
+      const ack = {
+        ...owner,
+        delivery_id: queued.delivery_id,
+        status: "sent",
+        message_id: "message-one",
+      };
+      expect(await request("/delivery/ack", { method: "POST", token, body: ack })).toMatchObject({
+        status: 200,
+        body: { accepted: "new", receipt: { status: "delivered", message_id: "message-one" } },
+      });
+      expect(await request("/delivery/ack", { method: "POST", token, body: ack })).toMatchObject({
+        status: 200,
+        body: { accepted: "existing" },
+      });
+      expect((await request("/delivery/ack", {
+        method: "POST",
+        token,
+        body: { ...ack, message_id: "message-two" },
+      })).status).toBe(409);
+      expect((await request("/delivery/claim", { method: "POST", token: "wrong", body: owner })).status).toBe(401);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("bounds JSON bodies and returns stable route errors", async () => {

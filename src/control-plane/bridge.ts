@@ -2,6 +2,16 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { APP_VERSION } from "../config/settings.js";
 import {
+  ExtensionDeliveryConflictError,
+  ExtensionDeliveryNotFoundError,
+  extensionDeliveryAckSchema,
+  extensionDeliveryClaimSchema,
+  type ExtensionDeliveryAck,
+  type ExtensionDeliveryClaim,
+  type ExtensionDeliveryReceipt,
+  type LeasedExtensionDelivery,
+} from "./extension-delivery.js";
+import {
   extensionIdentityEvidenceSchema,
   type ExtensionIdentityEvidence,
 } from "./extension-identity.js";
@@ -19,6 +29,16 @@ import {
 export interface BridgeStartOptions {
   readonly ports?: readonly number[];
   readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => void | Promise<void>;
+  readonly claimExtensionDelivery?: (
+    claim: ExtensionDeliveryClaim,
+  ) => LeasedExtensionDelivery | null | Promise<LeasedExtensionDelivery | null>;
+  readonly ackExtensionDelivery?: (ack: ExtensionDeliveryAck) => {
+    readonly accepted: "new" | "existing";
+    readonly receipt: ExtensionDeliveryReceipt;
+  } | Promise<{
+    readonly accepted: "new" | "existing";
+    readonly receipt: ExtensionDeliveryReceipt;
+  }>;
 }
 
 export interface BridgeStatus {
@@ -35,6 +55,10 @@ let activePort: number | null = null;
 let pairedOrigin: string | null = null;
 let bearerToken: string | null = null;
 let onIdentityEvidence: (evidence: ExtensionIdentityEvidence) => void | Promise<void> = () => undefined;
+let claimExtensionDelivery: NonNullable<BridgeStartOptions["claimExtensionDelivery"]> = () => null;
+let ackExtensionDelivery: NonNullable<BridgeStartOptions["ackExtensionDelivery"]> = () => {
+  throw new ExtensionDeliveryNotFoundError("delivery not found");
+};
 let lifecycleQueue: Promise<void> = Promise.resolve();
 
 function enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -205,6 +229,64 @@ async function receiveIdentityEvidence(
   json(response, 202, { accepted: true }, origin);
 }
 
+async function receiveDeliveryClaim(
+  request: IncomingMessage,
+  response: ServerResponse,
+  origin: string,
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = await readJson(request);
+  } catch (error: unknown) {
+    json(response, error instanceof RequestBodyTooLargeError ? 413 : 400, {
+      error: error instanceof RequestBodyTooLargeError ? "body_too_large" : "bad_request",
+    }, origin);
+    return;
+  }
+  const parsed = extensionDeliveryClaimSchema.safeParse(body);
+  if (!parsed.success) {
+    json(response, 400, { error: "invalid_delivery_claim" }, origin);
+    return;
+  }
+  const command = await claimExtensionDelivery(parsed.data);
+  json(response, 200, { command }, origin);
+}
+
+async function receiveDeliveryAck(
+  request: IncomingMessage,
+  response: ServerResponse,
+  origin: string,
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = await readJson(request);
+  } catch (error: unknown) {
+    json(response, error instanceof RequestBodyTooLargeError ? 413 : 400, {
+      error: error instanceof RequestBodyTooLargeError ? "body_too_large" : "bad_request",
+    }, origin);
+    return;
+  }
+  const parsed = extensionDeliveryAckSchema.safeParse(body);
+  if (!parsed.success) {
+    json(response, 400, { error: "invalid_delivery_ack" }, origin);
+    return;
+  }
+  try {
+    const result = await ackExtensionDelivery(parsed.data);
+    json(response, 200, result, origin);
+  } catch (error: unknown) {
+    if (error instanceof ExtensionDeliveryConflictError) {
+      json(response, 409, { error: "conflicting_delivery_ack" }, origin);
+      return;
+    }
+    if (error instanceof ExtensionDeliveryNotFoundError) {
+      json(response, 404, { error: "delivery_not_found" }, origin);
+      return;
+    }
+    throw error;
+  }
+}
+
 async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const url = new URL(request.url ?? "/", `http://${LOCAL_CONTROL_BRIDGE_HOST}`);
   const route = url.pathname;
@@ -228,7 +310,8 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     return;
   }
 
-  if (route !== "/pair" && route !== "/status" && route !== "/identity-evidence") {
+  if (route !== "/pair" && route !== "/status" && route !== "/identity-evidence"
+    && route !== "/delivery/claim" && route !== "/delivery/ack") {
     request.resume();
     json(response, 404, { error: "not_found" });
     return;
@@ -253,6 +336,10 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     return;
   }
   if (route === "/identity-evidence" && request.method !== "POST") {
+    methodNotAllowed(request, response);
+    return;
+  }
+  if ((route === "/delivery/claim" || route === "/delivery/ack") && request.method !== "POST") {
     methodNotAllowed(request, response);
     return;
   }
@@ -284,6 +371,14 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   }
   if (route === "/identity-evidence") {
     await receiveIdentityEvidence(request, response, origin);
+    return;
+  }
+  if (route === "/delivery/claim") {
+    await receiveDeliveryClaim(request, response, origin);
+    return;
+  }
+  if (route === "/delivery/ack") {
+    await receiveDeliveryAck(request, response, origin);
     return;
   }
   json(response, 200, {
@@ -371,6 +466,10 @@ async function startBridgeOnce(options: BridgeStartOptions): Promise<number | nu
 
 export function startBridge(options: BridgeStartOptions = {}): Promise<number | null> {
   onIdentityEvidence = options.onIdentityEvidence ?? (() => undefined);
+  claimExtensionDelivery = options.claimExtensionDelivery ?? (() => null);
+  ackExtensionDelivery = options.ackExtensionDelivery ?? (() => {
+    throw new ExtensionDeliveryNotFoundError("delivery not found");
+  });
   return enqueue(() => startBridgeOnce(options));
 }
 
@@ -382,6 +481,10 @@ export function stopBridge(): Promise<void> {
     pairedOrigin = null;
     bearerToken = null;
     onIdentityEvidence = () => undefined;
+    claimExtensionDelivery = () => null;
+    ackExtensionDelivery = () => {
+      throw new ExtensionDeliveryNotFoundError("delivery not found");
+    };
     if (server !== null) await close(server);
   });
 }

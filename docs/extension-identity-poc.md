@@ -47,7 +47,7 @@ SPA route changes increment the document-local epoch, including `/c/A → /c/B �
 `/g/project/c/A → /g/project/c/B → /g/project/c/A` becoming epochs `0 → 1 → 2`.
 
 `background.js` is the only component that calls the Bridge. It discovers ports
-`12081`–`12085`, checks `service === "local-review-control-bridge"` and `protocol === 1`,
+`12081`–`12085`, checks `service === "local-review-control-bridge"` and `protocol === 2`,
 pairs through `/pair`, and stores the bearer token in its extension-local storage. MV3
 `chrome.storage.local` survives service-worker suspension and extension reload, while the
 Bridge bearer token exists only in Bridge process memory. After a Bridge restart,
@@ -84,11 +84,12 @@ No extension build, bundle, package, or signing step is required. The directory
 4. Select the same `Local-Review-MCP/extension` directory.
 5. Confirm there is no manifest or runtime error.
 
-The same four files are used by both Chromium browsers:
+The same plain-source files are used by both Chromium browsers:
 
 ```text
 extension/manifest.json
 extension/background.js
+extension/chatgpt-dom.js
 extension/content.js
 extension/fiber.js
 ```
@@ -132,7 +133,7 @@ The `request_id` must equal the normalized base ID from the same MCP HTTP
 
 Implemented: evidence capture and authenticated local transport.
 
-Not implemented: requestId → conversationId correlation registry, ConversationRouting
-integration, TaskContext/ReviewRequest/ReviewDelivery changes, reliable delivery,
-durable retry, CRX/store publishing, automatic installation/update, browser-worker
-changes, or browser actuation.
+Identity remains separate from the request-to-conversation correlation registry and the reliable
+delivery transport documented in `reliable-extension-delivery.md`. Neither changes
+TaskContext/ReviewRequest/ReviewDelivery, publishes a CRX, installs automatically, or changes the
+browser-worker path.

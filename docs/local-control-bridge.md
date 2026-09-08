@@ -3,7 +3,7 @@
 LRM runs two separate local HTTP servers:
 
 - MCP is the read-only Data Plane at the configured MCP endpoint.
-- Local Control Bridge is the loopback-only Control Plane used by the Extension Identity PoC.
+- Local Control Bridge is the loopback-only Control Plane used by Extension identity and delivery.
 
 The Bridge binds only to `127.0.0.1` and tries these discovery ports in order:
 `12081`, `12082`, `12083`, `12084`, `12085`. If none is available, MCP still starts and the
@@ -11,7 +11,7 @@ Bridge is reported as unavailable.
 
 ## Foundation protocol
 
-The Bridge protocol version is `1`, sent in the `x-lrm-bridge-protocol` header on every route
+The Bridge protocol version is `2`, sent in the `x-lrm-bridge-protocol` header on every route
 except `GET /hello`.
 
 - `GET /hello` is unauthenticated discovery. It returns the Bridge service name, protocol,
@@ -23,11 +23,14 @@ except `GET /hello`.
 - `POST /identity-evidence` uses the same protocol, paired Origin, and bearer gates. It accepts
   strict `{ request_id, conversation_id, document_id, navigation_epoch }` evidence and passes it
   to the injectable `onIdentityEvidence` sink.
+- `POST /delivery/claim` accepts a strict conversation plus browser-document owner and returns
+  `{ command: null }` or one durably leased command.
+- `POST /delivery/ack` accepts a strict `sent`, `not_sent`, or `ambiguous` receipt and delegates
+  durable settlement to the injected Extension Delivery service.
 
 Bridge request bodies are capped at 64 KiB. Oversized JSON returns `413`; malformed JSON
 returns `400`. The token is held in process memory only and is independent of MCP auth/OAuth.
 
-The PoC route has no `requestId` to `conversationId` correlation, persistence, delivery queue,
-command route, filesystem access, shell execution, Git mutation, Codex execution, or
-Playwright/DOM control. Browser evidence is accepted only as an already-validated payload from
-the extension; the Bridge does not invent document identity.
+The Bridge owns no delivery filesystem state and does not access `ReviewDelivery`; app composition
+injects the delivery handlers. It still exposes no filesystem, shell, Git, Codex, or MCP write
+capability.

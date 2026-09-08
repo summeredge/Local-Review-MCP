@@ -1,4 +1,4 @@
-export const LOCAL_CONTROL_BRIDGE_PROTOCOL = 1 as const;
+export const LOCAL_CONTROL_BRIDGE_PROTOCOL = 2 as const;
 export const LOCAL_CONTROL_BRIDGE_SERVICE = "local-review-control-bridge" as const;
 export const LOCAL_CONTROL_BRIDGE_HOST = "127.0.0.1" as const;
 export const LOCAL_CONTROL_BRIDGE_PORTS = [12081, 12082, 12083, 12084, 12085] as const;

@@ -5,6 +5,7 @@ import { isPortInUse, startHttpServer, type HttpServerOptions } from "./mcp/http
 import { REGISTERED_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
 import { startBridge, stopBridge } from "./control-plane/bridge.js";
 import { ConversationCorrelationRegistry } from "./control-plane/conversation-correlation.js";
+import { ExtensionDeliveryService } from "./control-plane/extension-delivery.js";
 import type { ExtensionIdentityEvidence } from "./control-plane/extension-identity.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { validateWorkspaceIdentityConsistency } from "./workspace/identity.js";
@@ -15,6 +16,7 @@ export interface AppContext extends McpRuntimeContext {
   readonly settings: ResolvedSettings;
   readonly tunnel: TunnelManager;
   readonly correlations: ConversationCorrelationRegistry;
+  readonly extensionDeliveries: ExtensionDeliveryService;
 }
 
 export interface AppStartOptions extends HttpServerOptions {
@@ -48,6 +50,7 @@ export function createAppContext(
   return {
     settings,
     correlations: new ConversationCorrelationRegistry(),
+    extensionDeliveries: new ExtensionDeliveryService(),
     tunnel: createTunnelManager(settings.remote, {
       localEndpoint: localOrigin(settings),
       authToken: settings.auth.token,
@@ -66,13 +69,17 @@ export async function startApp(
   try {
     const server = await startHttpServer(settings, context, options);
     try {
+      const extensionDeliveries = context.extensionDeliveries;
       await context.correlations.restore();
+      await extensionDeliveries.restore();
       const bridgePort = await startBridge({
         ports: options.bridgePorts,
         onIdentityEvidence: async (evidence) => {
           await context.correlations.observe(evidence);
           await options.onIdentityEvidence?.(evidence);
         },
+        claimExtensionDelivery: (claim) => extensionDeliveries.claim(claim),
+        ackExtensionDelivery: (ack) => extensionDeliveries.acknowledge(ack),
       });
       if (bridgePort === null) {
         console.warn("Local Control Bridge unavailable; local MCP remains available");

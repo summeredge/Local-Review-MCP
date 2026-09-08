@@ -17,6 +17,7 @@
   let scanTimer = null;
   let scanInFlight = null;
   let nonceCounter = 0;
+  let deliveryInFlight = null;
   const sent = new Set();
 
   function routeConversation(href = location.href) {
@@ -66,6 +67,71 @@
         registration = null;
       });
     return registration;
+  }
+
+  async function pollDelivery() {
+    if (!alive || deliveryInFlight || !globalThis.LRM_DOM?.ready?.()) return;
+    const epoch = navigationEpoch;
+    const href = location.href;
+    const conversationId = routeConversation(href);
+    if (!conversationId || !(await registerDocument())) return;
+    const stillCurrent = () => alive
+      && navigationEpoch === epoch
+      && location.href === href
+      && routeConversation() === conversationId;
+    if (!stillCurrent() || !LRM_DOM.ready()) return;
+    deliveryInFlight = (async () => {
+      const claimed = await sendToWorker({
+        type: 'delivery_claim',
+        conversation_id: conversationId,
+        navigation_epoch: epoch
+      });
+      const command = claimed?.ok === true ? claimed.command : null;
+      if (!command) return;
+      const acknowledge = (status, details) => sendToWorker({
+        type: 'delivery_ack',
+        delivery_id: command.delivery_id,
+        navigation_epoch: epoch,
+        status,
+        ...details
+      });
+      if (command.conversation_id !== conversationId || !stillCurrent()) {
+        await acknowledge('not_sent', { error: 'document identity changed before send' });
+        return;
+      }
+      if (!LRM_DOM.ready()) {
+        await acknowledge('not_sent', { error: 'composer_busy' });
+        return;
+      }
+      if (!LRM_DOM.insertPrompt(command.message)) {
+        await acknowledge('not_sent', { error: 'composer refused exact message' });
+        return;
+      }
+      const armed = await sendToWorker({
+        type: 'delivery_submit_started',
+        delivery_id: command.delivery_id,
+        navigation_epoch: epoch
+      });
+      if (armed?.ok !== true) {
+        LRM_DOM.clearPromptExact(command.message);
+        return;
+      }
+      if (!stillCurrent()) {
+        LRM_DOM.clearPromptExact(command.message);
+        await acknowledge('not_sent', { error: 'document identity changed before submit' });
+        return;
+      }
+      const result = await LRM_DOM.send(command.message, stillCurrent);
+      if (!result.clicked) {
+        LRM_DOM.clearPromptExact(command.message);
+        await acknowledge('not_sent', { error: 'send control unavailable' });
+      } else if (result.message_id) {
+        await acknowledge('sent', { message_id: result.message_id });
+      } else {
+        await acknowledge('ambiguous', { error: 'submit occurred without a stable message receipt' });
+      }
+    })().finally(() => { deliveryInFlight = null; });
+    await deliveryInFlight;
   }
 
   function fiberScan() {
@@ -174,10 +240,12 @@
   window.addEventListener('hashchange', routeChanged);
   setInterval(routeChanged, 250);
   setInterval(scheduleScan, 1000);
+  setInterval(() => { void pollDelivery(); }, 1500);
 
   if (typeof MutationObserver === 'function' && document.documentElement) {
     new MutationObserver(scheduleScan).observe(document.documentElement, { childList: true, subtree: true });
   }
   void registerDocument();
   scheduleScan();
+  void pollDelivery();
 })();

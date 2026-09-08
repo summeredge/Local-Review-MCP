@@ -394,6 +394,7 @@ describe("content route ownership and navigation epochs", () => {
 class Storage {
   readonly data: Record<string, unknown>;
   readonly writes: Record<string, unknown>[] = [];
+  failNextWrites = 0;
 
   public constructor(initial: Record<string, unknown> = {}) {
     this.data = structuredClone(initial);
@@ -404,6 +405,10 @@ class Storage {
   }
 
   public async set(values: Record<string, unknown>): Promise<void> {
+    if (this.failNextWrites > 0) {
+      this.failNextWrites -= 1;
+      throw new Error("storage unavailable");
+    }
     this.writes.push(structuredClone(values));
     Object.assign(this.data, structuredClone(values));
   }
@@ -425,7 +430,12 @@ function response(status: number, body: unknown): Record<string, unknown> {
 function loadBackground(
   storage: Storage,
   responder: (url: URL, init: Record<string, unknown>) => Promise<Record<string, unknown>>,
-): { calls: FetchCall[]; send: (message: Record<string, unknown>, documentId: string, tabId?: number) => Promise<Record<string, unknown>> } {
+): { calls: FetchCall[]; send: (
+  message: Record<string, unknown>,
+  documentId: string,
+  tabId?: number,
+  url?: string,
+) => Promise<Record<string, unknown>> } {
   let listener: ((message: Record<string, unknown>, sender: Record<string, unknown>, sendResponse: (value: Record<string, unknown>) => void) => boolean) | null = null;
   const calls: FetchCall[] = [];
   const chrome = {
@@ -448,9 +458,9 @@ function loadBackground(
   if (!listener) throw new Error("background listener was not registered");
   return {
     calls,
-    send: (message, documentId, tabId = 7) => new Promise((resolve, reject) => {
+    send: (message, documentId, tabId = 7, url) => new Promise((resolve, reject) => {
       try {
-        const keep = listener!(message, { tab: { id: tabId }, documentId, frameId: 0 }, resolve);
+        const keep = listener!(message, { tab: { id: tabId }, documentId, frameId: 0, url }, resolve);
         if (keep !== true) reject(new Error("background listener did not keep response channel open"));
       } catch (error) {
         reject(error);
@@ -459,7 +469,7 @@ function loadBackground(
   };
 }
 
-const bridgeHello = { service: "local-review-control-bridge", protocol: 1, paired: true };
+const bridgeHello = { service: "local-review-control-bridge", protocol: 2, paired: true };
 const evidenceMessage = (conversationId: string, navigation_epoch: number, extra: Record<string, unknown> = {}) => ({
   type: "identity_evidence",
   request_id: UUID_REQUEST_ID,
@@ -486,6 +496,9 @@ describe("Extension background identity authority", () => {
     expect(storage.data.token).toBe("paired-token");
     expect(new URL(worker.calls.at(-1)!.input).pathname).toBe("/identity-evidence");
     expect(JSON.parse(String(worker.calls.at(-1)!.init.body))).toMatchObject({ request_id: UUID_REQUEST_ID });
+    const hellos = worker.calls.filter((call) => new URL(call.input).pathname === "/hello").length;
+    await worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1");
+    expect(worker.calls.filter((call) => new URL(call.input).pathname === "/hello")).toHaveLength(hellos);
   });
 
   it("uses sender.documentId and rejects stale epochs/documents across A to B to A", async () => {
@@ -639,5 +652,150 @@ describe("Extension background identity authority", () => {
     expect(contentSource).not.toMatch(/identity-evidence.*fetch/isu);
     expect(fiberSource).not.toMatch(/inboundRequestId|ConversationRouting|tool_result|authorization|cookie/iu);
     expect(backgroundSource).not.toMatch(/inboundRequestId|ConversationRouting|ReviewDelivery/iu);
+  });
+
+  it("rejects an old identity-only Bridge protocol", async () => {
+    const worker = loadBackground(new Storage(), async (url) =>
+      url.pathname === "/hello"
+        ? response(200, { ...bridgeHello, protocol: 1 })
+        : response(500, {}));
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-old");
+    await expect(worker.send(evidenceMessage(CONVERSATION_A, 0), "document-old"))
+      .resolves.toMatchObject({ ok: false, error: "bridge_unavailable" });
+  });
+
+  it("durably retries a lost sent ACK before claiming new work after worker restart", async () => {
+    const storage = new Storage({ port: 12081, token: "paired-token" });
+    const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+    const command = {
+      delivery_id: "32ca0d45-8b29-414a-bbe4-8e26c3aae911",
+      conversation_id: CONVERSATION_A,
+      message: "send once",
+      deadline: Date.now() + 30_000,
+    };
+    const first = loadBackground(storage, async (requestUrl) => {
+      if (requestUrl.pathname === "/hello") return response(200, bridgeHello);
+      if (requestUrl.pathname === "/delivery/claim") return response(200, { command });
+      if (requestUrl.pathname === "/delivery/ack") return response(503, { error: "lost" });
+      return response(404, {});
+    });
+    await first.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);
+    const claimed = await first.send({
+      type: "delivery_claim",
+      conversation_id: CONVERSATION_A,
+      navigation_epoch: 0,
+    }, "document-one", 7, url);
+    expect(claimed).toMatchObject({ ok: true, command });
+    expect(JSON.stringify(storage.data.deliveryInFlight)).not.toContain(command.message);
+    await first.send({
+      type: "delivery_submit_started",
+      delivery_id: command.delivery_id,
+      navigation_epoch: 0,
+    }, "document-one", 7, url);
+    await expect(first.send({
+      type: "delivery_ack",
+      delivery_id: command.delivery_id,
+      navigation_epoch: 0,
+      status: "sent",
+      message_id: "message-one",
+    }, "document-one", 7, url)).resolves.toMatchObject({ ok: false });
+    expect(storage.data.deliveryAckOutbox).toMatchObject([{
+      delivery_id: command.delivery_id,
+      status: "sent",
+      message_id: "message-one",
+    }]);
+    expect(storage.data.deliveryInFlight).toEqual([]);
+
+    const routes: string[] = [];
+    const restarted = loadBackground(storage, async (requestUrl) => {
+      routes.push(requestUrl.pathname);
+      if (requestUrl.pathname === "/hello") return response(200, bridgeHello);
+      if (requestUrl.pathname === "/delivery/ack") return response(200, { accepted: "existing" });
+      if (requestUrl.pathname === "/delivery/claim") return response(200, { command: null });
+      return response(404, {});
+    });
+    await restarted.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);
+    await restarted.send({
+      type: "delivery_claim",
+      conversation_id: CONVERSATION_A,
+      navigation_epoch: 0,
+    }, "document-one", 7, url);
+    expect(routes.indexOf("/delivery/ack")).toBeLessThan(routes.indexOf("/delivery/claim"));
+    expect(routes.filter((route) => route === "/delivery/claim")).toHaveLength(1);
+    expect(storage.data.deliveryAckOutbox).toEqual([]);
+  });
+
+  it("turns an expired submit-without-receipt into ambiguous before any new claim", async () => {
+    const storage = new Storage({ port: 12081, token: "paired-token" });
+    const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+    const command = {
+      delivery_id: "42ca0d45-8b29-414a-bbe4-8e26c3aae911",
+      conversation_id: CONVERSATION_A,
+      message: "maybe sent",
+      deadline: Date.now() + 20,
+    };
+    const first = loadBackground(storage, async (requestUrl) => {
+      if (requestUrl.pathname === "/hello") return response(200, bridgeHello);
+      if (requestUrl.pathname === "/delivery/claim") return response(200, { command });
+      return response(404, {});
+    });
+    await first.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);
+    await first.send({ type: "delivery_claim", conversation_id: CONVERSATION_A, navigation_epoch: 0 }, "document-one", 7, url);
+    await first.send({ type: "delivery_submit_started", delivery_id: command.delivery_id, navigation_epoch: 0 }, "document-one", 7, url);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const posted: Record<string, unknown>[] = [];
+    const restarted = loadBackground(storage, async (requestUrl, init) => {
+      if (requestUrl.pathname === "/hello") return response(200, bridgeHello);
+      if (requestUrl.pathname === "/delivery/ack") {
+        posted.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+        return response(200, { accepted: "new" });
+      }
+      if (requestUrl.pathname === "/delivery/claim") return response(200, { command: null });
+      return response(404, {});
+    });
+    await restarted.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);
+    await restarted.send({ type: "delivery_claim", conversation_id: CONVERSATION_A, navigation_epoch: 0 }, "document-one", 7, url);
+    expect(posted).toMatchObject([{
+      delivery_id: command.delivery_id,
+      conversation_id: CONVERSATION_A,
+      status: "ambiguous",
+    }]);
+  });
+
+  it("never posts an ACK before its outbox write succeeds", async () => {
+    const storage = new Storage({ port: 12081, token: "paired-token" });
+    const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+    const command = {
+      delivery_id: "52ca0d45-8b29-414a-bbe4-8e26c3aae911",
+      conversation_id: CONVERSATION_A,
+      message: "durable first",
+      deadline: Date.now() + 30_000,
+    };
+    let ackPosts = 0;
+    const worker = loadBackground(storage, async (requestUrl) => {
+      if (requestUrl.pathname === "/hello") return response(200, bridgeHello);
+      if (requestUrl.pathname === "/delivery/claim") return response(200, { command });
+      if (requestUrl.pathname === "/delivery/ack") {
+        ackPosts += 1;
+        return response(200, { accepted: "new" });
+      }
+      return response(404, {});
+    });
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);
+    await worker.send({ type: "delivery_claim", conversation_id: CONVERSATION_A, navigation_epoch: 0 }, "document-one", 7, url);
+    await worker.send({ type: "delivery_submit_started", delivery_id: command.delivery_id, navigation_epoch: 0 }, "document-one", 7, url);
+    storage.failNextWrites = 1;
+
+    await expect(worker.send({
+      type: "delivery_ack",
+      delivery_id: command.delivery_id,
+      navigation_epoch: 0,
+      status: "sent",
+      message_id: "message-one",
+    }, "document-one", 7, url)).resolves.toMatchObject({ ok: false, error: "internal_error" });
+    expect(ackPosts).toBe(0);
+    expect(storage.data.deliveryAckOutbox).toEqual([]);
+    expect(storage.data.deliveryInFlight).toMatchObject([{ phase: "submitting" }]);
   });
 });

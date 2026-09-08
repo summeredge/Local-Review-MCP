@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Local Review MCP Extension Identity PoC",
+  "name": "Local Review MCP Extension Control Plane",
   "version": "0.1.0",
-  "description": "Captures exact ChatGPT browser identity evidence for Local Review MCP.",
+  "description": "Captures exact ChatGPT identity and reliably delivers control-plane messages.",
   "minimum_chrome_version": "106",
   "permissions": [
     "storage"
@@ -26,6 +26,7 @@
         "https://chat.openai.com/*"
       ],
       "js": [
+        "chatgpt-dom.js",
         "content.js"
       ],
       "run_at": "document_idle"

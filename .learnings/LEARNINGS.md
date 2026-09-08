@@ -169,3 +169,28 @@ pending；再发送 R1 并断言返回 exact owner。
 - See Also: none
 
 ---
+
+## [LRN-20260908-002] Browser send 的不可逆边界必须先持久化
+
+**Priority**: high
+**Status**: resolved
+**Area**: infra
+
+### 内容
+
+可靠浏览器投递不能把 Send click 或 HTTP ACK 当作完成边界。正文仅由 App 持久化；
+Extension 在 click 前只持久化 owner 与 `submitting` 元数据，观察到 exact user message 和
+稳定 message_id 后先写 ACK outbox，再 POST。重启恢复到 `submitting` 且无法取得 receipt
+时必须进入 ambiguous，不能重新发送。
+
+### 建议修复
+
+所有跨 App/MV3/page 三种生命周期的发送协议都应明确 pre-submit、irreversible submit、
+receipt、durable ACK 四个边界，并用 lost-ACK 与 submit-without-receipt 测试固定顺序。
+
+### 元数据
+
+- Source: task_review
+- See Also: none
+
+---
