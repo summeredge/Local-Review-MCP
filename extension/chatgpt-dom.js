@@ -53,6 +53,17 @@ globalThis.LRM_DOM = (() => {
     return plainText(box);
   }
 
+  function isEmptyEditorNode(node) {
+    const name = String(node?.nodeName || '').toUpperCase();
+    return (name === 'BR' || BLOCK_ELEMENTS.has(name))
+      && [...(node.childNodes || [])].every(isEmptyEditorNode);
+  }
+
+  function isComposerEmpty(box = composer()) {
+    return Boolean(box && box.textContent === ''
+      && [...(box.childNodes || [])].every(isEmptyEditorNode));
+  }
+
   function hasComposerAttachments() {
     const box = composer();
     const host = box?.closest('form') || box?.parentElement;
@@ -64,7 +75,7 @@ globalThis.LRM_DOM = (() => {
   function ready() {
     const box = composer();
     return Boolean(box && box.isConnected
-      && composerText(box) === ''
+      && isComposerEmpty(box)
       && box.getAttribute('aria-disabled') !== 'true'
       && box.getAttribute('contenteditable') !== 'false'
       && !stopButton()

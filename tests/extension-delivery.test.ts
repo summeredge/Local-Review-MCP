@@ -154,7 +154,14 @@ describe("Extension delivery content fence", () => {
 
   it("delivers a multiline block-normalized message only after exact insertion", async () => {
     const deliveredCommand = { ...command, message: MULTILINE_MESSAGE };
-    const dom = domHarness({ blockComposer: true, normalizeAsync: true, message: MULTILINE_MESSAGE });
+    const dom = domHarness({
+      blockComposer: true,
+      emptyComposerBlock: true,
+      normalizeAsync: true,
+      message: MULTILINE_MESSAGE,
+    });
+    expect((dom.composer as FakeNode & { innerText: string }).innerText).toBe("\n");
+    expect(dom.dom.ready()).toBe(true);
     dom.setClickReceipt("message-block");
     const harness = contentHarness(dom.dom, (message) =>
       message.type === "delivery_claim" ? { ok: true, command: deliveredCommand } : { ok: true });
@@ -166,6 +173,8 @@ describe("Extension delivery content fence", () => {
       status: "sent",
       message_id: "message-block",
     });
+    expect(types).toContain("register_document");
+    expect(types).toContain("delivery_claim");
     expect(types.indexOf("delivery_submit_started")).toBeGreaterThan(types.indexOf("delivery_claim"));
     expect(types.indexOf("delivery_ack")).toBeGreaterThan(types.indexOf("delivery_submit_started"));
     expect(dom.composer.textContent).not.toMatch(/\r?\n/u);
@@ -226,7 +235,12 @@ interface FakeNode {
   click(): void;
 }
 
-function domHarness(options: { blockComposer?: boolean; normalizeAsync?: boolean; message?: string } = {}): {
+function domHarness(options: {
+  blockComposer?: boolean;
+  emptyComposerBlock?: boolean;
+  normalizeAsync?: boolean;
+  message?: string;
+} = {}): {
   dom: {
     ready(): boolean;
     insertPrompt(message: string): boolean | Promise<boolean>;
@@ -244,7 +258,9 @@ function domHarness(options: { blockComposer?: boolean; normalizeAsync?: boolean
   let stop = false;
   let clickReceipt: string | null = null;
   let clicks = 0;
-  let blockNodes: FakeNode[] = [];
+  let blockNodes: FakeNode[] = options.emptyComposerBlock
+    ? [node("", "P", [node("", "BR")])]
+    : [];
   let observer: (() => void) | null = null;
   const submittedMessage = options.message ?? command.message;
   const users: FakeNode[] = [];
@@ -258,7 +274,10 @@ function domHarness(options: { blockComposer?: boolean; normalizeAsync?: boolean
     Object.defineProperty(composer, "childNodes", { configurable: true, get: () => blockNodes });
     Object.defineProperty(composer, "innerText", {
       configurable: true,
-      get: () => blockNodes.map((block) => block.textContent).join("\n"),
+      get: () => blockNodes.map((block) =>
+        block.nodeName === "P" && block.childNodes?.some((child) => child.nodeName === "BR")
+          ? "\n"
+          : block.textContent).join("\n"),
     });
   }
   const setComposerText = (value: string) => {
@@ -327,10 +346,11 @@ function domHarness(options: { blockComposer?: boolean; normalizeAsync?: boolean
   };
 }
 
-function node(textContent = "", nodeName = ""): FakeNode {
+function node(textContent = "", nodeName = "", childNodes?: FakeNode[]): FakeNode {
   return {
     textContent,
     nodeName,
+    childNodes,
     parentElement: null,
     closest: () => null,
     querySelector: () => null,
@@ -344,6 +364,20 @@ function node(textContent = "", nodeName = ""): FakeNode {
 }
 
 describe("ChatGPT DOM delivery adapter", () => {
+  it("treats only structurally empty composers as ready", () => {
+    expect(domHarness().dom.ready()).toBe(true);
+
+    const emptyBlock = domHarness({ blockComposer: true, emptyComposerBlock: true });
+    expect((emptyBlock.composer as FakeNode & { innerText: string }).innerText).toBe("\n");
+    expect(emptyBlock.dom.ready()).toBe(true);
+
+    for (const text of ["A", " ", "\t", "user draft", "first line\nsecond line"]) {
+      const harness = domHarness({ blockComposer: true });
+      harness.setComposerText(text);
+      expect(harness.dom.ready(), JSON.stringify(text)).toBe(false);
+    }
+  });
+
   it("protects drafts, attachments, and generating pages", async () => {
     const harness = domHarness();
     harness.composer.textContent = "user draft";
