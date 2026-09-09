@@ -1,0 +1,20 @@
+{
+  "port": 12080,
+  "workspace": {
+    "id": "local-review-mcp",
+    "name": "Local Review MCP",
+    "path": "C:\\Users\\shaoy\\Documents\\Local-Review-MCP"
+  },
+  "auth": {
+    "token": "d7e1d19e503a463f96f57d5cbe7dea94"
+  },
+  "remote": {
+    "enabled": true,
+    "provider": "cloudflare",
+    "endpoint": "https://review.syqiu.kdns.fr/mcp",
+    "token": "eyJhIjoiZWFhN2ZkZTUwNTZkYmM1ZTUwNTJhOTAwYTVjYjMxOGEiLCJ0IjoiYTZiY2FlOGMtYjc3NS00YzZjLTlmMWItMGRlYTBjYjcxNzEyIiwicyI6Ik5ESTROVE00WXpVdE56Qm1NQzAwTmpCa0xXSm1NR1V0TmpNMllUQTNaVGMzT1RZdyJ9"
+  },
+  "supervisor": {
+    "enabled": false
+  }
+}

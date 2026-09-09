@@ -11,6 +11,7 @@ const command = {
   message: "send exactly once",
   deadline: Date.now() + 30_000,
 };
+const MULTILINE_MESSAGE = "Review Request:\r\nfirst paragraph\u00a0with space\r\n\r\nsecond paragraph";
 
 let contentSource = "";
 let domSource = "";
@@ -24,9 +25,9 @@ beforeAll(async () => {
 
 interface DomMock {
   ready(): boolean;
-  insertPrompt(message: string): boolean;
+  insertPrompt(message: string): boolean | Promise<boolean>;
   clearPromptExact(message: string): boolean;
-  send(message: string, current: () => boolean): Promise<{ clicked: boolean; message_id: string | null }>;
+  send(message: string, current: () => boolean, timeoutMs?: number): Promise<{ clicked: boolean; message_id: string | null }>;
 }
 
 function contentHarness(
@@ -151,6 +152,39 @@ describe("Extension delivery content fence", () => {
     expect(dom.send).toHaveBeenCalledTimes(1);
   });
 
+  it("delivers a multiline block-normalized message only after exact insertion", async () => {
+    const deliveredCommand = { ...command, message: MULTILINE_MESSAGE };
+    const dom = domHarness({ blockComposer: true, normalizeAsync: true, message: MULTILINE_MESSAGE });
+    dom.setClickReceipt("message-block");
+    const harness = contentHarness(dom.dom, (message) =>
+      message.type === "delivery_claim" ? { ok: true, command: deliveredCommand } : { ok: true });
+    const ack = await waitForMessage(harness.messages, (message) => message.type === "delivery_ack");
+    const types = harness.messages.map((message) => message.type);
+
+    expect(ack).toMatchObject({
+      delivery_id: command.delivery_id,
+      status: "sent",
+      message_id: "message-block",
+    });
+    expect(types.indexOf("delivery_submit_started")).toBeGreaterThan(types.indexOf("delivery_claim"));
+    expect(types.indexOf("delivery_ack")).toBeGreaterThan(types.indexOf("delivery_submit_started"));
+    expect(dom.composer.textContent).not.toMatch(/\r?\n/u);
+    expect(dom.composer.childNodes?.map((node) => node.nodeName)).toEqual(["P", "P", "P", "P"]);
+    expect(dom.clickCount()).toBe(1);
+  });
+
+  it("ACKs not_sent when insertion cannot prove the complete message", async () => {
+    const dom = readyDom({ clicked: true, message_id: "must-not-send" });
+    dom.insertPrompt.mockReturnValue(false);
+    const harness = contentHarness(dom, (message) =>
+      message.type === "delivery_claim" ? { ok: true, command } : { ok: true });
+    const ack = await waitForMessage(harness.messages, (message) => message.type === "delivery_ack");
+
+    expect(ack).toMatchObject({ status: "not_sent", error: "composer refused exact message" });
+    expect(harness.messages.some((message) => message.type === "delivery_submit_started")).toBe(false);
+    expect(dom.send).not.toHaveBeenCalled();
+  });
+
   it("treats a click without a stable message receipt as ambiguous", async () => {
     const dom = readyDom({ clicked: true, message_id: null });
     const harness = contentHarness(dom, (message) =>
@@ -177,6 +211,8 @@ describe("Extension delivery content fence", () => {
 
 interface FakeNode {
   textContent: string;
+  nodeName?: string;
+  childNodes?: FakeNode[];
   isConnected?: boolean;
   disabled?: boolean;
   parentElement?: FakeNode | null;
@@ -190,21 +226,27 @@ interface FakeNode {
   click(): void;
 }
 
-function domHarness(): {
+function domHarness(options: { blockComposer?: boolean; normalizeAsync?: boolean; message?: string } = {}): {
   dom: {
     ready(): boolean;
-    insertPrompt(message: string): boolean;
-    send(message: string, current: () => boolean, timeoutMs: number): Promise<unknown>;
+    insertPrompt(message: string): boolean | Promise<boolean>;
+    clearPromptExact(message: string): boolean;
+    send(message: string, current: () => boolean, timeoutMs?: number): Promise<{ clicked: boolean; message_id: string | null }>;
   };
   composer: FakeNode;
   setAttachment(value: boolean): void;
   setStop(value: boolean): void;
   setClickReceipt(id: string | null): void;
+  setComposerText(value: string): void;
+  clickCount(): number;
 } {
   let attachment = false;
   let stop = false;
   let clickReceipt: string | null = null;
+  let clicks = 0;
+  let blockNodes: FakeNode[] = [];
   let observer: (() => void) | null = null;
+  const submittedMessage = options.message ?? command.message;
   const users: FakeNode[] = [];
   const form = node();
   const composer = node();
@@ -212,13 +254,33 @@ function domHarness(): {
   composer.parentElement = form;
   composer.closest = (selector) => selector === "form" ? form : null;
   form.querySelector = () => attachment ? node() : null;
+  if (options.blockComposer) {
+    Object.defineProperty(composer, "childNodes", { configurable: true, get: () => blockNodes });
+    Object.defineProperty(composer, "innerText", {
+      configurable: true,
+      get: () => blockNodes.map((block) => block.textContent).join("\n"),
+    });
+  }
+  const setComposerText = (value: string) => {
+    if (!options.blockComposer) {
+      composer.textContent = value;
+      return;
+    }
+    const normalized = value.replace(/\r\n?/gu, "\n");
+    composer.textContent = normalized.replace(/\n/gu, "");
+    blockNodes = options.normalizeAsync ? [] : normalized.split("\n").map((line) => node(line, "P"));
+    if (options.normalizeAsync) {
+      setTimeout(() => { blockNodes = normalized.split("\n").map((line) => node(line, "P")); }, 0);
+    }
+  };
   const button = node();
   button.click = () => {
+    clicks += 1;
     if (!clickReceipt) return;
-    const message = node(command.message);
+    const message = node(submittedMessage);
     message.hasAttribute = (name) => name === "data-message-id";
     message.getAttribute = (name) => name === "data-message-id" ? clickReceipt : null;
-    message.querySelectorAll = (selector) => selector === ".whitespace-pre-wrap" ? [node(command.message)] : [];
+    message.querySelectorAll = (selector) => selector === ".whitespace-pre-wrap" ? [node(submittedMessage)] : [];
     users.push(message);
     observer?.();
   };
@@ -234,8 +296,8 @@ function domHarness(): {
       return selector === '[data-message-author-role="user"]' ? users : [];
     },
     execCommand(action: string, _ui: boolean, value?: string) {
-      if (action === "insertText") composer.textContent = value ?? "";
-      if (action === "delete") composer.textContent = "";
+      if (action === "insertText") setComposerText(value ?? "");
+      if (action === "delete") setComposerText("");
       return true;
     },
   };
@@ -252,19 +314,23 @@ function domHarness(): {
   return {
     dom: (context as unknown as { LRM_DOM: {
       ready(): boolean;
-      insertPrompt(message: string): boolean;
-      send(message: string, current: () => boolean, timeoutMs: number): Promise<unknown>;
+      insertPrompt(message: string): boolean | Promise<boolean>;
+      clearPromptExact(message: string): boolean;
+      send(message: string, current: () => boolean, timeoutMs?: number): Promise<{ clicked: boolean; message_id: string | null }>;
     } }).LRM_DOM,
     composer,
     setAttachment: (value) => { attachment = value; },
     setStop: (value) => { stop = value; },
     setClickReceipt: (id) => { clickReceipt = id; },
+    setComposerText,
+    clickCount: () => clicks,
   };
 }
 
-function node(textContent = ""): FakeNode {
+function node(textContent = "", nodeName = ""): FakeNode {
   return {
     textContent,
+    nodeName,
     parentElement: null,
     closest: () => null,
     querySelector: () => null,
@@ -278,11 +344,11 @@ function node(textContent = ""): FakeNode {
 }
 
 describe("ChatGPT DOM delivery adapter", () => {
-  it("protects drafts, attachments, and generating pages", () => {
+  it("protects drafts, attachments, and generating pages", async () => {
     const harness = domHarness();
     harness.composer.textContent = "user draft";
     expect(harness.dom.ready()).toBe(false);
-    expect(harness.dom.insertPrompt(command.message)).toBe(false);
+    await expect(harness.dom.insertPrompt(command.message)).resolves.toBe(false);
     expect(harness.composer.textContent).toBe("user draft");
     harness.composer.textContent = "";
     harness.setAttachment(true);
@@ -292,9 +358,70 @@ describe("ChatGPT DOM delivery adapter", () => {
     expect(harness.dom.ready()).toBe(false);
   });
 
+  it("uses one exact canonical text for multiline block insertion and clearing", async () => {
+    const harness = domHarness({ blockComposer: true, normalizeAsync: true });
+    await expect(harness.dom.insertPrompt(MULTILINE_MESSAGE)).resolves.toBe(true);
+    expect(harness.composer.textContent).not.toMatch(/\r?\n/u);
+    expect(harness.composer.childNodes?.map((node) => node.nodeName)).toEqual(["P", "P", "P", "P"]);
+    expect(harness.dom.clearPromptExact(MULTILINE_MESSAGE)).toBe(true);
+    expect(harness.composer.textContent).toBe("");
+  });
+
+  it.each([
+    ["a missing character", MULTILINE_MESSAGE.slice(0, -1)],
+    ["an extra visible character", `${MULTILINE_MESSAGE}!`],
+    ["a modified paragraph", MULTILINE_MESSAGE.replace("second paragraph", "changed paragraph")],
+  ])("refuses to send when the composer has %s", async (_label, modified) => {
+    const harness = domHarness({ blockComposer: true, message: MULTILINE_MESSAGE });
+    await expect(harness.dom.insertPrompt(MULTILINE_MESSAGE)).resolves.toBe(true);
+    harness.setComposerText(modified);
+
+    await expect(harness.dom.send(MULTILINE_MESSAGE, () => true, 10)).resolves.toEqual({
+      clicked: false,
+      message_id: null,
+    });
+    expect(harness.clickCount()).toBe(0);
+  });
+
+  it("does not clear a composer after the user changes its exact message", async () => {
+    const harness = domHarness({ blockComposer: true });
+    await expect(harness.dom.insertPrompt(MULTILINE_MESSAGE)).resolves.toBe(true);
+    harness.setComposerText(`${MULTILINE_MESSAGE}!`);
+
+    expect(harness.dom.clearPromptExact(MULTILINE_MESSAGE)).toBe(false);
+    expect(harness.composer.textContent).not.toBe("");
+  });
+
+  it.each([
+    ["an attachment", (harness: ReturnType<typeof domHarness>) => harness.setAttachment(true)],
+    ["a generating/stop state", (harness: ReturnType<typeof domHarness>) => harness.setStop(true)],
+  ])("does not send when %s appears after insertion", async (_label, block) => {
+    const harness = domHarness();
+    await expect(harness.dom.insertPrompt(command.message)).resolves.toBe(true);
+    harness.setClickReceipt("must-not-send");
+    block(harness);
+
+    await expect(harness.dom.send(command.message, () => true, 10)).resolves.toEqual({
+      clicked: false,
+      message_id: null,
+    });
+    expect(harness.clickCount()).toBe(0);
+  });
+
+  it("does not send after the identity fence changes", async () => {
+    const harness = domHarness();
+    await expect(harness.dom.insertPrompt(command.message)).resolves.toBe(true);
+
+    await expect(harness.dom.send(command.message, () => false, 10)).resolves.toEqual({
+      clicked: false,
+      message_id: null,
+    });
+    expect(harness.clickCount()).toBe(0);
+  });
+
   it("returns only a new exact user-message receipt and never equates click with success", async () => {
     const harness = domHarness();
-    expect(harness.dom.insertPrompt(command.message)).toBe(true);
+    await expect(harness.dom.insertPrompt(command.message)).resolves.toBe(true);
     const missing = await harness.dom.send(command.message, () => true, 1) as { clicked: boolean; message_id: string | null };
     expect(missing).toEqual({ clicked: true, message_id: null });
 

@@ -103,7 +103,7 @@
         await acknowledge('not_sent', { error: 'composer_busy' });
         return;
       }
-      if (!LRM_DOM.insertPrompt(command.message)) {
+      if (!(await LRM_DOM.insertPrompt(command.message))) {
         await acknowledge('not_sent', { error: 'composer refused exact message' });
         return;
       }

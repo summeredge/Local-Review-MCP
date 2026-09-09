@@ -4,7 +4,38 @@ globalThis.LRM_DOM = (() => {
   const STOP = 'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], '
     + 'button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[aria-label="Stop answering"]';
   const SEND = 'button[data-testid="send-button"], form button[aria-label^="Send" i]';
-  const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const BLOCK_ELEMENTS = new Set([
+    'ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DD', 'DIV', 'DL', 'DT', 'FIELDSET',
+    'FIGCAPTION', 'FIGURE', 'FOOTER', 'FORM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+    'HEADER', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'P', 'PRE', 'SECTION', 'TABLE',
+    'TBODY', 'TD', 'TFOOT', 'TH', 'THEAD', 'TR', 'UL'
+  ]);
+
+  const canonicalText = (value) => String(value ?? '')
+    .replace(/\r\n?/gu, '\n')
+    .replace(/\u00a0/gu, ' ');
+
+  function domText(node) {
+    if (!node) return '';
+    if (node.nodeType === 3) return node.nodeValue ?? node.textContent ?? '';
+    if (typeof node.innerText === 'string' && (node.innerText !== '' || !node.textContent)) return node.innerText;
+    const name = String(node.nodeName || '').toUpperCase();
+    if (name === 'BR') return '\n';
+    if (!node.childNodes) return node.textContent || '';
+
+    const children = [...node.childNodes];
+    let value = '';
+    for (const [index, child] of children.entries()) {
+      value += domText(child);
+      if (BLOCK_ELEMENTS.has(String(child.nodeName || '').toUpperCase()) && index < children.length - 1) {
+        value += '\n';
+      }
+    }
+    return value;
+  }
+
+  const plainText = (node) => canonicalText(domText(node));
+  const sameText = (actual, expected) => canonicalText(actual) === canonicalText(expected);
 
   function composer() {
     return document.querySelector('#prompt-textarea');
@@ -18,6 +49,10 @@ globalThis.LRM_DOM = (() => {
     return document.querySelector(SEND);
   }
 
+  function composerText(box = composer()) {
+    return plainText(box);
+  }
+
   function hasComposerAttachments() {
     const box = composer();
     const host = box?.closest('form') || box?.parentElement;
@@ -29,14 +64,14 @@ globalThis.LRM_DOM = (() => {
   function ready() {
     const box = composer();
     return Boolean(box && box.isConnected
-      && compact(box.textContent) === ''
+      && composerText(box) === ''
       && box.getAttribute('aria-disabled') !== 'true'
       && box.getAttribute('contenteditable') !== 'false'
       && !stopButton()
       && !hasComposerAttachments());
   }
 
-  function insertPrompt(message) {
+  async function insertPrompt(message) {
     const box = composer();
     if (!ready() || !box) return false;
     box.focus();
@@ -46,12 +81,14 @@ globalThis.LRM_DOM = (() => {
       inputType: 'insertText',
       data: message
     }));
-    return compact(box.textContent) === compact(message);
+    if (sameText(composerText(), message)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return sameText(composerText(), message);
   }
 
   function clearPromptExact(message) {
     const box = composer();
-    if (!box || compact(box.textContent) !== compact(message)) return false;
+    if (!box || !sameText(composerText(box), message)) return false;
     box.focus();
     document.execCommand('selectAll', false);
     document.execCommand('delete', false);
@@ -60,7 +97,7 @@ globalThis.LRM_DOM = (() => {
       inputType: 'deleteContentBackward',
       data: null
     }));
-    return compact(box.textContent) === '';
+    return composerText(box) === '';
   }
 
   function userMessages() {
@@ -70,9 +107,8 @@ globalThis.LRM_DOM = (() => {
       const messageId = identified?.getAttribute('data-message-id') || '';
       if (!messageId) continue;
       const parts = [...node.querySelectorAll('.whitespace-pre-wrap')]
-        .map((part) => compact(part.textContent))
-        .filter(Boolean);
-      found.push({ message_id: messageId, text: parts.length ? parts.join('\n') : compact(node.textContent), node });
+        .map((part) => plainText(part));
+      found.push({ message_id: messageId, text: parts.length ? parts.join('\n') : plainText(node), node });
     }
     return found;
   }
@@ -80,8 +116,14 @@ globalThis.LRM_DOM = (() => {
   async function send(message, stillCurrent, timeoutMs = 20_000) {
     const box = composer();
     const button = sendButton();
-    if (!box || !button || button.disabled || button.getAttribute('aria-disabled') === 'true'
-      || !stillCurrent() || stopButton() || compact(box.textContent) !== compact(message)) {
+    const canSend = () => box && composer() === box && box.isConnected
+      && button && button.isConnected !== false
+      && box.getAttribute('aria-disabled') !== 'true'
+      && box.getAttribute('contenteditable') !== 'false'
+      && !button.disabled && button.getAttribute('aria-disabled') !== 'true'
+      && stillCurrent() && !stopButton() && !hasComposerAttachments()
+      && sameText(composerText(box), message);
+    if (!canSend()) {
       return { clicked: false, message_id: null };
     }
     const before = new Set(userMessages().map((entry) => entry.message_id));
@@ -89,22 +131,25 @@ globalThis.LRM_DOM = (() => {
       let observer = null;
       let timer = null;
       let done = false;
-      const finish = (messageId) => {
+      let clicked = false;
+      const finish = (messageId, didClick = clicked) => {
         if (done) return;
         done = true;
         observer?.disconnect();
         clearTimeout(timer);
-        resolve({ clicked: true, message_id: messageId });
+        resolve({ clicked: didClick, message_id: messageId });
       };
       const check = () => {
         if (!stillCurrent()) return finish(null);
         const receipt = userMessages().find((entry) =>
-          !before.has(entry.message_id) && compact(entry.text) === compact(message));
+          !before.has(entry.message_id) && sameText(entry.text, message));
         if (receipt) finish(receipt.message_id);
       };
       observer = new MutationObserver(check);
       observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true });
       timer = setTimeout(() => { check(); finish(null); }, Math.max(1, Math.min(timeoutMs, 20_000)));
+      if (!canSend()) return finish(null, false);
+      clicked = true;
       button.click();
       check();
     });
