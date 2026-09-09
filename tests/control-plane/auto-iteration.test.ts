@@ -229,6 +229,28 @@ function startInput(overrides: Partial<AutoIterationStartInput> = {}): AutoItera
 }
 
 describe("AutoIterationService", () => {
+  it("notifies only after terminal persistence and replays terminal notifications on recovery", async () => {
+    const f = await fixture();
+    const listener = vi.fn(async (loop: AutoIteration) => {
+      expect(await f.auto.getLoop(loop.loop_id)).toEqual(loop);
+      throw new Error("listener unavailable");
+    });
+    f.auto.setTerminalListener(listener);
+
+    const terminal = await f.auto.start(startInput());
+    expect(terminal.stage).toBe("completed");
+    await vi.waitFor(() => expect(listener).toHaveBeenCalledTimes(1));
+    expect((await f.auto.getLoop(terminal.loop_id))!.stage).toBe("completed");
+
+    const recoveredListener = vi.fn();
+    const restarted = new AutoIterationService(f.registry, {
+      storageRoot: f.root,
+      terminalListener: recoveredListener,
+    });
+    await restarted.recover();
+    await vi.waitFor(() => expect(recoveredListener).toHaveBeenCalledWith(terminal));
+  });
+
   it("completes an approved execution without starting another Codex process", async () => {
     const value = await fixture(["APPROVE"]);
 
@@ -292,6 +314,8 @@ describe("AutoIterationService", () => {
       terminal_decision: "HUMAN_REQUIRED",
     });
     expect(human.starts).toHaveLength(0);
+    expect((await new TaskContextService(human.root).getTaskContext("task-001"))!.status)
+      .toBe("human_required");
   });
 
   it("maps max_iterations reached to human_required without starting another execution", async () => {

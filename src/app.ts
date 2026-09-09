@@ -16,6 +16,7 @@ import {
 } from "./control-plane/extension-delivery.js";
 import { CodexExecutionCompletionService } from "./control-plane/codex-execution-completion.js";
 import { AutoIterationService } from "./control-plane/auto-iteration.js";
+import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
 import type { ExtensionIdentityEvidence } from "./control-plane/extension-identity.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { defaultTaskContextStorageRoot } from "./context/task.js";
@@ -33,6 +34,7 @@ export interface AppContext extends McpRuntimeContext {
   readonly codexExecutionAdapter?: CodexExecutionAdapter;
   readonly controlledActuation?: ControlledActuationService;
   readonly autoIteration?: AutoIterationService;
+  readonly goalOrchestration?: GoalOrchestrationService;
 }
 
 export interface AppStartOptions extends HttpServerOptions {
@@ -82,6 +84,13 @@ export function createAppContext(
     extensionDeliveries,
     controlledActuation,
   });
+  const goalOrchestration = new GoalOrchestrationService(registry, {
+    storageRoot,
+    authorizationStore: actuationAuthorizationStore,
+    controlledActuation,
+    autoIteration,
+  });
+  autoIteration.setTerminalListener((loop) => goalOrchestration.onAutoIterationTerminal(loop));
   codexExecutionCompletion.setTerminalListener((execution) => autoIteration.onExecutionTerminal(execution));
   return {
     settings,
@@ -92,6 +101,7 @@ export function createAppContext(
     codexExecutionAdapter,
     controlledActuation,
     autoIteration,
+    goalOrchestration,
     tunnel: createTunnelManager(settings.remote, {
       localEndpoint: localOrigin(settings),
       authToken: settings.auth.token,
@@ -134,6 +144,11 @@ export async function startApp(
         await context.autoIteration?.recover();
       } catch {
         console.warn("Auto Iterate recovery failed; local MCP remains available");
+      }
+      try {
+        await context.goalOrchestration?.recover();
+      } catch {
+        console.warn("Goal Orchestration recovery failed; local MCP remains available");
       }
       const bridgePort = await startBridge({
         ports: options.bridgePorts,

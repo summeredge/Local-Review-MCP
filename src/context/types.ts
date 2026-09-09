@@ -3,6 +3,7 @@ export const TASK_STATUSES = [
   "reviewing",
   "completed",
   "failed",
+  "human_required",
 ] as const;
 
 export type TaskStatus = typeof TASK_STATUSES[number];

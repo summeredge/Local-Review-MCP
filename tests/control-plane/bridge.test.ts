@@ -375,6 +375,24 @@ describe("Local Control Bridge app lifecycle", () => {
     }
   });
 
+  it("keeps MCP available when Goal Orchestration recovery fails", async () => {
+    await stopBridge();
+    const runtime = createAppContext(settings());
+    vi.spyOn(runtime.goalOrchestration!, "recover").mockRejectedValue(new Error("corrupt"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let server: Server | null = null;
+    try {
+      server = await startApp(settings(), runtime, { bridgePorts: [0] });
+      expect(server.listening).toBe(true);
+      expect(warning).toHaveBeenCalledWith(
+        "Goal Orchestration recovery failed; local MCP remains available",
+      );
+    } finally {
+      warning.mockRestore();
+      if (server !== null) await close(server);
+    }
+  });
+
   it("routes accepted identity evidence into the production correlation registry", async () => {
     await stopBridge();
     const root = await mkdtemp(join(tmpdir(), "local-review-mcp-app-correlation-"));

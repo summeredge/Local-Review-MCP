@@ -165,6 +165,9 @@ export type AutoIterationLoop = AutoIteration;
 export type AutoIterationStartInput = z.infer<typeof autoIterationStartInputSchema>;
 export type AutoIterationStage = z.infer<typeof autoIterationStageSchema>;
 export type AutoIterationTerminalDecision = z.infer<typeof autoIterationTerminalDecisionSchema>;
+export type AutoIterationTerminalListener = (
+  loop: AutoIteration,
+) => void | Promise<void>;
 
 export const autoIterationStateFile = (storageRoot: string): string =>
   join(resolve(storageRoot), "control-plane", "auto-iterations.json");
@@ -332,6 +335,7 @@ export interface AutoIterationServiceOptions {
   readonly controlledActuation?: ControlledActuationPort & {
     readonly authorizationStore?: AuthorizationReader;
   };
+  readonly terminalListener?: AutoIterationTerminalListener;
 }
 
 export class AutoIterationService {
@@ -352,6 +356,7 @@ export class AutoIterationService {
   private readonly parser: Pick<ReviewVerdictParser, "parse">;
   private readonly authorizationStore: AuthorizationReader;
   private readonly flights = new Map<string, Promise<AutoIteration>>();
+  private terminalListener?: AutoIterationTerminalListener;
 
   public constructor(
     registry: WorkspaceRegistry,
@@ -392,6 +397,7 @@ export class AutoIterationService {
         executionContextService: this.executions,
       });
     this.store = new AutoIterationStore(this.storageRoot);
+    this.terminalListener = options.terminalListener;
 
     for (const dependency of [
       this.tasks.storageRoot,
@@ -421,6 +427,10 @@ export class AutoIterationService {
 
   public async listLoops(): Promise<AutoIteration[]> {
     return this.store.list();
+  }
+
+  public setTerminalListener(listener: AutoIterationTerminalListener | undefined): void {
+    this.terminalListener = listener;
   }
 
   public start(input: AutoIterationStartInput): Promise<AutoIteration> {
@@ -459,6 +469,7 @@ export class AutoIterationService {
     const loops = await this.store.list();
     for (const loop of loops) {
       if (loop.stage === "completed" || loop.stage === "human_required" || loop.stage === "failed") {
+        this.notifyTerminal(loop);
         continue;
       }
       try {
@@ -959,6 +970,7 @@ export class AutoIterationService {
     } catch (error: unknown) {
       console.warn(`Auto Iterate task completion update failed for loop "${current.loop_id}"`, errorMessage(error));
     }
+    this.notifyTerminal(current);
     return current;
   }
 
@@ -1001,6 +1013,7 @@ export class AutoIterationService {
     } catch (error: unknown) {
       console.warn(`Auto Iterate task failure update failed for loop "${current.loop_id}"`, errorMessage(error));
     }
+    this.notifyTerminal(current);
     return current;
   }
 
@@ -1009,12 +1022,29 @@ export class AutoIterationService {
     reason: string,
     summary?: string,
   ): Promise<AutoIteration> {
-    return this.update(loop, {
+    const current = await this.update(loop, {
       stage: "human_required",
       terminal_decision: "HUMAN_REQUIRED",
       terminal_reason: reason,
       ...(summary === undefined ? {} : { terminal_summary: summary }),
     });
+    try {
+      await this.tasks.updateTaskContext(current.task_id, { status: "human_required" });
+    } catch (error: unknown) {
+      console.warn(`Auto Iterate task human-required update failed for loop "${current.loop_id}"`, errorMessage(error));
+    }
+    this.notifyTerminal(current);
+    return current;
+  }
+
+  private notifyTerminal(loop: AutoIteration): void {
+    if (this.terminalListener === undefined) return;
+    const listener = this.terminalListener;
+    void Promise.resolve()
+      .then(() => listener(clone(loop)))
+      .catch((error: unknown) => {
+        console.warn(`Auto Iterate terminal listener failed for loop "${loop.loop_id}"`, errorMessage(error));
+      });
   }
 
   private async update(loop: AutoIteration, patch: Partial<AutoIteration>): Promise<AutoIteration> {
