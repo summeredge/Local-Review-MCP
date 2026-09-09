@@ -412,6 +412,54 @@ describe("GoalOrchestrationService", () => {
       .toBe(authorization.authorization_id);
   });
 
+  it("fails closed when authorization and execution exist without an actuation reservation", async () => {
+    const f = await fixture();
+    const plan = input();
+    const checkpoint = runningGoal(plan);
+    await f.tasks.createTaskContext({
+      task_id: "task-1",
+      workspace_id: plan.workspace_id,
+      conversation_id: plan.conversation_id,
+    });
+    const execution = await f.executions.createExecutionContext({
+      execution_id: checkpoint.execution_id!,
+      task_id: "task-1",
+      workspace_id: plan.workspace_id,
+      process_id: 9001,
+      command: "codex exec --json -",
+    });
+    await f.controlled.authorize({
+      actuation_id: checkpoint.actuation_id!,
+      workspace_id: plan.workspace_id,
+      task_id: "task-1",
+      execution_id: checkpoint.execution_id!,
+      instruction: [
+        "## 修改目标",
+        "Make the change",
+        "",
+        "## 修改要求",
+        "- Keep it small",
+        "",
+        "## 验收标准",
+        "- Tests pass",
+      ].join("\n"),
+    });
+    await persistGoal(f.root, checkpoint);
+
+    await f.service.recover();
+
+    expect((await f.service.getGoal(plan.goal_id))!.status).toBe("human_required");
+    expect(f.starts).not.toHaveBeenCalled();
+    expect(f.auto.start).not.toHaveBeenCalled();
+    expect(f.auto.loops.size).toBe(0);
+    expect(await f.controlled.getActuation(checkpoint.actuation_id!)).toBeNull();
+    expect(await f.executions.getExecutionContext(
+      plan.workspace_id,
+      "task-1",
+      checkpoint.execution_id!,
+    )).toEqual(execution);
+  });
+
   it("serializes concurrent advance and terminal notification races", async () => {
     const f = await fixture();
     const plan = input([{
@@ -476,6 +524,38 @@ describe("GoalOrchestrationService", () => {
     expect(recovered!.current_task_id).toBe("task-2");
     expect(recovered!.status).toBe("running");
     expect(f.starts).toHaveBeenCalledTimes(startsBeforeRecovery);
+  });
+
+  it("keeps a completed Goal and all lower durable evidence terminally stable", async () => {
+    const f = await fixture();
+    const plan = input();
+    await f.service.createGoal(plan);
+    let goal = await f.service.startGoal({ goal_id: plan.goal_id });
+    f.auto.terminal(goal.loop_id!, "completed");
+    goal = await f.service.advanceGoal(plan.goal_id);
+    expect(goal.status).toBe("completed");
+
+    const before = {
+      goal,
+      tasks: await f.tasks.listTaskContexts(),
+      executions: await f.executions.listExecutions(plan.workspace_id, "task-1"),
+      controlled: await readFile(controlledActuationStateFile(f.root), "utf8"),
+      loops: structuredClone([...f.auto.loops]),
+      starts: f.starts.mock.calls.length,
+      autoStarts: f.auto.start.mock.calls.length,
+    };
+
+    await f.service.startGoal({ goal_id: plan.goal_id });
+    await f.service.advanceGoal(plan.goal_id);
+    await f.service.recover();
+
+    expect(await f.service.getGoal(plan.goal_id)).toEqual(before.goal);
+    expect(await f.tasks.listTaskContexts()).toEqual(before.tasks);
+    expect(await f.executions.listExecutions(plan.workspace_id, "task-1")).toEqual(before.executions);
+    expect(await readFile(controlledActuationStateFile(f.root), "utf8")).toBe(before.controlled);
+    expect([...f.auto.loops]).toEqual(before.loops);
+    expect(f.starts).toHaveBeenCalledTimes(before.starts);
+    expect(f.auto.start).toHaveBeenCalledTimes(before.autoStarts);
   });
 
   it("fails closed on lower identity conflict without creating an execution", async () => {

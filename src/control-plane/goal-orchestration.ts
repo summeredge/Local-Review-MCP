@@ -546,6 +546,9 @@ export class GoalOrchestrationService {
       || taskContext.status === "human_required" || taskContext.status === "reviewing") {
       throw new Error("terminal or reviewing TaskContext exists without its AutoIteration");
     }
+    if (execution !== null && actuation === null) {
+      throw new Error("Execution exists without its durable actuation reservation");
+    }
     if (actuation?.status === "failed" || execution?.status === "failed") return "failed";
     if (authorization === null && (actuation !== null || execution !== null)) {
       throw new Error("execution or actuation exists without its authorization");
