@@ -4,6 +4,11 @@ import { endpoint, localOrigin, type ResolvedSettings } from "./config/settings.
 import { isPortInUse, startHttpServer, type HttpServerOptions } from "./mcp/http.js";
 import { REGISTERED_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
 import { startBridge, stopBridge } from "./control-plane/bridge.js";
+import {
+  ActuationAuthorizationStore,
+  ControlledActuationService,
+} from "./control-plane/controlled-actuation.js";
+import { CodexExecutionAdapter } from "./control-plane/codex-execution-adapter.js";
 import { ConversationCorrelationRegistry } from "./control-plane/conversation-correlation.js";
 import {
   ExtensionDeliveryService,
@@ -12,6 +17,7 @@ import {
 import { CodexExecutionCompletionService } from "./control-plane/codex-execution-completion.js";
 import type { ExtensionIdentityEvidence } from "./control-plane/extension-identity.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
+import { defaultTaskContextStorageRoot } from "./context/task.js";
 import { validateWorkspaceIdentityConsistency } from "./workspace/identity.js";
 import { WorkspaceManager } from "./workspace/manager.js";
 import { WorkspaceRegistry } from "./workspace/registry.js";
@@ -22,6 +28,9 @@ export interface AppContext extends McpRuntimeContext {
   readonly correlations: ConversationCorrelationRegistry;
   readonly extensionDeliveries: ExtensionDeliveryService;
   readonly codexExecutionCompletion?: CodexExecutionCompletionService;
+  readonly actuationAuthorizationStore?: ActuationAuthorizationStore;
+  readonly codexExecutionAdapter?: CodexExecutionAdapter;
+  readonly controlledActuation?: ControlledActuationService;
 }
 
 export interface AppStartOptions extends HttpServerOptions {
@@ -52,11 +61,26 @@ export function createAppContext(
   if (runtimeIdentity !== undefined) {
     validateWorkspaceIdentityConsistency(registry.active, runtimeIdentity);
   }
+  const storageRoot = defaultTaskContextStorageRoot(environment);
+  const codexExecutionCompletion = new CodexExecutionCompletionService(storageRoot);
+  const codexExecutionAdapter = new CodexExecutionAdapter(registry, {
+    storageRoot,
+    completionService: codexExecutionCompletion,
+    environment,
+  });
+  const actuationAuthorizationStore = new ActuationAuthorizationStore(storageRoot);
   return {
     settings,
     correlations: new ConversationCorrelationRegistry(),
     extensionDeliveries: new ExtensionDeliveryService(),
-    codexExecutionCompletion: new CodexExecutionCompletionService(),
+    codexExecutionCompletion,
+    actuationAuthorizationStore,
+    codexExecutionAdapter,
+    controlledActuation: new ControlledActuationService(registry, {
+      storageRoot,
+      authorizationStore: actuationAuthorizationStore,
+      adapter: codexExecutionAdapter,
+    }),
     tunnel: createTunnelManager(settings.remote, {
       localEndpoint: localOrigin(settings),
       authToken: settings.auth.token,
@@ -82,6 +106,11 @@ export async function startApp(
           .recoverRunningExecutions();
       } catch {
         console.warn("Codex execution completion recovery failed; local MCP remains available");
+      }
+      try {
+        await context.controlledActuation?.restore();
+      } catch {
+        console.warn("Controlled Actuation unavailable; durable state could not be restored");
       }
       let deliveryAvailable = true;
       try {
