@@ -7,6 +7,8 @@ dist/
 *.token
 config.production.json
 config.production.backup-*.json
+config.e2e.json
+docs/e2e-validation-marker.md
 __pycache__/
 *.pyc
 LocalReviewLauncher/launcher.config.json
