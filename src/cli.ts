@@ -11,6 +11,7 @@ import {
   generateBrowserRouterExample,
   generateReviewDeliveryBrowserExample,
 } from "./router/browser-router-diagnostic.js";
+import { runGoalE2EDiagnostic } from "./control-plane/goal-e2e-diagnostic.js";
 import { registeredMcpToolsMessage } from "./mcp/server.js";
 import { createStartupManager } from "./supervisor/startup.js";
 import { createSupervisor } from "./supervisor/supervisor.js";
@@ -77,6 +78,8 @@ try {
         ? undefined
         : new WorkspaceManager(diagnosticSettings.workspace).identity);
     console.log(JSON.stringify(await generateConversationRoutingExample(identity), null, 2));
+  } else if (argv[0] === "diagnose-goal-e2e") {
+    await runGoalE2EDiagnostic(argv.slice(1));
   } else {
     const cli = parseCliArgs(argv);
     const settings = await loadSettings(argv);

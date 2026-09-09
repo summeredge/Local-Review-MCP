@@ -22,6 +22,7 @@
     "diagnose:iteration-directive": "npm run build && node dist/src/cli.js diagnose-iteration-directive",
     "diagnose:review-snapshot": "npm run build && node dist/src/cli.js diagnose-review-snapshot",
     "diagnose:review-context": "npm run build && node dist/src/cli.js diagnose-review-context",
+    "diagnose:goal-e2e": "npm run build && node dist/src/cli.js diagnose-goal-e2e",
     "start:browser-worker": "npm run build && node dist/src/browser-worker/cli.js",
     "start": "node dist/src/cli.js"
   },
