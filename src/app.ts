@@ -15,6 +15,7 @@ import {
   ExtensionDeliveryUnavailableError,
 } from "./control-plane/extension-delivery.js";
 import { CodexExecutionCompletionService } from "./control-plane/codex-execution-completion.js";
+import { AutoIterationService } from "./control-plane/auto-iteration.js";
 import type { ExtensionIdentityEvidence } from "./control-plane/extension-identity.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { defaultTaskContextStorageRoot } from "./context/task.js";
@@ -31,6 +32,7 @@ export interface AppContext extends McpRuntimeContext {
   readonly actuationAuthorizationStore?: ActuationAuthorizationStore;
   readonly codexExecutionAdapter?: CodexExecutionAdapter;
   readonly controlledActuation?: ControlledActuationService;
+  readonly autoIteration?: AutoIterationService;
 }
 
 export interface AppStartOptions extends HttpServerOptions {
@@ -62,6 +64,7 @@ export function createAppContext(
     validateWorkspaceIdentityConsistency(registry.active, runtimeIdentity);
   }
   const storageRoot = defaultTaskContextStorageRoot(environment);
+  const extensionDeliveries = new ExtensionDeliveryService(storageRoot);
   const codexExecutionCompletion = new CodexExecutionCompletionService(storageRoot);
   const codexExecutionAdapter = new CodexExecutionAdapter(registry, {
     storageRoot,
@@ -69,18 +72,26 @@ export function createAppContext(
     environment,
   });
   const actuationAuthorizationStore = new ActuationAuthorizationStore(storageRoot);
+  const controlledActuation = new ControlledActuationService(registry, {
+    storageRoot,
+    authorizationStore: actuationAuthorizationStore,
+    adapter: codexExecutionAdapter,
+  });
+  const autoIteration = new AutoIterationService(registry, {
+    storageRoot,
+    extensionDeliveries,
+    controlledActuation,
+  });
+  codexExecutionCompletion.setTerminalListener((execution) => autoIteration.onExecutionTerminal(execution));
   return {
     settings,
     correlations: new ConversationCorrelationRegistry(),
-    extensionDeliveries: new ExtensionDeliveryService(),
+    extensionDeliveries,
     codexExecutionCompletion,
     actuationAuthorizationStore,
     codexExecutionAdapter,
-    controlledActuation: new ControlledActuationService(registry, {
-      storageRoot,
-      authorizationStore: actuationAuthorizationStore,
-      adapter: codexExecutionAdapter,
-    }),
+    controlledActuation,
+    autoIteration,
     tunnel: createTunnelManager(settings.remote, {
       localEndpoint: localOrigin(settings),
       authToken: settings.auth.token,
@@ -118,6 +129,11 @@ export async function startApp(
       } catch {
         deliveryAvailable = false;
         console.warn("Extension Delivery unavailable; durable state could not be restored");
+      }
+      try {
+        await context.autoIteration?.recover();
+      } catch {
+        console.warn("Auto Iterate recovery failed; local MCP remains available");
       }
       const bridgePort = await startBridge({
         ports: options.bridgePorts,

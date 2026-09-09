@@ -38,8 +38,14 @@ export type CodexProcessProbe = (
   processId: number,
 ) => CodexProcessProbeState | Promise<CodexProcessProbeState>;
 
+export type CodexExecutionTerminalListener = (
+  execution: ExecutionContext,
+) => void | Promise<void>;
+
 export interface CodexExecutionCompletionOptions {
   readonly processProbe?: CodexProcessProbe;
+  readonly onTerminal?: CodexExecutionTerminalListener;
+  readonly onExecutionTerminal?: CodexExecutionTerminalListener;
 }
 
 const identitySchema = z.object({
@@ -297,6 +303,7 @@ export class CodexExecutionCompletionService {
   private readonly tasks: TaskContextService;
   private readonly executions: ExecutionContextService;
   private readonly processProbe: CodexProcessProbe;
+  private terminalListener?: CodexExecutionTerminalListener;
   public readonly storageRoot: string;
 
   public constructor(
@@ -307,6 +314,11 @@ export class CodexExecutionCompletionService {
     this.tasks = new TaskContextService(this.storageRoot);
     this.executions = new ExecutionContextService(this.storageRoot);
     this.processProbe = options.processProbe ?? defaultProcessProbe;
+    this.terminalListener = options.onTerminal ?? options.onExecutionTerminal;
+  }
+
+  public setTerminalListener(listener: CodexExecutionTerminalListener | undefined): void {
+    this.terminalListener = listener;
   }
 
   public async reconcile(input: CodexExecutionIdentity): Promise<ExecutionContext> {
@@ -484,26 +496,40 @@ export class CodexExecutionCompletionService {
     return current;
   }
 
-  private pass(current: ExecutionContext, summary: string): Promise<ExecutionContext> {
-    return current.status === "running"
-      ? this.executions.updateExecutionContext(
-        current.workspace_id,
-        current.task_id,
-        current.execution_id,
-        { status: "passed", summary },
-      )
-      : Promise.resolve(current);
+  private async pass(current: ExecutionContext, summary: string): Promise<ExecutionContext> {
+    if (current.status !== "running") return current;
+    const next = await this.executions.updateExecutionContext(
+      current.workspace_id,
+      current.task_id,
+      current.execution_id,
+      { status: "passed", summary },
+    );
+    await this.notifyTerminal(next);
+    return next;
   }
 
-  private fail(current: ExecutionContext, summary: string): Promise<ExecutionContext> {
-    return current.status === "running"
-      ? this.executions.updateExecutionContext(
-        current.workspace_id,
-        current.task_id,
-        current.execution_id,
-        { status: "failed", summary: boundedSummary(summary, "Codex execution failed.") },
-      )
-      : Promise.resolve(current);
+  private async fail(current: ExecutionContext, summary: string): Promise<ExecutionContext> {
+    if (current.status !== "running") return current;
+    const next = await this.executions.updateExecutionContext(
+      current.workspace_id,
+      current.task_id,
+      current.execution_id,
+      { status: "failed", summary: boundedSummary(summary, "Codex execution failed.") },
+    );
+    await this.notifyTerminal(next);
+    return next;
+  }
+
+  private async notifyTerminal(execution: ExecutionContext): Promise<void> {
+    if (this.terminalListener === undefined) return;
+    try {
+      await this.terminalListener(execution);
+    } catch (error: unknown) {
+      console.warn(
+        "Codex execution terminal notification failed; execution state is already persisted",
+        error,
+      );
+    }
   }
 }
 

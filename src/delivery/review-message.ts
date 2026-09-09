@@ -20,6 +20,7 @@ export function buildReviewMessage(
     "ITERATE means a blocking issue within the current task scope must be fixed, and it requires goal, at least one requirement, and at least one acceptance_criteria item.",
     "HUMAN_REQUIRED means the result needs user decision or clarification, is outside the current task scope, or cannot be safely decided by the current iteration. Do not expand the iteration for out-of-scope issues.",
     "Do not output controller, retry, transport, or lifecycle states as verdict decisions.",
+    "For ITERATE, include the exact additional field \"iteration\": {\"goal\": \"...\", \"requirements\": [\"...\"], \"acceptance_criteria\": [\"...\"] }.",
     "The block must use this exact review_request_id:",
     "<lrm-review-result>",
     "{",

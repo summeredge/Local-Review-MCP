@@ -287,6 +287,15 @@ export class ActuationAuthorizationStore {
     });
   }
 
+  public async getAuthorizationByActuation(actuationId: string): Promise<ActuationAuthorization | null> {
+    await this.restore();
+    const parsedId = actuationIdSchema.parse(actuationId);
+    return this.exclusive(async () => {
+      const authorization = this.state.authorizations.find((candidate) => candidate.actuation_id === parsedId);
+      return authorization === undefined ? null : clone(authorization);
+    });
+  }
+
   public async getActuation(actuationId: string): Promise<ControlledActuation | null> {
     await this.restore();
     const parsedId = actuationIdSchema.parse(actuationId);

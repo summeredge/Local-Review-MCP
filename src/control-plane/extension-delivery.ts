@@ -206,6 +206,7 @@ export class ExtensionDeliveryNotFoundError extends Error {}
 export class ExtensionDeliveryUnavailableError extends Error {}
 
 export class ExtensionDeliveryService {
+  public readonly storageRoot: string;
   private readonly file: string;
   private deliveries = new Map<string, ExtensionDelivery>();
   private readonly waiters = new Map<string, Set<(receipt: ExtensionDeliveryReceipt) => void>>();
@@ -213,7 +214,8 @@ export class ExtensionDeliveryService {
   private operationQueue: Promise<void> = Promise.resolve();
 
   public constructor(storageRoot = defaultTaskContextStorageRoot()) {
-    this.file = stateFile(storageRoot);
+    this.storageRoot = resolve(storageRoot);
+    this.file = stateFile(this.storageRoot);
   }
 
   public restore(): Promise<void> {

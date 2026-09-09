@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CodexExecutionCompletionService,
   codexExecutionLogPaths,
@@ -101,6 +101,26 @@ describe("CodexExecutionCompletionService", () => {
 
     expect(result).toMatchObject({ status: "passed", summary: "Task completed", process_id: 4101 });
     expect(result.finished_at).toBeTruthy();
+  });
+
+  it("notifies a terminal listener once after durable completion", async () => {
+    const root = await storageRoot();
+    const execution = await runningExecution(root);
+    await stdout(root, execution, completed);
+    const listener = vi.fn();
+    const service = new CodexExecutionCompletionService(root, {
+      processProbe: () => "alive",
+      onTerminal: listener,
+    });
+
+    await service.reconcile(identity(execution));
+    await service.reconcile(identity(execution));
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+      execution_id: execution.executionId,
+      status: "passed",
+    }));
   });
 
   it("maps turn.failed and top-level error to failed without treating command items as terminal", async () => {
