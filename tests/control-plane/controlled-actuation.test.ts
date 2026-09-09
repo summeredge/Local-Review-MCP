@@ -212,6 +212,62 @@ describe("ControlledActuationService", () => {
     });
   });
 
+  it("repairs a persisted starting actuation when execution already has a process identity", async () => {
+    const value = await fixture();
+    const service = new ControlledActuationService(value.registry, { storageRoot: value.storageRoot });
+    const authorization = await service.authorize(authorizationInput());
+    const request: ControlledActuationRequest = {
+      actuation_id: authorization.actuation_id,
+      authorization_id: authorization.authorization_id,
+    };
+    await service.authorizationStore.reserveActuation(request);
+    await new ExecutionContextService(value.storageRoot).createExecutionContext({
+      execution_id: "execution-001",
+      task_id: "task-001",
+      workspace_id: "workspace-a",
+      status: "running",
+      process_id: 5106,
+    });
+
+    const start = vi.fn(() => {
+      throw new Error("must not start");
+    });
+    const restarted = new ControlledActuationService(value.registry, {
+      storageRoot: value.storageRoot,
+      adapter: { start },
+    });
+    await expect(restarted.actuate(request)).resolves.toMatchObject({
+      accepted: "existing",
+      execution_id: "execution-001",
+      process_id: 5106,
+      actuation: { status: "started" },
+    });
+    expect(start).not.toHaveBeenCalled();
+    await expect(restarted.getActuation("actuation-001")).resolves.toMatchObject({ status: "started" });
+  });
+
+  it("fails closed for a persisted starting actuation without an execution context", async () => {
+    const value = await fixture();
+    const service = new ControlledActuationService(value.registry, { storageRoot: value.storageRoot });
+    const authorization = await service.authorize(authorizationInput());
+    const request: ControlledActuationRequest = {
+      actuation_id: authorization.actuation_id,
+      authorization_id: authorization.authorization_id,
+    };
+    await service.authorizationStore.reserveActuation(request);
+
+    const start = vi.fn(() => {
+      throw new Error("must not start");
+    });
+    const restarted = new ControlledActuationService(value.registry, {
+      storageRoot: value.storageRoot,
+      adapter: { start },
+    });
+    await expect(restarted.actuate(request)).rejects.toThrow(/not recoverable/iu);
+    expect(start).not.toHaveBeenCalled();
+    await expect(restarted.getActuation("actuation-001")).resolves.toMatchObject({ status: "starting" });
+  });
+
   it("rejects terminal and ambiguous execution reuse before the Adapter", async () => {
     const value = await fixture();
     const start = vi.fn(async () => ({
