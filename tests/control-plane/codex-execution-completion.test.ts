@@ -123,21 +123,68 @@ describe("CodexExecutionCompletionService", () => {
     }));
   });
 
-  it("maps turn.failed and top-level error to failed without treating command items as terminal", async () => {
+  it("maps turn.failed to failed", async () => {
     const root = await storageRoot();
     const turnFailed = await runningExecution(root, { executionId: "execution-turn-failed" });
     await stdout(root, turnFailed, `${JSON.stringify({ type: "turn.failed", error: { message: "turn failed" } })}\n`);
     await expect(new CodexExecutionCompletionService(root, { processProbe: () => "alive" })
       .reconcile(identity(turnFailed))).resolves.toMatchObject({ status: "failed", summary: "turn failed" });
+  });
 
-    const topLevelError = await runningExecution(root, {
-      taskId: "task-error",
-      executionId: "execution-error",
-      processId: 4102,
-    });
-    await stdout(root, topLevelError, `${JSON.stringify({ type: "error", message: "stream failed" })}\n`);
+  it("keeps a top-level error running while the process is still alive", async () => {
+    const root = await storageRoot();
+    const execution = await runningExecution(root);
+    await stdout(root, execution, `${JSON.stringify({ type: "error", message: "transient diagnostic" })}\n`);
+
     await expect(new CodexExecutionCompletionService(root, { processProbe: () => "alive" })
-      .reconcile(identity(topLevelError))).resolves.toMatchObject({ status: "failed", summary: "stream failed" });
+      .reconcile(identity(execution))).resolves.toMatchObject({ status: "running" });
+  });
+
+  it("uses the last top-level error as the diagnostic after a confirmed process exit", async () => {
+    const root = await storageRoot();
+    const execution = await runningExecution(root);
+    const errorMessage = "terminal diagnostic";
+    await stdout(root, execution, `${JSON.stringify({ type: "error", message: errorMessage })}\n`);
+
+    await expect(new CodexExecutionCompletionService(root, { processProbe: () => "alive" })
+      .observeProcessExit({
+        ...identity(execution),
+        process_id: execution.processId,
+        exit_code: 0,
+        signal: null,
+      })).resolves.toMatchObject({ status: "failed", summary: errorMessage });
+  });
+
+  it("prefers turn.failed over an earlier top-level diagnostic error", async () => {
+    const root = await storageRoot();
+    const execution = await runningExecution(root);
+    await stdout(root, execution, [
+      JSON.stringify({ type: "error", message: "transient diagnostic" }),
+      JSON.stringify({ type: "turn.failed", error: { message: "turn failed" } }),
+      "",
+    ].join("\n"));
+
+    await expect(new CodexExecutionCompletionService(root, { processProbe: () => "alive" })
+      .reconcile(identity(execution))).resolves.toMatchObject({ status: "failed", summary: "turn failed" });
+  });
+
+  it("passes after a top-level diagnostic error when the turn completes", async () => {
+    const root = await storageRoot();
+    const execution = await runningExecution(root);
+    await stdout(root, execution, [
+      JSON.stringify({ type: "error", message: "transient diagnostic" }),
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "started" } }),
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "continued successfully" } }),
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "   " } }),
+      JSON.stringify({ type: "turn.completed" }),
+      "",
+    ].join("\n"));
+
+    await expect(new CodexExecutionCompletionService(root, { processProbe: () => "alive" })
+      .reconcile(identity(execution))).resolves.toMatchObject({
+        status: "passed",
+        summary: "continued successfully",
+      });
   });
 
   it("does not fail the turn for a failed command when the turn completes", async () => {

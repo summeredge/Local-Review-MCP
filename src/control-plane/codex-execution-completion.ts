@@ -165,6 +165,8 @@ interface TerminalEvidence {
   readonly outcome: "passed" | "failed" | "conflict" | null;
   readonly summary?: string;
   readonly agentSummary?: string;
+  readonly diagnosticSummary?: string;
+  readonly hasDiagnosticError: boolean;
 }
 
 function terminalEvidence(events: readonly JsonRecord[]): TerminalEvidence {
@@ -172,6 +174,7 @@ function terminalEvidence(events: readonly JsonRecord[]): TerminalEvidence {
   let failed = false;
   let turnFailureMessage: string | undefined;
   let topLevelErrorMessage: string | undefined;
+  let hasDiagnosticError = false;
   let agentSummary: string | undefined;
 
   for (const event of events) {
@@ -184,7 +187,7 @@ function terminalEvidence(events: readonly JsonRecord[]): TerminalEvidence {
         turnFailureMessage = messageFrom(event.error) ?? turnFailureMessage;
         break;
       case "error":
-        failed = true;
+        hasDiagnosticError = true;
         topLevelErrorMessage = messageFrom(event.message) ?? topLevelErrorMessage;
         break;
       case "item.completed": {
@@ -200,15 +203,20 @@ function terminalEvidence(events: readonly JsonRecord[]): TerminalEvidence {
     }
   }
 
-  if (completed && failed) return { outcome: "conflict" };
+  if (completed && failed) return { outcome: "conflict", hasDiagnosticError };
   if (failed) {
     return {
       outcome: "failed",
       summary: turnFailureMessage ?? topLevelErrorMessage,
+      hasDiagnosticError,
     };
   }
-  if (completed) return { outcome: "passed", agentSummary };
-  return { outcome: null };
+  if (completed) return { outcome: "passed", agentSummary, hasDiagnosticError };
+  return {
+    outcome: null,
+    diagnosticSummary: topLevelErrorMessage,
+    hasDiagnosticError,
+  };
 }
 
 function boundedSummary(value: string | undefined, fallback: string): string {
@@ -491,6 +499,13 @@ export class CodexExecutionCompletionService {
       ));
     }
     if (processState === "absent" || exit.status === "valid") {
+      if (terminal.hasDiagnosticError) {
+        const diagnostic = terminal.diagnosticSummary ?? await stderrTail(paths.stderr);
+        return this.fail(current, boundedSummary(
+          diagnostic,
+          "Codex process exited without terminal turn evidence.",
+        ));
+      }
       return this.fail(current, "Codex process exited without terminal turn evidence.");
     }
     return current;
