@@ -21,6 +21,8 @@ import {
 import { CodexExecutionCompletionService } from "./control-plane/codex-execution-completion.js";
 import { AutoIterationService } from "./control-plane/auto-iteration.js";
 import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
+import { ExtensionReviewCompletionAdapter } from "./delivery/extension-review-completion-adapter.js";
+import { ReviewCompletionRouter } from "./router/review-completion-router.js";
 import {
   ChatGPTConnectorStore,
   migrateLegacyOAuthState,
@@ -91,9 +93,15 @@ export function createAppContext(
     authorizationStore: actuationAuthorizationStore,
     adapter: codexExecutionAdapter,
   });
+  const completionRouter = new ReviewCompletionRouter(
+    storageRoot,
+    new ExtensionReviewCompletionAdapter(extensionDeliveries, extensionReviewCompletions),
+    runtimeIdentity,
+  );
   const autoIteration = new AutoIterationService(registry, {
     storageRoot,
     extensionDeliveries,
+    completionRouter,
     controlledActuation,
   });
   const goalOrchestration = new GoalOrchestrationService(registry, {
@@ -151,12 +159,6 @@ export async function startApp(
       const extensionDeliveries = context.extensionDeliveries;
       await context.correlations.restore();
       try {
-        await (context.codexExecutionCompletion ?? new CodexExecutionCompletionService())
-          .recoverRunningExecutions();
-      } catch {
-        console.warn("Codex execution completion recovery failed; local MCP remains available");
-      }
-      try {
         await context.controlledActuation?.restore();
       } catch {
         console.warn("Controlled Actuation unavailable; durable state could not be restored");
@@ -175,16 +177,6 @@ export async function startApp(
       } catch {
         completionAvailable = false;
         console.warn("Extension Review Completion unavailable; durable state could not be restored");
-      }
-      try {
-        await context.autoIteration?.recover();
-      } catch {
-        console.warn("Auto Iterate recovery failed; local MCP remains available");
-      }
-      try {
-        await context.goalOrchestration?.recover();
-      } catch {
-        console.warn("Goal Orchestration recovery failed; local MCP remains available");
       }
       const bridgePort = await startBridge({
         ports: options.bridgePorts,
@@ -227,6 +219,22 @@ export async function startApp(
       await context.tunnel.start();
     } catch {
       console.error("Tunnel failed to start; local MCP remains available");
+    }
+    try {
+      await (context.codexExecutionCompletion ?? new CodexExecutionCompletionService())
+        .recoverRunningExecutions();
+    } catch {
+      console.warn("Codex execution completion recovery failed; local MCP remains available");
+    }
+    try {
+      await context.autoIteration?.recover();
+    } catch {
+      console.warn("Auto Iterate recovery failed; local MCP remains available");
+    }
+    try {
+      await context.goalOrchestration?.recover();
+    } catch {
+      console.warn("Goal Orchestration recovery failed; local MCP remains available");
     }
     return server;
   } catch (error: unknown) {

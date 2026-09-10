@@ -107,6 +107,16 @@ describe("ExtensionDeliveryService", () => {
     }
   });
 
+  it("looks up a logical delivery id, returns a clone, and leaves durable state unchanged", async () => {
+    const { deliveries } = await service();
+    const queued = await deliveries.enqueue(conversation, "logical delivery", "review-delivery-one");
+    const lookedUp = await deliveries.getByLogicalDeliveryId("review-delivery-one");
+    expect(lookedUp).toEqual(queued);
+    if (lookedUp !== null) (lookedUp as { message: string }).message = "mutated clone";
+    await expect(deliveries.getByLogicalDeliveryId("review-delivery-one")).resolves.toEqual(queued);
+    await expect(deliveries.getByLogicalDeliveryId("missing-delivery")).resolves.toBeNull();
+  });
+
   it("restores a live lease and only makes an expired pre-send lease claimable", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-09-08T00:00:00Z"));

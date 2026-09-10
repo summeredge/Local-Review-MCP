@@ -1,7 +1,7 @@
 # Step 8 — Browser Transport Decision Gate
 
-**Status:** decision recorded; implementation unchanged  
-**Decision:** use Extension Reliable Delivery as the future primary transport for outbound Review Delivery and control commands. Keep the Playwright Browser Worker as a supported explicit/diagnostic transport and as the current completion collector until a separate decision changes that boundary. Do not add automatic fallback in this step.
+**Status:** decision recorded; PR-C completion ownership implemented
+**Decision:** use Extension Reliable Delivery as the primary transport for outbound Review Delivery and control commands, and use the live Extension for production Review Completion. Keep the Playwright Browser Worker as a supported explicit/diagnostic transport. Do not add automatic fallback.
 
 This gate is based on the current source and tests in this checkout. It does not
 infer the call graph from earlier design documents.
@@ -70,7 +70,7 @@ The following source facts define the current boundary:
 | The default `BrowserRouter` transport is Playwright | `src/router/browser-router.ts` constructs `BrowserWorkerDeliveryAdapter(new BrowserWorkerClient())`. |
 | Extension delivery is not connected to `ReviewDelivery` | `src/app.ts` wires Extension Delivery into Bridge claim/ACK handlers, but there is no `extensionDeliveries.enqueue()` caller in `src/`. |
 | The MCP server does not expose browser control | `src/mcp/server.ts` registers read-only workspace, file, Git, and review-context tools only. |
-| Completion is still Worker-based | `src/router/review-completion-router.ts` calls `BrowserWorkerClient.collectCompletion()`. |
+| Production completion is Extension-based | `createAppContext()` injects `ExtensionReviewCompletionAdapter`; the Worker completion adapter remains diagnostic/legacy. |
 
 Therefore, there is currently no production runtime branch of the form
 `ReviewDelivery -> Browser Delivery Layer -> {Worker, Extension}`. The next
@@ -261,7 +261,8 @@ being copied.
 - Isolated Worker diagnostics and test environments.
 - An explicitly provisioned, dedicated ChatGPT profile whose login and lifecycle
   are managed as part of the Worker deployment.
-- Completion collection while that path remains the established implementation.
+- Explicit Worker completion diagnostics while production completion is
+  Extension-backed.
 
 **Maintenance cost**
 
@@ -297,8 +298,8 @@ diagnostics, and duplicate-send reconciliation.
 - Fiber and DOM access use undocumented page implementation details. The route,
   selector, and Fiber allowlists must be maintained and revalidated against real
   browser releases.
-- The current Extension path has no Review Delivery enqueue/await adapter yet;
-  Step 9 must add that composition without weakening the existing ownership
+- The Extension path now composes Review Delivery and Review Completion through
+  durable enqueue/await adapters without weakening the existing ownership
   fences.
 - The Bridge currently pairs one Extension Origin. Multiple Conversations in
   one browser Extension are supported; multiple independently paired Extension
@@ -325,7 +326,7 @@ reconciliation work.
 
 Not for the current requirements. Extension Reliable Delivery covers the
 primary Windows interactive case; Playwright remains available for explicit
-diagnostics and the current completion path. Automatic fallback would solve a
+diagnostics and legacy completion collection. Automatic fallback would solve a
 future availability problem by introducing a present correctness problem.
 
 **Complexity introduced**
@@ -365,11 +366,12 @@ cross-transport idempotency, diagnostics, and substantially more test cases.
 Select **Option B — Extension Reliable Delivery** as the primary transport for
 future outbound Review Delivery and Dispatch Command Broker work.
 
-This is a forward direction only. The current runtime remains unchanged:
+The existing default compatibility paths remain available, while production
+AutoIteration Review Completion is now Extension-backed:
 
 - `BrowserRouter` still defaults to `BrowserWorkerDeliveryAdapter`.
-- `BrowserWorker` is not deleted or demoted to a fallback implementation in
-  this step.
+- `BrowserWorker` is not deleted; its completion adapter remains available for
+  explicit diagnostics and legacy compatibility.
 - `ExtensionDeliveryService`, Bridge protocol `2`, Extension identity, and
   correlation behavior are not changed.
 - No automatic Hybrid fallback is introduced.
@@ -398,11 +400,11 @@ This is a forward direction only. The current runtime remains unchanged:
 
 ### Decision scope
 
-This recommendation is for the **outbound Review Delivery transport**. It does
-not decide that the Extension must collect Review completion. Completion remains
-an independent concern and currently uses the Playwright Worker. A future
-completion transport decision must account for how a live Extension observes and
-proves assistant completion before replacing that path.
+This recommendation covers the **outbound Review Delivery transport**. PR-C now
+also gives production Review Completion to the live Extension through the
+durable `expected_user_message_id` and completion receipt chain. The Playwright
+Worker remains available for explicit diagnostics and is not an automatic
+fallback.
 
 ## D. Architecture impact
 
@@ -473,7 +475,7 @@ The selected direction preserves these rules:
 | Stale tab/document acts after navigation | Continue requiring exact `MessageSender.documentId`, Conversation URL equality, and navigation epoch. |
 | Bridge or Extension state is corrupt | Keep delivery unavailable and preserve the corrupt file for diagnosis; keep MCP identity/Data Plane available. |
 | Extension and Worker refer to different sessions/accounts | Do not use automatic Hybrid fallback. If explicit Worker selection is later needed, make profile/account ownership visible and deliberate. |
-| Submission and completion use different browser transports | Keep completion as a separate contract until its own identity and receipt proof are decided. |
+| Submission and completion use different browser transports | Keep the shared Extension identity and receipt proof intact; do not add automatic cross-transport fallback. |
 
 The current automated Extension and Worker tests cover the source-level
 contracts. The existing documentation still calls for one real Edge validation
@@ -500,5 +502,5 @@ The implementation is in `src/control-plane/dispatch-command-broker.ts` and
 `src/delivery/extension-delivery-adapter.ts`. The current Playwright
 `BrowserRouter` default remains available; an Extension-backed Router uses the
 injected adapter and the same `ExtensionDeliveryService` instance as the
-Bridge. Completion remains Worker-based and no automatic Hybrid fallback is
-introduced.
+Bridge. Production completion is Extension-backed and no automatic Hybrid
+fallback is introduced.

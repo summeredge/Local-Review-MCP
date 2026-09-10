@@ -155,6 +155,8 @@ function diagnosticOutput(
     `storage_root: ${orchestration.storageRoot ?? "unknown"}`,
     `runtime_endpoint: ${getEndpoint(settings)}`,
     `bridge_endpoint: ${bridgeEndpoint}`,
+    "review_completion_transport: extension",
+    "browser_worker_required: false",
   ];
   if (goal.execution_id !== undefined) lines.push(`execution_id: ${goal.execution_id}`);
   if (goal.actuation_id !== undefined) lines.push(`actuation_id: ${goal.actuation_id}`);

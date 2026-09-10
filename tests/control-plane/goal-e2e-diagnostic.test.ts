@@ -139,5 +139,7 @@ describe("diagnose-goal-e2e", () => {
     expect(output).toContain("loop_id:");
     expect(output).toContain("max_iterations: 2");
     expect(output).toContain("max_iterations=2");
+    expect(output).toContain("review_completion_transport: extension");
+    expect(output).toContain("browser_worker_required: false");
   });
 });

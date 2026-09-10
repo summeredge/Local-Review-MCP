@@ -8,8 +8,8 @@ the Browser Worker Interaction Layer.
 
 Step 9 adds an Extension-backed implementation behind the same adapter seam:
 `ReviewDelivery -> DispatchCommandBroker -> ExtensionDeliveryService`. The
-existing Playwright adapter remains the default Router transport and the
-completion path remains Worker-based.
+Playwright adapters remain available for explicit diagnostics, while production
+Review Completion is owned by the Extension-backed adapter.
 
 ```text
 Codex

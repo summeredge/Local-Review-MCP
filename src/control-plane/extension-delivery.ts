@@ -9,11 +9,12 @@ const MAX_DELIVERIES = 1_000;
 const LEASE_MS = 30_000;
 const ID = /^[A-Za-z0-9_-]+$/u;
 const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
+const logicalDeliveryIdSchema = z.string().min(1).max(128);
 
 const enqueueSchema = z.object({
   conversation_id: z.string().min(1).max(256).regex(CONVERSATION_ID),
   message: z.string().min(1).max(48 * 1024),
-  logical_delivery_id: z.string().min(1).max(128).optional(),
+  logical_delivery_id: logicalDeliveryIdSchema.optional(),
 }).strict();
 
 const ownerSchema = z.object({
@@ -362,6 +363,14 @@ export class ExtensionDeliveryService {
   public async get(deliveryId: string): Promise<ExtensionDelivery | null> {
     await this.restore();
     const delivery = this.deliveries.get(z.string().uuid().parse(deliveryId));
+    return delivery ? clone(delivery) : null;
+  }
+
+  public async getByLogicalDeliveryId(logicalDeliveryId: string): Promise<ExtensionDelivery | null> {
+    await this.restore();
+    const parsedId = logicalDeliveryIdSchema.parse(logicalDeliveryId);
+    const delivery = [...this.deliveries.values()].find((candidate) =>
+      candidate.logical_delivery_id === parsedId);
     return delivery ? clone(delivery) : null;
   }
 

@@ -31,7 +31,14 @@ import {
 import { ExtensionDeliveryAdapter } from "../../src/delivery/extension-delivery-adapter.js";
 import { BrowserWorkerReviewCompletionAdapter } from "../../src/delivery/browser-worker-review-completion-adapter.js";
 import type { ReviewDeliveryRequest } from "../../src/delivery/review-delivery-adapter.js";
-import type { ExtensionDeliveryReceipt } from "../../src/control-plane/extension-delivery.js";
+import {
+  ExtensionDeliveryService,
+  type ExtensionDeliveryReceipt,
+} from "../../src/control-plane/extension-delivery.js";
+import {
+  ExtensionReviewCompletionService,
+  type ExtensionReviewCompletionInput,
+} from "../../src/control-plane/extension-review-completion.js";
 import { BrowserWorkerClient, type BrowserCompletionResult } from "../../src/browser-worker-client/browser-worker-client.js";
 import { ConversationRoutingService } from "../../src/context/conversation-routing-service.js";
 import { ExecutionContextService } from "../../src/context/execution-service.js";
@@ -42,6 +49,7 @@ import type { ExecutionContext } from "../../src/context/types.js";
 import { TaskContextService } from "../../src/context/service.js";
 import { BrowserRouter } from "../../src/router/browser-router.js";
 import { ReviewCompletionRouter } from "../../src/router/review-completion-router.js";
+import { ExtensionReviewCompletionAdapter } from "../../src/delivery/extension-review-completion-adapter.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
 
 type ReviewDecision = "APPROVE" | "ITERATE" | "HUMAN_REQUIRED";
@@ -214,6 +222,84 @@ class FakeReviewBoundary {
   }
 }
 
+type ExtensionCompletionOutcome = "completed" | "failed" | "timeout";
+
+class DurableExtensionReviewBoundary {
+  public readonly deliveries: ExtensionDeliveryService;
+  public readonly completions: ExtensionReviewCompletionService;
+  public readonly deliveryRequests: ReviewDeliveryRequest[] = [];
+  public readonly completionRequests: ExtensionReviewCompletionInput[] = [];
+  public readonly dispatch = vi.fn(async (
+    request: ReviewDeliveryRequest,
+  ): Promise<ExtensionDeliveryReceipt> => {
+    this.deliveryRequests.push(structuredClone(request));
+    const queued = await this.deliveries.enqueue(
+      request.conversation_id,
+      request.message ?? "review",
+      request.delivery_id,
+    );
+    const owner = {
+      conversation_id: request.conversation_id,
+      client_id: "extension-integration",
+      document_id: "document-integration",
+      navigation_epoch: 0,
+    } as const;
+    const leased = await this.deliveries.claim(owner);
+    if (leased === null || leased.delivery_id !== queued.delivery_id) {
+      throw new Error("Extension Delivery was not claimed by the integration actor.");
+    }
+    return (await this.deliveries.acknowledge({
+      ...owner,
+      delivery_id: queued.delivery_id,
+      status: "sent",
+      message_id: `user-${request.delivery_id}`,
+    })).receipt;
+  });
+  public readonly completionAdapter: ExtensionReviewCompletionAdapter;
+  private nextDecision = 0;
+
+  public constructor(
+    root: string,
+    private readonly decisions: readonly ReviewDecision[],
+    private readonly outcome: ExtensionCompletionOutcome = "completed",
+  ) {
+    this.deliveries = new ExtensionDeliveryService(root);
+    this.completions = new ExtensionReviewCompletionService(root);
+    this.completionAdapter = new ExtensionReviewCompletionAdapter(this.deliveries, {
+      enqueue: async (input) => {
+        this.completionRequests.push(structuredClone(input));
+        const completion = await this.completions.enqueue(input);
+        if (this.outcome === "timeout") return completion;
+        const owner = {
+          conversation_id: input.conversation_id,
+          client_id: "extension-integration",
+          document_id: "document-integration",
+          navigation_epoch: 0,
+        } as const;
+        if (await this.completions.claim(owner) === null) {
+          throw new Error("Extension Review Completion was not claimed by the integration actor.");
+        }
+        await this.completions.acknowledge({
+          ...owner,
+          completion_id: completion.completion_id,
+          ...(this.outcome === "failed"
+            ? { status: "failed" as const, error: "extension observer failed" }
+            : {
+              status: "completed" as const,
+              assistant_message_id: `assistant-${input.review_request_id}`,
+              content: verdict(
+                input.review_request_id,
+                this.decisions[Math.min(this.nextDecision++, this.decisions.length - 1)]!,
+              ),
+            }),
+        });
+        return completion;
+      },
+      awaitResult: (completionId, timeoutMs) => this.completions.awaitResult(completionId, timeoutMs),
+    }, { timeoutMs: outcome === "timeout" ? 1 : 1_000 });
+  }
+}
+
 type Harness = {
   readonly root: string;
   readonly workspaceRoot: string;
@@ -320,6 +406,50 @@ async function createHarness(
     auto,
     goals,
     drainTerminalListeners,
+  };
+}
+
+type ExtensionHarness = Harness & {
+  readonly extension: DurableExtensionReviewBoundary;
+};
+
+async function createExtensionHarness(
+  decisions: readonly ReviewDecision[] = ["APPROVE"],
+  outcome: ExtensionCompletionOutcome = "completed",
+): Promise<ExtensionHarness> {
+  const base = await createHarness(decisions);
+  const extension = new DurableExtensionReviewBoundary(base.root, decisions, outcome);
+  const browserRouter = new BrowserRouter(
+    base.root,
+    new ExtensionDeliveryAdapter(extension),
+  );
+  const completionRouter = new ReviewCompletionRouter(base.root, extension.completionAdapter);
+  const auto = new AutoIterationService(base.registry, {
+    storageRoot: base.root,
+    taskContextService: base.tasks,
+    executionContextService: base.executions,
+    authorizationStore: base.authorizations,
+    browserRouter,
+    completionRouter,
+    extensionDeliveries: extension.deliveries,
+    controlledActuation: base.controlled,
+  });
+  const goals = new GoalOrchestrationService(base.registry, {
+    storageRoot: base.root,
+    taskContextService: base.tasks,
+    executionContextService: base.executions,
+    authorizationStore: base.authorizations,
+    controlledActuation: base.controlled,
+    autoIteration: auto,
+  });
+  return {
+    ...base,
+    extension,
+    browserRouter,
+    completionRouter,
+    auto,
+    goals,
+    drainTerminalListeners: wireGoalAdvance(auto, goals),
   };
 }
 
@@ -902,6 +1032,70 @@ describe("Control Plane control loop integration", () => {
     expect((await harness.auto.listLoops()).filter((loop) =>
       !["completed", "failed", "human_required"].includes(loop.stage))).toHaveLength(1);
     await assertIdentity(harness, value, "task-2", false);
+  });
+
+  it("completes the main AutoIteration path with durable Extension Review Completion and no Browser Worker", async () => {
+    const harness = await createExtensionHarness(["APPROVE"]);
+    const collectCompletion = vi.spyOn(BrowserWorkerClient.prototype, "collectCompletion");
+    try {
+      const value = plan("goal-extension-success");
+      const { goal } = await startPlan(harness, value);
+      await emitTerminal(harness, goal.execution_id!, "passed");
+
+      const completed = await harness.goals.getGoal(value.goal_id);
+      const loop = completed?.loop_id === undefined
+        ? null
+        : await harness.auto.getLoop(completed.loop_id);
+      expect(completed?.status).toBe("completed");
+      expect(loop).toMatchObject({ stage: "completed", terminal_decision: "APPROVE" });
+      expect(harness.extension.deliveryRequests).toHaveLength(1);
+      expect(harness.extension.completionRequests).toHaveLength(1);
+      expect(collectCompletion).not.toHaveBeenCalled();
+      if (loop?.review_request_id === undefined || loop.delivery_id === undefined) {
+        throw new Error("Extension integration did not persist Review identities.");
+      }
+      const delivery = await harness.extension.deliveries.getByLogicalDeliveryId(loop.delivery_id);
+      const completion = await harness.extension.completions.getByReviewRequestId(loop.review_request_id);
+      const result = await new ReviewResultService(harness.root).getReviewResultByRequest(
+        value.workspace_id,
+        loop.review_request_id,
+      );
+      expect(delivery).toMatchObject({
+        logical_delivery_id: loop.delivery_id,
+        phase: "delivered",
+        receipt: { message_id: `user-${loop.delivery_id}` },
+      });
+      expect(completion).toMatchObject({
+        review_delivery_id: loop.delivery_id,
+        phase: "completed",
+        receipt: { content: verdict(loop.review_request_id, "APPROVE") },
+      });
+      expect(result).toMatchObject({
+        status: "COMPLETED",
+        content: verdict(loop.review_request_id, "APPROVE"),
+      });
+    } finally {
+      collectCompletion.mockRestore();
+    }
+  });
+
+  it.each([
+    ["FAILED", "failed" as const, "human_required" as const],
+    ["TIMEOUT", "timeout" as const, "human_required" as const],
+  ])("maps Extension Completion %s to human_required", async (_label, outcome, expectedStatus) => {
+    const harness = await createExtensionHarness(["APPROVE"], outcome);
+    const value = plan(`goal-extension-${outcome}`);
+    const { goal } = await startPlan(harness, value);
+    await emitTerminal(harness, goal.execution_id!, "passed");
+
+    const loop = await harness.auto.getLoop(goal.loop_id!);
+    expect((await harness.goals.getGoal(value.goal_id))?.status).toBe(expectedStatus);
+    expect(loop?.stage).toBe(expectedStatus);
+    expect(harness.extension.completionRequests).toHaveLength(1);
+    expect(await new ReviewResultService(harness.root).getReviewResultByRequest(
+      value.workspace_id,
+      loop?.review_request_id!,
+    )).toMatchObject({ status: outcome === "failed" ? "FAILED" : "TIMEOUT" });
   });
 });
 

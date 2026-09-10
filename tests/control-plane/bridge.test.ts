@@ -472,6 +472,53 @@ describe("Local Control Bridge app lifecycle", () => {
     expect(bridgeStatus()).toMatchObject({ available: false, port: null, paired: false });
   });
 
+  it("starts Bridge and Tunnel before Codex terminal recovery can advance AutoIteration", async () => {
+    await stopBridge();
+    const runtime = createAppContext(settings());
+    const events: string[] = [];
+    vi.spyOn(runtime.tunnel, "start").mockImplementation(async () => {
+      expect(bridgeStatus().available).toBe(true);
+      events.push("tunnel-start");
+      return { state: "LOCAL_ONLY" };
+    });
+    vi.spyOn(runtime.autoIteration!, "onExecutionTerminal").mockImplementation(async () => {
+      expect(events).toEqual(["tunnel-start", "codex-recovery"]);
+      events.push("auto-terminal");
+    });
+    vi.spyOn(runtime.codexExecutionCompletion!, "recoverRunningExecutions")
+      .mockImplementation(async () => {
+        events.push("codex-recovery");
+        await runtime.autoIteration!.onExecutionTerminal({} as never);
+      });
+    vi.spyOn(runtime.autoIteration!, "recover").mockImplementation(async () => {
+      expect(events).toEqual(["tunnel-start", "codex-recovery", "auto-terminal"]);
+      events.push("auto-recovery");
+    });
+    vi.spyOn(runtime.goalOrchestration!, "recover").mockImplementation(async () => {
+      expect(events).toEqual([
+        "tunnel-start",
+        "codex-recovery",
+        "auto-terminal",
+        "auto-recovery",
+      ]);
+      events.push("goal-recovery");
+    });
+
+    let server: Server | null = null;
+    try {
+      server = await startApp(settings(), runtime, { bridgePorts: [0] });
+      expect(events).toEqual([
+        "tunnel-start",
+        "codex-recovery",
+        "auto-terminal",
+        "auto-recovery",
+        "goal-recovery",
+      ]);
+    } finally {
+      if (server !== null) await close(server);
+    }
+  });
+
   it("keeps MCP available when the Bridge candidates are unavailable", async () => {
     await stopBridge();
     const occupied = createServer();
