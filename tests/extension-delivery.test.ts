@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import * as vm from "node:vm";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { buildReviewMessage } from "../src/delivery/review-message.js";
 
 const ORIGIN = "https://chatgpt.com";
 const A = "11111111-2222-3333-4444-555555555555";
@@ -12,6 +13,13 @@ const command = {
   deadline: Date.now() + 30_000,
 };
 const MULTILINE_MESSAGE = "Review Request:\r\nfirst paragraph\u00a0with space\r\n\r\nsecond paragraph";
+const REVIEW_REQUEST = buildReviewMessage({
+  workspace_id: "workspace-local-review",
+  task_id: "task-realistic-001",
+  execution_id: "execution-realistic-001",
+  review_request_id: "review-request-realistic-001",
+  routing_id: "routing-realistic-001",
+});
 
 let contentSource = "";
 let domSource = "";
@@ -221,6 +229,8 @@ describe("Extension delivery content fence", () => {
 interface FakeNode {
   textContent: string;
   nodeName?: string;
+  nodeType?: number;
+  nodeValue?: string | null;
   childNodes?: FakeNode[];
   isConnected?: boolean;
   disabled?: boolean;
@@ -252,6 +262,7 @@ function domHarness(options: {
   setStop(value: boolean): void;
   setClickReceipt(id: string | null): void;
   setComposerText(value: string): void;
+  setComposerBlocks(blocks: FakeNode[]): void;
   clickCount(): number;
 } {
   let attachment = false;
@@ -274,12 +285,13 @@ function domHarness(options: {
     Object.defineProperty(composer, "childNodes", { configurable: true, get: () => blockNodes });
     Object.defineProperty(composer, "innerText", {
       configurable: true,
-      get: () => blockNodes.map((block) =>
-        block.nodeName === "P" && block.childNodes?.some((child) => child.nodeName === "BR")
-          ? "\n"
-          : block.textContent).join("\n"),
+      get: () => blockNodes.map((block) => block.nodeName === "P" && block.childNodes?.some((child) => child.nodeName === "BR")
+        ? "\n"
+        : block.textContent).join(""),
     });
   }
+  const blocksForText = (value: string) => value.split("\n").map((line) =>
+    line === "" ? node("", "P", [node("", "BR")]) : node(line, "P", [textNode(line)]));
   const setComposerText = (value: string) => {
     if (!options.blockComposer) {
       composer.textContent = value;
@@ -287,10 +299,14 @@ function domHarness(options: {
     }
     const normalized = value.replace(/\r\n?/gu, "\n");
     composer.textContent = normalized.replace(/\n/gu, "");
-    blockNodes = options.normalizeAsync ? [] : normalized.split("\n").map((line) => node(line, "P"));
+    blockNodes = options.normalizeAsync ? [] : blocksForText(normalized);
     if (options.normalizeAsync) {
-      setTimeout(() => { blockNodes = normalized.split("\n").map((line) => node(line, "P")); }, 0);
+      setTimeout(() => { blockNodes = blocksForText(normalized); }, 0);
     }
+  };
+  const setComposerBlocks = (blocks: FakeNode[]) => {
+    blockNodes = blocks;
+    composer.textContent = blocks.map((block) => block.textContent).join("");
   };
   const button = node();
   button.click = () => {
@@ -342,6 +358,7 @@ function domHarness(options: {
     setStop: (value) => { stop = value; },
     setClickReceipt: (id) => { clickReceipt = id; },
     setComposerText,
+    setComposerBlocks,
     clickCount: () => clicks,
   };
 }
@@ -361,6 +378,14 @@ function node(textContent = "", nodeName = "", childNodes?: FakeNode[]): FakeNod
     dispatchEvent: () => true,
     click: () => undefined,
   };
+}
+
+function textNode(value: string): FakeNode {
+  return { ...node(value, "#text"), nodeType: 3, nodeValue: value };
+}
+
+function paragraph(value: string, children = [textNode(value)]): FakeNode {
+  return node(value, "P", children);
 }
 
 describe("ChatGPT DOM delivery adapter", () => {
@@ -399,6 +424,62 @@ describe("ChatGPT DOM delivery adapter", () => {
     expect(harness.composer.childNodes?.map((node) => node.nodeName)).toEqual(["P", "P", "P", "P"]);
     expect(harness.dom.clearPromptExact(MULTILINE_MESSAGE)).toBe(true);
     expect(harness.composer.textContent).toBe("");
+  });
+
+  it("proves a complete production Review Request through block insertion, clearing, and send", async () => {
+    expect(REVIEW_REQUEST).toContain("workspace_id: workspace-local-review");
+    expect(REVIEW_REQUEST).toContain("task_id: task-realistic-001");
+    expect(REVIEW_REQUEST).toContain("execution_id: execution-realistic-001");
+    expect(REVIEW_REQUEST).toContain("review_request_id: review-request-realistic-001");
+    expect(REVIEW_REQUEST).toContain("routing_id: routing-realistic-001");
+    expect(REVIEW_REQUEST).toContain("\n\nUse Local Review MCP");
+    expect(REVIEW_REQUEST).toContain('\n  "schema_version": 1,');
+    expect(REVIEW_REQUEST).toContain("<lrm-review-result>\n");
+    expect(REVIEW_REQUEST).toContain("\n</lrm-review-result>");
+
+    const harness = domHarness({ blockComposer: true, normalizeAsync: true, message: REVIEW_REQUEST });
+    await expect(harness.dom.insertPrompt(REVIEW_REQUEST)).resolves.toBe(true);
+    expect((harness.composer as FakeNode & { innerText: string }).innerText).not.toBe(REVIEW_REQUEST);
+    expect(harness.dom.clearPromptExact(REVIEW_REQUEST)).toBe(true);
+    expect(harness.composer.textContent).toBe("");
+
+    await expect(harness.dom.insertPrompt(REVIEW_REQUEST)).resolves.toBe(true);
+    harness.setClickReceipt("review-request-message");
+    await expect(harness.dom.send(REVIEW_REQUEST, () => true, 20)).resolves.toEqual({
+      clicked: true,
+      message_id: "review-request-message",
+    });
+  });
+
+  it.each([
+    ["a changed blank-line count", REVIEW_REQUEST.replace("routing_id: routing-realistic-001\n\nUse", "routing_id: routing-realistic-001\nUse")],
+    ["a changed JSON indentation", REVIEW_REQUEST.replace('  "schema_version"', ' "schema_version"')],
+  ])("refuses to send when the production Review Request has %s", async (_label, modified) => {
+    const harness = domHarness({ blockComposer: true, message: REVIEW_REQUEST });
+    await expect(harness.dom.insertPrompt(REVIEW_REQUEST)).resolves.toBe(true);
+    harness.setComposerText(modified);
+
+    await expect(harness.dom.send(REVIEW_REQUEST, () => true, 10)).resolves.toEqual({
+      clicked: false,
+      message_id: null,
+    });
+    expect(harness.clickCount()).toBe(0);
+  });
+
+  it.each([
+    ["adjacent paragraphs", [paragraph("A"), paragraph("B")], "A\nB"],
+    ["an empty paragraph between paragraphs", [paragraph("A"), node("", "P", [node("", "BR")]), paragraph("B")], "A\n\nB"],
+    ["nested marks", [paragraph("AB", [node("A", "SPAN", [textNode("A")]), node("B", "MARK", [textNode("B")])])], "AB"],
+    ["a real block break", [paragraph("AB", [textNode("A"), node("", "BR"), textNode("B")])], "A\nB"],
+  ])("reads %s as exact logical text", async (_label, blocks, expected) => {
+    const harness = domHarness({ blockComposer: true, message: expected });
+    harness.setComposerBlocks(blocks as FakeNode[]);
+    harness.setClickReceipt("structured-message");
+
+    await expect(harness.dom.send(expected, () => true, 20)).resolves.toEqual({
+      clicked: true,
+      message_id: "structured-message",
+    });
   });
 
   it.each([

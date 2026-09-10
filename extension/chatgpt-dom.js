@@ -18,18 +18,20 @@ globalThis.LRM_DOM = (() => {
   function domText(node) {
     if (!node) return '';
     if (node.nodeType === 3) return node.nodeValue ?? node.textContent ?? '';
-    if (typeof node.innerText === 'string' && (node.innerText !== '' || !node.textContent)) return node.innerText;
     const name = String(node.nodeName || '').toUpperCase();
     if (name === 'BR') return '\n';
     if (!node.childNodes) return node.textContent || '';
 
     const children = [...node.childNodes];
+    if (BLOCK_ELEMENTS.has(name) && children.length === 1
+      && String(children[0].nodeName || '').toUpperCase() === 'BR') return '';
     let value = '';
-    for (const [index, child] of children.entries()) {
+    let previousBlock = false;
+    for (const child of children) {
+      const block = BLOCK_ELEMENTS.has(String(child.nodeName || '').toUpperCase());
+      if (block && previousBlock) value += '\n';
       value += domText(child);
-      if (BLOCK_ELEMENTS.has(String(child.nodeName || '').toUpperCase()) && index < children.length - 1) {
-        value += '\n';
-      }
+      previousBlock = block;
     }
     return value;
   }
