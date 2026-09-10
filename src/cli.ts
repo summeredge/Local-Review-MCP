@@ -12,6 +12,10 @@ import {
   generateReviewDeliveryBrowserExample,
 } from "./router/browser-router-diagnostic.js";
 import { runGoalE2EDiagnostic } from "./control-plane/goal-e2e-diagnostic.js";
+import {
+  confirmChatGPTConnector,
+  diagnoseChatGPTConnector,
+} from "./control-plane/chatgpt-connector.js";
 import { registeredMcpToolsMessage } from "./mcp/server.js";
 import { createStartupManager } from "./supervisor/startup.js";
 import { createSupervisor } from "./supervisor/supervisor.js";
@@ -29,9 +33,61 @@ function printErrorDetails(error: unknown, warning = false): void {
   log("Original error:", error);
 }
 
+function connectorConfirmArgs(argv: readonly string[]): {
+  readonly settingsArgs: string[];
+  readonly workspaceId: string;
+  readonly mcpUrl: string;
+} {
+  const settingsArgs: string[] = [];
+  let workspaceId: string | undefined;
+  let mcpUrl: string | undefined;
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    const value = argv[index + 1];
+    if (value === undefined || value.startsWith("--")) throw new Error(`${argument} requires a value`);
+    if (argument === "--workspace-id") workspaceId = value;
+    else if (argument === "--mcp-url") mcpUrl = value;
+    else if (["--config", "--port", "--workspace", "--token"].includes(argument)) {
+      settingsArgs.push(argument, value);
+    } else {
+      throw new Error(`unknown argument: ${argument}`);
+    }
+    index += 1;
+  }
+  if (!workspaceId) throw new Error("--workspace-id is required");
+  if (!mcpUrl) throw new Error("--mcp-url is required");
+  return { settingsArgs, workspaceId, mcpUrl };
+}
+
+function connectorCommandError(error: unknown): void {
+  console.log(JSON.stringify({
+    ok: false,
+    error: error instanceof Error ? error.message : "ChatGPT connector command failed",
+  }));
+  process.exitCode = 1;
+}
+
 try {
   const argv = process.argv.slice(2);
-  if (argv[0] === "diagnose-review-context") {
+  if (argv[0] === "diagnose-chatgpt-connector") {
+    try {
+      const settings = await loadSettings(argv.slice(1));
+      const result = await diagnoseChatGPTConnector(settings);
+      console.log(JSON.stringify(result, null, 2));
+      if (!result.ok) process.exitCode = 1;
+    } catch (error: unknown) {
+      connectorCommandError(error);
+    }
+  } else if (argv[0] === "confirm-chatgpt-connector") {
+    try {
+      const args = connectorConfirmArgs(argv.slice(1));
+      const settings = await loadSettings(args.settingsArgs);
+      const binding = await confirmChatGPTConnector(settings, args);
+      console.log(JSON.stringify({ ok: true, connector: binding }, null, 2));
+    } catch (error: unknown) {
+      connectorCommandError(error);
+    }
+  } else if (argv[0] === "diagnose-review-context") {
     const diagnosticArgs = argv.slice(1);
     const diagnosticCli = parseCliArgs(diagnosticArgs);
     const diagnosticSettings = diagnosticCli.configPath === undefined

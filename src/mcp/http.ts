@@ -32,6 +32,7 @@ type HttpRuntimeContext = McpRuntimeContext & {
 
 export interface HttpServerOptions {
   readonly oauthClientRegistryPath?: string;
+  readonly oauthTokenStorePath?: string;
 }
 
 class RequestBodyTooLargeError extends Error {
@@ -227,7 +228,7 @@ function oauthMetadata(urls: OAuthUrls): Record<string, unknown> {
     token_endpoint: urls.tokenEndpoint.href,
     registration_endpoint: urls.registrationEndpoint.href,
     response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
   };
@@ -456,8 +457,37 @@ async function handleOAuthRequest(
       return true;
     }
 
-    if (params.get("grant_type") !== "authorization_code") {
-      sendOAuthError(response, 400, "unsupported_grant_type", "Only authorization_code is supported");
+    const grantType = params.get("grant_type");
+    if (grantType === "refresh_token") {
+      const clientId = params.get("client_id");
+      const refreshToken = params.get("refresh_token");
+      if (clientId === null || refreshToken === null) {
+        sendOAuthError(response, 400, "invalid_request", "client_id and refresh_token are required");
+        return true;
+      }
+      try {
+        const token = oauth.refreshToken({
+          clientId,
+          refreshToken,
+          ...(params.get("resource") === null ? {} : { resource: params.get("resource") ?? undefined }),
+        });
+        sendOAuthJson(response, 200, {
+          access_token: token.token,
+          token_type: "Bearer",
+          expires_in: token.expiresIn,
+          refresh_token: token.refreshToken,
+        });
+      } catch (error: unknown) {
+        if (error instanceof OAuthRequestError) {
+          sendOAuthError(response, 400, error.code, error.message);
+        } else {
+          sendOAuthError(response, 500, "server_error", "OAuth server error");
+        }
+      }
+      return true;
+    }
+    if (grantType !== "authorization_code") {
+      sendOAuthError(response, 400, "unsupported_grant_type", "Unsupported grant_type");
       return true;
     }
     const clientId = params.get("client_id");
@@ -485,6 +515,7 @@ async function handleOAuthRequest(
         access_token: token.token,
         token_type: "Bearer",
         expires_in: token.expiresIn,
+        refresh_token: token.refreshToken,
       });
     } catch (error: unknown) {
       if (error instanceof OAuthRequestError) {
@@ -504,7 +535,10 @@ export function createHttpServer(
   context: HttpRuntimeContext,
   options: HttpServerOptions = {},
 ): Server {
-  const oauth = new OAuthService({ clientRegistryPath: options.oauthClientRegistryPath });
+  const oauth = new OAuthService({
+    clientRegistryPath: options.oauthClientRegistryPath,
+    tokenStorePath: options.oauthTokenStorePath,
+  });
   return createServer((request, response) => {
     void (async () => {
       const path = request.url === undefined

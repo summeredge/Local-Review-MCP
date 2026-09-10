@@ -25,4 +25,5 @@
 {"ts":"2026-09-08T12:11:09+08:00","action":"add","type":"learning","id":"LRN-20260908-002","summary":"浏览器 Send 前持久化 submitting，receipt 后先写 ACK outbox；无法确认则 ambiguous 不重发"}
 {"ts":"2026-09-08T18:10:00+08:00","action":"add","type":"error","id":"ERR-20260908-004","summary":"Zod 重启恢复重排 receipt 字段；JSON.stringify 误判相同 ACK 冲突"}
 {"ts":"2026-09-08T22:40:00+08:00","action":"add","type":"error","id":"ERR-20260908-005","summary":"异步 execution context 直接覆盖造成截断 JSON；改用同目录临时文件原子 rename"}
+{"ts":"2026-09-10T13:06:00+08:00","action":"add","type":"error","id":"ERR-20260910-001","summary":"Windows listen(0) 偶发分配 Fetch 禁用端口；单文件和单 worker 全量复核"}
 ```

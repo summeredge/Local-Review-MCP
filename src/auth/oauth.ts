@@ -44,13 +44,14 @@ export interface OAuthRegisteredClient {
   readonly client_name: string;
   readonly redirect_uris: readonly string[];
   readonly token_endpoint_auth_method: "none";
-  readonly grant_types: readonly ["authorization_code"];
+  readonly grant_types: readonly ["authorization_code", "refresh_token"];
   readonly response_types: readonly ["code"];
   readonly client_id_issued_at: number;
 }
 
 export interface OAuthServiceOptions {
   readonly clientRegistryPath?: string;
+  readonly tokenStorePath?: string;
 }
 
 interface PersistedOAuthClient {
@@ -145,8 +146,10 @@ function loadClientRegistry(path: string): Map<string, OAuthRegisteredClient> {
       || value.redirect_uris.length > 20
       || value.redirect_uris.some((uri) => typeof uri !== "string")
       || !Array.isArray(value.grant_types)
-      || value.grant_types.length !== 1
-      || value.grant_types[0] !== "authorization_code"
+      || value.grant_types.length < 1
+      || value.grant_types.length > 2
+      || !value.grant_types.includes("authorization_code")
+      || value.grant_types.some((grant) => grant !== "authorization_code" && grant !== "refresh_token")
       || value.token_endpoint_auth_method !== "none"
       || !Array.isArray(value.response_types)
       || value.response_types.length !== 1
@@ -164,7 +167,7 @@ function loadClientRegistry(path: string): Map<string, OAuthRegisteredClient> {
       client_name: value.client_name,
       redirect_uris: [...value.redirect_uris],
       token_endpoint_auth_method: "none",
-      grant_types: ["authorization_code"],
+      grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       client_id_issued_at: value.created_at,
     });
@@ -329,8 +332,23 @@ function supportedList(
   }
 }
 
+function supportedGrantTypes(value: unknown): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)
+    || value.length === 0
+    || value.length > 2
+    || new Set(value).size !== value.length
+    || value.some((item) => item !== "authorization_code" && item !== "refresh_token")
+    || !value.includes("authorization_code")) {
+    throw new OAuthRequestError(
+      "invalid_client_metadata",
+      "grant_types must contain authorization_code and may include refresh_token",
+    );
+  }
+}
+
 export class OAuthService {
-  public readonly tokens = new OAuthTokenStore();
+  public readonly tokens: OAuthTokenStore;
 
   private readonly clients: Map<string, OAuthRegisteredClient>;
   private readonly clientRegistryPath: string;
@@ -341,6 +359,9 @@ export class OAuthService {
       options.clientRegistryPath ?? defaultOAuthClientRegistryPath(),
     );
     this.clients = loadClientRegistry(this.clientRegistryPath);
+    this.tokens = new OAuthTokenStore({
+      path: resolve(options.tokenStorePath ?? join(dirname(this.clientRegistryPath), "tokens.json")),
+    });
   }
 
   public registerClient(input: unknown): OAuthRegisteredClient {
@@ -376,7 +397,7 @@ export class OAuthService {
         "only public clients using token_endpoint_auth_method=none are supported",
       );
     }
-    supportedList(input.grant_types, "grant_types", "authorization_code", true);
+    supportedGrantTypes(input.grant_types);
     supportedList(input.response_types, "response_types", "code");
 
     const client: OAuthRegisteredClient = {
@@ -384,7 +405,7 @@ export class OAuthService {
       client_name: clientName.trim(),
       redirect_uris: [...redirectUris],
       token_endpoint_auth_method: "none",
-      grant_types: ["authorization_code"],
+      grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       client_id_issued_at: Math.floor(Date.now() / 1000),
     };
@@ -453,7 +474,27 @@ export class OAuthService {
       throw new OAuthRequestError("invalid_grant", "code_verifier does not match the challenge");
     }
 
-    return this.tokens.issue(stored.resource);
+    return this.tokens.issue(stored.resource, stored.clientId);
+  }
+
+  public refreshToken(request: {
+    readonly clientId: string;
+    readonly refreshToken: string;
+    readonly resource?: string;
+  }): IssuedOAuthToken {
+    if (this.clients.get(request.clientId) === undefined) {
+      throw new OAuthRequestError("invalid_client", "Invalid client_id");
+    }
+    const resource = request.resource === undefined
+      ? undefined
+      : normalizeResource(request.resource);
+    const token = this.tokens.rotate(
+      request.refreshToken,
+      request.clientId,
+      resource,
+    );
+    if (token === null) throw new OAuthRequestError("invalid_grant", "Refresh token is invalid or expired");
+    return token;
   }
 
   public validateAccessToken(token: string | undefined, resource: string): boolean {

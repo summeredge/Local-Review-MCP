@@ -45,6 +45,8 @@
 
 参考仓库只读，禁止修改。不要整体复制无关子系统。
 
+ChatGPT connector 创建、重建与验证按 `docs/chatgpt-connector-workflow.md` 执行。
+
 ---
 
 ## Implementation Path

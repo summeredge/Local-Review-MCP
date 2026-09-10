@@ -405,3 +405,39 @@ Windows 下使用 `rg -g '*.js' <directory>`，不要依赖 shell 展开路径�
 - See Also: none
 
 ---
+
+## [ERR-20260910-001] Node fetch 拒绝随机分配的禁用端口
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+Windows 全量 Vitest 并发运行时，`listen(0)` 两次随机分配到 Fetch 标准禁止访问的端口，
+导致不同 HTTP 测试以 `TypeError: fetch failed` / `Error: bad port` 偶发失败；相关单文件重跑均通过。
+
+### 错误信息
+
+```text
+TypeError: fetch failed
+Caused by: Error: bad port
+```
+
+### 上下文
+
+- 并发全量运行分别在 `browser-worker-client.test.ts` 和 `control-plane/bridge.test.ts` 失败
+- 两个失败文件单独重跑均通过
+- `npm test -- --maxWorkers=1` 全量通过 509 tests，1 skipped
+
+### 建议修复
+
+先单独重跑失败文件；若错误链明确包含 `Error: bad port`，使用单 worker 全量复核，
+不要修改被冻结的业务实现或把它误判为功能回归。
+
+### 元数据
+
+- Reproducible: no
+- See Also: ERR-20260908-003
+
+---

@@ -25,6 +25,7 @@ afterEach(async () => {
 async function makeServer(options: {
   readonly workspace?: string;
   readonly registryPath?: string;
+  readonly port?: number;
 } = {}): Promise<{
   port: number;
   server: Server;
@@ -36,7 +37,7 @@ async function makeServer(options: {
   const registryPath = options.registryPath ?? join(workspace, "oauth", "clients.json");
   const server = await startApp({
     host: "127.0.0.1",
-    port: 0,
+    port: options.port ?? 0,
     workspace,
     auth: { token: TOKEN },
     remote: { enabled: false, endpoint: "" },
@@ -137,6 +138,44 @@ function pkceChallenge(verifier: string): string {
   return createHash("sha256").update(verifier, "utf8").digest("base64url");
 }
 
+async function authorizeAndExchange(
+  port: number,
+  clientId: string,
+  redirectUri: string,
+): Promise<{ access_token: string; refresh_token: string }> {
+  const verifier = "v".repeat(43);
+  const resource = `http://127.0.0.1:${port}/mcp`;
+  const authorization = await requestText(
+    port,
+    `/oauth/authorize?${new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      code_challenge: pkceChallenge(verifier),
+      code_challenge_method: "S256",
+      resource,
+    }).toString()}`,
+    "GET",
+  );
+  const code = new URL(authorization.headers.location ?? redirectUri).searchParams.get("code");
+  const response = await requestText(
+    port,
+    "/oauth/token",
+    "POST",
+    new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: clientId,
+      code: code ?? "",
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+      resource,
+    }).toString(),
+    { "content-type": "application/x-www-form-urlencoded" },
+  );
+  expect(response.status).toBe(200);
+  return JSON.parse(response.text) as { access_token: string; refresh_token: string };
+}
+
 describe("HTTP Bearer authentication", () => {
   it("rejects missing and incorrect tokens with the same generic response", async () => {
     const { port } = await makeServer();
@@ -188,6 +227,10 @@ describe("MCP OAuth compatibility", () => {
     const second = store.issue("https://review.example/mcp");
     store.delete(second.token);
     expect(store.validate(second.token, "https://review.example/mcp")).toBe(false);
+
+    const expiring = new OAuthTokenStore({ accessTtlSeconds: 10, refreshTtlSeconds: 10 });
+    const pair = expiring.issue("https://review.example/mcp", "client-1", 1_000);
+    expect(expiring.rotate(pair.refreshToken, "client-1", undefined, 11_000)).toBeNull();
   });
 
   it("serves protected-resource and authorization-server discovery metadata", async () => {
@@ -229,7 +272,7 @@ describe("MCP OAuth compatibility", () => {
       token_endpoint: `http://127.0.0.1:${port}/oauth/token`,
       registration_endpoint: `http://127.0.0.1:${port}/oauth/register`,
       response_types_supported: ["code"],
-      grant_types_supported: ["authorization_code"],
+      grant_types_supported: ["authorization_code", "refresh_token"],
       code_challenge_methods_supported: ["S256"],
       token_endpoint_auth_methods_supported: ["none"],
     });
@@ -242,7 +285,7 @@ describe("MCP OAuth compatibility", () => {
     });
   });
 
-  it("accepts ChatGPT Connector DCR metadata without enabling extra grants", async () => {
+  it("accepts ChatGPT Connector DCR metadata with refresh-token support", async () => {
     const { port } = await makeServer();
     const registration = await requestText(
       port,
@@ -272,7 +315,7 @@ describe("MCP OAuth compatibility", () => {
 
     expect(registration.status).toBe(201);
     expect(client.client_id).toEqual(expect.any(String));
-    expect(client.grant_types).toEqual(["authorization_code"]);
+    expect(client.grant_types).toEqual(["authorization_code", "refresh_token"]);
     expect(client.client_secret).toBeUndefined();
   });
 
@@ -325,7 +368,7 @@ describe("MCP OAuth compatibility", () => {
     const body = JSON.stringify({
       client_name: "ChatGPT",
       redirect_uris: [redirectUri],
-      grant_types: ["authorization_code"],
+      grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: "none",
     });
@@ -347,7 +390,7 @@ describe("MCP OAuth compatibility", () => {
       client_id: expect.any(String),
       client_name: "ChatGPT",
       redirect_uris: [redirectUri],
-      grant_types: ["authorization_code"],
+      grant_types: ["authorization_code", "refresh_token"],
       token_endpoint_auth_method: "none",
       created_at: expect.any(Number),
     });
@@ -486,6 +529,155 @@ describe("MCP OAuth compatibility", () => {
     );
     expect(replay.status).toBe(400);
     expect(JSON.parse(replay.text)).toMatchObject({ error: "invalid_grant" });
+  });
+
+  it("persists access and refresh tokens, rotates refresh tokens, and binds client and resource", async () => {
+    const first = await makeServer();
+    const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
+    const registration = await requestText(
+      first.port,
+      "/oauth/register",
+      "POST",
+      JSON.stringify({
+        client_name: "ChatGPT",
+        redirect_uris: [redirectUri],
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+      }),
+      { "content-type": "application/json" },
+    );
+    const client = JSON.parse(registration.text) as { client_id: string };
+    const original = await authorizeAndExchange(first.port, client.client_id, redirectUri);
+    expect(original).toMatchObject({
+      access_token: expect.any(String),
+      refresh_token: expect.any(String),
+    });
+    const tokenStorePath = join(first.workspace, "oauth", "tokens.json");
+    const persisted = await readFile(tokenStorePath, "utf8");
+    expect(persisted).not.toContain(original.access_token);
+    expect(persisted).not.toContain(original.refresh_token);
+    expect(JSON.parse(persisted)).toMatchObject({
+      schema_version: 1,
+      tokens: expect.arrayContaining([
+        expect.objectContaining({
+          hash: expect.any(String),
+          kind: "access",
+          client_id: client.client_id,
+          resource: `http://127.0.0.1:${first.port}/mcp`,
+          issued_at: expect.any(Number),
+          expires_at: expect.any(Number),
+          revoked: false,
+        }),
+        expect.objectContaining({
+          hash: expect.any(String),
+          kind: "refresh",
+          client_id: client.client_id,
+          resource: `http://127.0.0.1:${first.port}/mcp`,
+          issued_at: expect.any(Number),
+          expires_at: expect.any(Number),
+          revoked: false,
+        }),
+      ]),
+    });
+
+    const stablePort = first.port;
+    await stopServer(first.server);
+    const second = await makeServer({
+      workspace: first.workspace,
+      registryPath: first.registryPath,
+      port: stablePort,
+    });
+    await expect(postMcp(second.port, `Bearer ${original.access_token}`))
+      .resolves.toMatchObject({ status: 200 });
+
+    const unknownClient = await requestText(
+      second.port,
+      "/oauth/token",
+      "POST",
+      new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: "wrong-client",
+        refresh_token: original.refresh_token,
+      }).toString(),
+      { "content-type": "application/x-www-form-urlencoded" },
+    );
+    expect(JSON.parse(unknownClient.text)).toMatchObject({ error: "invalid_client" });
+
+    const wrongResource = await requestText(
+      second.port,
+      "/oauth/token",
+      "POST",
+      new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: client.client_id,
+        refresh_token: original.refresh_token,
+        resource: "https://other.example/mcp",
+      }).toString(),
+      { "content-type": "application/x-www-form-urlencoded" },
+    );
+    expect(JSON.parse(wrongResource.text)).toMatchObject({ error: "invalid_grant" });
+
+    const refreshed = await requestText(
+      second.port,
+      "/oauth/token",
+      "POST",
+      new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: client.client_id,
+        refresh_token: original.refresh_token,
+        resource: `http://127.0.0.1:${second.port}/mcp`,
+      }).toString(),
+      { "content-type": "application/x-www-form-urlencoded" },
+    );
+    const rotated = JSON.parse(refreshed.text) as { access_token: string; refresh_token: string };
+    expect(refreshed.status).toBe(200);
+    expect(rotated.access_token).not.toBe(original.access_token);
+    expect(rotated.refresh_token).not.toBe(original.refresh_token);
+    expect(JSON.parse(await readFile(tokenStorePath, "utf8"))).toMatchObject({
+      tokens: expect.arrayContaining([
+        expect.objectContaining({ kind: "refresh", revoked: true }),
+        expect.objectContaining({ kind: "refresh", revoked: false }),
+      ]),
+    });
+    await expect(postMcp(second.port, `Bearer ${rotated.access_token}`))
+      .resolves.toMatchObject({ status: 200 });
+
+    const replay = await requestText(
+      second.port,
+      "/oauth/token",
+      "POST",
+      new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: client.client_id,
+        refresh_token: original.refresh_token,
+      }).toString(),
+      { "content-type": "application/x-www-form-urlencoded" },
+    );
+    expect(JSON.parse(replay.text)).toMatchObject({ error: "invalid_grant" });
+
+    await stopServer(second.server);
+    const third = await makeServer({
+      workspace: first.workspace,
+      registryPath: first.registryPath,
+      port: stablePort,
+    });
+    const afterRestart = await requestText(
+      third.port,
+      "/oauth/token",
+      "POST",
+      new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: client.client_id,
+        refresh_token: rotated.refresh_token,
+      }).toString(),
+      { "content-type": "application/x-www-form-urlencoded" },
+    );
+    expect(afterRestart.status).toBe(200);
+    expect(JSON.parse(afterRestart.text)).toMatchObject({
+      access_token: expect.any(String),
+      refresh_token: expect.any(String),
+    });
   });
 
   it("rejects non-loopback HTTP redirects and plain PKCE", async () => {
