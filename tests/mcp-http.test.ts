@@ -99,7 +99,7 @@ describe("MCP HTTP runtime", () => {
     await client.connect(transport);
     const result = await client.callTool({ name: "workspace_info", arguments: {} });
     expect(result.isError).not.toBe(true);
-    expect(JSON.stringify(result)).not.toContain("wfr_ingress");
+    expect(result.structuredContent).toMatchObject({ request_id: "wfr_ingress" });
     expect(seen).toEqual(["wfr_ingress"]);
     await client.close();
     expect(inboundRequestId()).toBeNull();

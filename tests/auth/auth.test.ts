@@ -5,8 +5,10 @@ import { request as httpRequest, type IncomingHttpHeaders, type Server } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { startApp } from "../../src/app.js";
+import { createAppContext, startApp } from "../../src/app.js";
+import { OAuthService } from "../../src/auth/oauth.js";
 import { OAuthTokenStore } from "../../src/auth/token.js";
+import { workspaceOAuthStatePaths } from "../../src/control-plane/chatgpt-connector.js";
 
 const runningServers: Server[] = [];
 const temporaryDirectories: string[] = [];
@@ -216,6 +218,72 @@ describe("HTTP Bearer authentication", () => {
 });
 
 describe("MCP OAuth compatibility", () => {
+  it("keeps OAuth clients and tokens isolated by workspace state root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-oauth-isolation-"));
+    temporaryDirectories.push(root);
+    const pathsA = workspaceOAuthStatePaths("workspace-a", root);
+    const pathsB = workspaceOAuthStatePaths("workspace-b", root);
+    const serviceA = new OAuthService({
+      clientRegistryPath: pathsA.clientRegistryPath,
+      tokenStorePath: pathsA.tokenStorePath,
+    });
+    const serviceB = new OAuthService({
+      clientRegistryPath: pathsB.clientRegistryPath,
+      tokenStorePath: pathsB.tokenStorePath,
+    });
+    const clientA = serviceA.registerClient({
+      client_name: "Workspace A",
+      redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+    });
+    const tokenA = serviceA.tokens.issue("https://a.example/mcp", clientA.client_id);
+
+    expect(pathsA.clientRegistryPath).not.toBe(pathsB.clientRegistryPath);
+    expect(serviceB.getClient(clientA.client_id)).toBeUndefined();
+    expect(serviceB.validateAccessToken(tokenA.token, "https://a.example/mcp")).toBe(false);
+  });
+
+  it("injects the active workspace OAuth paths through the app HTTP construction", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-oauth-app-workspace-"));
+    const stateBase = await mkdtemp(join(tmpdir(), "local-review-mcp-oauth-app-state-"));
+    temporaryDirectories.push(workspace, stateBase);
+    const identity = { id: "workspace-app", name: "Workspace App", path: workspace };
+    const appSettings = {
+      host: "127.0.0.1" as const,
+      port: 0,
+      workspace,
+      workspaceIdentity: identity,
+      workspaces: [identity],
+      auth: { token: TOKEN },
+      remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
+    };
+    const context = createAppContext(appSettings, {
+      ...process.env,
+      LOCALAPPDATA: stateBase,
+      XDG_STATE_HOME: stateBase,
+    });
+    const server = await startApp(appSettings, context);
+    runningServers.push(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("test server has no port");
+    const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
+    const registration = await requestText(
+      address.port,
+      "/oauth/register",
+      "POST",
+      JSON.stringify({ client_name: "ChatGPT", redirect_uris: [redirectUri] }),
+      { "content-type": "application/json" },
+    );
+    const client = JSON.parse(registration.text) as { client_id: string };
+    await authorizeAndExchange(address.port, client.client_id, redirectUri);
+
+    const paths = workspaceOAuthStatePaths(identity.id, context.storageRoot);
+    await expect(readFile(paths.clientRegistryPath, "utf8")).resolves.toContain(client.client_id);
+    await expect(readFile(paths.tokenStorePath, "utf8")).resolves.toContain('"kind": "refresh"');
+    await expect(readFile(join(context.storageRoot!, "oauth", "clients.json"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("stores only hash-backed tokens and handles expiry and deletion", () => {
     const store = new OAuthTokenStore(10);
     const issued = store.issue("https://review.example/mcp", 1_000);
@@ -634,12 +702,17 @@ describe("MCP OAuth compatibility", () => {
     expect(refreshed.status).toBe(200);
     expect(rotated.access_token).not.toBe(original.access_token);
     expect(rotated.refresh_token).not.toBe(original.refresh_token);
-    expect(JSON.parse(await readFile(tokenStorePath, "utf8"))).toMatchObject({
-      tokens: expect.arrayContaining([
-        expect.objectContaining({ kind: "refresh", revoked: true }),
-        expect.objectContaining({ kind: "refresh", revoked: false }),
-      ]),
-    });
+    const afterRotation = JSON.parse(await readFile(tokenStorePath, "utf8")) as {
+      tokens: Array<{ hash: string; kind: string; revoked: boolean }>;
+    };
+    expect(afterRotation.tokens).not.toContainEqual(expect.objectContaining({
+      hash: createHash("sha256").update(original.refresh_token, "utf8").digest("hex"),
+    }));
+    expect(afterRotation.tokens.every((record) => !record.revoked)).toBe(true);
+    expect(afterRotation.tokens).toContainEqual(expect.objectContaining({
+      kind: "refresh",
+      revoked: false,
+    }));
     await expect(postMcp(second.port, `Bearer ${rotated.access_token}`))
       .resolves.toMatchObject({ status: 200 });
 

@@ -1,5 +1,5 @@
 import type { Server } from "node:http";
-import { basename } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { endpoint, localOrigin, type ResolvedSettings } from "./config/settings.js";
 import { isPortInUse, startHttpServer, type HttpServerOptions } from "./mcp/http.js";
 import { REGISTERED_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
@@ -17,6 +17,10 @@ import {
 import { CodexExecutionCompletionService } from "./control-plane/codex-execution-completion.js";
 import { AutoIterationService } from "./control-plane/auto-iteration.js";
 import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
+import {
+  ChatGPTConnectorStore,
+  migrateLegacyOAuthState,
+} from "./control-plane/chatgpt-connector.js";
 import type { ExtensionIdentityEvidence } from "./control-plane/extension-identity.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { defaultTaskContextStorageRoot } from "./context/task.js";
@@ -25,6 +29,7 @@ import { WorkspaceManager } from "./workspace/manager.js";
 import { WorkspaceRegistry } from "./workspace/registry.js";
 
 export interface AppContext extends McpRuntimeContext {
+  readonly storageRoot?: string;
   readonly settings: ResolvedSettings;
   readonly tunnel: TunnelManager;
   readonly correlations: ConversationCorrelationRegistry;
@@ -66,6 +71,7 @@ export function createAppContext(
     validateWorkspaceIdentityConsistency(registry.active, runtimeIdentity);
   }
   const storageRoot = defaultTaskContextStorageRoot(environment);
+  const connectorEvidence = new ChatGPTConnectorStore(registry.active.id, storageRoot);
   const extensionDeliveries = new ExtensionDeliveryService(storageRoot);
   const codexExecutionCompletion = new CodexExecutionCompletionService(storageRoot);
   const codexExecutionAdapter = new CodexExecutionAdapter(registry, {
@@ -94,6 +100,8 @@ export function createAppContext(
   codexExecutionCompletion.setTerminalListener((execution) => autoIteration.onExecutionTerminal(execution));
   return {
     settings,
+    storageRoot,
+    connectorEvidence,
     correlations: new ConversationCorrelationRegistry(),
     extensionDeliveries,
     codexExecutionCompletion,
@@ -118,7 +126,20 @@ export async function startApp(
   options: AppStartOptions = {},
 ): Promise<Server> {
   try {
-    const server = await startHttpServer(settings, context, options);
+    const workspaceOAuth = context.storageRoot === undefined
+      ? undefined
+      : await migrateLegacyOAuthState({
+          workspaceId: context.registry.active.id,
+          storageRoot: context.storageRoot,
+          singleWorkspace: context.registry.list().length === 1,
+        });
+    const server = await startHttpServer(settings, context, {
+      oauthClientRegistryPath: options.oauthClientRegistryPath ?? workspaceOAuth?.clientRegistryPath,
+      oauthTokenStorePath: options.oauthTokenStorePath
+        ?? (options.oauthClientRegistryPath === undefined
+          ? workspaceOAuth?.tokenStorePath
+          : join(dirname(options.oauthClientRegistryPath), "tokens.json")),
+    });
     try {
       const extensionDeliveries = context.extensionDeliveries;
       await context.correlations.restore();

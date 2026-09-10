@@ -1,31 +1,65 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import type { Server } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ResolvedSettings } from "../src/config/settings.js";
+import { OAuthTokenStore } from "../src/auth/token.js";
 import {
+  CONNECTOR_EVIDENCE_TTL_MS,
   ChatGPTConnectorStore,
   chatgptConnectorStateFile,
   confirmChatGPTConnector,
   connectorAction,
   diagnoseChatGPTConnector,
+  legacyChatgptConnectorStateFile,
   mcpUrlFromPublic,
+  migrateLegacyOAuthState,
   normalizePublicUrl,
+  parseConnectorConfirmArgs,
+  workspaceOAuthStatePaths,
 } from "../src/control-plane/chatgpt-connector.js";
+import { createHttpServer } from "../src/mcp/http.js";
+import { WorkspaceRegistry } from "../src/workspace/registry.js";
 
 const temporaryDirectories: string[] = [];
+const clients: Client[] = [];
+const servers: Server[] = [];
+const NOW = Date.parse("2026-09-10T04:00:00.000Z");
+const CURRENT_URL = "https://host.example/mcp";
 
 afterEach(async () => {
+  await Promise.all(clients.splice(0).map((client) => client.close().catch(() => undefined)));
+  await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => {
+    server.close(() => resolve());
+  })));
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {
     recursive: true,
     force: true,
   })));
 });
 
+async function listen(server: Server): Promise<number> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("test server has no port");
+  return address.port;
+}
+
 async function temporaryRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "local-review-mcp-connector-"));
   temporaryDirectories.push(root);
   return root;
+}
+
+async function writeJson(path: string, value: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
 function settings(endpoint = "https://HOST.example/mcp"): ResolvedSettings {
@@ -61,7 +95,7 @@ function healthyOAuthFetch(options: { refresh?: boolean } = {}): typeof fetch {
     }
     if (url.includes("oauth-protected-resource")) {
       return Response.json({
-        resource: "https://host.example/mcp",
+        resource: CURRENT_URL,
         authorization_servers: ["https://host.example"],
       });
     }
@@ -78,7 +112,39 @@ function healthyOAuthFetch(options: { refresh?: boolean } = {}): typeof fetch {
   }) as typeof fetch;
 }
 
-describe("ChatGPT connector decisions", () => {
+async function prepare(store: ChatGPTConnectorStore, url = CURRENT_URL): Promise<void> {
+  await store.prepare({ workspaceName: "Workspace One", currentMcpUrl: url });
+}
+
+async function evidence(
+  store: ChatGPTConnectorStore,
+  requestId: string,
+  patch: Partial<Parameters<ChatGPTConnectorStore["recordEvidence"]>[0]> = {},
+): Promise<void> {
+  await store.recordEvidence({
+    request_id: requestId,
+    tool_name: "workspace_info",
+    workspace_id: "workspace-1",
+    mcp_resource: CURRENT_URL,
+    authentication: "oauth",
+    success: true,
+    completed_at: new Date(NOW).toISOString(),
+    ...patch,
+  });
+}
+
+function verifiedBinding(workspaceId = "workspace-1", resource = CURRENT_URL) {
+  return {
+    workspace_id: workspaceId,
+    connector_name: `Local Review MCP · ${workspaceId}`,
+    verified_mcp_url: resource,
+    pending_mcp_url: null,
+    status: "verified",
+    last_verified_at: "2026-09-10T03:00:00.000Z",
+  } as const;
+}
+
+describe("ChatGPT connector decisions and scoped state", () => {
   it("reuses the C2C URL normalization and create/none/update rules", () => {
     expect(connectorAction(null, "https://host/mcp")).toBe("create");
     expect(connectorAction("https://HOST/mcp", "https://host/mcp/")).toBe("none");
@@ -88,68 +154,248 @@ describe("ChatGPT connector decisions", () => {
     expect(normalizePublicUrl("https://HOST/mcp/")).toBe("https://host/mcp");
   });
 
-  it("keeps the verified URL through a failed repair and restart, then confirms the new URL", async () => {
+  it("isolates parallel workspace writes and keeps a stable connector name", async () => {
     const root = await temporaryRoot();
-    const first = new ChatGPTConnectorStore(root);
-    const created = await first.prepare({
-      workspaceId: "workspace-1",
-      workspaceName: "Original Name",
-      currentMcpUrl: "https://old.example/mcp",
-    });
-    expect(created.action).toBe("create");
-    const verified = await first.confirm({
-      workspaceId: "workspace-1",
-      currentMcpUrl: "https://old.example/mcp",
-      verifiedAt: "2026-09-10T00:00:00.000Z",
-    });
+    const a = new ChatGPTConnectorStore("workspace-a", root);
+    const b = new ChatGPTConnectorStore("workspace-b", root);
+    await Promise.all([
+      a.prepare({ workspaceName: "Workspace A", currentMcpUrl: "https://a.example/mcp" }),
+      b.prepare({ workspaceName: "Workspace B", currentMcpUrl: "https://b.example/mcp" }),
+    ]);
+    await a.prepare({ workspaceName: "Renamed A", currentMcpUrl: "https://a.example/mcp" });
 
-    const repair = await first.prepare({
-      workspaceId: "workspace-1",
+    await expect(a.read()).resolves.toMatchObject({
+      connector_name: "Local Review MCP · Workspace A",
+      pending_mcp_url: "https://a.example/mcp",
+    });
+    await expect(b.read()).resolves.toMatchObject({
+      connector_name: "Local Review MCP · Workspace B",
+      pending_mcp_url: "https://b.example/mcp",
+    });
+    expect(chatgptConnectorStateFile("workspace-a", root))
+      .not.toBe(chatgptConnectorStateFile("workspace-b", root));
+    expect(chatgptConnectorStateFile("CON", root)).toContain(`${join("workspaces", "ws-CON")}`);
+    expect(() => chatgptConnectorStateFile("../outside", root)).toThrow();
+  });
+
+  it("rejects scoped state copied from another workspace", async () => {
+    const root = await temporaryRoot();
+    const source = new ChatGPTConnectorStore("workspace-a", root);
+    await source.prepare({ workspaceName: "Workspace A", currentMcpUrl: "https://a.example/mcp" });
+    const targetFile = chatgptConnectorStateFile("workspace-b", root);
+    await mkdir(dirname(targetFile), { recursive: true });
+    await writeFile(targetFile, await readFile(chatgptConnectorStateFile("workspace-a", root), "utf8"));
+
+    await expect(new ChatGPTConnectorStore("workspace-b", root).read())
+      .rejects.toThrow("ChatGPT connector state is invalid");
+  });
+
+  it("keeps the old verified URL through interrupted repair and verifies only from evidence", async () => {
+    const root = await temporaryRoot();
+    const first = new ChatGPTConnectorStore("workspace-1", root);
+    await prepare(first, "https://old.example/mcp");
+    await evidence(first, "request-old", { mcp_resource: "https://old.example/mcp" });
+    await first.confirm("request-old", "https://old.example/mcp", NOW);
+
+    await prepare(first, "https://new.example/mcp");
+    await expect(new ChatGPTConnectorStore("workspace-1", root).read()).resolves.toMatchObject({
+      verified_mcp_url: "https://old.example/mcp",
+      pending_mcp_url: "https://new.example/mcp",
+      status: "repair_required",
+    });
+    await expect(new ChatGPTConnectorStore("workspace-1", root).prepare({
+      workspaceName: "Renamed",
+      currentMcpUrl: "https://new.example/mcp",
+    })).resolves.toMatchObject({ action: "update" });
+  });
+});
+
+describe("workspace_info verification evidence", () => {
+  it("records a successful OAuth-authenticated workspace_info call before confirmation", async () => {
+    const storageRoot = await temporaryRoot();
+    const workspace = await temporaryRoot();
+    const identity = { id: "workspace-1", name: "Workspace One", path: workspace };
+    const current = { ...settings(), workspace, workspaceIdentity: identity, workspaces: [identity] };
+    const store = new ChatGPTConnectorStore(identity.id, storageRoot);
+    await prepare(store);
+    const oauthPaths = workspaceOAuthStatePaths(identity.id, storageRoot);
+    const issued = new OAuthTokenStore({ path: oauthPaths.tokenStorePath }).issue(CURRENT_URL, "client-1");
+    const server = createHttpServer(current, {
+      registry: new WorkspaceRegistry([identity]),
+      connectorEvidence: store,
+    }, {
+      oauthClientRegistryPath: oauthPaths.clientRegistryPath,
+      oauthTokenStorePath: oauthPaths.tokenStorePath,
+    });
+    servers.push(server);
+    const port = await listen(server);
+    const client = new Client({ name: "connector-evidence-test", version: "0.1.0" });
+    clients.push(client);
+    await client.connect(new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${port}/mcp`),
+      { requestInit: { headers: {
+        authorization: `Bearer ${issued.token}`,
+        "x-request-id": "connector-proof-1",
+      } } },
+    ));
+
+    const result = await client.callTool({ name: "workspace_info", arguments: {} });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      request_id: "connector-proof-1",
+      workspace_id: identity.id,
+      workspace_name: identity.name,
+    });
+    await expect(confirmChatGPTConnector(current, "connector-proof-1", storageRoot))
+      .resolves.toMatchObject({ status: "verified", verified_mcp_url: CURRENT_URL });
+  });
+
+  it("rejects missing, wrong-tool, failed, wrong-workspace, old-resource, expired, and static evidence", async () => {
+    const root = await temporaryRoot();
+    const store = new ChatGPTConnectorStore("workspace-1", root);
+    await prepare(store);
+    await expect(store.confirm("missing", CURRENT_URL, NOW)).rejects.toThrow("not found");
+
+    const cases = [
+      ["ordinary", { tool_name: "read_file" }, "not for workspace_info"],
+      ["failed", { success: false }, "not successful"],
+      ["old", { mcp_resource: "https://old.example/mcp" }, "current MCP resource"],
+      ["expired", {
+        completed_at: new Date(NOW - CONNECTOR_EVIDENCE_TTL_MS - 1).toISOString(),
+      }, "expired"],
+      ["static", { authentication: "static" as const }, "not OAuth-authenticated"],
+    ] as const;
+    for (const [requestId, patch, message] of cases) {
+      await evidence(store, requestId, patch);
+      await expect(store.confirm(requestId, CURRENT_URL, NOW)).rejects.toThrow(message);
+    }
+    await expect(evidence(store, "other", { workspace_id: "workspace-2" }))
+      .rejects.toThrow("another workspace");
+  });
+
+  it("consumes successful current OAuth workspace_info evidence and survives restart", async () => {
+    const root = await temporaryRoot();
+    const store = new ChatGPTConnectorStore("workspace-1", root);
+    await prepare(store);
+    await evidence(store, "request-current");
+    await expect(store.confirm("request-current", CURRENT_URL, NOW)).resolves.toMatchObject({
+      verified_mcp_url: CURRENT_URL,
+      pending_mcp_url: null,
+      status: "verified",
+      last_verified_at: new Date(NOW).toISOString(),
+    });
+    await expect(store.confirm("request-current", CURRENT_URL, NOW + 1))
+      .rejects.toThrow("already consumed");
+    await expect(new ChatGPTConnectorStore("workspace-1", root).prepare({
       workspaceName: "Renamed Workspace",
-      currentMcpUrl: "https://new.example/mcp",
-    });
-    expect(repair).toMatchObject({
-      action: "update",
-      binding: {
-        connector_name: created.binding.connector_name,
-        verified_mcp_url: "https://old.example/mcp",
-        pending_mcp_url: "https://new.example/mcp",
-        status: "repair_required",
-      },
-    });
-    expect(verified.connector_name).toBe(repair.binding.connector_name);
+      currentMcpUrl: "https://HOST.example/mcp/",
+    })).resolves.toMatchObject({ action: "none", binding: { status: "verified" } });
+  });
 
-    const restarted = new ChatGPTConnectorStore(root);
-    await expect(restarted.prepare({
-      workspaceId: "workspace-1",
-      workspaceName: "Renamed Again",
-      currentMcpUrl: "https://new.example/mcp",
-    })).resolves.toMatchObject({
-      action: "update",
-      binding: { verified_mcp_url: "https://old.example/mcp" },
+  it("does not accept caller-supplied workspace and URL without durable evidence", async () => {
+    const root = await temporaryRoot();
+    const current = settings();
+    await diagnoseChatGPTConnector(current, { storageRoot: root, fetch: healthyOAuthFetch() });
+    await expect(confirmChatGPTConnector(current, "caller-claim", root)).rejects.toThrow("not found");
+    expect(() => parseConnectorConfirmArgs([
+      "--config", "settings.json",
+      "--workspace-id", "workspace-1",
+      "--mcp-url", CURRENT_URL,
+    ])).toThrow("unknown argument: --workspace-id");
+    expect(parseConnectorConfirmArgs([
+      "--config", "settings.json",
+      "--request-id", "request-current",
+    ])).toEqual({ settingsArgs: ["--config", "settings.json"], requestId: "request-current" });
+  });
+});
+
+describe("legacy migration", () => {
+  it("copies one exact legacy connector binding without deleting the legacy file", async () => {
+    const root = await temporaryRoot();
+    const legacyFile = legacyChatgptConnectorStateFile(root);
+    await writeJson(legacyFile, {
+      schema_version: 1,
+      bindings: [verifiedBinding()],
+    });
+    const store = new ChatGPTConnectorStore("workspace-1", root);
+    await expect(store.read()).resolves.toMatchObject({ workspace_id: "workspace-1", status: "verified" });
+    expect(JSON.parse(await readFile(chatgptConnectorStateFile("workspace-1", root), "utf8")))
+      .toMatchObject({ schema_version: 1, binding: { workspace_id: "workspace-1" }, evidence: [] });
+    await expect(new ChatGPTConnectorStore("workspace-1", root).read())
+      .resolves.toMatchObject({ workspace_id: "workspace-1" });
+    await expect(readFile(legacyFile, "utf8")).resolves.toContain("workspace-1");
+  });
+
+  it("migrates uniquely owned OAuth state once and omits revoked tokens", async () => {
+    const root = await temporaryRoot();
+    await writeJson(legacyChatgptConnectorStateFile(root), {
+      schema_version: 1,
+      bindings: [verifiedBinding()],
+    });
+    await writeJson(join(root, "oauth", "clients.json"), {
+      version: 1,
+      clients: [{
+        client_id: "client-1",
+        client_name: "ChatGPT",
+        redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+        grant_types: ["authorization_code", "refresh_token"],
+        token_endpoint_auth_method: "none",
+        response_types: ["code"],
+        created_at: 1,
+      }],
+    });
+    await writeJson(join(root, "oauth", "tokens.json"), {
+      schema_version: 1,
+      tokens: [
+        {
+          hash: "a".repeat(64), kind: "access", client_id: "client-1", resource: CURRENT_URL,
+          issued_at: NOW - 1_000, expires_at: NOW + 60_000, revoked: false,
+        },
+        {
+          hash: "b".repeat(64), kind: "refresh", client_id: "client-1", resource: CURRENT_URL,
+          issued_at: NOW - 1_000, expires_at: NOW + 60_000, revoked: true,
+        },
+      ],
     });
 
-    await expect(restarted.confirm({
+    const migrated = await migrateLegacyOAuthState({
       workspaceId: "workspace-1",
-      currentMcpUrl: "https://old.example/mcp",
-    })).rejects.toThrow("pending connector binding");
-    await restarted.confirm({
-      workspaceId: "workspace-1",
-      currentMcpUrl: "https://new.example/mcp",
-      verifiedAt: "2026-09-10T01:00:00.000Z",
+      storageRoot: root,
+      singleWorkspace: true,
+      now: NOW,
     });
-    await expect(new ChatGPTConnectorStore(root).prepare({
+    expect(migrated.migration).toBe("migrated");
+    expect(JSON.parse(await readFile(migrated.tokenStorePath, "utf8")))
+      .toMatchObject({ tokens: [{ hash: "a".repeat(64), revoked: false }] });
+    await expect(migrateLegacyOAuthState({
       workspaceId: "workspace-1",
-      workspaceName: "Renamed Again",
-      currentMcpUrl: "https://NEW.example/mcp/",
-    })).resolves.toMatchObject({
-      action: "none",
-      binding: {
-        verified_mcp_url: "https://new.example/mcp",
-        pending_mcp_url: null,
-        status: "verified",
-      },
+      storageRoot: root,
+      singleWorkspace: true,
+      now: NOW,
+    })).resolves.toMatchObject({ migration: "not_needed" });
+    await expect(readFile(join(root, "oauth", "tokens.json"), "utf8")).resolves.toContain("b".repeat(64));
+  });
+
+  it("refuses ambiguous multi-workspace OAuth migration without writing scoped state", async () => {
+    const root = await temporaryRoot();
+    await writeJson(legacyChatgptConnectorStateFile(root), {
+      schema_version: 1,
+      bindings: [
+        verifiedBinding("workspace-1", CURRENT_URL),
+        verifiedBinding("workspace-2", "https://two.example/mcp"),
+      ],
     });
+    await writeJson(join(root, "oauth", "clients.json"), { version: 1, clients: [] });
+    await writeJson(join(root, "oauth", "tokens.json"), { schema_version: 1, tokens: [] });
+
+    await expect(migrateLegacyOAuthState({
+      workspaceId: "workspace-1",
+      storageRoot: root,
+      singleWorkspace: false,
+    })).resolves.toMatchObject({ migration: "reauthorization_required" });
+    const paths = workspaceOAuthStatePaths("workspace-1", root);
+    await expect(readFile(paths.clientRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(paths.tokenStorePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 
@@ -163,12 +409,14 @@ describe("diagnose-chatgpt-connector", () => {
     expect(result).toMatchObject({
       ok: true,
       workspace_id: "workspace-1",
-      remote: { ready: true, mcp_url: "https://host.example/mcp" },
+      remote: { ready: true, mcp_url: CURRENT_URL },
       oauth: {
         ready: true,
         pkce_s256: true,
         dynamic_registration: true,
         refresh_token: true,
+        migration: "not_needed",
+        reauthorization_required: false,
       },
       connector: {
         name: "Local Review MCP · Workspace One",
@@ -177,36 +425,29 @@ describe("diagnose-chatgpt-connector", () => {
         verified_mcp_url: null,
       },
     });
-    const serialized = JSON.stringify(result);
-    expect(serialized).not.toContain("AUTH_SENTINEL");
-    const state = await readFile(chatgptConnectorStateFile(root), "utf8");
-    expect(state).not.toContain("AUTH_SENTINEL");
-    expect(JSON.parse(state)).toMatchObject({
-      schema_version: 1,
-      bindings: [{
-        verified_mcp_url: null,
-        pending_mcp_url: "https://host.example/mcp",
-      }],
-    });
+    expect(JSON.stringify(result)).not.toContain("AUTH_SENTINEL");
+    expect(JSON.parse(await readFile(chatgptConnectorStateFile("workspace-1", root), "utf8")))
+      .toMatchObject({
+        schema_version: 1,
+        binding: { verified_mcp_url: null, pending_mcp_url: CURRENT_URL },
+        evidence: [],
+      });
   });
 
   it("does not request browser actuation when Remote MCP or OAuth discovery is unavailable", async () => {
     const root = await temporaryRoot();
-    const unavailable = await diagnoseChatGPTConnector(settings(), {
+    await expect(diagnoseChatGPTConnector(settings(), {
       storageRoot: root,
       fetch: vi.fn(async () => new Response(null, { status: 503 })) as typeof fetch,
-    });
-    expect(unavailable).toMatchObject({
+    })).resolves.toMatchObject({
       ok: false,
       remote: { ready: false },
       connector: { action: "none" },
     });
-
-    const invalidOAuth = await diagnoseChatGPTConnector(settings(), {
+    await expect(diagnoseChatGPTConnector(settings(), {
       storageRoot: root,
       fetch: healthyOAuthFetch({ refresh: false }),
-    });
-    expect(invalidOAuth).toMatchObject({
+    })).resolves.toMatchObject({
       ok: false,
       remote: { ready: true },
       oauth: { ready: false, refresh_token: false },
@@ -214,29 +455,28 @@ describe("diagnose-chatgpt-connector", () => {
     });
   });
 
-  it("requires matching workspace_info identity and current URL before confirmation", async () => {
+  it("reports ambiguous legacy OAuth ownership as requiring reauthorization", async () => {
     const root = await temporaryRoot();
+    await writeJson(legacyChatgptConnectorStateFile(root), {
+      schema_version: 1,
+      bindings: [
+        verifiedBinding("workspace-1", CURRENT_URL),
+        verifiedBinding("workspace-2", "https://two.example/mcp"),
+      ],
+    });
+    await writeJson(join(root, "oauth", "clients.json"), { version: 1, clients: [] });
+    await writeJson(join(root, "oauth", "tokens.json"), { schema_version: 1, tokens: [] });
     const current = settings();
-    await diagnoseChatGPTConnector(current, { storageRoot: root, fetch: healthyOAuthFetch() });
-    await expect(confirmChatGPTConnector(current, {
-      workspaceId: "wrong-workspace",
-      mcpUrl: "https://host.example/mcp",
-    }, root)).rejects.toThrow("workspace_id");
-    await expect(confirmChatGPTConnector(current, {
-      workspaceId: "workspace-1",
-      mcpUrl: "https://old.example/mcp",
-    }, root)).rejects.toThrow("current remote endpoint");
-    await expect(confirmChatGPTConnector(current, {
-      workspaceId: "workspace-1",
-      mcpUrl: "https://host.example/mcp",
-    }, root)).resolves.toMatchObject({ status: "verified" });
+    const identity2 = { id: "workspace-2", name: "Workspace Two", path: "C:\\workspace-two" };
+    current.workspaces = [...(current.workspaces ?? []), identity2];
 
     await expect(diagnoseChatGPTConnector(current, {
       storageRoot: root,
       fetch: healthyOAuthFetch(),
     })).resolves.toMatchObject({
       ok: true,
-      connector: { action: "none", status: "verified" },
+      oauth: { migration: "reauthorization_required", reauthorization_required: true },
+      connector: { reason: "legacy_oauth_reauthorization_required" },
     });
   });
 });

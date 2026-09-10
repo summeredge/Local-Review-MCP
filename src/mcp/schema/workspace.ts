@@ -7,6 +7,7 @@ import {
 } from "./common.js";
 
 export const workspaceInfoOutputSchema = workspaceContextSchema.extend({
+  request_id: z.string().min(1).max(100).regex(/^[A-Za-z0-9_-]+$/u),
   root_alias: rootAliasSchema,
   project_types: z.array(z.string()),
 });

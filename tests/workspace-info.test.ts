@@ -65,6 +65,7 @@ describe("workspace_info", () => {
 
     expect(info.workspace_id).toBe("legacy-workspace");
     expect(info.workspace_name).toBe(basename(workspace));
+    expect(info.request_id).toEqual(expect.any(String));
     expect(info.root_alias).toBe("workspace:/");
     expect(info.project_types).toEqual(["dotnet", "go", "node", "python", "rust", "typescript"]);
 

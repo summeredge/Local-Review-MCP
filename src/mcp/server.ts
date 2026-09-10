@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
@@ -12,6 +13,7 @@ import type { WorkspaceRegistry, WorkspaceSelection } from "../workspace/registr
 import { searchText } from "../workspace/search.js";
 import { containsNullByte } from "../workspace/text.js";
 import { structuredResponse } from "./respond.js";
+import { inboundRequestOrigin } from "./inbound.js";
 import { ROOT_ALIAS } from "./schema/common.js";
 import {
   gitDiffOutputSchema,
@@ -37,6 +39,17 @@ import {
 export interface McpRuntimeContext {
   readonly workspace?: WorkspaceManager;
   readonly registry: WorkspaceRegistry;
+  readonly connectorEvidence?: {
+    recordEvidence(input: {
+      readonly request_id: string;
+      readonly tool_name: string;
+      readonly workspace_id: string;
+      readonly mcp_resource: string;
+      readonly authentication: "oauth" | "static" | "unknown";
+      readonly success: boolean;
+      readonly completed_at: string;
+    }): Promise<void>;
+  };
 }
 
 export const V01_TOOL_NAMES = [
@@ -350,6 +363,7 @@ async function detectProjectTypes(workspace: WorkspaceManager): Promise<string[]
 
 async function workspaceInfo(selection: WorkspaceSelection): Promise<WorkspaceInfoOutput> {
   return {
+    request_id: inboundRequestOrigin()?.requestId ?? randomUUID(),
     workspace_id: selection.id,
     workspace_name: selection.name,
     root_alias: ROOT_ALIAS,
@@ -441,9 +455,36 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async (input) => {
+      const origin = inboundRequestOrigin();
+      let workspaceId = input.workspace_id;
       try {
-        return structuredResponse(workspaceInfoOutputSchema, await workspaceInfo(registry.resolve(input.workspace_id)));
+        const selection = registry.resolve(input.workspace_id);
+        workspaceId = selection.id;
+        const output = await workspaceInfo(selection);
+        if (origin !== null && origin.mcpResource !== null && context.connectorEvidence !== undefined) {
+          await context.connectorEvidence.recordEvidence({
+            request_id: output.request_id,
+            tool_name: "workspace_info",
+            workspace_id: output.workspace_id,
+            mcp_resource: origin.mcpResource,
+            authentication: origin.authentication,
+            success: true,
+            completed_at: new Date().toISOString(),
+          });
+        }
+        return structuredResponse(workspaceInfoOutputSchema, output);
       } catch (error: unknown) {
+        if (origin !== null && origin.mcpResource !== null && context.connectorEvidence !== undefined) {
+          await context.connectorEvidence.recordEvidence({
+            request_id: origin.requestId,
+            tool_name: "workspace_info",
+            workspace_id: workspaceId ?? registry.active.id,
+            mcp_resource: origin.mcpResource,
+            authentication: origin.authentication,
+            success: false,
+            completed_at: new Date().toISOString(),
+          }).catch(() => undefined);
+        }
         return toToolError(error);
       }
     },

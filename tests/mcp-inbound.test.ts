@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { inboundRequestId, requestIdFromHeader, withInboundRequestId } from "../src/mcp/inbound.js";
+import {
+  inboundRequestId,
+  inboundRequestOrigin,
+  requestIdFromHeader,
+  withInboundRequestId,
+  withInboundRequestOrigin,
+} from "../src/mcp/inbound.js";
 
 describe("MCP inbound request id boundary", () => {
   it("normalizes and rejects ambiguous or invalid x-request-id values", () => {
@@ -35,5 +41,18 @@ describe("MCP inbound request id boundary", () => {
 
     expect(seen).toEqual(["wfr_a", "wfr_b"]);
     expect(inboundRequestId()).toBeNull();
+  });
+
+  it("carries only safe MCP resource and authentication origin metadata", () => {
+    expect(withInboundRequestOrigin({
+      requestId: "connector-proof",
+      mcpResource: "https://review.example/mcp",
+      authentication: "oauth",
+    }, () => inboundRequestOrigin())).toEqual({
+      requestId: "connector-proof",
+      mcpResource: "https://review.example/mcp",
+      authentication: "oauth",
+    });
+    expect(inboundRequestOrigin()).toBeNull();
   });
 });

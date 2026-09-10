@@ -5,7 +5,7 @@ import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import type { ResolvedSettings } from "../config/settings.js";
-import { defaultTaskContextStorageRoot } from "../context/task.js";
+import { defaultTaskContextStorageRoot, workspaceStateRoot } from "../context/task.js";
 import { WorkspaceManager } from "../workspace/manager.js";
 
 export const CHATGPT_PLUGINS_URL = "https://chatgpt.com/plugins";
@@ -15,6 +15,8 @@ export const CONNECTOR_DESCRIPTION =
   "Securely connect ChatGPT to the current Local Review MCP workspace for review.";
 export const CONNECTOR_STATE_SCHEMA_VERSION = 1 as const;
 export const DEFAULT_CONNECTOR_PREFIX = "Local Review MCP";
+export const CONNECTOR_EVIDENCE_TTL_MS = 10 * 60 * 1000;
+const MAX_CONNECTOR_EVIDENCE = 100;
 
 export type ConnectorAction = "none" | "create" | "update";
 export type ConnectorStatus = "unconfigured" | "repair_required" | "verified";
@@ -26,6 +28,17 @@ export interface ChatGPTConnectorBinding {
   readonly pending_mcp_url: string | null;
   readonly status: ConnectorStatus;
   readonly last_verified_at: string | null;
+}
+
+export interface ConnectorVerificationEvidence {
+  readonly request_id: string;
+  readonly tool_name: string;
+  readonly workspace_id: string;
+  readonly mcp_resource: string;
+  readonly authentication: "oauth" | "static" | "unknown";
+  readonly success: boolean;
+  readonly completed_at: string;
+  readonly consumed_at: string | null;
 }
 
 const bindingSchema = z.object({
@@ -52,7 +65,20 @@ const bindingSchema = z.object({
   }
 });
 
-const stateSchema = z.object({
+const connectorRequestIdSchema = z.string().min(1).max(100).regex(/^[A-Za-z0-9_-]+$/u);
+
+const evidenceSchema = z.object({
+  request_id: connectorRequestIdSchema,
+  tool_name: z.string().min(1).max(100),
+  workspace_id: z.string().min(1).max(128),
+  mcp_resource: z.string().url(),
+  authentication: z.enum(["oauth", "static", "unknown"]),
+  success: z.boolean(),
+  completed_at: z.string().datetime({ offset: true }),
+  consumed_at: z.string().datetime({ offset: true }).nullable(),
+}).strict();
+
+const legacyStateSchema = z.object({
   schema_version: z.literal(CONNECTOR_STATE_SCHEMA_VERSION),
   bindings: z.array(bindingSchema),
 }).strict().superRefine((value, context) => {
@@ -68,6 +94,18 @@ const stateSchema = z.object({
     workspaceIds.add(binding.workspace_id);
   });
 });
+
+const stateSchema = z.object({
+  schema_version: z.literal(CONNECTOR_STATE_SCHEMA_VERSION),
+  binding: bindingSchema.nullable(),
+  evidence: z.array(evidenceSchema).max(MAX_CONNECTOR_EVIDENCE),
+}).strict();
+
+interface ConnectorState {
+  readonly schema_version: 1;
+  readonly binding: ChatGPTConnectorBinding | null;
+  readonly evidence: readonly ConnectorVerificationEvidence[];
+}
 
 export function normalizePublicUrl(url: string): string {
   return url.trim().replace(/\/+$/u, "").toLowerCase();
@@ -104,8 +142,15 @@ export function connectorNameFor(options: {
   return `${DEFAULT_CONNECTOR_PREFIX} · ${sanitizeConnectorLabel(options.workspaceName, options.workspaceId)}`;
 }
 
-export function chatgptConnectorStateFile(storageRoot = defaultTaskContextStorageRoot()): string {
+export function legacyChatgptConnectorStateFile(storageRoot = defaultTaskContextStorageRoot()): string {
   return join(resolve(storageRoot), "control-plane", "chatgpt-connectors.json");
+}
+
+export function chatgptConnectorStateFile(
+  workspaceId: string,
+  storageRoot = defaultTaskContextStorageRoot(),
+): string {
+  return join(workspaceStateRoot(storageRoot, workspaceId), "control-plane", "chatgpt-connector.json");
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -114,124 +159,338 @@ function errorCode(error: unknown): string | undefined {
 
 export class ChatGPTConnectorStore {
   private readonly file: string;
+  private readonly legacyFile: string;
+  private operationQueue: Promise<void> = Promise.resolve();
 
-  public constructor(storageRoot = defaultTaskContextStorageRoot()) {
-    this.file = chatgptConnectorStateFile(storageRoot);
+  public constructor(
+    public readonly workspaceId: string,
+    storageRoot = defaultTaskContextStorageRoot(),
+  ) {
+    this.file = chatgptConnectorStateFile(workspaceId, storageRoot);
+    this.legacyFile = legacyChatgptConnectorStateFile(storageRoot);
   }
 
-  public async read(workspaceId: string): Promise<ChatGPTConnectorBinding | null> {
-    const state = await this.readState();
-    return state.bindings.find((binding) => binding.workspace_id === workspaceId) ?? null;
+  public read(): Promise<ChatGPTConnectorBinding | null> {
+    return this.operationQueue.then(async () => (await this.readState()).binding);
   }
 
   public async prepare(input: {
-    readonly workspaceId: string;
     readonly workspaceName: string;
     readonly currentMcpUrl: string;
   }): Promise<{ binding: ChatGPTConnectorBinding; action: ConnectorAction }> {
-    const state = await this.readState();
-    const previous = state.bindings.find((binding) => binding.workspace_id === input.workspaceId);
-    const currentMcpUrl = mcpUrlFromPublic(input.currentMcpUrl);
-    if (currentMcpUrl === null) throw new Error("Current MCP URL is required");
-    const action = connectorAction(previous?.verified_mcp_url, currentMcpUrl);
-    const connectorName = connectorNameFor({
-      workspaceName: input.workspaceName,
-      workspaceId: input.workspaceId,
-      previousName: previous?.connector_name,
+    return this.exclusive(async () => {
+      const state = await this.readState();
+      const previous = state.binding;
+      const currentMcpUrl = mcpUrlFromPublic(input.currentMcpUrl);
+      if (currentMcpUrl === null) throw new Error("Current MCP URL is required");
+      const action = connectorAction(previous?.verified_mcp_url, currentMcpUrl);
+      const connectorName = connectorNameFor({
+        workspaceName: input.workspaceName,
+        workspaceId: this.workspaceId,
+        previousName: previous?.connector_name,
+      });
+      const binding: ChatGPTConnectorBinding = action === "none"
+        ? {
+            workspace_id: this.workspaceId,
+            connector_name: connectorName,
+            verified_mcp_url: currentMcpUrl,
+            pending_mcp_url: null,
+            status: "verified",
+            last_verified_at: previous?.last_verified_at ?? null,
+          }
+        : {
+            workspace_id: this.workspaceId,
+            connector_name: connectorName,
+            verified_mcp_url: previous?.verified_mcp_url ?? null,
+            pending_mcp_url: currentMcpUrl,
+            status: action === "create" ? "unconfigured" : "repair_required",
+            last_verified_at: previous?.last_verified_at ?? null,
+          };
+      await this.writeState({ ...state, binding });
+      return { binding, action };
     });
-    const binding: ChatGPTConnectorBinding = action === "none"
-      ? {
-          workspace_id: input.workspaceId,
-          connector_name: connectorName,
-          verified_mcp_url: currentMcpUrl,
-          pending_mcp_url: null,
-          status: "verified",
-          last_verified_at: previous?.last_verified_at ?? null,
-        }
-      : {
-          workspace_id: input.workspaceId,
-          connector_name: connectorName,
-          verified_mcp_url: previous?.verified_mcp_url ?? null,
-          pending_mcp_url: currentMcpUrl,
-          status: action === "create" ? "unconfigured" : "repair_required",
-          last_verified_at: previous?.last_verified_at ?? null,
-        };
-    await this.writeState(this.replace(state.bindings, binding));
-    return { binding, action };
   }
 
-  public async confirm(input: {
-    readonly workspaceId: string;
-    readonly currentMcpUrl: string;
-    readonly verifiedAt?: string;
-  }): Promise<ChatGPTConnectorBinding> {
-    const state = await this.readState();
-    const previous = state.bindings.find((binding) => binding.workspace_id === input.workspaceId);
-    if (previous === undefined) throw new Error("ChatGPT connector binding is not configured");
-    const currentMcpUrl = mcpUrlFromPublic(input.currentMcpUrl);
-    if (currentMcpUrl === null) throw new Error("Current MCP URL is required");
-    const pendingMatches = previous.pending_mcp_url !== null
-      && normalizePublicUrl(previous.pending_mcp_url) === normalizePublicUrl(currentMcpUrl);
-    const verifiedMatches = previous.pending_mcp_url === null
-      && previous.verified_mcp_url !== null
-      && normalizePublicUrl(previous.verified_mcp_url) === normalizePublicUrl(currentMcpUrl);
-    if (!pendingMatches && !verifiedMatches) {
-      throw new Error("Current MCP URL does not match the pending connector binding");
-    }
-    const binding: ChatGPTConnectorBinding = {
-      ...previous,
-      verified_mcp_url: currentMcpUrl,
-      pending_mcp_url: null,
-      status: "verified",
-      last_verified_at: input.verifiedAt ?? new Date().toISOString(),
-    };
-    await this.writeState(this.replace(state.bindings, binding));
-    return binding;
+  public async recordEvidence(input: Omit<ConnectorVerificationEvidence, "consumed_at">): Promise<void> {
+    await this.exclusive(async () => {
+      const state = await this.readState();
+      const evidence = evidenceSchema.parse({ ...input, consumed_at: null });
+      if (evidence.workspace_id !== this.workspaceId) {
+        throw new Error("workspace_info evidence belongs to another workspace");
+      }
+      const previous = state.evidence.find((entry) => entry.request_id === evidence.request_id);
+      if (previous !== undefined) {
+        if (JSON.stringify({ ...previous, consumed_at: null }) === JSON.stringify(evidence)) return;
+        throw new Error("MCP request evidence id already identifies different evidence");
+      }
+      await this.writeState({
+        ...state,
+        evidence: [...state.evidence, evidence].slice(-MAX_CONNECTOR_EVIDENCE),
+      });
+    });
   }
 
-  private replace(
-    bindings: readonly ChatGPTConnectorBinding[],
-    replacement: ChatGPTConnectorBinding,
-  ): ChatGPTConnectorBinding[] {
-    return [
-      ...bindings.filter((binding) => binding.workspace_id !== replacement.workspace_id),
-      replacement,
-    ];
+  public async confirm(
+    requestId: string,
+    currentMcpUrl: string,
+    now = Date.now(),
+  ): Promise<ChatGPTConnectorBinding> {
+    return this.exclusive(async () => {
+      const safeRequestId = connectorRequestIdSchema.parse(requestId);
+      const state = await this.readState();
+      const previous = state.binding;
+      if (previous === null) throw new Error("ChatGPT connector binding is not configured");
+      const evidence = state.evidence.find((entry) => entry.request_id === safeRequestId);
+      if (evidence === undefined) throw new Error("workspace_info evidence was not found");
+      if (evidence.consumed_at !== null) throw new Error("workspace_info evidence was already consumed");
+      if (evidence.tool_name !== "workspace_info") throw new Error("MCP evidence is not for workspace_info");
+      if (!evidence.success) throw new Error("workspace_info evidence is not successful");
+      if (evidence.authentication !== "oauth") throw new Error("workspace_info evidence is not OAuth-authenticated");
+      if (evidence.workspace_id !== this.workspaceId) throw new Error("workspace_info evidence belongs to another workspace");
+      const completedAt = Date.parse(evidence.completed_at);
+      if (!Number.isFinite(completedAt) || completedAt > now || now - completedAt > CONNECTOR_EVIDENCE_TTL_MS) {
+        throw new Error("workspace_info evidence is expired");
+      }
+      const normalizedCurrent = mcpUrlFromPublic(currentMcpUrl);
+      if (normalizedCurrent === null
+        || normalizePublicUrl(evidence.mcp_resource) !== normalizePublicUrl(normalizedCurrent)) {
+        throw new Error("workspace_info evidence does not match the current MCP resource");
+      }
+      const pendingMatches = previous.pending_mcp_url !== null
+        && normalizePublicUrl(previous.pending_mcp_url) === normalizePublicUrl(normalizedCurrent);
+      const verifiedMatches = previous.pending_mcp_url === null
+        && previous.verified_mcp_url !== null
+        && normalizePublicUrl(previous.verified_mcp_url) === normalizePublicUrl(normalizedCurrent);
+      if (!pendingMatches && !verifiedMatches) {
+        throw new Error("Current MCP URL does not match the pending connector binding");
+      }
+      const binding: ChatGPTConnectorBinding = {
+        ...previous,
+        verified_mcp_url: normalizedCurrent,
+        pending_mcp_url: null,
+        status: "verified",
+        last_verified_at: evidence.completed_at,
+      };
+      await this.writeState({
+        ...state,
+        binding,
+        evidence: state.evidence.map((entry) => entry.request_id === safeRequestId
+          ? { ...entry, consumed_at: new Date(now).toISOString() }
+          : entry),
+      });
+      return binding;
+    });
   }
 
-  private async readState(): Promise<{ schema_version: 1; bindings: ChatGPTConnectorBinding[] }> {
+  private exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.operationQueue.then(operation, operation);
+    this.operationQueue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async readState(): Promise<ConnectorState> {
     let raw: string;
     try {
       raw = await readFile(this.file, "utf8");
     } catch (error: unknown) {
       if (errorCode(error) === "ENOENT") {
-        return { schema_version: CONNECTOR_STATE_SCHEMA_VERSION, bindings: [] };
+        return this.migrateLegacyState();
       }
       throw new Error("ChatGPT connector state could not be loaded", { cause: error });
     }
     try {
-      return stateSchema.parse(JSON.parse(raw));
+      const state = stateSchema.parse(JSON.parse(raw));
+      if (state.binding?.workspace_id !== undefined && state.binding.workspace_id !== this.workspaceId) {
+        throw new Error("ChatGPT connector state belongs to another workspace");
+      }
+      if (state.evidence.some((entry) => entry.workspace_id !== this.workspaceId)) {
+        throw new Error("ChatGPT connector evidence belongs to another workspace");
+      }
+      return state;
     } catch (error: unknown) {
       throw new Error("ChatGPT connector state is invalid", { cause: error });
     }
   }
 
-  private async writeState(bindings: readonly ChatGPTConnectorBinding[]): Promise<void> {
+  private async migrateLegacyState(): Promise<ConnectorState> {
+    let raw: string;
+    try {
+      raw = await readFile(this.legacyFile, "utf8");
+    } catch (error: unknown) {
+      if (errorCode(error) === "ENOENT") {
+        return { schema_version: CONNECTOR_STATE_SCHEMA_VERSION, binding: null, evidence: [] };
+      }
+      throw new Error("Legacy ChatGPT connector state could not be loaded", { cause: error });
+    }
+    let legacy: z.infer<typeof legacyStateSchema>;
+    try {
+      legacy = legacyStateSchema.parse(JSON.parse(raw));
+    } catch (error: unknown) {
+      throw new Error("Legacy ChatGPT connector state is invalid", { cause: error });
+    }
+    const state: ConnectorState = {
+      schema_version: CONNECTOR_STATE_SCHEMA_VERSION,
+      binding: legacy.bindings.find((binding) => binding.workspace_id === this.workspaceId) ?? null,
+      evidence: [],
+    };
+    if (state.binding !== null) await this.writeState(state);
+    return state;
+  }
+
+  private async writeState(state: ConnectorState): Promise<void> {
     const directory = dirname(this.file);
-    const temporary = join(directory, `.chatgpt-connectors-${process.pid}-${randomUUID()}.tmp`);
+    const temporary = join(directory, `.chatgpt-connector-${process.pid}-${randomUUID()}.tmp`);
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await chmod(directory, 0o700);
     try {
-      await writeFile(temporary, `${JSON.stringify({
-        schema_version: CONNECTOR_STATE_SCHEMA_VERSION,
-        bindings,
-      }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      await writeFile(temporary, `${JSON.stringify(stateSchema.parse(state), null, 2)}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
       await rename(temporary, this.file);
       await chmod(this.file, 0o600);
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
     }
   }
+}
+
+const persistedOAuthClientSchema = z.object({
+  client_id: z.string().min(1),
+  client_secret: z.string().optional(),
+  client_name: z.string().min(1).max(200),
+  redirect_uris: z.array(z.string().url()).min(1).max(20),
+  grant_types: z.array(z.string()).min(1).max(2),
+  token_endpoint_auth_method: z.literal("none"),
+  response_types: z.array(z.string()).min(1),
+  created_at: z.number().int().nonnegative(),
+}).strict();
+
+const oauthClientStateSchema = z.object({
+  version: z.literal(1),
+  clients: z.array(persistedOAuthClientSchema),
+}).strict();
+
+const persistedOAuthTokenSchema = z.object({
+  hash: z.string().regex(/^[a-f0-9]{64}$/u),
+  kind: z.enum(["access", "refresh"]),
+  client_id: z.string().min(1),
+  resource: z.string().url(),
+  issued_at: z.number().int().nonnegative(),
+  expires_at: z.number().int().positive(),
+  revoked: z.boolean(),
+}).strict();
+
+const oauthTokenStateSchema = z.object({
+  schema_version: z.literal(1),
+  tokens: z.array(persistedOAuthTokenSchema),
+}).strict();
+
+export type OAuthLegacyMigrationStatus = "not_needed" | "migrated" | "reauthorization_required";
+
+export interface WorkspaceOAuthState {
+  readonly clientRegistryPath: string;
+  readonly tokenStorePath: string;
+  readonly migration: OAuthLegacyMigrationStatus;
+}
+
+export function workspaceOAuthStatePaths(
+  workspaceId: string,
+  storageRoot = defaultTaskContextStorageRoot(),
+): Omit<WorkspaceOAuthState, "migration"> {
+  const oauthRoot = join(workspaceStateRoot(storageRoot, workspaceId), "oauth");
+  return {
+    clientRegistryPath: join(oauthRoot, "clients.json"),
+    tokenStorePath: join(oauthRoot, "tokens.json"),
+  };
+}
+
+async function readOptionalJson(path: string): Promise<unknown | null> {
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as unknown;
+  } catch (error: unknown) {
+    if (errorCode(error) === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function writeAtomicJson(path: string, value: unknown): Promise<void> {
+  const directory = dirname(path);
+  const temporary = join(directory, `.migration-${process.pid}-${randomUUID()}.tmp`);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  try {
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    await rename(temporary, path);
+    await chmod(path, 0o600);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+export async function migrateLegacyOAuthState(options: {
+  readonly workspaceId: string;
+  readonly storageRoot?: string;
+  readonly singleWorkspace: boolean;
+  readonly now?: number;
+}): Promise<WorkspaceOAuthState> {
+  const storageRoot = resolve(options.storageRoot ?? defaultTaskContextStorageRoot());
+  const paths = workspaceOAuthStatePaths(options.workspaceId, storageRoot);
+  const [scopedClients, scopedTokens] = await Promise.all([
+    readOptionalJson(paths.clientRegistryPath),
+    readOptionalJson(paths.tokenStorePath),
+  ]);
+  if (scopedClients !== null) return { ...paths, migration: "not_needed" };
+
+  const legacyOAuthRoot = join(storageRoot, "oauth");
+  let legacyClientsRaw: unknown | null;
+  let legacyTokensRaw: unknown | null;
+  let legacyConnectorRaw: unknown | null;
+  try {
+    [legacyClientsRaw, legacyTokensRaw, legacyConnectorRaw] = await Promise.all([
+      readOptionalJson(join(legacyOAuthRoot, "clients.json")),
+      readOptionalJson(join(legacyOAuthRoot, "tokens.json")),
+      readOptionalJson(legacyChatgptConnectorStateFile(storageRoot)),
+    ]);
+  } catch {
+    return { ...paths, migration: "reauthorization_required" };
+  }
+  if (legacyClientsRaw === null && legacyTokensRaw === null) {
+    return { ...paths, migration: "not_needed" };
+  }
+
+  const clients = oauthClientStateSchema.safeParse(legacyClientsRaw);
+  const tokens = oauthTokenStateSchema.safeParse(legacyTokensRaw);
+  const connectors = legacyStateSchema.safeParse(legacyConnectorRaw);
+  if (!clients.success || !tokens.success || !connectors.success
+    || !options.singleWorkspace || connectors.data.bindings.length !== 1) {
+    return { ...paths, migration: "reauthorization_required" };
+  }
+  const binding = connectors.data.bindings[0];
+  if (binding?.workspace_id !== options.workspaceId) {
+    return { ...paths, migration: "reauthorization_required" };
+  }
+  const resources = new Set(
+    [binding.verified_mcp_url, binding.pending_mcp_url]
+      .filter((resource): resource is string => resource !== null)
+      .map(normalizePublicUrl),
+  );
+  const clientIds = new Set(clients.data.clients.map((client) => client.client_id));
+  const activeTokens = tokens.data.tokens.filter((token) =>
+    !token.revoked && token.expires_at > (options.now ?? Date.now()));
+  if (activeTokens.some((token) =>
+    !resources.has(normalizePublicUrl(token.resource)) || !clientIds.has(token.client_id))) {
+    return { ...paths, migration: "reauthorization_required" };
+  }
+
+  if (scopedTokens === null) {
+    await writeAtomicJson(paths.tokenStorePath, { schema_version: 1, tokens: activeTokens });
+  }
+  await writeAtomicJson(paths.clientRegistryPath, clients.data);
+  return { ...paths, migration: "migrated" };
 }
 
 export interface ChatGPTConnectorDiagnostic {
@@ -247,6 +506,8 @@ export interface ChatGPTConnectorDiagnostic {
     pkce_s256: boolean;
     dynamic_registration: boolean;
     refresh_token: boolean;
+    migration: OAuthLegacyMigrationStatus;
+    reauthorization_required: boolean;
   };
   connector: {
     name: string;
@@ -307,6 +568,7 @@ function resultBase(
   workspace: { id: string; name: string },
   binding: ChatGPTConnectorBinding | null,
   currentMcpUrl: string | null,
+  migration: OAuthLegacyMigrationStatus,
 ): ChatGPTConnectorDiagnostic {
   return {
     ok: false,
@@ -318,6 +580,8 @@ function resultBase(
       pkce_s256: false,
       dynamic_registration: false,
       refresh_token: false,
+      migration,
+      reauthorization_required: migration === "reauthorization_required",
     },
     connector: {
       name: connectorNameFor({
@@ -346,12 +610,18 @@ export async function diagnoseChatGPTConnector(
   } = {},
 ): Promise<ChatGPTConnectorDiagnostic> {
   const workspace = activeWorkspace(settings);
-  const store = new ChatGPTConnectorStore(dependencies.storageRoot);
-  const existing = await store.read(workspace.id);
+  const storageRoot = dependencies.storageRoot ?? defaultTaskContextStorageRoot();
+  const store = new ChatGPTConnectorStore(workspace.id, storageRoot);
+  const existing = await store.read();
+  const oauthState = await migrateLegacyOAuthState({
+    workspaceId: workspace.id,
+    storageRoot,
+    singleWorkspace: (settings.workspaces?.length ?? 1) === 1,
+  });
   const currentMcpUrl = settings.remote.enabled
     ? mcpUrlFromPublic(settings.remote.endpoint)
     : null;
-  const result = resultBase(workspace, existing, currentMcpUrl);
+  const result = resultBase(workspace, existing, currentMcpUrl, oauthState.migration);
   if (currentMcpUrl === null) return result;
 
   const fetchImpl = dependencies.fetch ?? fetch;
@@ -422,7 +692,6 @@ export async function diagnoseChatGPTConnector(
     }
 
     const prepared = await store.prepare({
-      workspaceId: workspace.id,
       workspaceName: workspace.name,
       currentMcpUrl,
     });
@@ -431,11 +700,13 @@ export async function diagnoseChatGPTConnector(
     result.connector.status = prepared.binding.status;
     result.connector.action = prepared.action;
     result.connector.verified_mcp_url = prepared.binding.verified_mcp_url;
-    result.connector.reason = prepared.action === "create"
-      ? "first_connection"
-      : prepared.action === "update"
-        ? "endpoint_changed"
-        : "verified_endpoint_matches";
+    result.connector.reason = oauthState.migration === "reauthorization_required"
+      ? "legacy_oauth_reauthorization_required"
+      : prepared.action === "create"
+        ? "first_connection"
+        : prepared.action === "update"
+          ? "endpoint_changed"
+          : "verified_endpoint_matches";
     return result;
   } catch {
     return result;
@@ -444,22 +715,37 @@ export async function diagnoseChatGPTConnector(
 
 export async function confirmChatGPTConnector(
   settings: ResolvedSettings,
-  proof: { readonly workspaceId: string; readonly mcpUrl: string },
+  requestId: string,
   storageRoot?: string,
 ): Promise<ChatGPTConnectorBinding> {
   const workspace = activeWorkspace(settings);
-  if (proof.workspaceId !== workspace.id) {
-    throw new Error("workspace_info workspace_id does not match the active workspace");
-  }
   const currentMcpUrl = settings.remote.enabled
     ? mcpUrlFromPublic(settings.remote.endpoint)
     : null;
-  if (currentMcpUrl === null
-    || normalizePublicUrl(proof.mcpUrl) !== normalizePublicUrl(currentMcpUrl)) {
-    throw new Error("workspace_info MCP URL does not match the current remote endpoint");
+  if (currentMcpUrl === null) throw new Error("Current remote MCP URL is unavailable");
+  return new ChatGPTConnectorStore(workspace.id, storageRoot).confirm(requestId, currentMcpUrl);
+}
+
+export function parseConnectorConfirmArgs(argv: readonly string[]): {
+  readonly settingsArgs: string[];
+  readonly requestId: string;
+} {
+  const settingsArgs: string[] = [];
+  let requestId: string | undefined;
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    const value = argv[index + 1];
+    if (value === undefined || value.startsWith("--")) throw new Error(`${argument} requires a value`);
+    if (argument === "--request-id") requestId = value;
+    else if (["--config", "--port", "--workspace", "--token"].includes(argument)) {
+      settingsArgs.push(argument, value);
+    } else {
+      throw new Error(`unknown argument: ${argument}`);
+    }
+    index += 1;
   }
-  return new ChatGPTConnectorStore(storageRoot).confirm({
-    workspaceId: workspace.id,
-    currentMcpUrl,
-  });
+  if (!requestId) throw new Error("--request-id is required");
+  const parsedRequestId = connectorRequestIdSchema.safeParse(requestId);
+  if (!parsedRequestId.success) throw new Error("--request-id is invalid");
+  return { settingsArgs, requestId: parsedRequestId.data };
 }

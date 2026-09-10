@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { taskIdSchema } from "./schema.js";
+import { taskIdSchema, workspaceIdSchema } from "./schema.js";
 
 export const TASK_DIRECTORY = ".task" as const;
 export const TASK_CONTEXTS_DIRECTORY = join(TASK_DIRECTORY, "contexts");
@@ -23,6 +23,10 @@ export function defaultTaskContextStorageRoot(
     environment.XDG_STATE_HOME ?? join(home, ".local", "state"),
     "LocalReviewMCP",
   );
+}
+
+export function workspaceStateRoot(storageRoot: string, workspaceId: string): string {
+  return join(resolve(storageRoot), "workspaces", `ws-${workspaceIdSchema.parse(workspaceId)}`);
 }
 
 export function taskContextsDirectory(storageRoot: string): string {

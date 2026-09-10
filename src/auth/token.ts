@@ -142,7 +142,7 @@ export class OAuthTokenStore {
       || (resource !== undefined && stored.resource !== resource)) {
       return null;
     }
-    this.tokens.set(key, { ...stored, revoked: true });
+    this.tokens.delete(key);
     return this.issue(stored.resource, stored.client_id, now);
   }
 
@@ -150,7 +150,7 @@ export class OAuthTokenStore {
     const key = hashToken(token);
     const stored = this.tokens.get(key);
     if (stored === undefined) return;
-    this.tokens.set(key, { ...stored, revoked: true });
+    this.tokens.delete(key);
     this.save();
   }
 
@@ -177,7 +177,7 @@ export class OAuthTokenStore {
     }
     const now = Date.now();
     for (const token of (parsed as PersistedOAuthTokens).tokens) {
-      if (token.expires_at > now) this.tokens.set(token.hash, token);
+      if (!token.revoked && token.expires_at > now) this.tokens.set(token.hash, token);
     }
   }
 
@@ -187,7 +187,7 @@ export class OAuthTokenStore {
     const temporary = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
     const state: PersistedOAuthTokens = {
       schema_version: 1,
-      tokens: [...this.tokens.values()].filter((token) => token.expires_at > now),
+      tokens: [...this.tokens.values()].filter((token) => !token.revoked && token.expires_at > now),
     };
     try {
       mkdirSync(directory, { recursive: true, mode: 0o700 });

@@ -1,12 +1,32 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
-const store = new AsyncLocalStorage<string | null>();
+export type InboundAuthentication = "oauth" | "static" | "unknown";
+
+export interface InboundRequestOrigin {
+  readonly requestId: string;
+  readonly mcpResource: string | null;
+  readonly authentication: InboundAuthentication;
+}
+
+const store = new AsyncLocalStorage<InboundRequestOrigin | null>();
+
+export function withInboundRequestOrigin<T>(origin: InboundRequestOrigin, body: () => T): T {
+  return store.run(origin, body);
+}
 
 export function withInboundRequestId<T>(requestId: string | null, body: () => T): T {
-  return store.run(requestId, body);
+  return store.run(requestId === null ? null : {
+    requestId,
+    mcpResource: null,
+    authentication: "unknown",
+  }, body);
 }
 
 export function inboundRequestId(): string | null {
+  return store.getStore()?.requestId ?? null;
+}
+
+export function inboundRequestOrigin(): InboundRequestOrigin | null {
   return store.getStore() ?? null;
 }
 

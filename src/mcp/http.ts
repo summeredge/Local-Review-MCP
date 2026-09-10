@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
@@ -11,7 +12,7 @@ import {
   isValidCodeChallenge,
   validateRedirectUri,
 } from "../auth/oauth.js";
-import { isAuthenticated } from "../auth/middleware.js";
+import { authenticationSource, isAuthenticated } from "../auth/middleware.js";
 import {
   APP_VERSION,
   DEFAULT_HOST,
@@ -21,7 +22,7 @@ import {
   type ResolvedSettings,
 } from "../config/settings.js";
 import type { TunnelProvider, TunnelStatus } from "../tunnel/types.js";
-import { requestIdFromHeader, withInboundRequestId } from "./inbound.js";
+import { requestIdFromHeader, withInboundRequestOrigin } from "./inbound.js";
 import { createMcpServer, registeredMcpToolsMessage, type McpRuntimeContext } from "./server.js";
 
 export const MAX_MCP_REQUEST_BYTES = 1024 * 1024;
@@ -557,17 +558,25 @@ export function createHttpServer(
       }
 
       if (path === MCP_PATH) {
-        if (!isAuthenticated(request, settings.auth.token)) {
-          const urls = await oauthUrls(settings, context, request);
-          if (!isAuthenticated(request, settings.auth.token, oauth.tokens, urls.resource.href)) {
-            request.resume();
-            console.warn("Auth failed");
-            sendUnauthorized(response, urls.protectedResourceMetadata.href);
-            return;
-          }
+        const urls = await oauthUrls(settings, context, request);
+        const authentication = authenticationSource(
+          request,
+          settings.auth.token,
+          oauth.tokens,
+          urls.resource.href,
+        );
+        if (authentication === null) {
+          request.resume();
+          console.warn("Auth failed");
+          sendUnauthorized(response, urls.protectedResourceMetadata.href);
+          return;
         }
-        const requestId = requestIdFromHeader(request.headers["x-request-id"]);
-        await withInboundRequestId(requestId, () => handleMcpRequest(request, response, context));
+        const requestId = requestIdFromHeader(request.headers["x-request-id"]) ?? randomUUID();
+        await withInboundRequestOrigin({
+          requestId,
+          mcpResource: urls.resource.href,
+          authentication,
+        }, () => handleMcpRequest(request, response, context));
         return;
       }
 
