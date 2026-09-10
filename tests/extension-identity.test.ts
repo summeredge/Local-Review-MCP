@@ -495,7 +495,7 @@ function loadBackground(
   };
 }
 
-const bridgeHello = { service: "local-review-control-bridge", protocol: 2, paired: true };
+const bridgeHello = { service: "local-review-control-bridge", protocol: 3, paired: true };
 const evidenceMessage = (conversationId: string, navigation_epoch: number, extra: Record<string, unknown> = {}) => ({
   type: "identity_evidence",
   request_id: UUID_REQUEST_ID,
@@ -1026,5 +1026,201 @@ describe("Extension background identity authority", () => {
     expect(ackPosts).toBe(0);
     expect(storage.data.deliveryAckOutbox).toEqual([]);
     expect(storage.data.deliveryInFlight).toMatchObject([{ phase: "submitting" }]);
+  });
+});
+
+describe("Extension background review completion transport", () => {
+  it("claims exact registered conversation ownership and fences an old navigation epoch", async () => {
+    const storage = new Storage();
+    const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+    const watch = {
+      completion_id: "32ca0d45-8b29-414a-bbe4-8e26c3aae911",
+      conversation_id: CONVERSATION_A,
+      review_request_id: "review-completion-a",
+      expected_user_message_id: "user-message-a",
+      deadline: Date.now() + 30_000,
+    };
+    const claimBodies: Record<string, unknown>[] = [];
+    const worker = loadBackground(storage, async (requestUrl, init) => {
+      if (requestUrl.pathname === "/hello") return response(200, bridgeHello);
+      if (requestUrl.pathname === "/pair") return response(200, { token: "paired-token" });
+      if (requestUrl.pathname === "/completion/claim") {
+        claimBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+        return response(200, watch);
+      }
+      return response(404, {});
+    });
+
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);
+    await expect(worker.send({
+      type: "completion_claim",
+      conversation_id: CONVERSATION_A,
+      navigation_epoch: 0,
+    }, "document-one", 7, url)).resolves.toMatchObject({ ok: true, ...watch });
+    expect(claimBodies).toMatchObject([{
+      conversation_id: CONVERSATION_A,
+      document_id: "document-one",
+      navigation_epoch: 0,
+    }]);
+    expect(claimBodies[0]?.client_id).toBe(storage.data.extensionClientId);
+    expect(storage.data.completionInFlight).toMatchObject([{
+      completion_id: watch.completion_id,
+      review_request_id: watch.review_request_id,
+      expected_user_message_id: watch.expected_user_message_id,
+      phase: "claimed",
+    }]);
+
+    await worker.send({ type: "navigation", navigation_epoch: 1 }, "document-one", 7, url);
+    await expect(worker.send({
+      type: "completion_ack",
+      completion_id: watch.completion_id,
+      navigation_epoch: 0,
+      status: "completed",
+      assistant_message_id: "assistant:logical-a",
+      content: "final text",
+    }, "document-one", 7, url)).resolves.toMatchObject({ ok: false, error: "wrong_conversation" });
+    await expect(worker.send({
+      type: "completion_claim",
+      conversation_id: CONVERSATION_A,
+      navigation_epoch: 0,
+    }, "document-two", 8, url)).resolves.toMatchObject({ ok: false, error: "wrong_conversation" });
+  });
+
+  it("writes completion ACK custody before POST and removes it only after server success", async () => {
+    const storage = new Storage();
+    const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+    const watch = {
+      completion_id: "42ca0d45-8b29-414a-bbe4-8e26c3aae911",
+      conversation_id: CONVERSATION_A,
+      review_request_id: "review-completion-b",
+      expected_user_message_id: "user-message-b",
+      deadline: Date.now() + 30_000,
+    };
+    let outboxVisibleAtPost = false;
+    const worker = loadBackground(storage, async (requestUrl) => {
+      if (requestUrl.pathname === "/hello") return response(200, bridgeHello);
+      if (requestUrl.pathname === "/pair") return response(200, { token: "paired-token" });
+      if (requestUrl.pathname === "/completion/claim") return response(200, watch);
+      if (requestUrl.pathname === "/completion/ack") {
+        outboxVisibleAtPost = Array.isArray(storage.data.completionAckOutbox)
+          && storage.data.completionAckOutbox.length === 1;
+        return response(200, { accepted: "new" });
+      }
+      return response(404, {});
+    });
+
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);
+    await worker.send({ type: "completion_claim", conversation_id: CONVERSATION_A, navigation_epoch: 0 }, "document-one", 7, url);
+    await expect(worker.send({
+      type: "completion_ack",
+      completion_id: watch.completion_id,
+      navigation_epoch: 0,
+      status: "completed",
+      assistant_message_id: "assistant:logical-b",
+      content: "final text",
+    }, "document-one", 7, url)).resolves.toMatchObject({ ok: true, queued: false });
+    expect(outboxVisibleAtPost).toBe(true);
+    expect(storage.data.completionAckOutbox).toEqual([]);
+    expect(storage.data.completionInFlight).toEqual([]);
+    const posted = worker.calls.find((call) => new URL(call.input).pathname === "/completion/ack");
+    expect(JSON.parse(String(posted?.init.body))).toMatchObject({
+      completion_id: watch.completion_id,
+      assistant_message_id: "assistant:logical-b",
+      content: "final text",
+    });
+  });
+
+  it("restores a completion ACK outbox and flushes it before a new claim", async () => {
+    const storage = new Storage({ port: 12081, token: "paired-token" });
+    const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+    const watch = {
+      completion_id: "52ca0d45-8b29-414a-bbe4-8e26c3aae911",
+      conversation_id: CONVERSATION_A,
+      review_request_id: "review-completion-c",
+      expected_user_message_id: "user-message-c",
+      deadline: Date.now() + 30_000,
+    };
+    const first = loadBackground(storage, async (requestUrl) => {
+      if (requestUrl.pathname === "/hello") return response(200, bridgeHello);
+      if (requestUrl.pathname === "/completion/claim") return response(200, watch);
+      if (requestUrl.pathname === "/completion/ack") return response(503, { error: "temporary" });
+      return response(404, {});
+    });
+    await first.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);
+    await first.send({ type: "completion_claim", conversation_id: CONVERSATION_A, navigation_epoch: 0 }, "document-one", 7, url);
+    await expect(first.send({
+      type: "completion_ack",
+      completion_id: watch.completion_id,
+      navigation_epoch: 0,
+      status: "failed",
+      error: "observation unavailable",
+    }, "document-one", 7, url)).resolves.toMatchObject({ ok: false, status: 503 });
+    expect(storage.data.completionAckOutbox).toMatchObject([{
+      completion_id: watch.completion_id,
+      status: "failed",
+      error: "observation unavailable",
+    }]);
+    expect(storage.data.completionInFlight).toEqual([]);
+
+    const routes: string[] = [];
+    const restarted = loadBackground(storage, async (requestUrl) => {
+      routes.push(requestUrl.pathname);
+      if (requestUrl.pathname === "/hello") return response(200, bridgeHello);
+      if (requestUrl.pathname === "/completion/ack") return response(200, { accepted: "existing" });
+      if (requestUrl.pathname === "/completion/claim") return response(200, { command: null });
+      return response(404, {});
+    });
+    await restarted.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);
+    await expect(restarted.send({
+      type: "completion_claim",
+      conversation_id: CONVERSATION_A,
+      navigation_epoch: 0,
+    }, "document-one", 7, url)).resolves.toEqual({ ok: true, command: null });
+    expect(routes.indexOf("/completion/ack")).toBeLessThan(routes.indexOf("/completion/claim"));
+    expect(storage.data.completionAckOutbox).toEqual([]);
+  });
+
+  it("blocks corrupt completion state without blocking the existing delivery path", async () => {
+    const malformed = {
+      completion_id: "62ca0d45-8b29-414a-bbe4-8e26c3aae911",
+      conversation_id: CONVERSATION_A,
+      client_id: "client-one",
+      document_id: "document-one",
+      navigation_epoch: 0,
+      status: "completed",
+      assistant_message_id: "assistant:logical-d",
+      content: "final",
+      unexpected: true,
+    };
+    const storage = new Storage({ completionAckOutbox: [malformed], deliveryAckOutbox: [], deliveryInFlight: [] });
+    const routes: string[] = [];
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const worker = loadBackground(storage, async (requestUrl) => {
+        routes.push(requestUrl.pathname);
+        if (requestUrl.pathname === "/hello") return response(200, bridgeHello);
+        if (requestUrl.pathname === "/pair") return response(200, { token: "paired-token" });
+        if (requestUrl.pathname === "/delivery/claim") return response(200, { command: null });
+        throw new Error("unexpected route");
+      });
+      const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+      await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);
+      await expect(worker.send({
+        type: "completion_claim",
+        conversation_id: CONVERSATION_A,
+        navigation_epoch: 0,
+      }, "document-one", 7, url)).resolves.toEqual({ ok: false, error: "completion_state_corrupt" });
+      await expect(worker.send({
+        type: "delivery_claim",
+        conversation_id: CONVERSATION_A,
+        navigation_epoch: 0,
+      }, "document-one", 7, url)).resolves.toEqual({ ok: true, command: null });
+      expect(routes).toContain("/delivery/claim");
+      expect(routes).not.toContain("/completion/claim");
+      expect(storage.data.completionAckOutbox).toEqual([malformed]);
+      expect(warning).toHaveBeenCalledTimes(1);
+    } finally {
+      warning.mockRestore();
+    }
   });
 });

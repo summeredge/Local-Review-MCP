@@ -9,6 +9,7 @@ import { ReviewDeliveryService } from "../context/review-delivery-service.js";
 import { ReviewRequestService } from "../context/review-request-service.js";
 import { TaskContextService } from "../context/service.js";
 import { BrowserWorkerDeliveryAdapter } from "../delivery/browser-worker-delivery-adapter.js";
+import { BrowserWorkerReviewCompletionAdapter } from "../delivery/browser-worker-review-completion-adapter.js";
 import { BrowserRouter } from "../router/browser-router.js";
 import { ReviewCompletionRouter } from "../router/review-completion-router.js";
 import {
@@ -251,7 +252,10 @@ export async function generateReviewCompletionExample(): Promise<ReviewCompletio
       storageRoot,
       new BrowserWorkerDeliveryAdapter(client),
     ).deliver("diagnostic-workspace", routing.routing_id);
-    const stored = await new ReviewCompletionRouter(storageRoot, client)
+    const stored = await new ReviewCompletionRouter(
+      storageRoot,
+      new BrowserWorkerReviewCompletionAdapter(client),
+    )
       .collect("diagnostic-workspace", routing.routing_id);
 
     const timeoutPage = new DiagnosticPage("timeout", [

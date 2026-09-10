@@ -12,6 +12,7 @@ import {
   CHATGPT_USER_MESSAGE_SELECTOR,
 } from "../src/browser-worker/selectors/chatgpt.js";
 import { BrowserWorkerClient } from "../src/browser-worker-client/browser-worker-client.js";
+import { BrowserWorkerReviewCompletionAdapter } from "../src/delivery/browser-worker-review-completion-adapter.js";
 import { ConversationRoutingService } from "../src/context/conversation-routing-service.js";
 import { ExecutionContextService } from "../src/context/execution-service.js";
 import { ReviewDeliveryService } from "../src/context/review-delivery-service.js";
@@ -309,7 +310,7 @@ describe("ReviewCompletionRouter", () => {
     const { request, routing, delivery } = await makeDeliveredChain(storageRoot);
     let calls = 0;
     let requestedReviewId = "";
-    const router = new ReviewCompletionRouter(storageRoot, {
+    const router = new ReviewCompletionRouter(storageRoot, new BrowserWorkerReviewCompletionAdapter({
       collectCompletion: async (conversationId: string, reviewRequestId: string) => {
         calls += 1;
         requestedReviewId = reviewRequestId;
@@ -320,7 +321,7 @@ describe("ReviewCompletionRouter", () => {
           extractedAt: new Date().toISOString(),
         };
       },
-    });
+    }));
 
     const first = await router.collect("workspace-a", routing.routing_id);
     const second = await router.collect("workspace-a", routing.routing_id);
@@ -343,7 +344,7 @@ describe("ReviewCompletionRouter", () => {
     const storageRoot = await makeStorageRoot();
     const { request, routing } = await makeDeliveredChain(storageRoot);
     let timedOut = true;
-    const router = new ReviewCompletionRouter(storageRoot, {
+    const router = new ReviewCompletionRouter(storageRoot, new BrowserWorkerReviewCompletionAdapter({
       collectCompletion: async (conversationId: string, _reviewRequestId: string) => timedOut
         ? {
           conversationId,
@@ -356,7 +357,7 @@ describe("ReviewCompletionRouter", () => {
           content: "review result",
           extractedAt: new Date().toISOString(),
         },
-    });
+    }));
 
     const failed = await router.collect("workspace-a", routing.routing_id);
     timedOut = false;

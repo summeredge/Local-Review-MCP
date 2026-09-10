@@ -14,6 +14,10 @@ import {
   ExtensionDeliveryService,
   ExtensionDeliveryUnavailableError,
 } from "./control-plane/extension-delivery.js";
+import {
+  ExtensionReviewCompletionService,
+  ExtensionReviewCompletionUnavailableError,
+} from "./control-plane/extension-review-completion.js";
 import { CodexExecutionCompletionService } from "./control-plane/codex-execution-completion.js";
 import { AutoIterationService } from "./control-plane/auto-iteration.js";
 import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
@@ -34,6 +38,7 @@ export interface AppContext extends McpRuntimeContext {
   readonly tunnel: TunnelManager;
   readonly correlations: ConversationCorrelationRegistry;
   readonly extensionDeliveries: ExtensionDeliveryService;
+  readonly extensionReviewCompletions: ExtensionReviewCompletionService;
   readonly codexExecutionCompletion?: CodexExecutionCompletionService;
   readonly actuationAuthorizationStore?: ActuationAuthorizationStore;
   readonly codexExecutionAdapter?: CodexExecutionAdapter;
@@ -73,6 +78,7 @@ export function createAppContext(
   const storageRoot = defaultTaskContextStorageRoot(environment);
   const connectorEvidence = new ChatGPTConnectorStore(registry.active.id, storageRoot);
   const extensionDeliveries = new ExtensionDeliveryService(storageRoot);
+  const extensionReviewCompletions = new ExtensionReviewCompletionService(storageRoot);
   const codexExecutionCompletion = new CodexExecutionCompletionService(storageRoot);
   const codexExecutionAdapter = new CodexExecutionAdapter(registry, {
     storageRoot,
@@ -104,6 +110,7 @@ export function createAppContext(
     connectorEvidence,
     correlations: new ConversationCorrelationRegistry(),
     extensionDeliveries,
+    extensionReviewCompletions,
     codexExecutionCompletion,
     actuationAuthorizationStore,
     codexExecutionAdapter,
@@ -161,6 +168,14 @@ export async function startApp(
         deliveryAvailable = false;
         console.warn("Extension Delivery unavailable; durable state could not be restored");
       }
+      const extensionReviewCompletions = context.extensionReviewCompletions;
+      let completionAvailable = true;
+      try {
+        await extensionReviewCompletions.restore();
+      } catch {
+        completionAvailable = false;
+        console.warn("Extension Review Completion unavailable; durable state could not be restored");
+      }
       try {
         await context.autoIteration?.recover();
       } catch {
@@ -184,6 +199,18 @@ export async function startApp(
         ackExtensionDelivery: async (ack) => {
           if (!deliveryAvailable) throw new ExtensionDeliveryUnavailableError("extension delivery unavailable");
           return extensionDeliveries.acknowledge(ack);
+        },
+        claimExtensionReviewCompletion: async (claim) => {
+          if (!completionAvailable) {
+            throw new ExtensionReviewCompletionUnavailableError("extension review completion unavailable");
+          }
+          return extensionReviewCompletions.claim(claim);
+        },
+        ackExtensionReviewCompletion: async (ack) => {
+          if (!completionAvailable) {
+            throw new ExtensionReviewCompletionUnavailableError("extension review completion unavailable");
+          }
+          return extensionReviewCompletions.acknowledge(ack);
         },
       });
       if (bridgePort === null) {

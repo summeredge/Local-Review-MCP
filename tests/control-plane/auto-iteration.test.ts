@@ -27,6 +27,7 @@ import { ReviewResultService } from "../../src/context/review-result-service.js"
 import { TaskContextService } from "../../src/context/service.js";
 import { BrowserRouter } from "../../src/router/browser-router.js";
 import { ReviewCompletionRouter } from "../../src/router/review-completion-router.js";
+import { BrowserWorkerReviewCompletionAdapter } from "../../src/delivery/browser-worker-review-completion-adapter.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
 
 const temporaryDirectories: string[] = [];
@@ -110,7 +111,7 @@ async function fixture(
     },
   });
   const completionCalls = vi.fn();
-  const completion = new ReviewCompletionRouter(root, {
+  const completion = new ReviewCompletionRouter(root, new BrowserWorkerReviewCompletionAdapter({
     collectCompletion: vi.fn(async (_conversationId, reviewRequestId) => {
       completionCalls(reviewRequestId);
       const decision = decisions[Math.min(completionCalls.mock.calls.length - 1, decisions.length - 1)]!;
@@ -121,7 +122,7 @@ async function fixture(
         extractedAt: new Date().toISOString(),
       };
     }),
-  });
+  }));
   const deliveryCalls = vi.fn(async () => {
     if (delivery === "delivered") {
       return { status: "delivered" as const, delivered_at: new Date().toISOString() };
@@ -355,14 +356,14 @@ describe("AutoIterationService", () => {
     },
   ])("maps $name to human_required without starting another execution", async ({ content, reason }) => {
     const invalid = await fixture(["APPROVE"]);
-    const invalidCompletion = new ReviewCompletionRouter(invalid.root, {
+    const invalidCompletion = new ReviewCompletionRouter(invalid.root, new BrowserWorkerReviewCompletionAdapter({
       collectCompletion: vi.fn(async () => ({
         conversationId: "conversation-001",
         status: "COMPLETED" as const,
         content,
         extractedAt: new Date().toISOString(),
       })),
-    });
+    }));
     const invalidAuto = new AutoIterationService(invalid.registry, {
       storageRoot: invalid.root,
       completionRouter: invalidCompletion,
@@ -385,7 +386,10 @@ describe("AutoIterationService", () => {
         status,
         error: `review completion ${status.toLowerCase()}`,
       }));
-      const completion = new ReviewCompletionRouter(value.root, { collectCompletion });
+      const completion = new ReviewCompletionRouter(
+        value.root,
+        new BrowserWorkerReviewCompletionAdapter({ collectCompletion }),
+      );
       const auto = new AutoIterationService(value.registry, {
         storageRoot: value.root,
         completionRouter: completion,
@@ -464,7 +468,10 @@ describe("AutoIterationService", () => {
       content: verdict(reviewRequestId, "APPROVE"),
       extractedAt: new Date().toISOString(),
     }));
-    const completion = new ReviewCompletionRouter(value.root, { collectCompletion });
+    const completion = new ReviewCompletionRouter(
+      value.root,
+      new BrowserWorkerReviewCompletionAdapter({ collectCompletion }),
+    );
     const restarted = new AutoIterationService(value.registry, {
       storageRoot: value.root,
       browserRouter: { deliver: delivery },

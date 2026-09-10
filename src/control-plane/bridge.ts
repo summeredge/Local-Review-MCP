@@ -13,6 +13,17 @@ import {
   type LeasedExtensionDelivery,
 } from "./extension-delivery.js";
 import {
+  ExtensionReviewCompletionConflictError,
+  ExtensionReviewCompletionNotFoundError,
+  ExtensionReviewCompletionUnavailableError,
+  extensionReviewCompletionAckSchema,
+  extensionReviewCompletionClaimSchema,
+  type ExtensionReviewCompletionAck,
+  type ExtensionReviewCompletionClaim,
+  type ExtensionReviewCompletionReceipt,
+  type LeasedExtensionReviewCompletion,
+} from "./extension-review-completion.js";
+import {
   extensionIdentityEvidenceSchema,
   type ExtensionIdentityEvidence,
 } from "./extension-identity.js";
@@ -24,6 +35,7 @@ import {
   LOCAL_CONTROL_BRIDGE_PROTOCOL,
   LOCAL_CONTROL_BRIDGE_SERVICE,
   MAX_BRIDGE_REQUEST_BYTES,
+  MAX_BRIDGE_COMPLETION_ACK_REQUEST_BYTES,
   parseExtensionOrigin,
 } from "./bridge-protocol.js";
 
@@ -39,6 +51,16 @@ export interface BridgeStartOptions {
   } | Promise<{
     readonly accepted: "new" | "existing";
     readonly receipt: ExtensionDeliveryReceipt;
+  }>;
+  readonly claimExtensionReviewCompletion?: (
+    claim: ExtensionReviewCompletionClaim,
+  ) => LeasedExtensionReviewCompletion | null | Promise<LeasedExtensionReviewCompletion | null>;
+  readonly ackExtensionReviewCompletion?: (ack: ExtensionReviewCompletionAck) => {
+    readonly accepted: "new" | "existing";
+    readonly receipt: ExtensionReviewCompletionReceipt;
+  } | Promise<{
+    readonly accepted: "new" | "existing";
+    readonly receipt: ExtensionReviewCompletionReceipt;
   }>;
 }
 
@@ -59,6 +81,12 @@ let onIdentityEvidence: (evidence: ExtensionIdentityEvidence) => void | Promise<
 let claimExtensionDelivery: NonNullable<BridgeStartOptions["claimExtensionDelivery"]> = () => null;
 let ackExtensionDelivery: NonNullable<BridgeStartOptions["ackExtensionDelivery"]> = () => {
   throw new ExtensionDeliveryNotFoundError("delivery not found");
+};
+let claimExtensionReviewCompletion: NonNullable<BridgeStartOptions["claimExtensionReviewCompletion"]> = () => {
+  throw new ExtensionReviewCompletionUnavailableError("extension review completion unavailable");
+};
+let ackExtensionReviewCompletion: NonNullable<BridgeStartOptions["ackExtensionReviewCompletion"]> = () => {
+  throw new ExtensionReviewCompletionUnavailableError("extension review completion unavailable");
 };
 let lifecycleQueue: Promise<void> = Promise.resolve();
 
@@ -133,12 +161,15 @@ function authorized(request: IncomingMessage, origin: string): boolean {
   return pairedOrigin === origin && bearerToken !== null && safeEqual(token, bearerToken);
 }
 
-function readJson(request: IncomingMessage): Promise<unknown> {
+function readJson(
+  request: IncomingMessage,
+  maxBytes = MAX_BRIDGE_REQUEST_BYTES,
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const contentLength = request.headers["content-length"];
     if (typeof contentLength === "string"
       && Number.isFinite(Number(contentLength))
-      && Number(contentLength) > MAX_BRIDGE_REQUEST_BYTES) {
+      && Number(contentLength) > maxBytes) {
       request.resume();
       reject(new RequestBodyTooLargeError());
       return;
@@ -151,7 +182,7 @@ function readJson(request: IncomingMessage): Promise<unknown> {
       if (settled) return;
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       size += buffer.byteLength;
-      if (size > MAX_BRIDGE_REQUEST_BYTES) {
+      if (size > maxBytes) {
         settled = true;
         chunks.length = 0;
         request.resume();
@@ -300,6 +331,76 @@ async function receiveDeliveryAck(
   }
 }
 
+async function receiveCompletionClaim(
+  request: IncomingMessage,
+  response: ServerResponse,
+  origin: string,
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = await readJson(request);
+  } catch (error: unknown) {
+    json(response, error instanceof RequestBodyTooLargeError ? 413 : 400, {
+      error: error instanceof RequestBodyTooLargeError ? "body_too_large" : "bad_request",
+    }, origin);
+    return;
+  }
+  const parsed = extensionReviewCompletionClaimSchema.safeParse(body);
+  if (!parsed.success) {
+    json(response, 400, { error: "invalid_completion_claim" }, origin);
+    return;
+  }
+  try {
+    const completion = await claimExtensionReviewCompletion(parsed.data);
+    json(response, 200, completion === null ? { command: null } : completion, origin);
+  } catch (error: unknown) {
+    if (error instanceof ExtensionReviewCompletionUnavailableError) {
+      json(response, 503, { error: "completion_unavailable" }, origin);
+      return;
+    }
+    throw error;
+  }
+}
+
+async function receiveCompletionAck(
+  request: IncomingMessage,
+  response: ServerResponse,
+  origin: string,
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = await readJson(request, MAX_BRIDGE_COMPLETION_ACK_REQUEST_BYTES);
+  } catch (error: unknown) {
+    json(response, error instanceof RequestBodyTooLargeError ? 413 : 400, {
+      error: error instanceof RequestBodyTooLargeError ? "body_too_large" : "bad_request",
+    }, origin);
+    return;
+  }
+  const parsed = extensionReviewCompletionAckSchema.safeParse(body);
+  if (!parsed.success) {
+    json(response, 400, { error: "invalid_completion_ack" }, origin);
+    return;
+  }
+  try {
+    const result = await ackExtensionReviewCompletion(parsed.data);
+    json(response, 200, result, origin);
+  } catch (error: unknown) {
+    if (error instanceof ExtensionReviewCompletionUnavailableError) {
+      json(response, 503, { error: "completion_unavailable" }, origin);
+      return;
+    }
+    if (error instanceof ExtensionReviewCompletionConflictError) {
+      json(response, 409, { error: "conflicting_completion_ack" }, origin);
+      return;
+    }
+    if (error instanceof ExtensionReviewCompletionNotFoundError) {
+      json(response, 404, { error: "completion_not_found" }, origin);
+      return;
+    }
+    throw error;
+  }
+}
+
 async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const url = new URL(request.url ?? "/", `http://${LOCAL_CONTROL_BRIDGE_HOST}`);
   const route = url.pathname;
@@ -324,7 +425,8 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   }
 
   if (route !== "/pair" && route !== "/status" && route !== "/identity-evidence"
-    && route !== "/delivery/claim" && route !== "/delivery/ack") {
+    && route !== "/delivery/claim" && route !== "/delivery/ack"
+    && route !== "/completion/claim" && route !== "/completion/ack") {
     request.resume();
     json(response, 404, { error: "not_found" });
     return;
@@ -352,7 +454,9 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     methodNotAllowed(request, response);
     return;
   }
-  if ((route === "/delivery/claim" || route === "/delivery/ack") && request.method !== "POST") {
+  if ((route === "/delivery/claim" || route === "/delivery/ack"
+    || route === "/completion/claim" || route === "/completion/ack")
+    && request.method !== "POST") {
     methodNotAllowed(request, response);
     return;
   }
@@ -392,6 +496,14 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   }
   if (route === "/delivery/ack") {
     await receiveDeliveryAck(request, response, origin);
+    return;
+  }
+  if (route === "/completion/claim") {
+    await receiveCompletionClaim(request, response, origin);
+    return;
+  }
+  if (route === "/completion/ack") {
+    await receiveCompletionAck(request, response, origin);
     return;
   }
   json(response, 200, {
@@ -483,6 +595,12 @@ export function startBridge(options: BridgeStartOptions = {}): Promise<number | 
   ackExtensionDelivery = options.ackExtensionDelivery ?? (() => {
     throw new ExtensionDeliveryNotFoundError("delivery not found");
   });
+  claimExtensionReviewCompletion = options.claimExtensionReviewCompletion ?? (() => {
+    throw new ExtensionReviewCompletionUnavailableError("extension review completion unavailable");
+  });
+  ackExtensionReviewCompletion = options.ackExtensionReviewCompletion ?? (() => {
+    throw new ExtensionReviewCompletionUnavailableError("extension review completion unavailable");
+  });
   return enqueue(() => startBridgeOnce(options));
 }
 
@@ -497,6 +615,12 @@ export function stopBridge(): Promise<void> {
     claimExtensionDelivery = () => null;
     ackExtensionDelivery = () => {
       throw new ExtensionDeliveryNotFoundError("delivery not found");
+    };
+    claimExtensionReviewCompletion = () => {
+      throw new ExtensionReviewCompletionUnavailableError("extension review completion unavailable");
+    };
+    ackExtensionReviewCompletion = () => {
+      throw new ExtensionReviewCompletionUnavailableError("extension review completion unavailable");
     };
     if (server !== null) await close(server);
   });

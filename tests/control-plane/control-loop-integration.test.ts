@@ -29,6 +29,7 @@ import {
   type GoalOrchestration,
 } from "../../src/control-plane/goal-orchestration.js";
 import { ExtensionDeliveryAdapter } from "../../src/delivery/extension-delivery-adapter.js";
+import { BrowserWorkerReviewCompletionAdapter } from "../../src/delivery/browser-worker-review-completion-adapter.js";
 import type { ReviewDeliveryRequest } from "../../src/delivery/review-delivery-adapter.js";
 import type { ExtensionDeliveryReceipt } from "../../src/control-plane/extension-delivery.js";
 import { BrowserWorkerClient, type BrowserCompletionResult } from "../../src/browser-worker-client/browser-worker-client.js";
@@ -283,7 +284,10 @@ async function createHarness(
     adapter: codex,
   });
   const browserRouter = new BrowserRouter(root, review.deliveryAdapter);
-  const completionRouter = new ReviewCompletionRouter(root, review.completionClient);
+  const completionRouter = new ReviewCompletionRouter(
+    root,
+    new BrowserWorkerReviewCompletionAdapter(review.completionClient),
+  );
   const auto = new AutoIterationService(registry, {
     storageRoot: root,
     taskContextService: tasks,
@@ -334,7 +338,10 @@ async function restart(harness: Harness): Promise<RestartedHarness> {
     adapter: { start: noSpawn },
   });
   const browserRouter = new BrowserRouter(harness.root, harness.review.deliveryAdapter);
-  const completionRouter = new ReviewCompletionRouter(harness.root, harness.review.completionClient);
+  const completionRouter = new ReviewCompletionRouter(
+    harness.root,
+    new BrowserWorkerReviewCompletionAdapter(harness.review.completionClient),
+  );
   const auto = new AutoIterationService(harness.registry, {
     storageRoot: harness.root,
     taskContextService: tasks,

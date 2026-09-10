@@ -6,9 +6,12 @@ import { ReviewResultService } from "../context/review-result-service.js";
 import type { ReviewResultStatus } from "../context/review-result-schema.js";
 import type { ReviewResult } from "../context/review-result.js";
 import {
-  BrowserWorkerClient,
-  type BrowserCompletionResult,
-} from "../browser-worker-client/browser-worker-client.js";
+  BrowserWorkerReviewCompletionAdapter,
+} from "../delivery/browser-worker-review-completion-adapter.js";
+import type {
+  ReviewCompletionAdapter,
+  ReviewCompletionResult,
+} from "../delivery/review-completion-adapter.js";
 import type { WorkspaceIdentity } from "../workspace/types.js";
 
 function errorMessage(error: unknown): string {
@@ -17,7 +20,7 @@ function errorMessage(error: unknown): string {
 }
 
 function completionResultInput(
-  result: BrowserCompletionResult,
+  result: ReviewCompletionResult,
   workspaceId: string,
   taskId: string,
   reviewRequestId: string,
@@ -58,7 +61,7 @@ export class ReviewCompletionRouter {
 
   public constructor(
     storageRoot: string = defaultTaskContextStorageRoot(),
-    private readonly client: Pick<BrowserWorkerClient, "collectCompletion"> = new BrowserWorkerClient(),
+    private readonly adapter: ReviewCompletionAdapter = new BrowserWorkerReviewCompletionAdapter(),
     runtimeIdentity?: WorkspaceIdentity,
   ) {
     this.routings = new ConversationRoutingService(storageRoot, runtimeIdentity);
@@ -97,15 +100,17 @@ export class ReviewCompletionRouter {
       { status: "reviewing" },
     );
 
-    let completion: BrowserCompletionResult;
+    let completion: ReviewCompletionResult;
     try {
-      completion = await this.client.collectCompletion(
-        routing.conversation_id,
-        request.review_request_id,
-      );
+      completion = await this.adapter.collect({
+        workspace_id: workspaceId,
+        task_id: routing.task_id,
+        review_request_id: request.review_request_id,
+        delivery_id: delivery.delivery_id,
+        conversation_id: routing.conversation_id,
+      });
     } catch (error: unknown) {
       completion = {
-        conversationId: routing.conversation_id,
         status: "FAILED",
         error: errorMessage(error),
       };

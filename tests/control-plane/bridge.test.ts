@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,11 +16,16 @@ import { ConversationCorrelationRegistry } from "../../src/control-plane/convers
 import { CodexExecutionCompletionService } from "../../src/control-plane/codex-execution-completion.js";
 import { ExtensionDeliveryService } from "../../src/control-plane/extension-delivery.js";
 import {
+  ExtensionReviewCompletionService,
+  extensionReviewCompletionStateFile,
+} from "../../src/control-plane/extension-review-completion.js";
+import {
   LOCAL_CONTROL_BRIDGE_HOST,
   LOCAL_CONTROL_BRIDGE_PORTS,
   LOCAL_CONTROL_BRIDGE_PROTOCOL,
   LOCAL_CONTROL_BRIDGE_SERVICE,
   MAX_BRIDGE_REQUEST_BYTES,
+  MAX_BRIDGE_COMPLETION_ACK_REQUEST_BYTES,
 } from "../../src/control-plane/bridge-protocol.js";
 
 const ORIGIN_A = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
@@ -138,6 +144,7 @@ describe("Local Control Bridge protocol", () => {
   it("rejects missing and incompatible protocol headers", async () => {
     expect((await request("/pair", { method: "POST", protocol: null, body: {} })).status).toBe(426);
     expect((await request("/pair", { method: "POST", protocol: "1", body: {} })).status).toBe(426);
+    expect((await request("/pair", { method: "POST", protocol: "2", body: {} })).status).toBe(426);
     expect((await request("/pair", { method: "POST", body: {} })).status).toBe(200);
   });
 
@@ -263,6 +270,133 @@ describe("Local Control Bridge protocol", () => {
       })).status).toBe(409);
       expect((await request("/delivery/claim", { method: "POST", token: "wrong", body: owner })).status).toBe(401);
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("validates and transports exact completion claims and idempotent ACKs", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-bridge-completion-"));
+    const completions = new ExtensionReviewCompletionService(root);
+    await completions.restore();
+    const queued = await completions.enqueue({
+      workspace_id: "workspace-a",
+      task_id: "task-a",
+      review_request_id: "review-a",
+      review_delivery_id: "delivery-a",
+      conversation_id: "conversation-one",
+      expected_user_message_id: "user-message-1",
+    });
+    await startBridge({
+      ports: [0],
+      claimExtensionReviewCompletion: (claim) => completions.claim(claim),
+      ackExtensionReviewCompletion: (ack) => completions.acknowledge(ack),
+    });
+    try {
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+      const owner = {
+        conversation_id: "conversation-one",
+        client_id: "client-one",
+        document_id: "document-one",
+        navigation_epoch: 4,
+      };
+      expect((await request("/completion/claim", {
+        method: "POST",
+        token,
+        body: { ...owner, extra: true },
+      })).status).toBe(400);
+      expect((await request("/completion/claim", {
+        method: "POST",
+        token,
+        body: { ...owner, conversation_id: "conversation-two" },
+      })).body).toEqual({ command: null });
+      const claimed = await request("/completion/claim", { method: "POST", token, body: owner });
+      expect(claimed).toMatchObject({
+        status: 200,
+        body: {
+          completion_id: queued.completion_id,
+          conversation_id: "conversation-one",
+          review_request_id: "review-a",
+          expected_user_message_id: "user-message-1",
+        },
+      });
+
+      const ack = {
+        ...owner,
+        completion_id: queued.completion_id,
+        status: "completed",
+        assistant_message_id: "assistant:logical-1",
+        content: "final review",
+      };
+      expect(await request("/completion/ack", { method: "POST", token, body: ack })).toMatchObject({
+        status: 200,
+        body: { accepted: "new", receipt: { status: "completed", content: "final review" } },
+      });
+      expect(await request("/completion/ack", { method: "POST", token, body: ack })).toMatchObject({
+        status: 200,
+        body: { accepted: "existing" },
+      });
+      expect((await request("/completion/ack", {
+        method: "POST",
+        token,
+        body: { ...ack, content: "different" },
+      })).status).toBe(409);
+      expect((await request("/completion/ack", {
+        method: "POST",
+        token,
+        body: { ...ack, completion_id: randomUUID() },
+      })).status).toBe(404);
+    } finally {
+      await stopBridge();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("gives completion ACKs a larger body limit without enlarging ordinary routes", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-bridge-completion-size-"));
+    const completions = new ExtensionReviewCompletionService(root);
+    const queued = await completions.enqueue({
+      workspace_id: "workspace-a",
+      task_id: "task-a",
+      review_request_id: "review-size",
+      review_delivery_id: "delivery-size",
+      conversation_id: "conversation-size",
+      expected_user_message_id: "user-size",
+    });
+    await startBridge({
+      ports: [0],
+      claimExtensionReviewCompletion: (claim) => completions.claim(claim),
+      ackExtensionReviewCompletion: (ack) => completions.acknowledge(ack),
+    });
+    try {
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+      const owner = {
+        conversation_id: "conversation-size",
+        client_id: "client-size",
+        document_id: "document-size",
+        navigation_epoch: 0,
+      };
+      await expect(request("/completion/claim", { method: "POST", token, body: owner })).resolves.toMatchObject({ status: 200 });
+      const content = "x".repeat(256 * 1024);
+      const ack = {
+        ...owner,
+        completion_id: queued.completion_id,
+        status: "completed",
+        assistant_message_id: "assistant-size",
+        content,
+      };
+      expect(Buffer.byteLength(JSON.stringify(ack), "utf8")).toBeLessThanOrEqual(
+        MAX_BRIDGE_COMPLETION_ACK_REQUEST_BYTES,
+      );
+      expect(await request("/completion/ack", { method: "POST", token, body: ack })).toMatchObject({ status: 200 });
+      expect((await request("/identity-evidence", {
+        method: "POST",
+        token,
+        body: { request_id: "request-size", conversation_id: "conversation-size", document_id: "document-size", navigation_epoch: 0, padding: "x".repeat(MAX_BRIDGE_REQUEST_BYTES) },
+      })).status).toBe(413);
+    } finally {
+      await stopBridge();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -494,6 +628,49 @@ describe("Local Control Bridge app lifecycle", () => {
       });
       expect(await readFile(deliveryFile, "utf8")).toBe("{broken");
       expect(warning).toHaveBeenCalledWith("Extension Delivery unavailable; durable state could not be restored");
+    } finally {
+      warning.mockRestore();
+      if (server !== null) await close(server);
+      await stopBridge();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps MCP and Delivery available when completion state is corrupt", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-app-completion-corrupt-"));
+    await mkdir(join(root, "control-plane"), { recursive: true });
+    const completionFile = extensionReviewCompletionStateFile(root);
+    await writeFile(completionFile, "{broken", "utf8");
+    const runtime = createAppContext(settings());
+    const context = {
+      ...runtime,
+      extensionDeliveries: new ExtensionDeliveryService(root),
+      extensionReviewCompletions: new ExtensionReviewCompletionService(root),
+    };
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let server: Server | null = null;
+    try {
+      server = await startApp(settings(), context, { bridgePorts: [0] });
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+      const owner = {
+        conversation_id: "conversation-completion-corrupt",
+        client_id: "client-completion-corrupt",
+        document_id: "document-completion-corrupt",
+        navigation_epoch: 0,
+      };
+      expect(await request("/completion/claim", { method: "POST", token, body: owner })).toEqual({
+        status: 503,
+        body: { error: "completion_unavailable" },
+      });
+      expect(await request("/delivery/claim", { method: "POST", token, body: owner })).toMatchObject({
+        status: 200,
+        body: { command: null },
+      });
+      expect(warning).toHaveBeenCalledWith(
+        "Extension Review Completion unavailable; durable state could not be restored",
+      );
+      expect(await readFile(completionFile, "utf8")).toBe("{broken");
     } finally {
       warning.mockRestore();
       if (server !== null) await close(server);

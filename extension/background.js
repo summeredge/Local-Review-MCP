@@ -3,12 +3,15 @@
 
   const PORTS = [12081, 12082, 12083, 12084, 12085];
   const SERVICE = 'local-review-control-bridge';
-  const PROTOCOL = 2;
+  const PROTOCOL = 3;
   const PROTOCOL_HEADER = 'x-lrm-bridge-protocol';
   const REQUEST_ID = /^[A-Za-z0-9_-]{1,100}$/u;
   const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
   const DOCUMENT_ID = /^[A-Za-z0-9_-]{1,256}$/u;
   const DELIVERY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+  const COMPLETION_ID = DELIVERY_ID;
+  const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+  const MAX_COMPLETION_CONTENT = 256 * 1024;
   const REQUEST_TIMEOUT_MS = 3000;
   const PORT_TRUST_MS = 10_000;
 
@@ -22,12 +25,17 @@
   let loading = null;
   let stateQueue = Promise.resolve();
   let deliveryStateQueue = Promise.resolve();
+  let completionStateQueue = Promise.resolve();
   let pairingPromise = null;
   let clientId = null;
   let deliveryAckOutbox = [];
   let deliveryInFlight = [];
   let deliveryRecoveryBlocked = false;
   let deliveryRecoveryWarningEmitted = false;
+  let completionAckOutbox = [];
+  let completionInFlight = [];
+  let completionRecoveryBlocked = false;
+  let completionRecoveryWarningEmitted = false;
   let trustedUntil = 0;
 
   function validDeliveryOwner(entry) {
@@ -55,6 +63,47 @@
       && Object.keys(entry).length === 7;
   }
 
+  function validCompletionOwner(entry) {
+    return entry && typeof entry === 'object'
+      && typeof entry.completion_id === 'string' && COMPLETION_ID.test(entry.completion_id)
+      && typeof entry.conversation_id === 'string' && CONVERSATION_ID.test(entry.conversation_id)
+      && typeof entry.client_id === 'string' && DOCUMENT_ID.test(entry.client_id)
+      && typeof entry.document_id === 'string' && DOCUMENT_ID.test(entry.document_id)
+      && Number.isSafeInteger(entry.navigation_epoch) && entry.navigation_epoch >= 0;
+  }
+
+  function validStoredCompletionAck(entry) {
+    if (!validCompletionOwner(entry) || !['completed', 'failed', 'ambiguous'].includes(entry.status)) return false;
+    const details = entry.status === 'completed'
+      ? typeof entry.assistant_message_id === 'string' && MESSAGE_ID.test(entry.assistant_message_id)
+        && validCompletionContent(entry.content)
+      : typeof entry.error === 'string' && entry.error.length > 0 && entry.error.length <= 500;
+    return details && Object.keys(entry).length === (entry.status === 'completed' ? 8 : 7);
+  }
+
+  function utf8Length(value) {
+    try {
+      return encodeURIComponent(value).replace(/%[0-9a-f]{2}|./giu, 'x').length;
+    } catch {
+      return Infinity;
+    }
+  }
+
+  function validCompletionContent(value) {
+    return typeof value === 'string' && value.length > 0 && value.length <= MAX_COMPLETION_CONTENT
+      && utf8Length(value) <= MAX_COMPLETION_CONTENT;
+  }
+
+  function validStoredCompletionInFlight(entry) {
+    return validCompletionOwner(entry)
+      && typeof entry.review_request_id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(entry.review_request_id)
+      && typeof entry.expected_user_message_id === 'string' && MESSAGE_ID.test(entry.expected_user_message_id)
+      && entry.phase === 'claimed'
+      && Number.isSafeInteger(entry.deadline)
+      && entry.deadline >= 0
+      && Object.keys(entry).length === 9;
+  }
+
   function serialState(task) {
     const result = stateQueue.then(task, task);
     stateQueue = result.then(() => undefined, () => undefined);
@@ -67,12 +116,18 @@
     return result;
   }
 
-  function validStoredDeliveryEntries(value, validator, limit) {
+  function serialCompletionState(task) {
+    const result = completionStateQueue.then(task, task);
+    completionStateQueue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  function validStoredDeliveryEntries(value, validator, limit, idKey = 'delivery_id') {
     if (!Array.isArray(value) || value.length > limit) return false;
     const ids = new Set();
     for (let index = 0; index < value.length; index += 1) {
       if (!Object.prototype.hasOwnProperty.call(value, index) || !validator(value[index])) return false;
-      const id = value[index].delivery_id;
+      const id = value[index][idKey];
       if (ids.has(id)) return false;
       ids.add(id);
     }
@@ -84,7 +139,8 @@
     if (!loading) {
       loading = chrome.storage.local.get([
         'port', 'token', 'tabDocuments', 'tabEpochs', 'tabConversations', 'retiredDocuments',
-        'extensionClientId', 'deliveryAckOutbox', 'deliveryInFlight'
+        'extensionClientId', 'deliveryAckOutbox', 'deliveryInFlight',
+        'completionAckOutbox', 'completionInFlight'
       ])
         .then((stored) => {
           port = PORTS.includes(stored.port) ? stored.port : null;
@@ -122,6 +178,36 @@
             initialState.deliveryAckOutbox = deliveryAckOutbox;
             initialState.deliveryInFlight = deliveryInFlight;
           }
+          const hasStoredCompletionAcks = Object.prototype.hasOwnProperty.call(stored, 'completionAckOutbox');
+          const hasStoredCompletionInFlight = Object.prototype.hasOwnProperty.call(stored, 'completionInFlight');
+          const storedCompletionAcks = stored.completionAckOutbox;
+          const storedCompletionInFlight = stored.completionInFlight;
+          const validCompletionAcks = !hasStoredCompletionAcks
+            || validStoredDeliveryEntries(storedCompletionAcks, validStoredCompletionAck, 200, 'completion_id');
+          const validCompletionInFlight = !hasStoredCompletionInFlight
+            || validStoredDeliveryEntries(storedCompletionInFlight, validStoredCompletionInFlight, 100, 'completion_id');
+          const completionAckIds = validCompletionAcks && hasStoredCompletionAcks
+            ? new Set(storedCompletionAcks.map((entry) => entry.completion_id))
+            : new Set();
+          const noOverlappingCompletion = !hasStoredCompletionAcks || !hasStoredCompletionInFlight
+            || !validCompletionAcks || !validCompletionInFlight
+            || storedCompletionInFlight.every((entry) => !completionAckIds.has(entry.completion_id));
+          completionRecoveryBlocked = !validCompletionAcks || !validCompletionInFlight || !noOverlappingCompletion;
+          if (completionRecoveryBlocked) {
+            if (!completionRecoveryWarningEmitted) {
+              console.warn('Extension review completion state is malformed; completion recovery is blocked');
+              completionRecoveryWarningEmitted = true;
+            }
+            completionAckOutbox = [];
+            completionInFlight = [];
+          } else {
+            completionAckOutbox = hasStoredCompletionAcks ? storedCompletionAcks.slice() : [];
+            completionInFlight = hasStoredCompletionInFlight ? storedCompletionInFlight.slice() : [];
+          }
+          if (!completionRecoveryBlocked) {
+            initialState.completionAckOutbox = completionAckOutbox;
+            initialState.completionInFlight = completionInFlight;
+          }
           return chrome.storage.local.set(initialState)
             .then(() => { loaded = true; });
         });
@@ -156,6 +242,18 @@
     });
     deliveryAckOutbox = persistedOutbox;
     deliveryInFlight = persistedInFlight;
+  }
+
+  async function commitCompletionState(nextOutbox, nextInFlight) {
+    const persistedOutbox = nextOutbox.slice(-200);
+    const persistedInFlight = nextInFlight.slice(-100);
+    await chrome.storage.local.set({
+      extensionClientId: clientId,
+      completionAckOutbox: persistedOutbox,
+      completionInFlight: persistedInFlight
+    });
+    completionAckOutbox = persistedOutbox;
+    completionInFlight = persistedInFlight;
   }
 
   function senderSource(sender) {
@@ -569,13 +667,197 @@
     });
   }
 
+  let flushingCompletionAcks = null;
+
+  function completionAckFor(entry, status, details = {}) {
+    return {
+      completion_id: entry.completion_id,
+      conversation_id: entry.conversation_id,
+      client_id: entry.client_id,
+      document_id: entry.document_id,
+      navigation_epoch: entry.navigation_epoch,
+      status,
+      ...details
+    };
+  }
+
+  function sameCompletionAck(payload, message, source, conversationId, navigationEpoch) {
+    return payload.completion_id === message.completion_id
+      && payload.conversation_id === conversationId
+      && payload.client_id === clientId
+      && payload.document_id === source.documentId
+      && payload.navigation_epoch === navigationEpoch
+      && payload.status === message.status
+      && (message.status === 'completed'
+        ? payload.assistant_message_id === message.assistant_message_id && payload.content === message.content
+        : payload.error === message.error);
+  }
+
+  async function queueCompletionAck(entry, status, details) {
+    const payload = completionAckFor(entry, status, details);
+    const previous = completionAckOutbox.find((candidate) => candidate.completion_id === entry.completion_id);
+    if (previous && JSON.stringify(previous) !== JSON.stringify(payload)) {
+      return { ok: false, error: 'conflicting_completion_ack' };
+    }
+    let nextOutbox = completionAckOutbox;
+    if (!previous) {
+      if (completionAckOutbox.length >= 200) return { ok: false, error: 'completion_ack_outbox_full' };
+      nextOutbox = [...completionAckOutbox, payload];
+    }
+    const nextInFlight = completionInFlight.filter((candidate) => candidate.completion_id !== entry.completion_id);
+    await commitCompletionState(nextOutbox, nextInFlight);
+    return { ok: true, payload };
+  }
+
+  async function flushCompletionAcksUnsafe() {
+    await load();
+    if (completionRecoveryBlocked) return { ok: false, error: 'completion_state_corrupt' };
+    for (const payload of [...completionAckOutbox]) {
+      const result = await postBridge('/completion/ack', payload);
+      if (!result.ok) return result;
+      await commitCompletionState(
+        completionAckOutbox.filter((candidate) => candidate.completion_id !== payload.completion_id),
+        completionInFlight
+      );
+    }
+    return { ok: true };
+  }
+
+  function flushCompletionAcks() {
+    if (flushingCompletionAcks) return flushingCompletionAcks;
+    flushingCompletionAcks = flushCompletionAcksUnsafe().finally(() => { flushingCompletionAcks = null; });
+    return flushingCompletionAcks;
+  }
+
+  async function prepareCompletionClaim() {
+    await load();
+    if (completionRecoveryBlocked) return { ok: false, error: 'completion_state_corrupt' };
+    const flushed = await flushCompletionAcks();
+    if (!flushed.ok || completionAckOutbox.length > 0) return { ok: false, error: 'completion_ack_pending' };
+    const now = Date.now();
+    const live = completionInFlight.filter((entry) => entry.deadline > now);
+    if (live.length !== completionInFlight.length) await commitCompletionState(completionAckOutbox, live);
+    return { ok: true };
+  }
+
+  function validCompletionWatch(value, conversationId) {
+    return value && typeof value === 'object'
+      && typeof value.completion_id === 'string' && COMPLETION_ID.test(value.completion_id)
+      && typeof value.conversation_id === 'string' && value.conversation_id === conversationId
+      && typeof value.review_request_id === 'string'
+      && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value.review_request_id)
+      && typeof value.expected_user_message_id === 'string'
+      && MESSAGE_ID.test(value.expected_user_message_id)
+      && Number.isSafeInteger(value.deadline)
+      && value.deadline > Date.now();
+  }
+
+  async function claimCompletion(message, sender) {
+    const source = senderSource(sender);
+    const conversationId = senderConversation(sender);
+    const requested = requestedEpoch(message);
+    if (!source || requested === null || !conversationId || message.conversation_id !== conversationId) {
+      return { ok: false, error: 'wrong_conversation' };
+    }
+    const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
+    if (!authority.ok || authority.conversation_id !== conversationId) return { ok: false, error: 'wrong_conversation' };
+    return serialCompletionState(async () => {
+      if (completionRecoveryBlocked) return { ok: false, error: 'completion_state_corrupt' };
+      const ready = await prepareCompletionClaim();
+      if (!ready.ok) return ready;
+      const claim = {
+        conversation_id: conversationId,
+        client_id: clientId,
+        document_id: source.documentId,
+        navigation_epoch: requested
+      };
+      const result = await postBridge('/completion/claim', claim);
+      if (!result.ok) return result;
+      if (result.data?.command === null) return { ok: true, command: null };
+      const watch = result.data?.completion_id ? result.data : result.data?.command;
+      if (!validCompletionWatch(watch, conversationId)) {
+        return { ok: false, error: 'invalid_completion_watch' };
+      }
+      if (completionInFlight.length >= 100
+        && !completionInFlight.some((entry) => entry.completion_id === watch.completion_id)) {
+        return { ok: false, error: 'completion_in_flight_full' };
+      }
+      const inFlight = {
+        completion_id: watch.completion_id,
+        conversation_id: watch.conversation_id,
+        review_request_id: watch.review_request_id,
+        expected_user_message_id: watch.expected_user_message_id,
+        client_id: clientId,
+        document_id: source.documentId,
+        navigation_epoch: requested,
+        deadline: watch.deadline,
+        phase: 'claimed'
+      };
+      await commitCompletionState(
+        completionAckOutbox,
+        [...completionInFlight.filter((entry) => entry.completion_id !== watch.completion_id), inFlight]
+      );
+      return { ok: true, ...watch };
+    });
+  }
+
+  async function receiveCompletionAck(message, sender) {
+    const source = senderSource(sender);
+    const conversationId = senderConversation(sender);
+    const requested = requestedEpoch(message);
+    if (!source || requested === null || !conversationId) return { ok: false, error: 'wrong_conversation' };
+    const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
+    if (!authority.ok || authority.conversation_id !== conversationId) return { ok: false, error: 'wrong_conversation' };
+    return serialCompletionState(async () => {
+      if (completionRecoveryBlocked) return { ok: false, error: 'completion_state_corrupt' };
+      const entry = completionInFlight.find((candidate) => candidate.completion_id === message.completion_id);
+      const queued = completionAckOutbox.find((candidate) => candidate.completion_id === message.completion_id);
+      if (!entry) {
+        if (!queued) return { ok: false, error: 'completion_not_owned' };
+        if (!sameCompletionAck(queued, message, source, conversationId, requested)) {
+          return { ok: false, error: 'conflicting_completion_ack' };
+        }
+        const flushed = await flushCompletionAcks();
+        return flushed.ok ? { ok: true, queued: completionAckOutbox.length > 0 } : flushed;
+      }
+      if (entry.client_id !== clientId || entry.document_id !== source.documentId
+        || entry.navigation_epoch !== requested || entry.conversation_id !== conversationId) {
+        return { ok: false, error: 'completion_not_owned' };
+      }
+      if (entry.deadline <= Date.now()) return { ok: false, error: 'completion_lease_expired' };
+      let status;
+      let details;
+      if (message.status === 'completed'
+        && typeof message.assistant_message_id === 'string'
+        && MESSAGE_ID.test(message.assistant_message_id)
+        && validCompletionContent(message.content)) {
+        status = 'completed';
+        details = { assistant_message_id: message.assistant_message_id, content: message.content };
+      } else if ((message.status === 'failed' || message.status === 'ambiguous')
+        && typeof message.error === 'string'
+        && message.error.length > 0
+        && message.error.length <= 500) {
+        status = message.status;
+        details = { error: message.error };
+      } else {
+        return { ok: false, error: 'invalid_completion_ack' };
+      }
+      const queuedAck = await queueCompletionAck(entry, status, details);
+      if (!queuedAck.ok) return queuedAck;
+      const flushed = await flushCompletionAcks();
+      return flushed.ok ? { ok: true, queued: completionAckOutbox.length > 0 } : flushed;
+    });
+  }
+
   const handlers = {
     register_document: registerDocument,
     navigation: receiveNavigation,
     identity_evidence: receiveEvidence,
     delivery_claim: claimDelivery,
     delivery_submit_started: deliverySubmitStarted,
-    delivery_ack: receiveDeliveryAck
+    delivery_ack: receiveDeliveryAck,
+    completion_claim: claimCompletion,
+    completion_ack: receiveCompletionAck
   };
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
