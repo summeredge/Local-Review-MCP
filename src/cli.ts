@@ -13,6 +13,10 @@ import {
 } from "./router/browser-router-diagnostic.js";
 import { runGoalE2EDiagnostic } from "./control-plane/goal-e2e-diagnostic.js";
 import {
+  parseExtensionReviewCompletionDiagnosticArgs,
+  runExtensionReviewCompletionDiagnostic,
+} from "./control-plane/extension-review-completion-diagnostic.js";
+import {
   confirmChatGPTConnector,
   diagnoseChatGPTConnector,
   parseConnectorConfirmArgs,
@@ -89,6 +93,12 @@ try {
   } else if (argv[0] === "diagnose-review-completion") {
     const { generateReviewCompletionExample } = await import("./browser-worker/review-completion-diagnostic.js");
     console.log(JSON.stringify(await generateReviewCompletionExample(), null, 2));
+  } else if (argv[0] === "diagnose-extension-review-completion") {
+    const diagnostic = await runExtensionReviewCompletionDiagnostic(
+      parseExtensionReviewCompletionDiagnosticArgs(argv.slice(1)),
+    );
+    console.log(JSON.stringify(diagnostic, null, 2));
+    if (!diagnostic.ok) process.exitCode = 1;
   } else if (argv[0] === "diagnose-review-verdict") {
     console.log(JSON.stringify(generateReviewVerdictExample(), null, 2));
   } else if (argv[0] === "diagnose-loop-decision") {

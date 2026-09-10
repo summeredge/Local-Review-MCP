@@ -4,8 +4,14 @@
   const FIBER_ASK = 'lrm-extension-identity-ask';
   const FIBER_REPLY = 'lrm-extension-identity-reply';
   const FIBER_VERSION = 1;
+  const COMPLETION_FIBER_ASK = 'lrm-extension-review-completion-ask';
+  const COMPLETION_FIBER_REPLY = 'lrm-extension-review-completion-reply';
+  const COMPLETION_FIBER_VERSION = 1;
   const REQUEST_ID = /^[A-Za-z0-9_-]{1,100}$/u;
   const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
+  const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+  const COMPLETION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+  const MAX_COMPLETION_CONTENT = 256 * 1024;
   const FIBER_TIMEOUT_MS = 1500;
   const SCAN_DELAY_MS = 150;
 
@@ -18,6 +24,8 @@
   let scanInFlight = null;
   let nonceCounter = 0;
   let deliveryInFlight = null;
+  let completionInFlight = null;
+  let completionScanTimer = null;
   const sent = new Set();
 
   function routeConversation(href = location.href) {
@@ -54,7 +62,10 @@
 
   async function registerDocument() {
     if (registeredEpoch >= navigationEpoch) return true;
-    if (registration) return registration;
+    if (registration) {
+      const previous = await registration;
+      return previous && registeredEpoch < navigationEpoch ? registerDocument() : previous;
+    }
     const requestedEpoch = navigationEpoch;
     registration = sendToWorker({ type: 'register_document', navigation_epoch: requestedEpoch })
       .then((reply) => {
@@ -181,6 +192,125 @@
     });
   }
 
+  function utf8Length(value) {
+    try {
+      return encodeURIComponent(value).replace(/%[0-9a-f]{2}|./giu, 'x').length;
+    } catch {
+      return Infinity;
+    }
+  }
+
+  function completionFiberScan(conversationId, expectedUserMessageId, completionId) {
+    return new Promise((resolve) => {
+      const nonce = `${++nonceCounter}-${Math.random().toString(36).slice(2)}`;
+      let settled = false;
+      let timer = null;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        window.removeEventListener('message', listener);
+        resolve(value);
+      };
+      const listener = (event) => {
+        if (event.source !== window || event.origin !== location.origin) return;
+        const data = event.data;
+        if (!data || typeof data !== 'object'
+          || data.source !== COMPLETION_FIBER_REPLY
+          || data.nonce !== nonce
+          || data.version !== COMPLETION_FIBER_VERSION
+          || data.completion_id !== completionId
+          || data.conversation_id !== conversationId
+          || data.expected_user_message_id !== expectedUserMessageId) return;
+        if (data.status === 'pending') {
+          finish({ status: 'pending' });
+          return;
+        }
+        if ((data.status === 'ambiguous' || data.status === 'failed')
+          && typeof data.error === 'string' && data.error.length > 0 && data.error.length <= 500) {
+          finish({ status: data.status, error: data.error });
+          return;
+        }
+        if (data.status === 'completed'
+          && typeof data.assistant_message_id === 'string'
+          && MESSAGE_ID.test(data.assistant_message_id)
+          && typeof data.content === 'string'
+          && data.content.length > 0
+          && data.content.length <= MAX_COMPLETION_CONTENT
+          && utf8Length(data.content) <= MAX_COMPLETION_CONTENT) {
+          finish({
+            status: 'completed',
+            assistant_message_id: data.assistant_message_id,
+            content: data.content,
+          });
+        }
+      };
+      timer = setTimeout(() => finish({ status: 'pending' }), FIBER_TIMEOUT_MS);
+      window.addEventListener('message', listener);
+      try {
+        window.postMessage({
+          source: COMPLETION_FIBER_ASK,
+          nonce,
+          version: COMPLETION_FIBER_VERSION,
+          completion_id: completionId,
+          conversation_id: conversationId,
+          expected_user_message_id: expectedUserMessageId,
+        }, location.origin);
+      } catch {
+        finish({ status: 'pending' });
+      }
+    });
+  }
+
+  async function pollCompletion() {
+    if (!alive || completionInFlight) return completionInFlight;
+    completionInFlight = (async () => {
+      const epoch = navigationEpoch;
+      const href = location.href;
+      const conversationId = routeConversation(href);
+      if (!conversationId || !(await registerDocument())) return;
+      const stillCurrent = () => alive
+        && navigationEpoch === epoch
+        && location.href === href
+        && routeConversation() === conversationId;
+      if (!stillCurrent()) return;
+      const claimed = await sendToWorker({
+        type: 'completion_claim',
+        conversation_id: conversationId,
+        navigation_epoch: epoch,
+      });
+      const watch = claimed?.ok === true
+        ? (claimed.completion_id ? claimed : claimed.command)
+        : null;
+      if (!watch || watch.conversation_id !== conversationId
+        || typeof watch.completion_id !== 'string' || !COMPLETION_ID.test(watch.completion_id)
+        || typeof watch.expected_user_message_id !== 'string'
+        || !MESSAGE_ID.test(watch.expected_user_message_id)
+        || !Number.isSafeInteger(watch.deadline) || watch.deadline <= Date.now()) return;
+      if (!stillCurrent()) return;
+      const result = await completionFiberScan(
+        conversationId,
+        watch.expected_user_message_id,
+        watch.completion_id,
+      );
+      if (!stillCurrent() || result.status === 'pending') return;
+      const details = result.status === 'completed'
+        ? { assistant_message_id: result.assistant_message_id, content: result.content }
+        : { error: result.error };
+      await sendToWorker({
+        type: 'completion_ack',
+        completion_id: watch.completion_id,
+        conversation_id: conversationId,
+        navigation_epoch: epoch,
+        status: result.status,
+        ...details,
+      });
+    })().finally(() => {
+      completionInFlight = null;
+    });
+    await completionInFlight;
+  }
+
   async function publishEvidence() {
     if (!alive || scanInFlight) return scanInFlight;
     scanInFlight = (async () => {
@@ -217,6 +347,14 @@
     }, SCAN_DELAY_MS);
   }
 
+  function scheduleCompletionScan() {
+    if (completionScanTimer !== null) return;
+    completionScanTimer = setTimeout(() => {
+      completionScanTimer = null;
+      void pollCompletion();
+    }, SCAN_DELAY_MS);
+  }
+
   function routeChanged() {
     const nextUrl = location.href;
     if (nextUrl === lastUrl) return;
@@ -225,6 +363,11 @@
     sent.clear();
     void registerDocument();
     scheduleScan();
+    if (completionScanTimer !== null) {
+      clearTimeout(completionScanTimer);
+      completionScanTimer = null;
+    }
+    scheduleCompletionScan();
   }
 
   for (const method of ['pushState', 'replaceState']) {
@@ -241,11 +384,16 @@
   setInterval(routeChanged, 250);
   setInterval(scheduleScan, 1000);
   setInterval(() => { void pollDelivery(); }, 1500);
+  setInterval(() => { void pollCompletion(); }, 1000);
 
   if (typeof MutationObserver === 'function' && document.documentElement) {
-    new MutationObserver(scheduleScan).observe(document.documentElement, { childList: true, subtree: true });
+    new MutationObserver(() => {
+      scheduleScan();
+      scheduleCompletionScan();
+    }).observe(document.documentElement, { childList: true, subtree: true });
   }
   void registerDocument();
   scheduleScan();
   void pollDelivery();
+  void pollCompletion();
 })();
