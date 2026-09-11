@@ -1,5 +1,5 @@
 import { createServer, type Server } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,6 +7,7 @@ import { execFile } from "node:child_process";
 
 const projectDirectory = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const preflightScript = join(projectDirectory, "scripts", "preflight-check.ps1");
+const startProductionScript = join(projectDirectory, "scripts", "start-production.ps1");
 const verifyScript = join(projectDirectory, "scripts", "verify-remote.ps1");
 const temporaryDirectories: string[] = [];
 const runningServers: Server[] = [];
@@ -112,6 +113,36 @@ function withoutCloudflared(): NodeJS.ProcessEnv {
 
 async function closeServer(server: Server): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+async function writeNpmShim(directory: string): Promise<void> {
+  await writeFile(join(directory, "npm.cmd"), [
+    "@echo off",
+    "if \"%~1\"==\"--version\" goto version",
+    "if \"%~1\"==\"run\" goto run",
+    "if \"%~1\"==\"start\" goto start",
+    "exit /b 0",
+    ":version",
+    "echo 10.0.0",
+    "exit /b 0",
+    ":run",
+    "echo run build>>\"%~dp0npm-log.txt\"",
+    "if \"%NPM_SHIM_BUILD_EXIT%\"==\"1\" exit /b 1",
+    "exit /b 0",
+    ":start",
+    "echo start>>\"%~dp0npm-log.txt\"",
+    "exit /b 0",
+    "",
+  ].join("\r\n"), "utf8");
+}
+
+function withNpmShim(shimDirectory: string, buildExitCode: number): NodeJS.ProcessEnv {
+  const pathValue = [
+    shimDirectory,
+    dirname(process.execPath),
+    process.env.Path ?? process.env.PATH ?? "",
+  ].join(";");
+  return { Path: pathValue, PATH: pathValue, NPM_SHIM_BUILD_EXIT: String(buildExitCode) };
 }
 
 async function makeRemoteServer(): Promise<string> {
@@ -247,6 +278,43 @@ describe("deployment scripts", () => {
 
     expect(result.code).not.toBe(0);
     expect(result.output).toMatch(/authenticated health check.*401/i);
+  });
+
+  it("builds the production runtime before starting it", async () => {
+    const directory = await makeTemporaryDirectory();
+    const shimDirectory = await makeTemporaryDirectory();
+    await writeNpmShim(shimDirectory);
+    const config = await writeConfig(directory, { workspace: directory, remoteEnabled: false });
+
+    const result = await runPowerShell(
+      startProductionScript,
+      ["-Config", config],
+      withNpmShim(shimDirectory, 0),
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.output).toMatch(/build: pass \(local-review-mcp /i);
+    await expect(readFile(join(shimDirectory, "npm-log.txt"), "utf8"))
+      .resolves.toMatch(/^run build\r?\nstart\r?\n$/);
+  });
+
+  it("does not start the runtime when the production build fails", async () => {
+    const directory = await makeTemporaryDirectory();
+    const shimDirectory = await makeTemporaryDirectory();
+    await writeNpmShim(shimDirectory);
+    const config = await writeConfig(directory, { workspace: directory, remoteEnabled: false });
+
+    const result = await runPowerShell(
+      startProductionScript,
+      ["-Config", config],
+      withNpmShim(shimDirectory, 1),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.output).toMatch(/production build failed/i);
+    expect(result.output).not.toMatch(/starting local review mcp/i);
+    await expect(readFile(join(shimDirectory, "npm-log.txt"), "utf8"))
+      .resolves.toMatch(/^run build\r?\n$/);
   });
 
   it("verifies health, MCP initialize, and the nine read-only tools", async () => {

@@ -72,20 +72,28 @@ try {
         exit $preflightExitCode
     }
 
-    Write-Host "Starting Local Review MCP..."
-    if ($configDocument.supervisor.enabled -eq $true) {
-        Write-Host "Supervisor: enabled (started by the Local Review MCP runtime)"
-    } else {
-        Write-Host "Supervisor: disabled"
-    }
-    if ($remoteEnabled) {
-        Write-Host "Cloudflare Tunnel mode: $tunnelMode"
-    } else {
-        Write-Host "Cloudflare Tunnel: disabled"
-    }
-
+    $packageVersion = (Get-Content -LiteralPath (Join-Path $projectRoot "package.json") -Raw | ConvertFrom-Json -ErrorAction Stop).version
     Push-Location $projectRoot
     try {
+        & npm run build
+        $buildExitCode = $LASTEXITCODE
+        if ($buildExitCode -ne 0) {
+            throw "Production build failed with exit code $buildExitCode; the runtime was not started."
+        }
+        Write-Host "Build: PASS (local-review-mcp $packageVersion)"
+
+        Write-Host "Starting Local Review MCP..."
+        if ($configDocument.supervisor.enabled -eq $true) {
+            Write-Host "Supervisor: enabled (started by the Local Review MCP runtime)"
+        } else {
+            Write-Host "Supervisor: disabled"
+        }
+        if ($remoteEnabled) {
+            Write-Host "Cloudflare Tunnel mode: $tunnelMode"
+        } else {
+            Write-Host "Cloudflare Tunnel: disabled"
+        }
+
         & npm start -- --config $configPath
         $exitCode = $LASTEXITCODE
     } finally {

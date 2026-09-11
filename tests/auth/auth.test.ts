@@ -1,14 +1,18 @@
 import { createHash } from "node:crypto";
 import { discoverOAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest, type IncomingHttpHeaders, type Server } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAppContext, startApp } from "../../src/app.js";
 import { OAuthService } from "../../src/auth/oauth.js";
 import { OAuthTokenStore } from "../../src/auth/token.js";
-import { workspaceOAuthStatePaths } from "../../src/control-plane/chatgpt-connector.js";
+import {
+  legacyChatgptConnectorStateFile,
+  workspaceOAuthStatePaths,
+} from "../../src/control-plane/chatgpt-connector.js";
+import { defaultTaskContextStorageRoot } from "../../src/context/task.js";
 
 const runningServers: Server[] = [];
 const temporaryDirectories: string[] = [];
@@ -138,6 +142,11 @@ async function requestText(
 
 function pkceChallenge(verifier: string): string {
   return createHash("sha256").update(verifier, "utf8").digest("base64url");
+}
+
+async function writeJsonFile(path: string, value: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
 async function authorizeAndExchange(
@@ -282,6 +291,88 @@ describe("MCP OAuth compatibility", () => {
     await expect(readFile(paths.tokenStorePath, "utf8")).resolves.toContain('"kind": "refresh"');
     await expect(readFile(join(context.storageRoot!, "oauth", "clients.json"), "utf8"))
       .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps a migrated legacy client_id usable across a runtime restart", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-legacy-oauth-workspace-"));
+    const stateBase = await mkdtemp(join(tmpdir(), "local-review-mcp-legacy-oauth-state-"));
+    temporaryDirectories.push(workspace, stateBase);
+    const identity = { id: "workspace-legacy", name: "Workspace Legacy", path: workspace };
+    const appSettings = {
+      host: "127.0.0.1" as const,
+      port: 0,
+      workspace,
+      workspaceIdentity: identity,
+      workspaces: [identity],
+      auth: { token: TOKEN },
+      remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
+    };
+    const environment = { ...process.env, LOCALAPPDATA: stateBase, XDG_STATE_HOME: stateBase };
+    const storageRoot = defaultTaskContextStorageRoot(environment);
+    const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
+    const legacyClientId = "legacy-client-id";
+    // The pre-migration runtime persisted clients and kept tokens in memory, so no tokens.json exists.
+    await writeJsonFile(join(storageRoot, "oauth", "clients.json"), {
+      version: 1,
+      clients: [{
+        client_id: legacyClientId,
+        client_name: "Local MCP Connector",
+        redirect_uris: [redirectUri],
+        grant_types: ["authorization_code"],
+        token_endpoint_auth_method: "none",
+        response_types: ["code"],
+        created_at: 1,
+      }],
+    });
+    await writeJsonFile(legacyChatgptConnectorStateFile(storageRoot), {
+      schema_version: 1,
+      bindings: [{
+        workspace_id: identity.id,
+        connector_name: "Local MCP Connector",
+        verified_mcp_url: "https://legacy.example/mcp",
+        pending_mcp_url: null,
+        status: "verified",
+        last_verified_at: "2026-09-10T03:00:00.000Z",
+      }],
+    });
+
+    const portOf = (server: Server): number => {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("test server has no port");
+      return address.port;
+    };
+    const authorize = (port: number) => requestText(
+      port,
+      `/oauth/authorize?${new URLSearchParams({
+        client_id: legacyClientId,
+        redirect_uri: redirectUri,
+        response_type: "code",
+        code_challenge: pkceChallenge("v".repeat(43)),
+        code_challenge_method: "S256",
+        resource: `http://127.0.0.1:${port}/mcp`,
+      }).toString()}`,
+      "GET",
+    );
+
+    const firstServer = await startApp(appSettings, createAppContext(appSettings, environment));
+    runningServers.push(firstServer);
+    const firstAuthorize = await authorize(portOf(firstServer));
+    expect(firstAuthorize.text).not.toContain("invalid_client");
+    expect(firstAuthorize.status).toBe(302);
+    await authorizeAndExchange(portOf(firstServer), legacyClientId, redirectUri);
+    await stopServer(firstServer);
+
+    const paths = workspaceOAuthStatePaths(identity.id, storageRoot);
+    await expect(readFile(paths.clientRegistryPath, "utf8")).resolves.toContain(legacyClientId);
+
+    const restarted = await startApp(appSettings, createAppContext(appSettings, environment));
+    runningServers.push(restarted);
+    const restartedAuthorize = await authorize(portOf(restarted));
+    expect(restartedAuthorize.text).not.toContain("invalid_client");
+    expect(restartedAuthorize.status).toBe(302);
+    expect(new URL(restartedAuthorize.headers.location ?? redirectUri).searchParams.get("code")).toBeTruthy();
+    await authorizeAndExchange(portOf(restarted), legacyClientId, redirectUri);
   });
 
   it("stores only hash-backed tokens and handles expiry and deletion", () => {
