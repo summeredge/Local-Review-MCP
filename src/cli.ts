@@ -61,7 +61,12 @@ try {
     try {
       const args = parseConnectorConfirmArgs(argv.slice(1));
       const settings = await loadSettings(args.settingsArgs);
-      const binding = await confirmChatGPTConnector(settings, args.requestId);
+      const binding = await confirmChatGPTConnector(
+        settings,
+        args.requestId,
+        undefined,
+        args.connectorName,
+      );
       console.log(JSON.stringify({ ok: true, connector: binding }, null, 2));
     } catch (error: unknown) {
       connectorCommandError(error);

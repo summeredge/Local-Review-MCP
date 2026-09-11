@@ -25,6 +25,12 @@ Connector 管理属于 Control Plane，不得注册成 MCP tool。每次连接�
 
    `npm run confirm:chatgpt-connector -- --config <config> --request-id <workspace_info.request_id>`
 
+   若 diagnostic 显示 `action=create`，但 ChatGPT 中已存在并通过第 7 步 `workspace_info` 验证的 connector（例如 `Local MCP Connector`），不要创建第二个 connector：`action=create` 只表示本地 binding 还没有已验证的 endpoint，不代表 ChatGPT 平台侧不存在 connector。此时用 fresh `workspace_info` request_id 显式带上该 connector 的实际名称，把现有 connector 采纳进本地 binding：
+
+   `npm run confirm:chatgpt-connector -- --config <config> --request-id <workspace_info.request_id> --connector-name "Local MCP Connector"`
+
+   `--connector-name` 必须与 ChatGPT 中实际使用的 connector 名称完全一致，并且仍然要在全部门禁（request_id 未消费、`tool_name=workspace_info`、OAuth、workspace 与 MCP resource 匹配、evidence 10 分钟内）通过之后才会被采纳。它只是操作者提供的 adoption metadata，`workspace_info` 证明不了 ChatGPT UI 的显示名称，所以只用它恢复 `unconfigured`/`repair_required` binding：binding 已是 `verified` 且名称不同时 fail closed，不做通用改名，也不改名 ChatGPT 平台侧 connector。
+
 9. 再运行 diagnostic；只有 `ok=true`、`status=verified`、`action=none` 才继续原任务或 E2E。
 
 普通 timeout、页面仍在加载时继续检查，不立即转人工。仅在 ChatGPT login、2FA、CAPTCHA，或自动化无法处理的明确授权/确认页暂停：

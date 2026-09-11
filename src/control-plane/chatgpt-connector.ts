@@ -142,6 +142,18 @@ export function connectorNameFor(options: {
   return `${DEFAULT_CONNECTOR_PREFIX} · ${sanitizeConnectorLabel(options.workspaceName, options.workspaceId)}`;
 }
 
+/**
+ * An adopted name is operator-supplied metadata: `workspace_info` evidence proves the workspace and
+ * MCP resource, never the ChatGPT UI display name. It is validated against the binding schema rule
+ * (1..200 after trimming) and never silently truncated.
+ */
+function normalizeConnectorName(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === "") throw new Error("Connector name must not be blank");
+  if (trimmed.length > 200) throw new Error("Connector name must be at most 200 characters");
+  return trimmed;
+}
+
 export function legacyChatgptConnectorStateFile(storageRoot = defaultTaskContextStorageRoot()): string {
   return join(resolve(storageRoot), "control-plane", "chatgpt-connectors.json");
 }
@@ -234,9 +246,11 @@ export class ChatGPTConnectorStore {
     requestId: string,
     currentMcpUrl: string,
     now = Date.now(),
+    connectorName?: string,
   ): Promise<ChatGPTConnectorBinding> {
     return this.exclusive(async () => {
       const safeRequestId = connectorRequestIdSchema.parse(requestId);
+      const requestedName = connectorName === undefined ? null : normalizeConnectorName(connectorName);
       const state = await this.readState();
       const previous = state.binding;
       if (previous === null) throw new Error("ChatGPT connector binding is not configured");
@@ -264,8 +278,18 @@ export class ChatGPTConnectorStore {
       if (!pendingMatches && !verifiedMatches) {
         throw new Error("Current MCP URL does not match the pending connector binding");
       }
+      // Adoption stays behind the evidence gate above and only ever fills a binding that still has
+      // to be verified; an existing verified binding must not be renamed through this path.
+      let adoptedName = previous.connector_name;
+      if (requestedName !== null && requestedName !== previous.connector_name) {
+        if (previous.status === "verified") {
+          throw new Error("Verified ChatGPT connector binding cannot be renamed");
+        }
+        adoptedName = requestedName;
+      }
       const binding: ChatGPTConnectorBinding = {
         ...previous,
+        connector_name: adoptedName,
         verified_mcp_url: normalizedCurrent,
         pending_mcp_url: null,
         status: "verified",
@@ -844,26 +868,31 @@ export async function confirmChatGPTConnector(
   settings: ResolvedSettings,
   requestId: string,
   storageRoot?: string,
+  connectorName?: string,
 ): Promise<ChatGPTConnectorBinding> {
   const workspace = activeWorkspace(settings);
   const currentMcpUrl = settings.remote.enabled
     ? mcpUrlFromPublic(settings.remote.endpoint)
     : null;
   if (currentMcpUrl === null) throw new Error("Current remote MCP URL is unavailable");
-  return new ChatGPTConnectorStore(workspace.id, storageRoot).confirm(requestId, currentMcpUrl);
+  return new ChatGPTConnectorStore(workspace.id, storageRoot)
+    .confirm(requestId, currentMcpUrl, Date.now(), connectorName);
 }
 
 export function parseConnectorConfirmArgs(argv: readonly string[]): {
   readonly settingsArgs: string[];
   readonly requestId: string;
+  readonly connectorName?: string;
 } {
   const settingsArgs: string[] = [];
   let requestId: string | undefined;
+  let connectorName: string | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     const value = argv[index + 1];
     if (value === undefined || value.startsWith("--")) throw new Error(`${argument} requires a value`);
     if (argument === "--request-id") requestId = value;
+    else if (argument === "--connector-name") connectorName = value;
     else if (["--config", "--port", "--workspace", "--token"].includes(argument)) {
       settingsArgs.push(argument, value);
     } else {
@@ -874,5 +903,9 @@ export function parseConnectorConfirmArgs(argv: readonly string[]): {
   if (!requestId) throw new Error("--request-id is required");
   const parsedRequestId = connectorRequestIdSchema.safeParse(requestId);
   if (!parsedRequestId.success) throw new Error("--request-id is invalid");
-  return { settingsArgs, requestId: parsedRequestId.data };
+  return {
+    settingsArgs,
+    requestId: parsedRequestId.data,
+    connectorName: connectorName === undefined ? undefined : normalizeConnectorName(connectorName),
+  };
 }

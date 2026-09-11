@@ -409,6 +409,166 @@ describe("workspace_info verification evidence", () => {
   });
 });
 
+describe("connector binding adoption", () => {
+  it("adopts an existing connector name once the evidence gate passes", async () => {
+    const root = await temporaryRoot();
+    const store = new ChatGPTConnectorStore("workspace-1", root);
+    await prepare(store);
+    await evidence(store, "request-adopt");
+    await expect(store.confirm("request-adopt", CURRENT_URL, NOW, "  Local MCP Connector  "))
+      .resolves.toMatchObject({
+        connector_name: "Local MCP Connector",
+        status: "verified",
+        verified_mcp_url: CURRENT_URL,
+        pending_mcp_url: null,
+        last_verified_at: new Date(NOW).toISOString(),
+      });
+    await expect(new ChatGPTConnectorStore("workspace-1", root).read()).resolves.toMatchObject({
+      connector_name: "Local MCP Connector",
+      status: "verified",
+    });
+    await expect(store.confirm("request-adopt", CURRENT_URL, NOW, "Local MCP Connector"))
+      .rejects.toThrow("already consumed");
+
+    await evidence(store, "request-cli", { completed_at: new Date().toISOString() });
+    await expect(confirmChatGPTConnector(settings(), "request-cli", root, "Local MCP Connector"))
+      .resolves.toMatchObject({ connector_name: "Local MCP Connector", status: "verified" });
+  });
+
+  it("adopts a name while repairing a changed endpoint", async () => {
+    const root = await temporaryRoot();
+    const store = new ChatGPTConnectorStore("workspace-1", root);
+    await prepare(store);
+    await evidence(store, "request-first");
+    await store.confirm("request-first", CURRENT_URL, NOW);
+
+    await prepare(store, "https://new.example/mcp");
+    await expect(store.read()).resolves.toMatchObject({ status: "repair_required" });
+    await evidence(store, "request-repair", { mcp_resource: "https://new.example/mcp" });
+    await expect(store.confirm("request-repair", "https://new.example/mcp", NOW, "Local MCP Connector"))
+      .resolves.toMatchObject({
+        connector_name: "Local MCP Connector",
+        status: "verified",
+        verified_mcp_url: "https://new.example/mcp",
+        pending_mcp_url: null,
+      });
+  });
+
+  it("keeps the generated name when no connector name is supplied", async () => {
+    const root = await temporaryRoot();
+    const store = new ChatGPTConnectorStore("workspace-1", root);
+    await prepare(store);
+    await evidence(store, "request-compat");
+    await expect(store.confirm("request-compat", CURRENT_URL, NOW)).resolves.toMatchObject({
+      connector_name: "Local Review MCP · Workspace One",
+      status: "verified",
+    });
+  });
+
+  it("never adopts a name when the evidence gate fails", async () => {
+    const root = await temporaryRoot();
+    const store = new ChatGPTConnectorStore("workspace-1", root);
+    await prepare(store);
+
+    await expect(store.confirm("missing", CURRENT_URL, NOW, "Local MCP Connector"))
+      .rejects.toThrow("not found");
+    const cases = [
+      ["ordinary", { tool_name: "read_file" }, "not for workspace_info"],
+      ["failed", { success: false }, "not successful"],
+      ["old", { mcp_resource: "https://old.example/mcp" }, "current MCP resource"],
+      ["expired", {
+        completed_at: new Date(NOW - CONNECTOR_EVIDENCE_TTL_MS - 1).toISOString(),
+      }, "expired"],
+      ["static", { authentication: "static" as const }, "not OAuth-authenticated"],
+    ] as const;
+    for (const [requestId, patch, message] of cases) {
+      await evidence(store, requestId, patch);
+      await expect(store.confirm(requestId, CURRENT_URL, NOW, "Local MCP Connector"))
+        .rejects.toThrow(message);
+    }
+    await evidence(store, "wrong-endpoint");
+    await expect(store.confirm("wrong-endpoint", "https://other.example/mcp", NOW, "Local MCP Connector"))
+      .rejects.toThrow("does not match the current MCP resource");
+    await evidence(store, "other-endpoint", { mcp_resource: "https://other.example/mcp" });
+    await expect(store.confirm("other-endpoint", "https://other.example/mcp", NOW, "Local MCP Connector"))
+      .rejects.toThrow("pending connector binding");
+    await expect(evidence(store, "other-workspace", { workspace_id: "workspace-2" }))
+      .rejects.toThrow("another workspace");
+
+    await expect(new ChatGPTConnectorStore("workspace-1", root).read()).resolves.toMatchObject({
+      connector_name: "Local Review MCP · Workspace One",
+      status: "unconfigured",
+      pending_mcp_url: CURRENT_URL,
+    });
+    // A rejected attempt must not consume evidence either.
+    await expect(store.confirm("wrong-endpoint", CURRENT_URL, NOW, "Local MCP Connector"))
+      .resolves.toMatchObject({ connector_name: "Local MCP Connector", status: "verified" });
+  });
+
+  it("refuses to rename a binding that is already verified", async () => {
+    const root = await temporaryRoot();
+    const store = new ChatGPTConnectorStore("workspace-1", root);
+    await prepare(store);
+    await evidence(store, "request-first");
+    await store.confirm("request-first", CURRENT_URL, NOW);
+    await evidence(store, "request-second");
+
+    await expect(store.confirm("request-second", CURRENT_URL, NOW, "Local MCP Connector"))
+      .rejects.toThrow("cannot be renamed");
+    await expect(store.read()).resolves.toMatchObject({
+      connector_name: "Local Review MCP · Workspace One",
+      status: "verified",
+    });
+    await expect(store.confirm("request-second", CURRENT_URL, NOW + 1)).resolves.toMatchObject({
+      connector_name: "Local Review MCP · Workspace One",
+    });
+  });
+
+  it("treats an identical name on a verified binding as idempotent", async () => {
+    const root = await temporaryRoot();
+    const store = new ChatGPTConnectorStore("workspace-1", root);
+    await prepare(store);
+    await evidence(store, "request-same");
+    await expect(store.confirm("request-same", CURRENT_URL, NOW, "Local Review MCP · Workspace One"))
+      .resolves.toMatchObject({
+        connector_name: "Local Review MCP · Workspace One",
+        status: "verified",
+      });
+  });
+
+  it("validates --connector-name without changing the existing CLI shape", () => {
+    expect(parseConnectorConfirmArgs([
+      "--config", "settings.json",
+      "--request-id", "request-current",
+      "--connector-name", "Local MCP Connector",
+    ])).toEqual({
+      settingsArgs: ["--config", "settings.json"],
+      requestId: "request-current",
+      connectorName: "Local MCP Connector",
+    });
+    expect(parseConnectorConfirmArgs([
+      "--config", "settings.json",
+      "--request-id", "request-current",
+    ])).toEqual({ settingsArgs: ["--config", "settings.json"], requestId: "request-current" });
+    expect(() => parseConnectorConfirmArgs([
+      "--request-id", "request-current",
+      "--connector-name", "",
+    ])).toThrow("blank");
+    expect(() => parseConnectorConfirmArgs([
+      "--request-id", "request-current",
+      "--connector-name", "   ",
+    ])).toThrow("blank");
+    expect(() => parseConnectorConfirmArgs([
+      "--request-id", "request-current",
+      "--connector-name", "x".repeat(201),
+    ])).toThrow("200 characters");
+    expect(() => parseConnectorConfirmArgs([
+      "--request-id", "request-current",
+      "--connector-name",
+    ])).toThrow("requires a value");
+  });
+});
+
 describe("legacy migration", () => {
   it("copies one exact legacy connector binding without deleting the legacy file", async () => {
     const root = await temporaryRoot();
