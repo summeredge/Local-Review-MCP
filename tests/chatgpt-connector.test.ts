@@ -929,10 +929,11 @@ describe("diagnose-chatgpt-connector", () => {
     await expect(diagnoseChatGPTConnector(settings(), {
       storageRoot: root,
       fetch: vi.fn(async () => new Response(null, { status: 503 })) as typeof fetch,
+      sleep: async () => undefined,
     })).resolves.toMatchObject({
       ok: false,
       remote: { ready: false },
-      connector: { action: "none" },
+      connector: { action: "none", reason: "remote_startup_timeout" },
     });
     await expect(diagnoseChatGPTConnector(settings(), {
       storageRoot: root,
@@ -1062,5 +1063,135 @@ describe("diagnose-chatgpt-connector", () => {
         oauth: { ready: false, refresh_token: false },
         connector: { action: "none", reason: "oauth_refresh_token_not_supported" },
       });
+  });
+
+  it("retries a cold-start tunnel and passes when the endpoint becomes ready", async () => {
+    const root = await temporaryRoot();
+    const healthy = healthyOAuthFetch();
+    let mcpAttempts = 0;
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST" && mcpAttempts++ === 0) {
+        return new Response(null, { status: 503 });
+      }
+      return healthy(input, init);
+    }) as typeof fetch;
+
+    await expect(diagnoseChatGPTConnector(settings(), {
+      storageRoot: root,
+      fetch: fetchImpl,
+      sleep: async () => undefined,
+    })).resolves.toMatchObject({
+      ok: true,
+      remote: {
+        ready: true,
+        readiness: { attempts: 2, final_state: "ready" },
+      },
+      oauth: { ready: true },
+    });
+  });
+
+  it("reports a bounded connection failure when the remote never connects", async () => {
+    const root = await temporaryRoot();
+    const fetchImpl = vi.fn(async () => {
+      throw new TypeError("fetch failed");
+    }) as typeof fetch;
+
+    await expect(diagnoseChatGPTConnector(settings(), {
+      storageRoot: root,
+      fetch: fetchImpl,
+      sleep: async () => undefined,
+    })).resolves.toMatchObject({
+      ok: false,
+      remote: {
+        ready: false,
+        readiness: { attempts: 10, final_state: "connection_failed" },
+      },
+      connector: { reason: "remote_connection_failed" },
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(10);
+  });
+
+  it("accepts a 401 OAuth challenge as remote readiness", async () => {
+    const root = await temporaryRoot();
+    await expect(diagnoseChatGPTConnector(settings(), {
+      storageRoot: root,
+      fetch: healthyOAuthFetch(),
+      sleep: async () => undefined,
+    })).resolves.toMatchObject({
+      ok: true,
+      remote: {
+        ready: true,
+        readiness: { attempts: 1, final_state: "ready" },
+      },
+      oauth: { ready: true },
+    });
+  });
+
+  it("reports a precise startup timeout for a permanently unavailable tunnel", async () => {
+    const root = await temporaryRoot();
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 503 })) as typeof fetch;
+
+    await expect(diagnoseChatGPTConnector(settings(), {
+      storageRoot: root,
+      fetch: fetchImpl,
+      sleep: async () => undefined,
+    })).resolves.toMatchObject({
+      ok: false,
+      remote: {
+        ready: false,
+        readiness: { attempts: 10, final_state: "tunnel_not_ready" },
+      },
+      connector: { reason: "remote_startup_timeout" },
+    });
+  });
+
+  it("distinguishes unavailable OAuth resource metadata from tunnel startup", async () => {
+    const root = await temporaryRoot();
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (init?.method === "POST") {
+        return new Response(null, {
+          status: 401,
+          headers: {
+            "www-authenticate":
+              "Bearer resource_metadata=\"https://host.example/.well-known/oauth-protected-resource/mcp\"",
+          },
+        });
+      }
+      if (url.includes("oauth-protected-resource")) return new Response(null, { status: 503 });
+      return new Response(null, { status: 404 });
+    }) as typeof fetch;
+
+    await expect(diagnoseChatGPTConnector(settings(), {
+      storageRoot: root,
+      fetch: fetchImpl,
+      sleep: async () => undefined,
+    })).resolves.toMatchObject({
+      ok: false,
+      remote: {
+        ready: true,
+        readiness: { attempts: 10, final_state: "oauth_resource_unavailable" },
+      },
+      connector: { reason: "oauth_resource_unavailable" },
+    });
+  });
+
+  it("reports an unexpected MCP HTTP response without retrying it", async () => {
+    const root = await temporaryRoot();
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 404 })) as typeof fetch;
+
+    await expect(diagnoseChatGPTConnector(settings(), {
+      storageRoot: root,
+      fetch: fetchImpl,
+      sleep: async () => undefined,
+    })).resolves.toMatchObject({
+      ok: false,
+      remote: {
+        ready: false,
+        readiness: { attempts: 1, final_state: "mcp_endpoint_unreachable" },
+      },
+      connector: { reason: "mcp_endpoint_unreachable" },
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });

@@ -17,6 +17,40 @@ export const CONNECTOR_STATE_SCHEMA_VERSION = 1 as const;
 export const DEFAULT_CONNECTOR_PREFIX = "Local Review MCP";
 export const CONNECTOR_EVIDENCE_TTL_MS = 10 * 60 * 1000;
 const MAX_CONNECTOR_EVIDENCE = 100;
+const REMOTE_READINESS_TIMEOUT_MS = 45_000;
+const REMOTE_READINESS_REQUEST_TIMEOUT_MS = 8_000;
+const REMOTE_READINESS_RETRY_DELAYS_MS = [
+  250,
+  500,
+  1_000,
+  2_000,
+  4_000,
+  8_000,
+  8_000,
+  8_000,
+  8_000,
+] as const;
+
+type RemoteProbeState =
+  | "not_checked"
+  | "tunnel_not_ready"
+  | "connection_failed"
+  | "oauth_resource_unavailable"
+  | "mcp_endpoint_unreachable"
+  | "ready";
+
+interface RemoteProbeTimelineEntry {
+  readonly attempt: number;
+  readonly elapsed_ms: number;
+  readonly state: RemoteProbeState;
+  readonly http_status: number | null;
+}
+
+interface RemoteProbeSummary {
+  attempts: number;
+  timeline: RemoteProbeTimelineEntry[];
+  final_state: RemoteProbeState;
+}
 
 export type ConnectorAction = "none" | "create" | "update";
 export type ConnectorStatus = "unconfigured" | "repair_required" | "verified";
@@ -638,6 +672,7 @@ export interface ChatGPTConnectorDiagnostic {
   remote: {
     ready: boolean;
     mcp_url: string | null;
+    readiness: RemoteProbeSummary;
   };
   oauth: {
     ready: boolean;
@@ -724,6 +759,262 @@ function oauthCapabilityFailure(metadata: Record<string, unknown>): string | nul
   return null;
 }
 
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error
+    && (error.name === "AbortError"
+      || error.name === "TimeoutError"
+      || (error as NodeJS.ErrnoException).code === "ABORT_ERR");
+}
+
+function isRetryableRemoteStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504;
+}
+
+function positiveSafeInteger(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return value;
+}
+
+interface ReadinessFetchResult {
+  readonly response: Response | null;
+  readonly timed_out: boolean;
+}
+
+async function fetchForReadiness(
+  fetchImpl: typeof fetch,
+  input: string | URL,
+  init: RequestInit | undefined,
+  deadline: number,
+  requestTimeoutMs: number,
+  now: () => number,
+): Promise<ReadinessFetchResult> {
+  const remaining = deadline - now();
+  if (remaining <= 0) return { response: null, timed_out: true };
+  const timeoutMs = Math.max(1, Math.min(requestTimeoutMs, remaining));
+  try {
+    const response = await fetchImpl(input, {
+      ...init,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return now() >= deadline
+      ? { response: null, timed_out: true }
+      : { response, timed_out: false };
+  } catch (error: unknown) {
+    return { response: null, timed_out: isTimeoutError(error) || now() >= deadline };
+  }
+}
+
+interface RemoteProbeAttempt {
+  readonly kind: "ready" | "retry" | "failure";
+  readonly state: RemoteProbeState;
+  readonly reason: string;
+  readonly http_status: number | null;
+}
+
+async function probeRemoteReadiness(
+  result: ChatGPTConnectorDiagnostic,
+  currentMcpUrl: string,
+  fetchImpl: typeof fetch,
+  deadline: number,
+  requestTimeoutMs: number,
+  now: () => number,
+): Promise<RemoteProbeAttempt> {
+  const mcp = await fetchForReadiness(
+    fetchImpl,
+    currentMcpUrl,
+    {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    },
+    deadline,
+    requestTimeoutMs,
+    now,
+  );
+  if (mcp.response === null) {
+    return mcp.timed_out
+      ? {
+          kind: "retry",
+          state: "tunnel_not_ready",
+          reason: "remote_startup_timeout",
+          http_status: null,
+        }
+      : {
+          kind: "retry",
+          state: "connection_failed",
+          reason: "remote_connection_failed",
+          http_status: null,
+        };
+  }
+  if (mcp.response.status !== 401) {
+    return isRetryableRemoteStatus(mcp.response.status)
+      ? {
+          kind: "retry",
+          state: "tunnel_not_ready",
+          reason: "remote_startup_timeout",
+          http_status: mcp.response.status,
+        }
+      : {
+          kind: "failure",
+          state: "mcp_endpoint_unreachable",
+          reason: "mcp_endpoint_unreachable",
+          http_status: mcp.response.status,
+        };
+  }
+
+  result.remote.ready = true;
+  const protectedUrl = metadataUrl(mcp.response.headers.get("www-authenticate"), currentMcpUrl);
+  if (protectedUrl === null) {
+    return {
+      kind: "failure",
+      state: "oauth_resource_unavailable",
+      reason: "oauth_protected_resource_metadata_missing",
+      http_status: 401,
+    };
+  }
+  const protectedResponse = await fetchForReadiness(
+    fetchImpl,
+    protectedUrl,
+    undefined,
+    deadline,
+    requestTimeoutMs,
+    now,
+  );
+  if (protectedResponse.response === null) {
+    return {
+      kind: "retry",
+      state: "oauth_resource_unavailable",
+      reason: "oauth_resource_unavailable",
+      http_status: null,
+    };
+  }
+  if (!protectedResponse.response.ok) {
+    if (isRetryableRemoteStatus(protectedResponse.response.status)) {
+      return {
+        kind: "retry",
+        state: "oauth_resource_unavailable",
+        reason: "oauth_resource_unavailable",
+        http_status: protectedResponse.response.status,
+      };
+    }
+    return {
+      kind: "failure",
+      state: "oauth_resource_unavailable",
+      reason: "oauth_protected_resource_metadata_unavailable",
+      http_status: protectedResponse.response.status,
+    };
+  }
+  let protectedMetadata: Record<string, unknown> | null;
+  try {
+    protectedMetadata = record(await protectedResponse.response.json());
+  } catch {
+    protectedMetadata = null;
+  }
+  if (protectedMetadata === null || !validHttpUrl(protectedMetadata.resource)) {
+    return {
+      kind: "failure",
+      state: "oauth_resource_unavailable",
+      reason: "oauth_protected_resource_metadata_invalid",
+      http_status: protectedResponse.response.status,
+    };
+  }
+  if (normalizePublicUrl(protectedMetadata.resource) !== normalizePublicUrl(currentMcpUrl)) {
+    return {
+      kind: "failure",
+      state: "oauth_resource_unavailable",
+      reason: "oauth_resource_mismatch",
+      http_status: protectedResponse.response.status,
+    };
+  }
+  const authorizationServer = stringList(protectedMetadata.authorization_servers)[0];
+  if (!validHttpUrl(authorizationServer)) {
+    return {
+      kind: "failure",
+      state: "oauth_resource_unavailable",
+      reason: "oauth_authorization_server_metadata_missing",
+      http_status: protectedResponse.response.status,
+    };
+  }
+  const authorizationMetadataUrl = new URL(
+    "/.well-known/oauth-authorization-server",
+    authorizationServer,
+  );
+  const authorizationResponse = await fetchForReadiness(
+    fetchImpl,
+    authorizationMetadataUrl,
+    undefined,
+    deadline,
+    requestTimeoutMs,
+    now,
+  );
+  if (authorizationResponse.response === null) {
+    return {
+      kind: "retry",
+      state: "oauth_resource_unavailable",
+      reason: "oauth_resource_unavailable",
+      http_status: null,
+    };
+  }
+  if (!authorizationResponse.response.ok) {
+    if (isRetryableRemoteStatus(authorizationResponse.response.status)) {
+      return {
+        kind: "retry",
+        state: "oauth_resource_unavailable",
+        reason: "oauth_resource_unavailable",
+        http_status: authorizationResponse.response.status,
+      };
+    }
+    return {
+      kind: "failure",
+      state: "oauth_resource_unavailable",
+      reason: "oauth_authorization_server_metadata_unavailable",
+      http_status: authorizationResponse.response.status,
+    };
+  }
+  let authorizationMetadata: Record<string, unknown> | null;
+  try {
+    authorizationMetadata = record(await authorizationResponse.response.json());
+  } catch {
+    authorizationMetadata = null;
+  }
+  if (authorizationMetadata === null) {
+    return {
+      kind: "failure",
+      state: "oauth_resource_unavailable",
+      reason: "oauth_authorization_server_metadata_invalid",
+      http_status: authorizationResponse.response.status,
+    };
+  }
+  result.oauth.pkce_s256 = stringList(
+    authorizationMetadata.code_challenge_methods_supported,
+  ).includes("S256");
+  result.oauth.dynamic_registration = validHttpUrl(authorizationMetadata.registration_endpoint);
+  result.oauth.refresh_token = stringList(
+    authorizationMetadata.grant_types_supported,
+  ).includes("refresh_token");
+  // `/health` only proves network reachability; OAuth readiness needs the full metadata document.
+  const capabilityFailure = oauthCapabilityFailure(authorizationMetadata);
+  result.oauth.ready = capabilityFailure === null;
+  if (capabilityFailure !== null) {
+    return {
+      kind: "failure",
+      state: "ready",
+      reason: capabilityFailure,
+      http_status: authorizationResponse.response.status,
+    };
+  }
+  return { kind: "ready", state: "ready", reason: "", http_status: 401 };
+}
+
 function resultBase(
   workspace: { id: string; name: string },
   binding: ChatGPTConnectorBinding | null,
@@ -734,7 +1025,11 @@ function resultBase(
     ok: false,
     workspace_id: workspace.id,
     workspace_name: workspace.name,
-    remote: { ready: false, mcp_url: currentMcpUrl },
+    remote: {
+      ready: false,
+      mcp_url: currentMcpUrl,
+      readiness: { attempts: 0, timeline: [], final_state: "not_checked" },
+    },
     oauth: {
       ready: false,
       pkce_s256: false,
@@ -753,7 +1048,7 @@ function resultBase(
       action: "none",
       mcp_url: currentMcpUrl,
       verified_mcp_url: binding?.verified_mcp_url ?? null,
-      reason: "remote_mcp_unavailable",
+      reason: currentMcpUrl === null ? "remote_not_configured" : "mcp_endpoint_unreachable",
     },
     pages: {
       plugins: CHATGPT_PLUGINS_URL,
@@ -767,6 +1062,10 @@ export async function diagnoseChatGPTConnector(
   dependencies: {
     readonly fetch?: typeof fetch;
     readonly storageRoot?: string;
+    readonly now?: () => number;
+    readonly sleep?: (milliseconds: number) => Promise<void>;
+    readonly remoteReadinessTimeoutMs?: number;
+    readonly remoteRequestTimeoutMs?: number;
   } = {},
 ): Promise<ChatGPTConnectorDiagnostic> {
   const workspace = activeWorkspace(settings);
@@ -785,93 +1084,64 @@ export async function diagnoseChatGPTConnector(
   if (currentMcpUrl === null) return result;
 
   const fetchImpl = dependencies.fetch ?? fetch;
-  try {
-    const response = await fetchImpl(currentMcpUrl, {
-      method: "POST",
-      headers: {
-        accept: "application/json, text/event-stream",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
-      signal: AbortSignal.timeout(8_000),
-    });
-    if (response.status !== 401) return result;
-    result.remote.ready = true;
-
-    const protectedUrl = metadataUrl(response.headers.get("www-authenticate"), currentMcpUrl);
-    if (protectedUrl === null) {
-      result.connector.reason = "oauth_protected_resource_metadata_missing";
-      return result;
-    }
-    const protectedResponse = await fetchImpl(protectedUrl, { signal: AbortSignal.timeout(8_000) });
-    if (!protectedResponse.ok) {
-      result.connector.reason = "oauth_protected_resource_metadata_unavailable";
-      return result;
-    }
-    const protectedMetadata = record(await protectedResponse.json());
-    if (protectedMetadata === null || !validHttpUrl(protectedMetadata.resource)) {
-      result.connector.reason = "oauth_protected_resource_metadata_invalid";
-      return result;
-    }
-    if (normalizePublicUrl(protectedMetadata.resource) !== normalizePublicUrl(currentMcpUrl)) {
-      result.connector.reason = "oauth_resource_mismatch";
-      return result;
-    }
-    const authorizationServer = stringList(protectedMetadata.authorization_servers)[0];
-    if (!validHttpUrl(authorizationServer)) {
-      result.connector.reason = "oauth_authorization_server_metadata_missing";
-      return result;
-    }
-    const authorizationMetadataUrl = new URL(
-      "/.well-known/oauth-authorization-server",
-      authorizationServer,
-    );
-    const authorizationResponse = await fetchImpl(authorizationMetadataUrl, {
-      signal: AbortSignal.timeout(8_000),
-    });
-    if (!authorizationResponse.ok) {
-      result.connector.reason = "oauth_authorization_server_metadata_unavailable";
-      return result;
-    }
-    const authorizationMetadata = record(await authorizationResponse.json());
-    if (authorizationMetadata === null) {
-      result.connector.reason = "oauth_authorization_server_metadata_invalid";
-      return result;
-    }
-    result.oauth.pkce_s256 = stringList(
-      authorizationMetadata.code_challenge_methods_supported,
-    ).includes("S256");
-    result.oauth.dynamic_registration = validHttpUrl(authorizationMetadata.registration_endpoint);
-    result.oauth.refresh_token = stringList(
-      authorizationMetadata.grant_types_supported,
-    ).includes("refresh_token");
-    // `/health` only proves network reachability; OAuth readiness needs the full metadata document.
-    const capabilityFailure = oauthCapabilityFailure(authorizationMetadata);
-    result.oauth.ready = capabilityFailure === null;
-    if (capabilityFailure !== null) {
-      result.connector.reason = capabilityFailure;
-      return result;
-    }
-
-    const prepared = await store.prepare({
-      workspaceName: workspace.name,
+  const now = dependencies.now ?? Date.now;
+  const sleep = dependencies.sleep ?? delay;
+  const readinessTimeoutMs = positiveSafeInteger(
+    dependencies.remoteReadinessTimeoutMs ?? REMOTE_READINESS_TIMEOUT_MS,
+    "remoteReadinessTimeoutMs",
+  );
+  const requestTimeoutMs = positiveSafeInteger(
+    dependencies.remoteRequestTimeoutMs ?? REMOTE_READINESS_REQUEST_TIMEOUT_MS,
+    "remoteRequestTimeoutMs",
+  );
+  const startedAt = now();
+  const deadline = startedAt + readinessTimeoutMs;
+  for (let attempt = 1; ; attempt += 1) {
+    const probe = await probeRemoteReadiness(
+      result,
       currentMcpUrl,
+      fetchImpl,
+      deadline,
+      requestTimeoutMs,
+      now,
+    );
+    result.remote.readiness.attempts = attempt;
+    result.remote.readiness.timeline.push({
+      attempt,
+      elapsed_ms: Math.max(0, now() - startedAt),
+      state: probe.state,
+      http_status: probe.http_status,
     });
-    result.ok = true;
-    result.connector.name = prepared.binding.connector_name;
-    result.connector.status = prepared.binding.status;
-    result.connector.action = prepared.action;
-    result.connector.verified_mcp_url = prepared.binding.verified_mcp_url;
-    result.connector.reason = oauthState.migration === "reauthorization_required"
-      ? "legacy_oauth_reauthorization_required"
-      : prepared.action === "create"
-        ? "first_connection"
-        : prepared.action === "update"
-          ? "endpoint_changed"
-          : "verified_endpoint_matches";
-    return result;
-  } catch {
-    return result;
+    result.remote.readiness.final_state = probe.state;
+    if (probe.kind === "failure") {
+      result.connector.reason = probe.reason;
+      return result;
+    }
+    if (probe.kind === "ready") {
+      const prepared = await store.prepare({
+        workspaceName: workspace.name,
+        currentMcpUrl,
+      });
+      result.ok = true;
+      result.connector.name = prepared.binding.connector_name;
+      result.connector.status = prepared.binding.status;
+      result.connector.action = prepared.action;
+      result.connector.verified_mcp_url = prepared.binding.verified_mcp_url;
+      result.connector.reason = oauthState.migration === "reauthorization_required"
+        ? "legacy_oauth_reauthorization_required"
+        : prepared.action === "create"
+          ? "first_connection"
+          : prepared.action === "update"
+            ? "endpoint_changed"
+            : "verified_endpoint_matches";
+      return result;
+    }
+    const remaining = deadline - now();
+    if (remaining <= 0 || attempt > REMOTE_READINESS_RETRY_DELAYS_MS.length) {
+      result.connector.reason = probe.reason;
+      return result;
+    }
+    await sleep(Math.min(REMOTE_READINESS_RETRY_DELAYS_MS[attempt - 1]!, remaining));
   }
 }
 
