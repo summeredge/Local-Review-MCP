@@ -455,11 +455,24 @@ async function readLegacyOAuthFiles(storageRoot: string): Promise<LegacyOAuthFil
   }
 }
 
-function legacyTokenResources(connector: unknown, workspaceId: string): ReadonlySet<string> | null {
+/**
+ * The pre-upgrade runtime shared one global OAuth registry and one legacy connector state file
+ * across every workspace, so the legacy state only belongs to a workspace when it names that
+ * workspace in exactly one binding. Anything else stays unproven and must not be migrated.
+ */
+function legacyWorkspaceBinding(
+  connector: unknown,
+  workspaceId: string,
+): ChatGPTConnectorBinding | null {
   const connectors = legacyStateSchema.safeParse(connector);
   if (!connectors.success || connectors.data.bindings.length !== 1) return null;
   const binding = connectors.data.bindings[0];
-  if (binding?.workspace_id !== workspaceId) return null;
+  return binding?.workspace_id === workspaceId ? binding : null;
+}
+
+function legacyTokenResources(connector: unknown, workspaceId: string): ReadonlySet<string> | null {
+  const binding = legacyWorkspaceBinding(connector, workspaceId);
+  if (binding === null) return null;
   return new Set(
     [binding.verified_mcp_url, binding.pending_mcp_url]
       .filter((resource): resource is string => resource !== null)
@@ -528,15 +541,17 @@ export async function migrateLegacyOAuthState(options: {
   const parsedLegacyClients = legacy.clients === null
     ? null
     : oauthClientStateSchema.safeParse(legacy.clients);
-  // A single configured workspace owns the global legacy registry; the legacy binding only proves
-  // which MCP resource the legacy tokens were issued for, so it decides token migration alone.
-  const ownedRegistry = options.singleWorkspace;
+  // Importing the global legacy registry needs proven workspace ownership: one configured
+  // workspace whose legacy connector state names it in a single valid binding. A missing, invalid,
+  // foreign, or ambiguous legacy binding never proves ownership.
+  const ownershipProven = options.singleWorkspace
+    && legacyWorkspaceBinding(legacy.connector, options.workspaceId) !== null;
   const tokenResources = legacyTokenResources(legacy.connector, options.workspaceId);
 
   // Client registration migration and token migration stay independent: a missing, empty, or
   // stale legacy token set must never stop the legacy client_id from reaching the scoped registry.
   if (scopedClients === null) {
-    if (!ownedRegistry || parsedLegacyClients === null || !parsedLegacyClients.success) {
+    if (!ownershipProven || parsedLegacyClients === null || !parsedLegacyClients.success) {
       return { ...paths, migration: "reauthorization_required" };
     }
     const clientIds = new Set(parsedLegacyClients.data.clients.map((client) => client.client_id));
@@ -550,7 +565,8 @@ export async function migrateLegacyOAuthState(options: {
     return { ...paths, migration: "migrated" };
   }
 
-  // Idempotent reconcile: only an exactly matching or strictly additive legacy client merges.
+  // Idempotent reconcile: a scoped registry that already holds the exact legacy clients needs
+  // nothing from the legacy global state, so it neither re-imports nor depends on the proof.
   if (parsedLegacyClients === null) return { ...paths, migration: "not_needed" };
   if (!parsedLegacyClients.success) return { ...paths, migration: "reauthorization_required" };
   const scopedById = new Map(
@@ -560,9 +576,8 @@ export async function migrateLegacyOAuthState(options: {
     const scopedClient = scopedById.get(client.client_id);
     return scopedClient === undefined || !sameClientRegistration(scopedClient, client);
   });
-  if (!ownedRegistry) {
-    return { ...paths, migration: unresolved ? "reauthorization_required" : "not_needed" };
-  }
+  if (!unresolved) return { ...paths, migration: "not_needed" };
+  if (!ownershipProven) return { ...paths, migration: "reauthorization_required" };
   const merged = [...scopedClients.clients];
   for (const client of parsedLegacyClients.data.clients) {
     const scopedClient = scopedById.get(client.client_id);
@@ -652,6 +667,28 @@ function validHttpUrl(value: unknown): value is string {
   }
 }
 
+/**
+ * OAuth readiness keeps one reason per missing capability so `diagnose:chatgpt-connector` names the
+ * exact layer that blocks ChatGPT instead of a single merged failure.
+ */
+function oauthCapabilityFailure(metadata: Record<string, unknown>): string | null {
+  if (!validHttpUrl(metadata.issuer)) return "oauth_issuer_invalid";
+  if (!validHttpUrl(metadata.authorization_endpoint)) return "oauth_authorization_endpoint_missing";
+  if (!validHttpUrl(metadata.token_endpoint)) return "oauth_token_endpoint_missing";
+  if (!validHttpUrl(metadata.registration_endpoint)) return "oauth_registration_not_supported";
+  if (!stringList(metadata.response_types_supported).includes("code")
+    || !stringList(metadata.grant_types_supported).includes("authorization_code")) {
+    return "oauth_authorization_code_not_supported";
+  }
+  if (!stringList(metadata.grant_types_supported).includes("refresh_token")) {
+    return "oauth_refresh_token_not_supported";
+  }
+  if (!stringList(metadata.code_challenge_methods_supported).includes("S256")) {
+    return "oauth_pkce_s256_not_supported";
+  }
+  return null;
+}
+
 function resultBase(
   workspace: { id: string; name: string },
   binding: ChatGPTConnectorBinding | null,
@@ -737,10 +774,12 @@ export async function diagnoseChatGPTConnector(
       return result;
     }
     const protectedMetadata = record(await protectedResponse.json());
-    if (protectedMetadata === null
-      || !validHttpUrl(protectedMetadata.resource)
-      || normalizePublicUrl(protectedMetadata.resource) !== normalizePublicUrl(currentMcpUrl)) {
+    if (protectedMetadata === null || !validHttpUrl(protectedMetadata.resource)) {
       result.connector.reason = "oauth_protected_resource_metadata_invalid";
+      return result;
+    }
+    if (normalizePublicUrl(protectedMetadata.resource) !== normalizePublicUrl(currentMcpUrl)) {
+      result.connector.reason = "oauth_resource_mismatch";
       return result;
     }
     const authorizationServer = stringList(protectedMetadata.authorization_servers)[0];
@@ -772,17 +811,10 @@ export async function diagnoseChatGPTConnector(
       authorizationMetadata.grant_types_supported,
     ).includes("refresh_token");
     // `/health` only proves network reachability; OAuth readiness needs the full metadata document.
-    const endpointsPublished = validHttpUrl(authorizationMetadata.issuer)
-      && validHttpUrl(authorizationMetadata.authorization_endpoint)
-      && validHttpUrl(authorizationMetadata.token_endpoint);
-    result.oauth.ready = result.oauth.pkce_s256
-      && result.oauth.dynamic_registration
-      && result.oauth.refresh_token
-      && endpointsPublished
-      && stringList(authorizationMetadata.response_types_supported).includes("code")
-      && stringList(authorizationMetadata.grant_types_supported).includes("authorization_code");
-    if (!result.oauth.ready) {
-      result.connector.reason = "oauth_capabilities_incomplete";
+    const capabilityFailure = oauthCapabilityFailure(authorizationMetadata);
+    result.oauth.ready = capabilityFailure === null;
+    if (capabilityFailure !== null) {
+      result.connector.reason = capabilityFailure;
       return result;
     }
 

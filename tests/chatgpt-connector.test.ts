@@ -82,7 +82,21 @@ function settings(endpoint = "https://HOST.example/mcp"): ResolvedSettings {
   };
 }
 
-function healthyOAuthFetch(options: { refresh?: boolean } = {}): typeof fetch {
+function healthyOAuthFetch(options: {
+  refresh?: boolean;
+  challenge?: string | null;
+  protected?: Record<string, unknown>;
+  authorization?: Record<string, unknown>;
+} = {}): typeof fetch {
+  const withOverrides = (
+    base: Record<string, unknown>,
+    overrides: Record<string, unknown> | undefined,
+  ): Record<string, unknown> => {
+    const merged = { ...base, ...overrides };
+    // `null` overrides drop the field so a case can model missing metadata.
+    for (const [key, value] of Object.entries(overrides ?? {})) if (value === null) delete merged[key];
+    return merged;
+  };
   return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = input instanceof Request ? input.url : String(input);
     if (init?.method === "POST") {
@@ -90,18 +104,23 @@ function healthyOAuthFetch(options: { refresh?: boolean } = {}): typeof fetch {
         status: 401,
         headers: {
           "content-type": "application/json",
-          "www-authenticate": "Bearer resource_metadata=\"https://host.example/.well-known/oauth-protected-resource/mcp\"",
+          ...(options.challenge === null
+            ? { "www-authenticate": "Bearer" }
+            : {
+                "www-authenticate": options.challenge
+                  ?? "Bearer resource_metadata=\"https://host.example/.well-known/oauth-protected-resource/mcp\"",
+              }),
         },
       });
     }
     if (url.includes("oauth-protected-resource")) {
-      return Response.json({
+      return Response.json(withOverrides({
         resource: CURRENT_URL,
         authorization_servers: ["https://host.example"],
-      });
+      }, options.protected));
     }
     if (url.endsWith("/.well-known/oauth-authorization-server")) {
-      return Response.json({
+      return Response.json(withOverrides({
         issuer: "https://host.example",
         authorization_endpoint: "https://host.example/oauth/authorize",
         token_endpoint: "https://host.example/oauth/token",
@@ -111,7 +130,7 @@ function healthyOAuthFetch(options: { refresh?: boolean } = {}): typeof fetch {
         grant_types_supported: options.refresh === false
           ? ["authorization_code"]
           : ["authorization_code", "refresh_token"],
-      });
+      }, options.authorization));
     }
     return new Response(null, { status: 404 });
   }) as typeof fetch;
@@ -508,15 +527,67 @@ describe("legacy OAuth upgrade regression", () => {
     await expect(scopedTokenHashes(migrated.tokenStorePath)).resolves.toEqual([]);
   });
 
-  it("A2: migrates the shipped pre-upgrade state that has no legacy connector binding", async () => {
+  it("A2: fails closed when the legacy connector state is missing", async () => {
     const root = await temporaryRoot();
     await writeLegacyClients(root);
 
-    const migrated = await upgrade(root);
-    expect(migrated.migration).toBe("migrated");
-    await expect(scopedClientIds(migrated.clientRegistryPath)).resolves.toEqual([LEGACY_CLIENT_ID]);
-    await expect(scopedTokenHashes(migrated.tokenStorePath)).resolves.toEqual([]);
+    await expect(upgrade(root)).resolves.toMatchObject({ migration: "reauthorization_required" });
+    const paths = workspaceOAuthStatePaths("workspace-1", root);
+    await expect(readFile(paths.clientRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(paths.tokenStorePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("A3: fails closed when the only legacy binding belongs to another workspace", async () => {
+    const root = await temporaryRoot();
+    await writeJson(legacyChatgptConnectorStateFile(root), {
+      schema_version: 1,
+      bindings: [verifiedBinding("workspace-2", "https://two.example/mcp")],
+    });
+    await writeLegacyClients(root);
+
+    await expect(upgrade(root)).resolves.toMatchObject({ migration: "reauthorization_required" });
+    const paths = workspaceOAuthStatePaths("workspace-1", root);
+    await expect(readFile(paths.clientRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("A4: fails closed on legacy bindings that cannot be resolved uniquely", async () => {
+    const root = await temporaryRoot();
+    await writeJson(legacyChatgptConnectorStateFile(root), {
+      schema_version: 1,
+      bindings: [
+        verifiedBinding("workspace-1", CURRENT_URL),
+        verifiedBinding("workspace-2", "https://two.example/mcp"),
+      ],
+    });
+    await writeLegacyClients(root);
+
+    await expect(upgrade(root)).resolves.toMatchObject({ migration: "reauthorization_required" });
+    const paths = workspaceOAuthStatePaths("workspace-1", root);
+    await expect(readFile(paths.clientRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("A5: fails closed on an invalid legacy connector state", async () => {
+    const root = await temporaryRoot();
+    await writeJson(legacyChatgptConnectorStateFile(root), {
+      schema_version: 1,
+      bindings: [{ ...verifiedBinding(), verified_mcp_url: null }],
+    });
+    await writeLegacyClients(root);
+
+    await expect(upgrade(root)).resolves.toMatchObject({ migration: "reauthorization_required" });
+    const paths = workspaceOAuthStatePaths("workspace-1", root);
+    await expect(readFile(paths.clientRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("A6: keeps an already scoped exact client without the legacy ownership proof", async () => {
+    const root = await temporaryRoot();
+    await writeLegacyClients(root);
+    const paths = workspaceOAuthStatePaths("workspace-1", root);
+    await writeJson(paths.clientRegistryPath, { version: 1, clients: [legacyClient()] });
+    const before = await readFile(paths.clientRegistryPath, "utf8");
+
     await expect(upgrade(root)).resolves.toMatchObject({ migration: "not_needed" });
+    await expect(readFile(paths.clientRegistryPath, "utf8")).resolves.toBe(before);
   });
 
   it("C: keeps the legacy client while omitting an expired token", async () => {
@@ -662,8 +733,61 @@ describe("diagnose-chatgpt-connector", () => {
       ok: false,
       remote: { ready: true },
       oauth: { ready: false, refresh_token: false },
-      connector: { action: "none", reason: "oauth_capabilities_incomplete" },
+      connector: { action: "none", reason: "oauth_refresh_token_not_supported" },
     });
+  });
+
+  it("names the exact OAuth layer that blocks readiness", async () => {
+    const cases: readonly [string, () => typeof fetch][] = [
+      ["oauth_protected_resource_metadata_missing", () => healthyOAuthFetch({ challenge: null })],
+      [
+        "oauth_resource_mismatch",
+        () => healthyOAuthFetch({ protected: { resource: "https://other.example/mcp" } }),
+      ],
+      [
+        "oauth_authorization_server_metadata_missing",
+        () => healthyOAuthFetch({ protected: { authorization_servers: null } }),
+      ],
+      ["oauth_issuer_invalid", () => healthyOAuthFetch({ authorization: { issuer: null } })],
+      [
+        "oauth_authorization_endpoint_missing",
+        () => healthyOAuthFetch({ authorization: { authorization_endpoint: null } }),
+      ],
+      [
+        "oauth_token_endpoint_missing",
+        () => healthyOAuthFetch({ authorization: { token_endpoint: "not-a-url" } }),
+      ],
+      [
+        "oauth_registration_not_supported",
+        () => healthyOAuthFetch({ authorization: { registration_endpoint: null } }),
+      ],
+      [
+        "oauth_authorization_code_not_supported",
+        () => healthyOAuthFetch({ authorization: { response_types_supported: ["token"] } }),
+      ],
+      ["oauth_refresh_token_not_supported", () => healthyOAuthFetch({ refresh: false })],
+      [
+        "oauth_pkce_s256_not_supported",
+        () => healthyOAuthFetch({ authorization: { code_challenge_methods_supported: ["plain"] } }),
+      ],
+    ];
+
+    for (const [reason, createFetch] of cases) {
+      const root = await temporaryRoot();
+      const result = await diagnoseChatGPTConnector(settings(), {
+        storageRoot: root,
+        fetch: createFetch(),
+      });
+      expect({
+        ok: result.ok,
+        ready: result.oauth.ready,
+        action: result.connector.action,
+        reason: result.connector.reason,
+      }).toEqual({ ok: false, ready: false, action: "none", reason });
+      // A blocked readiness proof never binds the connector.
+      await expect(readFile(chatgptConnectorStateFile("workspace-1", root), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
 
   it("reports ambiguous legacy OAuth ownership as requiring reauthorization", async () => {
@@ -728,7 +852,7 @@ describe("diagnose-chatgpt-connector", () => {
         ok: false,
         remote: { ready: true },
         oauth: { ready: false, refresh_token: false },
-        connector: { action: "none", reason: "oauth_capabilities_incomplete" },
+        connector: { action: "none", reason: "oauth_refresh_token_not_supported" },
       });
   });
 });
