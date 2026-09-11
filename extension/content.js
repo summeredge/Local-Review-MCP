@@ -19,6 +19,8 @@
   let navigationEpoch = 0;
   let lastUrl = location.href;
   let registeredEpoch = -1;
+  let registeredDocumentId = null;
+  let lastCompletionDiagnostic = '';
   let registration = null;
   let scanTimer = null;
   let scanInFlight = null;
@@ -70,6 +72,7 @@
     registration = sendToWorker({ type: 'register_document', navigation_epoch: requestedEpoch })
       .then((reply) => {
         if (reply?.ok !== true) return false;
+        registeredDocumentId = typeof reply.document_id === 'string' ? reply.document_id : null;
         registeredEpoch = Math.max(registeredEpoch, requestedEpoch);
         return true;
       })
@@ -222,6 +225,22 @@
           || data.completion_id !== completionId
           || data.conversation_id !== conversationId
           || data.expected_user_message_id !== expectedUserMessageId) return;
+        if (data.status !== 'completed' && data.diagnostic && typeof data.diagnostic === 'object') {
+          const diagnostic = { conversation_id: conversationId, document_id: registeredDocumentId,
+            epoch: navigationEpoch, completion_id: completionId };
+          for (const key of ['fiber_scan_count', 'candidate_count', 'matched_user_turn_count', 'assistant_candidate_count']) {
+            const value = data.diagnostic[key];
+            diagnostic[key] = Number.isSafeInteger(value) && value >= 0 ? value : 0;
+          }
+          const reason = data.diagnostic.completion_state_reason;
+          diagnostic.completion_state_reason = typeof reason === 'string' && /^[a-z_]{1,100}$/u.test(reason)
+            ? reason : 'unknown';
+          const serialized = JSON.stringify(diagnostic);
+          if (serialized !== lastCompletionDiagnostic) {
+            console.debug('[LRM completion]', serialized);
+            lastCompletionDiagnostic = serialized;
+          }
+        }
         if (data.status === 'pending') {
           finish({ status: 'pending' });
           return;

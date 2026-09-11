@@ -274,7 +274,14 @@
     for (let index = end - 1; index >= start; index -= 1) {
       const message = messages[index];
       if (!publicAssistantMessage(message)) continue;
-      if (message.end_turn === true && message.status === 'finished_successfully') return str(message.id);
+      const finished = ['finished_successfully', 'completed', 'done'].includes(message.status);
+      const streaming = message.streaming === true || message.isStreaming === true
+        ? true : message.streaming ?? message.isStreaming;
+      // An explicit active/unfinished marker wins over a stale terminal marker.
+      if (streaming === true || message.end_turn === false) return null;
+      if (finished && (message.end_turn === true || streaming === false
+        || ['completed', 'done'].includes(message.status))) return str(message.id);
+      if (message.status == null && message.end_turn === true && streaming === false) return str(message.id);
       return null;
     }
     return null;
@@ -376,10 +383,53 @@
     }, location.origin);
   }
 
+  function completionTurnOf(turn, diagnostic) {
+    const visited = new Set();
+    for (const section of turn.sections) {
+      const anchors = [section, ...Array.from(section.querySelectorAll?.('[data-message-id]') || []).slice(0, 100)];
+      for (const anchor of anchors) {
+        const root = fiberOf(anchor);
+        const queue = [];
+        for (let at = root, depth = 0; at && depth < MAX_CLIMB; at = at.return, depth += 1) queue.push([at, false]);
+        // Search only this DOM branch's descendants, never ancestor siblings or alternate trees.
+        if (root?.child) queue.push([root.child, true]);
+        for (let index = 0; index < queue.length && visited.size < 1000; index += 1) {
+          const [at, descend] = queue[index];
+          if (!at || visited.has(at)) continue;
+          visited.add(at);
+          diagnostic.fiber_scan_count += 1;
+          const props = at.memoizedProps;
+          const model = props?.turn;
+          const messages = model?.messages ?? props?.allMessages ?? props?.messages;
+          if (Array.isArray(messages) && messages.length) {
+            diagnostic.candidate_count += 1;
+            return { fiber: descend ? at : root, messages: messages.map((entry) => {
+              const message = entry?.message ?? entry;
+              return message && typeof message === 'object'
+                ? { ...message, id: message.id ?? message.message_id } : message;
+            }), turnId: str(model?.id) || turn.turnId };
+          }
+          // Only descend below the anchor, not into unrelated conversation branches.
+          if (descend) {
+            if (at.child) queue.push([at.child, true]);
+            if (at.sibling) queue.push([at.sibling, true]);
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   function scanCompletion(nonce, completionId, conversationId, expectedUserMessageId) {
+    const diagnostic = { fiber_scan_count: 0, candidate_count: 0, matched_user_turn_count: 0,
+      assistant_candidate_count: 0, completion_state_reason: 'user_turn_not_found' };
+    const reply = (status, details = {}) => completionReply(nonce, completionId, conversationId,
+      expectedUserMessageId, status, status === 'completed' ? details : { ...details, diagnostic: {
+        ...diagnostic, completion_state_reason: details.error || diagnostic.completion_state_reason,
+      } });
     const routeConversationId = conversationIdFromLocation();
     if (routeConversationId !== conversationId) {
-      completionReply(nonce, completionId, conversationId, expectedUserMessageId, 'ambiguous', {
+      reply('ambiguous', {
         error: 'completion_conversation_conflict',
       });
       return;
@@ -394,23 +444,46 @@
 
     const turns = turnsOf(sections);
     const first = Math.max(0, turns.length - MAX_TURNS);
-    const matches = [];
+    let matches = [];
     let conversationConflict = false;
     let conversationUnreadable = false;
     let wrongConversation = false;
+    const observed = new Map();
     for (let turnIndex = first; turnIndex < turns.length; turnIndex += 1) {
       const turn = turns[turnIndex];
       try {
-        const fiber = fiberOf(turn.sections[0]);
-        const messages = fiber ? turnMessagesOf(fiber) : null;
+        const observation = completionTurnOf(turn, diagnostic);
+        const fiber = observation?.fiber;
+        const messages = observation?.messages;
         if (!fiber || !messages) continue;
+        observed.set(turnIndex, observation);
         const userIndexes = [];
+        let matchPriority = 0;
         for (let index = 0; index < messages.length; index += 1) {
           const message = messages[index];
           if (message && typeof message === 'object' && message.author?.role === 'user'
             && message.id === expectedUserMessageId) userIndexes.push(index);
         }
+        if (userIndexes.length === 0 && (observation.turnId === expectedUserMessageId
+          || turn.turnId === expectedUserMessageId)) {
+          const users = messages.flatMap((message, index) => message?.author?.role === 'user' ? [index] : []);
+          if (users.length === 1) {
+            userIndexes.push(users[0]);
+            matchPriority = 1;
+          }
+        }
+        if (userIndexes.length === 0) {
+          const domUsers = turn.sections.flatMap((section) =>
+            Array.from(section.querySelectorAll?.('[data-message-author-role="user"][data-message-id]') || []));
+          const users = messages.flatMap((message, index) => message?.author?.role === 'user' ? [index] : []);
+          if (users.length === 1 && domUsers.length === 1
+            && domUsers[0].getAttribute('data-message-id') === expectedUserMessageId) {
+            userIndexes.push(users[0]);
+            matchPriority = 2;
+          }
+        }
         if (userIndexes.length === 0) continue;
+        diagnostic.matched_user_turn_count += userIndexes.length;
         const conversation = conversationEvidenceDetailsOf(fiber);
         if (conversation.conflict) {
           conversationConflict = true;
@@ -426,29 +499,52 @@
           continue;
         }
         for (const userIndex of userIndexes) {
-          matches.push({ turnId: turn.turnId, messages, userIndex });
+          matches.push({ turnId: turn.turnId, messages, userIndex, turnIndex, matchPriority });
         }
       } catch {
         // Hydration is transient; the next observer or fallback poll retries it.
       }
     }
 
+    const priority = Math.min(...matches.map((match) => match.matchPriority));
+    matches = matches.filter((match) => match.matchPriority === priority);
     if (conversationConflict || wrongConversation || matches.length > 1) {
-      completionReply(nonce, completionId, conversationId, expectedUserMessageId, 'ambiguous', {
+      reply('ambiguous', {
         error: 'completion_identity_ambiguous',
       });
       return;
     }
     if (conversationUnreadable) {
-      completionReply(nonce, completionId, conversationId, expectedUserMessageId, 'pending');
+      diagnostic.completion_state_reason = 'conversation_unreadable';
+      reply('pending');
       return;
     }
     if (matches.length === 0) {
-      completionReply(nonce, completionId, conversationId, expectedUserMessageId, 'pending');
+      reply('pending');
       return;
     }
 
     const match = matches[0];
+    // Current ChatGPT renders user and assistant as separate consecutive turn models.
+    // A missing model or identity is a boundary, never permission to skip to a later answer.
+    if (!match.messages.slice(match.userIndex + 1).some((message) => message?.author?.role === 'user')) {
+      for (let index = match.turnIndex + 1; index < turns.length; index += 1) {
+        const next = observed.get(index);
+        if (!next) {
+          diagnostic.completion_state_reason = 'following_turn_unreadable';
+          reply('pending');
+          return;
+        }
+        const identity = conversationEvidenceDetailsOf(next.fiber);
+        if (identity.conflict || identity.unreadable || identity.conversationId !== conversationId) {
+          diagnostic.completion_state_reason = 'following_turn_identity_unavailable';
+          reply('pending');
+          return;
+        }
+        if (next.messages.some((message) => message?.author?.role === 'user')) break;
+        match.messages.push(...next.messages);
+      }
+    }
     let end = match.messages.length;
     for (let index = match.userIndex + 1; index < match.messages.length; index += 1) {
       if (match.messages[index]?.author?.role === 'user') {
@@ -457,38 +553,42 @@
       }
     }
     const terminalRawId = turnEndMessageId(match.messages, match.userIndex + 1, end);
+    diagnostic.assistant_candidate_count = match.messages.slice(match.userIndex + 1, end)
+      .filter(publicAssistantMessage).length;
     if (!terminalRawId) {
-      completionReply(nonce, completionId, conversationId, expectedUserMessageId, 'pending');
+      diagnostic.completion_state_reason = diagnostic.assistant_candidate_count
+        ? 'assistant_not_terminal' : 'assistant_not_found';
+      reply('pending');
       return;
     }
 
     const assistants = authoredAssistantMessages(match.messages, undefined, match.userIndex + 1, end);
     const terminal = assistants.find((message) => message.id === terminalRawId);
     if (!terminal || terminal.identityConflict) {
-      completionReply(nonce, completionId, conversationId, expectedUserMessageId, 'ambiguous', {
+      reply('ambiguous', {
         error: 'completion_assistant_identity_ambiguous',
       });
       return;
     }
     if (terminal.textStatus === 'too_large') {
-      completionReply(nonce, completionId, conversationId, expectedUserMessageId, 'failed', {
+      reply('failed', {
         error: 'completion_content_too_large',
       });
       return;
     }
     if (!terminal.stable || !MESSAGE_ID.test(terminal.messageId)) {
-      completionReply(nonce, completionId, conversationId, expectedUserMessageId, 'failed', {
+      reply('failed', {
         error: 'completion_assistant_message_id_unavailable',
       });
       return;
     }
     if (terminal.textStatus !== 'text' || !terminal.rawText) {
-      completionReply(nonce, completionId, conversationId, expectedUserMessageId, 'failed', {
+      reply('failed', {
         error: 'completion_public_text_unavailable',
       });
       return;
     }
-    completionReply(nonce, completionId, conversationId, expectedUserMessageId, 'completed', {
+    reply('completed', {
       assistant_message_id: terminal.messageId,
       content: terminal.rawText,
     });
