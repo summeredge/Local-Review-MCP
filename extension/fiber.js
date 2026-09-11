@@ -11,6 +11,7 @@
   const MAX_CLIMB = 80;
   const MAX_TURNS = 100;
   const MAX_REQUESTS = 200;
+  const MAX_COMPLETION_MESSAGE_CANDIDATES = 20;
   const MAX_COMPLETION_CONTENT = 256 * 1024;
   const REQUEST_ID = /^[A-Za-z0-9_-]{1,100}$/u;
   const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
@@ -274,14 +275,8 @@
     for (let index = end - 1; index >= start; index -= 1) {
       const message = messages[index];
       if (!publicAssistantMessage(message)) continue;
-      const finished = ['finished_successfully', 'completed', 'done'].includes(message.status);
-      const streaming = message.streaming === true || message.isStreaming === true
-        ? true : message.streaming ?? message.isStreaming;
-      // An explicit active/unfinished marker wins over a stale terminal marker.
-      if (streaming === true || message.end_turn === false) return null;
-      if (finished && (message.end_turn === true || streaming === false
-        || ['completed', 'done'].includes(message.status))) return str(message.id);
-      if (message.status == null && message.end_turn === true && streaming === false) return str(message.id);
+      if (message.streaming === true || message.isStreaming === true) return null;
+      if (message.end_turn === true && message.status === 'finished_successfully') return str(message.id);
       return null;
     }
     return null;
@@ -383,32 +378,42 @@
     }, location.origin);
   }
 
-  function completionTurnOf(turn, diagnostic) {
+  function completionTurnOf(turn, diagnostic, expectedUserMessageId) {
     const visited = new Set();
+    const candidates = [];
+    const addCandidate = (fiber, messages, sourcePriority, turnId) => {
+      if (!Array.isArray(messages) || messages.length === 0
+        || candidates.length >= MAX_COMPLETION_MESSAGE_CANDIDATES) return;
+      diagnostic.candidate_count += 1;
+      candidates.push({ fiber, messages: messages.map((entry) => {
+        const message = entry?.message ?? entry;
+        return message && typeof message === 'object'
+          ? { ...message, id: message.id ?? message.message_id } : message;
+      }), turnId, sourcePriority });
+    };
     for (const section of turn.sections) {
+      if (candidates.length >= MAX_COMPLETION_MESSAGE_CANDIDATES) break;
       const anchors = [section, ...Array.from(section.querySelectorAll?.('[data-message-id]') || []).slice(0, 100)];
       for (const anchor of anchors) {
+        if (candidates.length >= MAX_COMPLETION_MESSAGE_CANDIDATES) break;
         const root = fiberOf(anchor);
         const queue = [];
         for (let at = root, depth = 0; at && depth < MAX_CLIMB; at = at.return, depth += 1) queue.push([at, false]);
         // Search only this DOM branch's descendants, never ancestor siblings or alternate trees.
         if (root?.child) queue.push([root.child, true]);
-        for (let index = 0; index < queue.length && visited.size < 1000; index += 1) {
+        for (let index = 0; index < queue.length && visited.size < 1000
+          && candidates.length < MAX_COMPLETION_MESSAGE_CANDIDATES; index += 1) {
           const [at, descend] = queue[index];
           if (!at || visited.has(at)) continue;
           visited.add(at);
           diagnostic.fiber_scan_count += 1;
           const props = at.memoizedProps;
           const model = props?.turn;
-          const messages = model?.messages ?? props?.allMessages ?? props?.messages;
-          if (Array.isArray(messages) && messages.length) {
-            diagnostic.candidate_count += 1;
-            return { fiber: descend ? at : root, messages: messages.map((entry) => {
-              const message = entry?.message ?? entry;
-              return message && typeof message === 'object'
-                ? { ...message, id: message.id ?? message.message_id } : message;
-            }), turnId: str(model?.id) || turn.turnId };
-          }
+          const fiber = descend ? at : root;
+          const turnId = str(model?.id) || turn.turnId;
+          addCandidate(fiber, model?.messages, 0, turnId);
+          addCandidate(fiber, props?.allMessages, 1, turnId);
+          addCandidate(fiber, props?.messages, 2, turnId);
           // Only descend below the anchor, not into unrelated conversation branches.
           if (descend) {
             if (at.child) queue.push([at.child, true]);
@@ -417,7 +422,19 @@
         }
       }
     }
-    return null;
+    let selected = null;
+    let selectedRank = Infinity;
+    for (const candidate of candidates) {
+      const rank = candidate.messages.some((message) => message?.author?.role === 'user'
+        && message.id === expectedUserMessageId) ? 0
+        : candidate.turnId === expectedUserMessageId ? 1 : 2;
+      if (selected === null || rank < selectedRank
+        || (rank === selectedRank && candidate.sourcePriority < selected.sourcePriority)) {
+        selected = candidate;
+        selectedRank = rank;
+      }
+    }
+    return selected;
   }
 
   function scanCompletion(nonce, completionId, conversationId, expectedUserMessageId) {
@@ -444,15 +461,12 @@
 
     const turns = turnsOf(sections);
     const first = Math.max(0, turns.length - MAX_TURNS);
-    let matches = [];
-    let conversationConflict = false;
-    let conversationUnreadable = false;
-    let wrongConversation = false;
+    const candidates = [];
     const observed = new Map();
     for (let turnIndex = first; turnIndex < turns.length; turnIndex += 1) {
       const turn = turns[turnIndex];
       try {
-        const observation = completionTurnOf(turn, diagnostic);
+        const observation = completionTurnOf(turn, diagnostic, expectedUserMessageId);
         const fiber = observation?.fiber;
         const messages = observation?.messages;
         if (!fiber || !messages) continue;
@@ -485,46 +499,48 @@
         if (userIndexes.length === 0) continue;
         diagnostic.matched_user_turn_count += userIndexes.length;
         const conversation = conversationEvidenceDetailsOf(fiber);
-        if (conversation.conflict) {
-          conversationConflict = true;
-          continue;
-        }
-        if (conversation.unreadable) {
-          conversationUnreadable = true;
-          continue;
-        }
-        if (!conversation.conversationId) continue;
-        if (conversation.conversationId !== conversationId) {
-          wrongConversation = true;
-          continue;
-        }
         for (const userIndex of userIndexes) {
-          matches.push({ turnId: turn.turnId, messages, userIndex, turnIndex, matchPriority });
+          candidates.push({ turnId: turn.turnId, messages, userIndex, turnIndex, matchPriority, conversation });
         }
       } catch {
         // Hydration is transient; the next observer or fallback poll retries it.
       }
     }
 
-    const priority = Math.min(...matches.map((match) => match.matchPriority));
-    matches = matches.filter((match) => match.matchPriority === priority);
-    if (conversationConflict || wrongConversation || matches.length > 1) {
+    const priority = candidates.length > 0
+      ? Math.min(...candidates.map((candidate) => candidate.matchPriority)) : null;
+    const matches = priority === null ? [] : candidates.filter((candidate) => candidate.matchPriority === priority);
+    const conversationConflict = matches.some((match) => match.conversation.conflict);
+    const conversationUnreadable = matches.some((match) => match.conversation.unreadable);
+    const conversationUnavailable = matches.some((match) => !match.conversation.conflict
+      && !match.conversation.unreadable && !match.conversation.conversationId);
+    const wrongConversation = matches.some((match) => !match.conversation.conflict
+      && !match.conversation.unreadable && Boolean(match.conversation.conversationId)
+      && match.conversation.conversationId !== conversationId);
+    if (conversationConflict || wrongConversation) {
       reply('ambiguous', {
         error: 'completion_identity_ambiguous',
       });
       return;
     }
-    if (conversationUnreadable) {
+    if (conversationUnreadable || conversationUnavailable) {
       diagnostic.completion_state_reason = 'conversation_unreadable';
       reply('pending');
       return;
     }
-    if (matches.length === 0) {
+    const validMatches = matches.filter((match) => match.conversation.conversationId === conversationId);
+    if (validMatches.length > 1) {
+      reply('ambiguous', {
+        error: 'completion_identity_ambiguous',
+      });
+      return;
+    }
+    if (validMatches.length === 0) {
       reply('pending');
       return;
     }
 
-    const match = matches[0];
+    const match = validMatches[0];
     // Current ChatGPT renders user and assistant as separate consecutive turn models.
     // A missing model or identity is a boundary, never permission to skip to a later answer.
     if (!match.messages.slice(match.userIndex + 1).some((message) => message?.author?.role === 'user')) {

@@ -110,12 +110,13 @@ function toolResult(id: string): Message {
 
 function section(
   messages: Message[],
-  options: { readonly conversationId?: string; readonly turnId?: string; readonly extra?: Record<string, unknown> } = {},
+  options: { readonly conversationId?: string; readonly turnId?: string; readonly modelTurnId?: string;
+    readonly extra?: Record<string, unknown> } = {},
 ): Section {
   let model: Fiber = {
     memoizedProps: {
       conversation: { id: options.conversationId ?? CONVERSATION_A },
-      turn: { messages },
+      turn: { ...(options.modelTurnId === undefined ? {} : { id: options.modelTurnId }), messages },
     },
     return: null,
   };
@@ -213,20 +214,16 @@ describe("MAIN-world review completion observation", () => {
       assistant_message_id: "assistant:working-turn-1:exchange-1:1700000000000" });
   });
 
-  it.each(["completed", "done", "finished_successfully"])("accepts %s with explicit stopped streaming and no end_turn", (status) => {
+  it.each(["completed", "done"])("does not accept unconfirmed %s status as terminal", (status) => {
     const response = finalMessage();
     delete response.end_turn;
     response.status = status;
     response.streaming = false;
-    expect(completionReply([section([user(EXPECTED_USER), response])])).toMatchObject({ status: "completed" });
-    response.streaming = true;
     expect(completionReply([section([user(EXPECTED_USER), response])])).toMatchObject({ status: "pending" });
   });
 
   it("finds wrapped messages in descendant/sibling fibers and matches a turn id alias", () => {
     const response = finalMessage();
-    delete response.end_turn;
-    response.status = "done";
     const model = { memoizedProps: { conversationId: CONVERSATION_A,
       turn: { id: EXPECTED_USER }, messages: [user("changed-user-id"), response].map(message => ({ message })) }, return: null };
     const root = { memoizedProps: {}, return: null, child: { memoizedProps: {}, return: null, sibling: model } };
@@ -242,15 +239,33 @@ describe("MAIN-world review completion observation", () => {
       .toMatchObject({ status: "completed" });
   });
 
+  it("does not let an unrelated first Fiber message candidate mask the target turn", () => {
+    const masked = section([user(EXPECTED_USER), finalMessage()], {
+      extra: { messages: [user("unrelated-user")] },
+    });
+    expect(completionReply([masked])).toMatchObject({ status: "completed", content: "Final answer" });
+  });
+
   it("prefers an exact message id over a turn alias and correlates a unique DOM user", () => {
     expect(completionReply([
-      section([user("old-user"), finalMessage("old", "old")], { turnId: EXPECTED_USER }),
+      section([user("old-user"), finalMessage("old", "old")], {
+        turnId: EXPECTED_USER, conversationId: CONVERSATION_B,
+      }),
       section([user(EXPECTED_USER), finalMessage("new", "new")], { turnId: "exact" }),
     ])).toMatchObject({ status: "completed", content: "new" });
     const correlated = section([user("fiber-user"), finalMessage()]);
     correlated.querySelectorAll = (selector: string) => selector.includes('data-message-author-role')
       ? [{ getAttribute: () => EXPECTED_USER }] : [];
     expect(completionReply([correlated])).toMatchObject({ status: "completed" });
+  });
+
+  it("does not let an exact match inherit an alias candidate's unreadable identity", () => {
+    expect(completionReply([
+      section([user("unreadable-alias"), finalMessage("old", "old")], {
+        turnId: EXPECTED_USER, extra: { conversationId: 42 },
+      }),
+      section([user(EXPECTED_USER), finalMessage("new", "new")], { turnId: "exact" }),
+    ])).toMatchObject({ status: "completed", content: "new" });
   });
 
   it("does not treat stopped streaming alone or conflicting streaming flags as completion", () => {
@@ -262,6 +277,11 @@ describe("MAIN-world review completion observation", () => {
     response.status = "done";
     response.isStreaming = true;
     expect(completionReply([section([user(EXPECTED_USER), response])])).toMatchObject({ status: "pending" });
+
+    const missingEndTurn = finalMessage("missing-end-turn");
+    delete missingEndTurn.end_turn;
+    missingEndTurn.streaming = false;
+    expect(completionReply([section([user(EXPECTED_USER), missingEndTurn])])).toMatchObject({ status: "pending" });
   });
 
   it("stops at another user, an unreadable section, or a different conversation", () => {
@@ -381,6 +401,17 @@ describe("MAIN-world review completion observation", () => {
       finalMessage("raw-two", "two", { workingTurnId: "same", turnExchangeId: "same", createTime: 3 }),
     ])]);
     expect(collision).toMatchObject({ status: "ambiguous", error: "completion_assistant_identity_ambiguous" });
+  });
+
+  it("fails closed when alias candidates disagree on conversation identity", () => {
+    expect(completionReply([
+      section([user("alias-one"), finalMessage("one")], {
+        turnId: "dom-one", modelTurnId: EXPECTED_USER,
+      }),
+      section([user("alias-two"), finalMessage("two")], {
+        turnId: "dom-two", modelTurnId: EXPECTED_USER, conversationId: CONVERSATION_B,
+      }),
+    ])).toMatchObject({ status: "ambiguous", error: "completion_identity_ambiguous" });
   });
 
   it("rejects oversized public content without truncating it", () => {
