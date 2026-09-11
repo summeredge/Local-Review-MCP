@@ -154,6 +154,15 @@ function normalizeConnectorName(value: string): string {
   return trimmed;
 }
 
+/**
+ * A Windows shell can leave escape residue around an operator-supplied name: `^` escaping a space,
+ * or escaping a quote the shell consumed (`^Local^ MCP^ Connector^`). That residue is never part of
+ * the name, but a caret escaping a letter is (`Plant ^A Connector`).
+ */
+function stripWindowsShellEscapeResidue(value: string): string {
+  return value.replace(/^\^+|\^+(?=\s)|\^+$/g, "");
+}
+
 export function legacyChatgptConnectorStateFile(storageRoot = defaultTaskContextStorageRoot()): string {
   return join(resolve(storageRoot), "control-plane", "chatgpt-connectors.json");
 }
@@ -279,17 +288,19 @@ export class ChatGPTConnectorStore {
         throw new Error("Current MCP URL does not match the pending connector binding");
       }
       // Adoption stays behind the evidence gate above and only ever fills a binding that still has
-      // to be verified; an existing verified binding must not be renamed through this path.
-      let adoptedName = previous.connector_name;
-      if (requestedName !== null && requestedName !== previous.connector_name) {
-        if (previous.status === "verified") {
-          throw new Error("Verified ChatGPT connector binding cannot be renamed");
-        }
-        adoptedName = requestedName;
+      // to be verified; an existing verified binding must not be renamed through this path. A name
+      // that only differs by recorded shell escape residue is the same connector, so it is stored
+      // in its artifact-free spelling instead of counting as a rename.
+      const recordedName = stripWindowsShellEscapeResidue(previous.connector_name);
+      const sameConnector = requestedName === null
+        || requestedName === previous.connector_name
+        || requestedName === recordedName;
+      if (!sameConnector && previous.status === "verified") {
+        throw new Error("Verified ChatGPT connector binding cannot be renamed");
       }
       const binding: ChatGPTConnectorBinding = {
         ...previous,
-        connector_name: adoptedName,
+        connector_name: requestedName ?? previous.connector_name,
         verified_mcp_url: normalizedCurrent,
         pending_mcp_url: null,
         status: "verified",
@@ -906,6 +917,9 @@ export function parseConnectorConfirmArgs(argv: readonly string[]): {
   return {
     settingsArgs,
     requestId: parsedRequestId.data,
-    connectorName: connectorName === undefined ? undefined : normalizeConnectorName(connectorName),
+    // The CLI is the shell boundary: escape residue is dropped here and never reaches storage.
+    connectorName: connectorName === undefined
+      ? undefined
+      : normalizeConnectorName(stripWindowsShellEscapeResidue(connectorName)),
   };
 }

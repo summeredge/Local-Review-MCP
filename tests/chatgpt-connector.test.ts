@@ -567,6 +567,54 @@ describe("connector binding adoption", () => {
       "--connector-name",
     ])).toThrow("requires a value");
   });
+
+  it("strips Windows shell escape residue at the CLI boundary", () => {
+    expect(parseConnectorConfirmArgs([
+      "--request-id", "request-current",
+      "--connector-name", "^Local^ MCP^ Connector^",
+    ])).toEqual({
+      settingsArgs: [],
+      requestId: "request-current",
+      connectorName: "Local MCP Connector",
+    });
+    expect(parseConnectorConfirmArgs([
+      "--request-id", "request-current",
+      "--connector-name", "^^Local^^ MCP^^ Connector^^",
+    ]).connectorName).toBe("Local MCP Connector");
+    expect(parseConnectorConfirmArgs([
+      "--request-id", "request-current",
+      "--connector-name", "Local MCP Connector",
+    ]).connectorName).toBe("Local MCP Connector");
+    expect(parseConnectorConfirmArgs([
+      "--request-id", "request-current",
+      "--connector-name", "Plant ^A Connector",
+    ]).connectorName).toBe("Plant ^A Connector");
+  });
+
+  it("repairs a recorded escape artifact instead of treating it as a rename", async () => {
+    const root = await temporaryRoot();
+    const store = new ChatGPTConnectorStore("workspace-1", root);
+    await prepare(store);
+    await evidence(store, "request-escaped");
+    await expect(store.confirm("request-escaped", CURRENT_URL, NOW, "^Local^ MCP^ Connector^"))
+      .resolves.toMatchObject({ connector_name: "^Local^ MCP^ Connector^", status: "verified" });
+
+    await evidence(store, "request-clean");
+    await expect(store.confirm("request-clean", CURRENT_URL, NOW, "Local MCP Connector"))
+      .resolves.toMatchObject({
+        connector_name: "Local MCP Connector",
+        status: "verified",
+        verified_mcp_url: CURRENT_URL,
+        pending_mcp_url: null,
+      });
+    await expect(new ChatGPTConnectorStore("workspace-1", root).read()).resolves.toMatchObject({
+      connector_name: "Local MCP Connector",
+    });
+
+    await evidence(store, "request-rename");
+    await expect(store.confirm("request-rename", CURRENT_URL, NOW, "Another Connector"))
+      .rejects.toThrow("cannot be renamed");
+  });
 });
 
 describe("legacy migration", () => {
