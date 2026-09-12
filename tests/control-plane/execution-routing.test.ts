@@ -12,6 +12,7 @@ import {
 } from "../../src/control-plane/controlled-actuation.js";
 import {
   ExecutionRoutingService,
+  executionCompletedEventSchema,
   type ExecutionCompletedEvent,
 } from "../../src/control-plane/execution-routing.js";
 import {
@@ -207,14 +208,18 @@ async function harness(options: {
   };
 }
 
-function event(h: Awaited<ReturnType<typeof harness>>, conversationId?: string): ExecutionCompletedEvent {
+function event(
+  h: Awaited<ReturnType<typeof harness>>,
+  conversationId?: string,
+  status: "completed" | "passed" = "passed",
+): ExecutionCompletedEvent {
   return {
     execution_id: h.executionId,
     task_id: h.taskId,
     workspace_id: h.workspaceId,
     ...(conversationId === undefined ? {} : { conversation_id: conversationId }),
-    status: "completed",
-    result: { status: "completed" },
+    status,
+    result: { status },
     diff_available: true,
   };
 }
@@ -238,6 +243,35 @@ describe("ExecutionRoutingService", () => {
     expect(h.deliveries.requests).toHaveLength(1);
     expect(h.completions.requests).toHaveLength(1);
   });
+
+  it("normalizes the legacy completed event status to passed", async () => {
+    const h = await harness();
+    const legacyEvent = event(h, "conversation-1", "completed");
+
+    expect(executionCompletedEventSchema.parse(legacyEvent).status).toBe("passed");
+    await expect(h.router.onCompleted(legacyEvent)).resolves.toMatchObject({
+      execution_id: h.executionId,
+      routing_status: "created",
+    });
+  });
+
+  it.each(["running", "failed"] as const)(
+    "does not trigger Review for a %s Execution",
+    async (status) => {
+      const h = await harness();
+      await h.executions.updateExecutionContext(h.workspaceId, h.taskId, h.executionId, { status });
+
+      await expect(h.router.onCompleted(event(h, "conversation-1"))).rejects.toMatchObject({
+        reason: "execution_not_completed",
+        code: "execution_not_completed",
+      });
+      expect(await h.goals.listGoals()).toHaveLength(0);
+      expect(await new ReviewRequestService(h.root).listReviewRequests(h.workspaceId))
+        .toHaveLength(0);
+      expect(h.deliveries.requests).toHaveLength(0);
+      expect(h.completions.requests).toHaveLength(0);
+    },
+  );
 
   it("rejects automatic routing with conversation_required when no conversation is bound", async () => {
     const h = await harness();

@@ -22,13 +22,16 @@ import { AutoIterationService, type AutoIteration } from "./auto-iteration.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
 
 const eventConversationIdSchema = z.string().max(256);
+const executionCompletedStatusSchema = z.enum(["completed", "passed"])
+  .default("passed")
+  .transform(() => "passed" as const);
 
 export const executionCompletedEventSchema = z.object({
   execution_id: executionIdSchema,
   task_id: taskIdSchema.optional(),
   workspace_id: workspaceIdSchema,
   conversation_id: eventConversationIdSchema.optional(),
-  status: z.enum(["completed", "passed"]).default("completed"),
+  status: executionCompletedStatusSchema,
   result: z.unknown().optional(),
   diff_available: z.boolean().optional(),
 }).strict();
