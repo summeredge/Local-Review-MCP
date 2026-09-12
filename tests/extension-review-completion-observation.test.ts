@@ -31,6 +31,7 @@ interface Fiber {
 
 interface Section {
   getAttribute(name: string): string | null;
+  querySelectorAll?(selector: string): unknown[];
   [key: string]: unknown;
 }
 
@@ -111,7 +112,9 @@ function toolResult(id: string): Message {
 function section(
   messages: Message[],
   options: { readonly conversationId?: string; readonly turnId?: string; readonly modelTurnId?: string;
-    readonly extra?: Record<string, unknown> } = {},
+    readonly extra?: Record<string, unknown>;
+    readonly assistantDom?: readonly { readonly id: string; readonly messageIndex?: number;
+      readonly fiberKey?: string; readonly conversationId?: string }[] } = {},
 ): Section {
   let model: Fiber = {
     memoizedProps: {
@@ -123,8 +126,24 @@ function section(
   for (let depth = 0; depth < 30; depth += 1) {
     model = { memoizedProps: { children: null }, return: model };
   }
+  const assistantDom = (options.assistantDom ?? []).map((entry) => {
+    const message = messages[entry.messageIndex ?? 0];
+    const fiber: Record<string, unknown> = {
+      memoizedProps: message === undefined ? {} : { message,
+        ...(entry.conversationId === undefined ? {} : { conversation: { id: entry.conversationId } }) },
+      return: null,
+    };
+    if (entry.fiberKey !== undefined) fiber.key = entry.fiberKey;
+    return {
+      getAttribute: (name: string) => name === "data-message-id" ? entry.id
+        : name === "data-message-author-role" ? "assistant" : null,
+      __reactFiber$test: fiber,
+    };
+  });
   return {
     getAttribute: (name) => name === "data-turn-id" ? (options.turnId ?? "turn-1") : null,
+    querySelectorAll: (selector) => selector === '[data-message-id]'
+      || selector === '[data-message-author-role="assistant"]' ? assistantDom : [],
     __reactFiber$test: {
       memoizedProps: { children: null, ...(options.extra ?? {}) },
       return: model,
@@ -298,7 +317,8 @@ describe("MAIN-world review completion observation", () => {
   it("reports bounded counters and a reason when the user is absent, without message content", () => {
     const result = completionReply([section([user("other", "PRIVATE"), finalMessage()])]);
     expect(result).toMatchObject({ status: "pending", diagnostic: { candidate_count: 1,
-      matched_user_turn_count: 0, assistant_candidate_count: 0, completion_state_reason: "user_turn_not_found" } });
+      matched_user_turn_count: 0, assistant_candidate_count: 0, completion_state_reason: "user_turn_not_found",
+      rejection_reason: "user_turn_not_found" } });
     expect(JSON.stringify(result)).not.toContain("PRIVATE");
   });
 
@@ -322,12 +342,35 @@ describe("MAIN-world review completion observation", () => {
       "completion_id",
       "content",
       "conversation_id",
+      "diagnostic",
       "expected_user_message_id",
       "nonce",
       "source",
       "status",
       "version",
     ]);
+    expect(reply.diagnostic).toMatchObject({
+      identity_source: "metadata_turn_tuple",
+      selected_identity_type: "turn_identity",
+      rejection_reason: "none",
+    });
+  });
+
+  it("uses a unique assistant DOM message id when model metadata has no stable identity", () => {
+    const unstable = finalMessage("raw-only", "answer");
+    unstable.metadata = {};
+    delete unstable.create_time;
+    expect(completionReply([section([user(EXPECTED_USER), unstable], {
+      assistantDom: [{ id: "dom-assistant-final", messageIndex: 1 }],
+    })])).toMatchObject({
+      status: "completed",
+      assistant_message_id: "dom-assistant-final",
+      diagnostic: {
+        identity_source: "dom_message_id",
+        selected_identity_type: "message_id",
+        rejection_reason: "none",
+      },
+    });
   });
 
   it.each([
@@ -426,7 +469,58 @@ describe("MAIN-world review completion observation", () => {
     unstable.metadata = {};
     delete unstable.create_time;
     expect(completionReply([section([user(EXPECTED_USER), unstable])]))
-      .toMatchObject({ status: "failed", error: "completion_assistant_message_id_unavailable" });
+      .toMatchObject({ status: "failed", error: "completion_assistant_message_id_unavailable", diagnostic: {
+        identity_source: "unavailable", selected_identity_type: "none", rejection_reason: "no_stable_identity",
+      } });
+  });
+
+  it("selects the terminal DOM identity among multiple assistant candidates in the target conversation", () => {
+    expect(completionReply([section([
+      user(EXPECTED_USER),
+      finalMessage("old-assistant", "old", { status: "finished_successfully", endTurn: false, createTime: 1 }),
+      finalMessage("terminal-assistant", "new", { createTime: 2 }),
+    ], {
+      assistantDom: [
+        { id: "dom-old-assistant", messageIndex: 1 },
+        { id: "dom-terminal-assistant", messageIndex: 2 },
+      ],
+    })])).toMatchObject({
+      status: "completed",
+      assistant_message_id: "dom-terminal-assistant",
+      diagnostic: { identity_source: "dom_message_id", selected_identity_type: "message_id" },
+    });
+  });
+
+  it("does not let a historical assistant DOM identity pollute the exact target turn", () => {
+    const target = finalMessage("target-raw", "target");
+    target.metadata = {};
+    delete target.create_time;
+    expect(completionReply([
+      section([user("historical-user"), finalMessage("historical-assistant", "history")], {
+        assistantDom: [{ id: "dom-historical-assistant", messageIndex: 1 }],
+      }),
+      section([user(EXPECTED_USER), target], {
+        turnId: "target-turn",
+        assistantDom: [{ id: "dom-target-assistant", messageIndex: 1 }],
+      }),
+    ])).toMatchObject({
+      status: "completed",
+      assistant_message_id: "dom-target-assistant",
+      content: "target",
+    });
+  });
+
+  it("rejects a DOM identity whose attached Fiber belongs to another conversation", () => {
+    const unstable = finalMessage("target-raw", "target");
+    unstable.metadata = {};
+    delete unstable.create_time;
+    expect(completionReply([section([user(EXPECTED_USER), unstable], {
+      assistantDom: [{ id: "wrong-conversation", messageIndex: 1, conversationId: CONVERSATION_B }],
+    })])).toMatchObject({
+      status: "failed",
+      error: "completion_assistant_message_id_unavailable",
+      diagnostic: { rejection_reason: "no_stable_identity" },
+    });
   });
 
   it("keeps the COS logical identity across raw UUID and parent changes", () => {

@@ -203,6 +203,18 @@
     }
   }
 
+  function diagnosticLabel(value) {
+    return typeof value === 'string' && /^[a-z_]{1,100}$/u.test(value) ? value : 'unknown';
+  }
+
+  function completedIdentityDiagnostic(value) {
+    return value && typeof value === 'object'
+      && diagnosticLabel(value.identity_source) !== 'unknown'
+      && diagnosticLabel(value.selected_identity_type) !== 'unknown'
+      && value.identity_source !== 'none'
+      && value.selected_identity_type !== 'none';
+  }
+
   function completionFiberScan(conversationId, expectedUserMessageId, completionId) {
     return new Promise((resolve) => {
       const nonce = `${++nonceCounter}-${Math.random().toString(36).slice(2)}`;
@@ -225,16 +237,16 @@
           || data.completion_id !== completionId
           || data.conversation_id !== conversationId
           || data.expected_user_message_id !== expectedUserMessageId) return;
-        if (data.status !== 'completed' && data.diagnostic && typeof data.diagnostic === 'object') {
+        if (data.diagnostic && typeof data.diagnostic === 'object') {
           const diagnostic = { conversation_id: conversationId, document_id: registeredDocumentId,
-            epoch: navigationEpoch, completion_id: completionId };
+            navigation_epoch: navigationEpoch, completion_id: completionId };
           for (const key of ['fiber_scan_count', 'candidate_count', 'matched_user_turn_count', 'assistant_candidate_count']) {
             const value = data.diagnostic[key];
             diagnostic[key] = Number.isSafeInteger(value) && value >= 0 ? value : 0;
           }
-          const reason = data.diagnostic.completion_state_reason;
-          diagnostic.completion_state_reason = typeof reason === 'string' && /^[a-z_]{1,100}$/u.test(reason)
-            ? reason : 'unknown';
+          for (const key of ['identity_source', 'selected_identity_type', 'rejection_reason', 'completion_state_reason']) {
+            diagnostic[key] = diagnosticLabel(data.diagnostic[key]);
+          }
           const serialized = JSON.stringify(diagnostic);
           if (serialized !== lastCompletionDiagnostic) {
             console.debug('[LRM completion]', serialized);
@@ -251,6 +263,7 @@
           return;
         }
         if (data.status === 'completed'
+          && completedIdentityDiagnostic(data.diagnostic)
           && typeof data.assistant_message_id === 'string'
           && MESSAGE_ID.test(data.assistant_message_id)
           && typeof data.content === 'string'

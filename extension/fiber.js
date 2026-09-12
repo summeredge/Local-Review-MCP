@@ -75,6 +75,56 @@
     return typeof value === 'string' && value.length > 0 ? value : null;
   }
 
+  function validMessageId(value) {
+    const id = str(value);
+    return id && MESSAGE_ID.test(id) ? id : null;
+  }
+
+  function metadataOf(message) {
+    return message && typeof message === 'object'
+      && message.metadata && typeof message.metadata === 'object'
+      ? message.metadata : null;
+  }
+
+  function metadataString(metadata, ...keys) {
+    for (const key of keys) {
+      const value = str(metadata?.[key]);
+      if (value) return value;
+    }
+    return null;
+  }
+
+  function messageIdOf(message) {
+    if (!message || typeof message !== 'object') return null;
+    return validMessageId(message.id) || validMessageId(message.message_id)
+      || validMessageId(message.messageId);
+  }
+
+  function stableMessageIdentityOf(message) {
+    if (!message || typeof message !== 'object') return null;
+    const metadata = metadataOf(message);
+    const explicit = [
+      [message.message_id, 'message_id'],
+      [message.messageId, 'message_id'],
+      [metadata?.message_id, 'metadata_message_id'],
+      [metadata?.messageId, 'metadata_message_id'],
+    ];
+    for (const [value, source] of explicit) {
+      const id = validMessageId(value);
+      if (id) return { id, source, type: 'message_id' };
+    }
+    return null;
+  }
+
+  function turnIdentityOf(message, expectedUserMessageId) {
+    if (!message || typeof message !== 'object') return null;
+    const metadata = metadataOf(message);
+    const value = str(message.turn_id) || str(message.turnId)
+      || metadataString(metadata, 'turn_id', 'turnId');
+    return value && value !== expectedUserMessageId && MESSAGE_ID.test(value)
+      ? value : null;
+  }
+
   function utf8Length(value) {
     try {
       return encodeURIComponent(value).replace(/%[0-9a-f]{2}|./giu, 'x').length;
@@ -105,7 +155,10 @@
   }
 
   function authoredTime(message) {
-    const raw = message && typeof message === 'object' ? Number(message.create_time) : NaN;
+    const metadata = metadataOf(message);
+    const raw = message && typeof message === 'object'
+      ? Number(message.create_time ?? message.createTime
+        ?? metadata?.create_time ?? metadata?.createTime) : NaN;
     if (!Number.isFinite(raw) || raw <= 0) return null;
     return Math.round(raw < 10_000_000_000 ? raw * 1000 : raw);
   }
@@ -170,7 +223,7 @@
       const props = at.memoizedProps;
       const message = props && typeof props === 'object' ? props.message : null;
       if (!publicAssistantMessage(message)) continue;
-      const id = str(message.id);
+      const id = messageIdOf(message);
       if (!id) continue;
       if (found !== null && found !== id) return null;
       found = id;
@@ -187,7 +240,13 @@
       && ['text', 'multimodal_text', 'image'].includes(content.content_type));
   }
 
-  function authoredAssistantMessages(messages, budget, start = 0, end = Array.isArray(messages) ? messages.length : 0) {
+  function authoredAssistantMessages(
+    messages,
+    budget,
+    start = 0,
+    end = Array.isArray(messages) ? messages.length : 0,
+    expectedUserMessageId = null,
+  ) {
     const out = [];
     const seen = new Set();
     const logicalIds = new Set();
@@ -199,19 +258,27 @@
     for (let index = start; index < Math.min(end, messages.length); index += 1) {
       const message = messages[index];
       if (!publicAssistantMessage(message)) continue;
-      const id = str(message.id);
+      const id = messageIdOf(message);
       const textResult = authoredTextResult(message);
       const rawText = textResult.status === 'text' ? textResult.text : '';
-      if (!id || (budget && budget.remaining <= 0) || seen.has(id)) continue;
-      const metadata = message.metadata && typeof message.metadata === 'object' ? message.metadata : null;
-      const parentId = metadata ? str(metadata.parent_id) : null;
-      const workingTurnId = metadata ? str(metadata.working_turn_id) : null;
-      const turnExchangeId = metadata ? str(metadata.turn_exchange_id) : null;
+      if ((budget && budget.remaining <= 0) || (id && seen.has(id))) continue;
+      const metadata = metadataOf(message);
+      const parentId = metadataString(metadata, 'parent_id', 'parentId');
+      const workingTurnId = metadataString(metadata, 'working_turn_id', 'workingTurnId');
+      const turnExchangeId = metadataString(metadata, 'turn_exchange_id', 'turnExchangeId');
       const createTime = authoredTime(message);
-      const authoredId = assistantLogicalId(id, parentId, workingTurnId, turnExchangeId, createTime);
+      const directIdentity = stableMessageIdentityOf(message);
+      const turnIdentity = turnIdentityOf(message, expectedUserMessageId);
+      const metadataTurnIdentity = (workingTurnId || turnExchangeId) && !createTime
+        ? `working:${workingTurnId || ''}:${turnExchangeId || ''}` : null;
+      const modelIdentity = assistantLogicalId(id, parentId, workingTurnId, turnExchangeId, createTime);
+      const authoredId = directIdentity?.id
+        || (modelIdentity === id && (turnIdentity || metadataTurnIdentity)
+          ? `assistant:turn:${turnIdentity || metadataTurnIdentity}` : modelIdentity)
+        || (turnIdentity ? `assistant:turn:${turnIdentity}` : null);
       const stableId = (workingTurnId || turnExchangeId) && createTime
         ? `assistant:${workingTurnId || ''}:${turnExchangeId || ''}:${createTime}` : null;
-      const collides = logicalIds.has(authoredId);
+      const collides = authoredId !== null && logicalIds.has(authoredId);
       if (collides) {
         for (const prior of out) {
           if (prior.messageId === authoredId) prior.identityConflict = true;
@@ -220,33 +287,59 @@
       let logicalId = collides
         ? assistantLogicalId(id, parentId, workingTurnId, turnExchangeId, null)
         : authoredId;
-      let stable = !collides && stableId !== null && logicalId === stableId
-        && logicalId !== id && logicalId !== parentId;
+      let identitySource = directIdentity?.source || (stableId !== null ? 'metadata_turn_tuple' : null);
+      let identityType = directIdentity?.type || (stableId !== null ? 'turn_identity' : null);
+      let stable = !collides && directIdentity !== null;
+      if (!stable && !collides && stableId !== null && logicalId === stableId
+        && logicalId !== id && logicalId !== parentId) stable = true;
+      if (!stable && !collides && turnIdentity && logicalId === `assistant:turn:${turnIdentity}`) {
+        stable = true;
+        identitySource = 'message_turn_id';
+        identityType = 'turn_identity';
+      }
+      if (!stable && !collides && metadataTurnIdentity && logicalId === `assistant:turn:${metadataTurnIdentity}`) {
+        stable = true;
+        identitySource = 'metadata_turn_identity';
+        identityType = 'turn_identity';
+      }
+      if (!stable && !collides && parentId && (workingTurnId || turnExchangeId)
+        && logicalId !== id && logicalId !== null) {
+        stable = true;
+        identitySource = 'parent_turn_tuple';
+        identityType = 'fallback';
+      }
       let identityConflict = collides;
       const thoughtParent = parentId ? thoughtParents.get(parentId) : null;
       if (thoughtParent) {
-        const parentMetadata = thoughtParent.metadata && typeof thoughtParent.metadata === 'object'
-          ? thoughtParent.metadata : null;
-        const parentWorking = parentMetadata ? str(parentMetadata.working_turn_id) : null;
-        const parentExchange = parentMetadata ? str(parentMetadata.turn_exchange_id) : null;
+        const parentMetadata = metadataOf(thoughtParent);
+        const parentWorking = metadataString(parentMetadata, 'working_turn_id', 'workingTurnId');
+        const parentExchange = metadataString(parentMetadata, 'turn_exchange_id', 'turnExchangeId');
         if (!turnIdentityContradicts(workingTurnId, parentWorking)
           && !turnIdentityContradicts(turnExchangeId, parentExchange)) {
-          if (logicalId === id) logicalId = parentId;
-          stable = true;
+          if (!stable && logicalId === id) logicalId = parentId;
+          if (!stable && logicalId === parentId) {
+            stable = true;
+            identitySource = 'thought_parent';
+            identityType = 'turn_identity';
+          }
         }
       }
-      if (logicalIds.has(logicalId)) {
+      if (logicalId !== null && logicalIds.has(logicalId)) {
         for (const prior of out) {
           if (prior.messageId === logicalId) prior.identityConflict = true;
         }
-        logicalId = id;
+        logicalId = id || null;
         stable = false;
         identityConflict = true;
+        identitySource = 'identity_collision';
+        identityType = 'none';
       }
       if (budget && rawText) budget.remaining -= Math.min(budget.remaining, rawText.length);
-      logicalIds.add(logicalId);
-      seen.add(id);
-      out.push({ id, messageId: logicalId, stable, identityConflict, rawText, textStatus: textResult.status, order: index, createTime });
+      if (logicalId !== null) logicalIds.add(logicalId);
+      if (id) seen.add(id);
+      out.push({ id, messageId: logicalId, stable, identityConflict, identitySource,
+        identityType: identityType || 'none', turnIdentity, rawText, textStatus: textResult.status,
+        order: index, createTime });
     }
     return out;
   }
@@ -270,13 +363,13 @@
     return out;
   }
 
-  function turnEndMessageId(messages, start = 0, end = Array.isArray(messages) ? messages.length : 0) {
+  function turnEndMessageIndex(messages, start = 0, end = Array.isArray(messages) ? messages.length : 0) {
     if (!Array.isArray(messages)) return null;
     for (let index = end - 1; index >= start; index -= 1) {
       const message = messages[index];
       if (!publicAssistantMessage(message)) continue;
       if (message.streaming === true || message.isStreaming === true) return null;
-      if (message.end_turn === true && message.status === 'finished_successfully') return str(message.id);
+      if (message.end_turn === true && message.status === 'finished_successfully') return index;
       return null;
     }
     return null;
@@ -378,22 +471,72 @@
     }, location.origin);
   }
 
+  function attributeOf(node, name) {
+    try {
+      const value = node && typeof node.getAttribute === 'function' ? node.getAttribute(name) : null;
+      return typeof value === 'string' && value.length > 0 ? value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function queryAll(node, selector) {
+    try {
+      return Array.from(node?.querySelectorAll?.(selector) || []);
+    } catch {
+      return [];
+    }
+  }
+
+  function fiberKeysOf(fiber) {
+    const keys = new Set();
+    for (let at = fiber, depth = 0; at && depth < MAX_CLIMB; at = at.return, depth += 1) {
+      const key = validMessageId(at.key);
+      if (key && !/^\d+$/u.test(key)) keys.add(key);
+    }
+    return [...keys];
+  }
+
+  function domAssistantIdentities(sections) {
+    const identities = [];
+    const seenNodes = new Set();
+    for (const section of sections) {
+      const nodes = [];
+      if (attributeOf(section, 'data-message-author-role') === 'assistant') nodes.push(section);
+      nodes.push(...queryAll(section, '[data-message-author-role="assistant"]'));
+      for (const node of nodes) {
+        if (!node || seenNodes.has(node)) continue;
+        seenNodes.add(node);
+        const id = validMessageId(attributeOf(node, 'data-message-id'))
+          || validMessageId(attributeOf(queryAll(node, '[data-message-id]')[0], 'data-message-id'));
+        const fiber = fiberOf(node);
+        const fiberMessageId = fiber ? messageOf(fiber) : null;
+        const fiberKeys = fiber ? fiberKeysOf(fiber) : [];
+        const conversation = fiber ? conversationEvidenceDetailsOf(fiber) : null;
+        if (!id && fiberKeys.length === 0) continue;
+        identities.push({ id, fiberMessageId, fiberKeys, conversation });
+      }
+    }
+    return identities;
+  }
+
   function completionTurnOf(turn, diagnostic, expectedUserMessageId) {
     const visited = new Set();
     const candidates = [];
-    const addCandidate = (fiber, messages, sourcePriority, turnId) => {
+    const domIdentities = domAssistantIdentities(turn.sections);
+    const addCandidate = (fiber, messages, sourcePriority, turnId, modelTurnId) => {
       if (!Array.isArray(messages) || messages.length === 0
         || candidates.length >= MAX_COMPLETION_MESSAGE_CANDIDATES) return;
       diagnostic.candidate_count += 1;
       candidates.push({ fiber, messages: messages.map((entry) => {
         const message = entry?.message ?? entry;
         return message && typeof message === 'object'
-          ? { ...message, id: message.id ?? message.message_id } : message;
-      }), turnId, sourcePriority });
+          ? { ...message, id: message.id ?? message.message_id ?? message.messageId } : message;
+      }), turnId, modelTurnId, domIdentities, sourcePriority });
     };
     for (const section of turn.sections) {
       if (candidates.length >= MAX_COMPLETION_MESSAGE_CANDIDATES) break;
-      const anchors = [section, ...Array.from(section.querySelectorAll?.('[data-message-id]') || []).slice(0, 100)];
+      const anchors = [section, ...queryAll(section, '[data-message-id]').slice(0, 100)];
       for (const anchor of anchors) {
         if (candidates.length >= MAX_COMPLETION_MESSAGE_CANDIDATES) break;
         const root = fiberOf(anchor);
@@ -411,9 +554,10 @@
           const model = props?.turn;
           const fiber = descend ? at : root;
           const turnId = str(model?.id) || turn.turnId;
-          addCandidate(fiber, model?.messages, 0, turnId);
-          addCandidate(fiber, props?.allMessages, 1, turnId);
-          addCandidate(fiber, props?.messages, 2, turnId);
+          const modelTurnId = str(model?.id);
+          addCandidate(fiber, model?.messages, 0, turnId, modelTurnId);
+          addCandidate(fiber, props?.allMessages, 1, turnId, modelTurnId);
+          addCandidate(fiber, props?.messages, 2, turnId, modelTurnId);
           // Only descend below the anchor, not into unrelated conversation branches.
           if (descend) {
             if (at.child) queue.push([at.child, true]);
@@ -437,15 +581,72 @@
     return selected;
   }
 
+  function completionAssistantIdentity(
+    terminal,
+    match,
+    assistantCandidateCount,
+    expectedUserMessageId,
+    conversationId,
+  ) {
+    if (terminal.identityType === 'message_id' && terminal.stable
+      && validMessageId(terminal.messageId)) {
+      return { id: terminal.messageId, source: terminal.identitySource || 'model_message_id', type: 'message_id' };
+    }
+
+    const domIdentities = Array.isArray(match.domIdentities) ? match.domIdentities : [];
+    const currentConversation = (entry) => {
+      const identity = entry?.conversation;
+      return !identity || (!identity.conflict && !identity.unreadable
+        && (!identity.conversationId || identity.conversationId === conversationId));
+    };
+    const currentDomIdentities = domIdentities.filter(currentConversation);
+    const rawId = validMessageId(terminal.id);
+    const exactDom = currentDomIdentities.filter((entry) => entry && entry.id
+      && ((rawId && entry.id === rawId)
+        || (rawId && entry.fiberMessageId === rawId)
+        || (terminal.messageId && entry.fiberMessageId === terminal.messageId)));
+    if (exactDom.length === 1) {
+      return { id: exactDom[0].id, source: 'dom_message_id', type: 'message_id' };
+    }
+    if (assistantCandidateCount === 1 && currentDomIdentities.length === 1 && currentDomIdentities[0].id) {
+      return { id: currentDomIdentities[0].id, source: 'dom_message_id', type: 'message_id' };
+    }
+
+    const exactFiberKeys = [];
+    for (const entry of currentDomIdentities) {
+      if (!entry || !Array.isArray(entry.fiberKeys)) continue;
+      if (rawId && entry.fiberMessageId === rawId) exactFiberKeys.push(...entry.fiberKeys);
+    }
+    if (exactFiberKeys.length === 1) {
+      return { id: exactFiberKeys[0], source: 'fiber_key', type: 'fallback' };
+    }
+    if (assistantCandidateCount === 1 && currentDomIdentities.length === 1
+      && currentDomIdentities[0].fiberKeys?.length === 1) {
+      return { id: currentDomIdentities[0].fiberKeys[0], source: 'fiber_key', type: 'fallback' };
+    }
+
+    if (terminal.stable && validMessageId(terminal.messageId)) {
+      return { id: terminal.messageId, source: terminal.identitySource || 'turn_identity',
+        type: terminal.identityType || 'turn_identity' };
+    }
+    const modelTurnId = validMessageId(match.modelTurnId);
+    if (assistantCandidateCount === 1 && modelTurnId && modelTurnId !== expectedUserMessageId) {
+      return { id: `assistant:turn:${modelTurnId}`, source: 'model_turn_id', type: 'turn_identity' };
+    }
+    return null;
+  }
+
   function scanCompletion(nonce, completionId, conversationId, expectedUserMessageId) {
     const diagnostic = { fiber_scan_count: 0, candidate_count: 0, matched_user_turn_count: 0,
-      assistant_candidate_count: 0, completion_state_reason: 'user_turn_not_found' };
+      assistant_candidate_count: 0, identity_source: 'none', selected_identity_type: 'none',
+      rejection_reason: 'none', completion_state_reason: 'user_turn_not_found' };
     const reply = (status, details = {}) => completionReply(nonce, completionId, conversationId,
-      expectedUserMessageId, status, status === 'completed' ? details : { ...details, diagnostic: {
+      expectedUserMessageId, status, { ...details, diagnostic: {
         ...diagnostic, completion_state_reason: details.error || diagnostic.completion_state_reason,
       } });
     const routeConversationId = conversationIdFromLocation();
     if (routeConversationId !== conversationId) {
+      diagnostic.rejection_reason = 'conversation_conflict';
       reply('ambiguous', {
         error: 'completion_conversation_conflict',
       });
@@ -500,7 +701,9 @@
         diagnostic.matched_user_turn_count += userIndexes.length;
         const conversation = conversationEvidenceDetailsOf(fiber);
         for (const userIndex of userIndexes) {
-          candidates.push({ turnId: turn.turnId, messages, userIndex, turnIndex, matchPriority, conversation });
+          candidates.push({ turnId: turn.turnId, modelTurnId: observation.modelTurnId,
+            domIdentities: observation.domIdentities, messages, userIndex, turnIndex,
+            matchPriority, conversation });
         }
       } catch {
         // Hydration is transient; the next observer or fallback poll retries it.
@@ -518,6 +721,7 @@
       && !match.conversation.unreadable && Boolean(match.conversation.conversationId)
       && match.conversation.conversationId !== conversationId);
     if (conversationConflict || wrongConversation) {
+      diagnostic.rejection_reason = 'conversation_conflict';
       reply('ambiguous', {
         error: 'completion_identity_ambiguous',
       });
@@ -525,17 +729,20 @@
     }
     if (conversationUnreadable || conversationUnavailable) {
       diagnostic.completion_state_reason = 'conversation_unreadable';
+      diagnostic.rejection_reason = 'conversation_unreadable';
       reply('pending');
       return;
     }
     const validMatches = matches.filter((match) => match.conversation.conversationId === conversationId);
     if (validMatches.length > 1) {
+      diagnostic.rejection_reason = 'multiple_target_turns';
       reply('ambiguous', {
         error: 'completion_identity_ambiguous',
       });
       return;
     }
     if (validMatches.length === 0) {
+      diagnostic.rejection_reason = 'user_turn_not_found';
       reply('pending');
       return;
     }
@@ -548,17 +755,20 @@
         const next = observed.get(index);
         if (!next) {
           diagnostic.completion_state_reason = 'following_turn_unreadable';
+          diagnostic.rejection_reason = 'following_turn_unreadable';
           reply('pending');
           return;
         }
         const identity = conversationEvidenceDetailsOf(next.fiber);
         if (identity.conflict || identity.unreadable || identity.conversationId !== conversationId) {
           diagnostic.completion_state_reason = 'following_turn_identity_unavailable';
+          diagnostic.rejection_reason = 'following_turn_identity_unavailable';
           reply('pending');
           return;
         }
         if (next.messages.some((message) => message?.author?.role === 'user')) break;
         match.messages.push(...next.messages);
+        match.domIdentities.push(...next.domIdentities);
       }
     }
     let end = match.messages.length;
@@ -568,44 +778,60 @@
         break;
       }
     }
-    const terminalRawId = turnEndMessageId(match.messages, match.userIndex + 1, end);
+    const terminalIndex = turnEndMessageIndex(match.messages, match.userIndex + 1, end);
     diagnostic.assistant_candidate_count = match.messages.slice(match.userIndex + 1, end)
       .filter(publicAssistantMessage).length;
-    if (!terminalRawId) {
-      diagnostic.completion_state_reason = diagnostic.assistant_candidate_count
-        ? 'assistant_not_terminal' : 'assistant_not_found';
+    if (terminalIndex === null) {
+      const reason = diagnostic.assistant_candidate_count ? 'assistant_not_terminal' : 'assistant_not_found';
+      diagnostic.completion_state_reason = reason;
+      diagnostic.rejection_reason = reason;
       reply('pending');
       return;
     }
 
-    const assistants = authoredAssistantMessages(match.messages, undefined, match.userIndex + 1, end);
-    const terminal = assistants.find((message) => message.id === terminalRawId);
+    const assistants = authoredAssistantMessages(match.messages, undefined, match.userIndex + 1, end,
+      expectedUserMessageId);
+    const terminal = assistants.find((message) => message.order === terminalIndex);
     if (!terminal || terminal.identityConflict) {
+      diagnostic.rejection_reason = terminal?.identityConflict ? 'identity_conflict' : 'terminal_unreadable';
       reply('ambiguous', {
         error: 'completion_assistant_identity_ambiguous',
       });
       return;
     }
     if (terminal.textStatus === 'too_large') {
+      diagnostic.rejection_reason = 'content_too_large';
       reply('failed', {
         error: 'completion_content_too_large',
       });
       return;
     }
-    if (!terminal.stable || !MESSAGE_ID.test(terminal.messageId)) {
+
+    const identity = completionAssistantIdentity(terminal, match, diagnostic.assistant_candidate_count,
+      expectedUserMessageId, conversationId);
+    if (!identity) {
+      diagnostic.identity_source = terminal.identitySource || 'unavailable';
+      diagnostic.selected_identity_type = terminal.identityType || 'none';
+      diagnostic.rejection_reason = 'no_stable_identity';
       reply('failed', {
         error: 'completion_assistant_message_id_unavailable',
       });
       return;
     }
     if (terminal.textStatus !== 'text' || !terminal.rawText) {
+      diagnostic.identity_source = identity.source;
+      diagnostic.selected_identity_type = identity.type;
+      diagnostic.rejection_reason = 'public_text_unavailable';
       reply('failed', {
         error: 'completion_public_text_unavailable',
       });
       return;
     }
+    diagnostic.identity_source = identity.source;
+    diagnostic.selected_identity_type = identity.type;
+    diagnostic.completion_state_reason = 'completed';
     reply('completed', {
-      assistant_message_id: terminal.messageId,
+      assistant_message_id: identity.id,
       content: terminal.rawText,
     });
   }
