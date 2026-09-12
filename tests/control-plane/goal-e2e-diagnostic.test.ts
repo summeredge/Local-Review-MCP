@@ -10,6 +10,7 @@ import {
   waitForExtensionReady,
 } from "../../src/control-plane/goal-e2e-diagnostic.js";
 import { diagnoseChatGPTConnector } from "../../src/control-plane/chatgpt-connector.js";
+import type { GoalPreflightResult } from "../../src/control-plane/goal-preflight.js";
 import type { GoalOrchestration } from "../../src/control-plane/goal-orchestration.js";
 
 const settings: ResolvedSettings = {
@@ -213,5 +214,61 @@ describe("diagnose-goal-e2e", () => {
       extension_ready: true,
       goal_status: "completed",
     });
+  });
+
+  it("does not create a Goal when the shared Preflight fails", async () => {
+    const createdServer = server();
+    const plan = buildDiagnosticGoalPlan("workspace-1", "conversation-1");
+    const created = vi.fn();
+    const started = vi.fn();
+    const context = {
+      registry: { active: { id: "workspace-1" } },
+      goalOrchestration: {
+        storageRoot: "C:\\state",
+        createGoal: created,
+        startGoal: started,
+        getGoal: vi.fn(),
+      },
+    } as unknown as AppContext;
+    const preflight = {
+      checkGoalPreflight: vi.fn(async (): Promise<GoalPreflightResult> => ({
+        ready: false,
+        runtime: { ready: true },
+        connector: {
+          ready: false,
+          status: "unconfigured",
+          action: "none",
+          reason: "remote_not_configured",
+        },
+        extension: {
+          ready: false,
+          paired: false,
+          present: false,
+          readiness_state: "extension_not_paired",
+          reason: "Extension is not paired.",
+        },
+        workspace: { valid: true, workspace_id: plan.workspace_id },
+        conversation: { valid: true, conversation_id: plan.conversation_id },
+        failure_stage: "connector",
+        failure_reason: "remote_not_configured",
+      })),
+    };
+    const logs: unknown[][] = [];
+
+    await expect(runGoalE2EDiagnostic(["--conversation-id", "conversation-1"], {
+      loadSettings: vi.fn(async () => settings),
+      createAppContext: vi.fn(() => context),
+      startApp: vi.fn(async () => createdServer),
+      preflight,
+      log: (...values: unknown[]) => logs.push(values),
+    })).rejects.toThrow("ChatGPT Connector is not ready: remote_not_configured");
+
+    expect(preflight.checkGoalPreflight).toHaveBeenCalledWith({
+      workspace_id: "workspace-1",
+      conversation_id: "conversation-1",
+    });
+    expect(created).not.toHaveBeenCalled();
+    expect(started).not.toHaveBeenCalled();
+    expect(logs.flat().join("\n")).toContain('"failure_stage": "connector"');
   });
 });

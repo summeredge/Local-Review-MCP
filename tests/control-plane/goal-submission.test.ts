@@ -14,9 +14,11 @@ import {
 import {
   GoalOrchestrationService,
 } from "../../src/control-plane/goal-orchestration.js";
+import type { GoalPreflightInput, GoalPreflightResult } from "../../src/control-plane/goal-preflight.js";
 import {
   GoalSubmissionService,
   type GoalSubmissionOrchestration,
+  type GoalSubmissionPreflight,
   type GoalSubmissionRequest,
 } from "../../src/control-plane/goal-submission.js";
 import { ExecutionContextService } from "../../src/context/execution-service.js";
@@ -43,11 +45,35 @@ function request(): GoalSubmissionRequest {
   };
 }
 
+function readyPreflight(input: GoalPreflightInput): GoalPreflightResult {
+  return {
+    ready: true,
+    runtime: { ready: true },
+    connector: {
+      ready: true,
+      status: "verified",
+      action: "none",
+      remote_ready: true,
+      oauth_ready: true,
+    },
+    extension: {
+      ready: true,
+      paired: true,
+      present: true,
+      bridge_available: true,
+      readiness_state: "ready",
+    },
+    workspace: { valid: true, workspace_id: input.workspace_id },
+    conversation: { valid: true, conversation_id: input.conversation_id },
+  };
+}
+
 async function fixture(): Promise<{
   readonly orchestration: GoalOrchestrationService;
   readonly tasks: TaskContextService;
   readonly executions: ExecutionContextService;
   readonly auto: { readonly start: ReturnType<typeof vi.fn> };
+  readonly preflight: GoalSubmissionPreflight;
 }> {
   const root = await mkdtemp(join(tmpdir(), "local-review-mcp-goal-submission-"));
   const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-goal-submission-workspace-"));
@@ -104,6 +130,9 @@ async function fixture(): Promise<{
       return structuredClone(loop);
     }),
   };
+  const preflight: GoalSubmissionPreflight = {
+    checkGoalPreflight: vi.fn(async (input: GoalPreflightInput) => readyPreflight(input)),
+  };
   return {
     orchestration: new GoalOrchestrationService(registry, {
       storageRoot: root,
@@ -116,6 +145,7 @@ async function fixture(): Promise<{
     tasks,
     executions,
     auto,
+    preflight,
   };
 }
 
@@ -124,11 +154,15 @@ describe("GoalSubmissionService", () => {
     const f = await fixture();
     const createGoal = vi.spyOn(f.orchestration, "createGoal");
     const startGoal = vi.spyOn(f.orchestration, "startGoal");
-    const submitted = await new GoalSubmissionService(f.orchestration).submitGoal(request());
+    const submitted = await new GoalSubmissionService(f.orchestration, f.preflight).submitGoal(request());
     const plan = createGoal.mock.calls[0]![0];
     const phase = plan.phases[0]!;
     const task = phase.tasks[0]!;
 
+    expect(f.preflight.checkGoalPreflight).toHaveBeenCalledWith({
+      workspace_id: "workspace-a",
+      conversation_id: "conversation-1",
+    });
     expect(startGoal).toHaveBeenCalledWith({ goal_id: plan.goal_id });
     expect(plan).toMatchObject({
       workspace_id: "workspace-a",
@@ -178,11 +212,41 @@ describe("GoalSubmissionService", () => {
       createGoal: vi.fn(),
       startGoal: vi.fn(),
     };
+    const preflight: GoalSubmissionPreflight = {
+      checkGoalPreflight: vi.fn(),
+    };
     const invalid = { ...request(), title: undefined };
 
-    await expect(new GoalSubmissionService(orchestration).submitGoal(invalid as never))
+    await expect(new GoalSubmissionService(orchestration, preflight).submitGoal(invalid as never))
       .rejects.toThrow(/title/);
     expect(orchestration.createGoal).not.toHaveBeenCalled();
     expect(orchestration.startGoal).not.toHaveBeenCalled();
+  });
+
+  it("stops before Goal creation when Preflight fails", async () => {
+    const f = await fixture();
+    const preflight: GoalSubmissionPreflight = {
+      checkGoalPreflight: vi.fn(async (input: GoalPreflightInput) => ({
+        ...readyPreflight(input),
+        ready: false,
+        connector: {
+          ready: false,
+          status: "unconfigured",
+          action: "none",
+          reason: "remote_not_configured",
+        },
+        failure_stage: "connector" as const,
+        failure_reason: "remote_not_configured",
+      })),
+    };
+
+    await expect(new GoalSubmissionService(f.orchestration, preflight).submitGoal(request()))
+      .rejects.toMatchObject({
+        name: "GoalPreflightError",
+        result: { failure_stage: "connector", failure_reason: "remote_not_configured" },
+      });
+    expect(await f.orchestration.listGoals()).toEqual([]);
+    expect(await f.tasks.listTaskContexts()).toEqual([]);
+    expect(f.auto.start).not.toHaveBeenCalled();
   });
 });

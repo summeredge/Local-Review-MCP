@@ -9,8 +9,15 @@ import { ReviewDeliveryService } from "../context/review-delivery-service.js";
 import { conversationIdSchema } from "../context/schema.js";
 import { bridgeStatus, extensionDeliveryReadiness } from "./bridge.js";
 import { diagnoseChatGPTConnector } from "./chatgpt-connector.js";
+import {
+  GOAL_PREFLIGHT_EXTENSION_READY_TIMEOUT_MS,
+  GOAL_PREFLIGHT_POLL_INTERVAL_MS,
+  GoalPreflightService,
+  normalizeReadiness,
+  waitForExtensionReady,
+  type GoalPreflightResult,
+} from "./goal-preflight.js";
 import type {
-  ExtensionDeliveryReadiness,
   ExtensionDeliveryReadinessCheck,
 } from "./extension-delivery.js";
 import type {
@@ -20,9 +27,11 @@ import type {
 } from "./goal-orchestration.js";
 
 export const DIAGNOSTIC_MAX_ITERATIONS = 2 as const;
-export const E2E_EXTENSION_READY_TIMEOUT_MS = 60_000;
+export const E2E_EXTENSION_READY_TIMEOUT_MS = GOAL_PREFLIGHT_EXTENSION_READY_TIMEOUT_MS;
 export const E2E_GOAL_TIMEOUT_MS = 10 * 60_000;
-const E2E_POLL_INTERVAL_MS = 250;
+const E2E_POLL_INTERVAL_MS = GOAL_PREFLIGHT_POLL_INTERVAL_MS;
+
+export { waitForExtensionReady };
 
 export interface GoalE2EDiagnosticArgs {
   readonly configPath?: string;
@@ -38,6 +47,7 @@ export interface GoalE2EDiagnosticDependencies {
   readonly bridgeStatus?: typeof bridgeStatus;
   readonly diagnoseConnector?: typeof diagnoseChatGPTConnector;
   readonly extensionReadiness?: ExtensionDeliveryReadinessCheck;
+  readonly preflight?: GoalPreflightPort;
   readonly now?: () => number;
   readonly wait?: (milliseconds: number) => Promise<void>;
   readonly extensionReadyTimeoutMs?: number;
@@ -92,30 +102,8 @@ export interface E2ERunSummary {
 type GoalOrchestrationPort = Pick<GoalOrchestrationService, "createGoal" | "startGoal" | "getGoal"> & {
   readonly storageRoot?: string;
 };
-
-function normalizeReadiness(value: ExtensionDeliveryReadiness | boolean): ExtensionDeliveryReadiness {
-  return typeof value === "boolean" ? { ready: value } : value;
-}
-
-export async function waitForExtensionReady(
-  readiness: ExtensionDeliveryReadinessCheck,
-  conversationId: string,
-  options: {
-    readonly timeoutMs?: number;
-    readonly now?: () => number;
-    readonly wait?: (milliseconds: number) => Promise<void>;
-  } = {},
-): Promise<ExtensionDeliveryReadiness> {
-  const now = options.now ?? Date.now;
-  const sleep = options.wait ?? ((milliseconds: number) => wait(milliseconds));
-  const deadline = now() + (options.timeoutMs ?? E2E_EXTENSION_READY_TIMEOUT_MS);
-  let latest = normalizeReadiness(await readiness(conversationId));
-  while (!latest.ready && now() < deadline) {
-    await sleep(E2E_POLL_INTERVAL_MS);
-    latest = normalizeReadiness(await readiness(conversationId));
-  }
-  return latest;
-}
+type GoalPreflightPort = Pick<GoalPreflightService, "checkGoalPreflight">
+  & Partial<Pick<GoalPreflightService, "setRuntimeReady">>;
 
 function timestamp(value: number | undefined): string | null {
   return value === undefined ? null : new Date(value).toISOString();
@@ -135,7 +123,7 @@ async function preRunSnapshot(
   storageRoot: string,
   runId: string,
   connectorStatus: string,
-  readiness: ExtensionDeliveryReadiness,
+  readiness: GoalPreflightResult["extension"],
 ): Promise<Record<string, unknown>> {
   const [deliveries, completions, correlations] = await Promise.all([
     countStateRecords(storageRoot, "extension-deliveries.json", "deliveries"),
@@ -148,7 +136,7 @@ async function preRunSnapshot(
     connector_status: connectorStatus,
     extension_ready: readiness.ready,
     bridge_available: readiness.bridge_available ?? null,
-    extension_paired: readiness.extension_paired ?? null,
+    extension_paired: readiness.paired ?? null,
     last_seen_at: timestamp(readiness.last_seen_at ?? undefined),
     readiness_state: readiness.readiness_state ?? null,
     extension_delivery_count: deliveries,
@@ -246,7 +234,7 @@ async function collectRunSummary(
 function blockedRunSummary(
   runId: string,
   connectorStatus: string,
-  readiness: ExtensionDeliveryReadiness,
+  readiness: GoalPreflightResult["extension"],
   failureStage: string,
   failureReason: string,
 ): E2ERunSummary {
@@ -272,7 +260,7 @@ function blockedRunSummary(
     },
     extension_readiness: {
       bridge_available: readiness.bridge_available ?? null,
-      extension_paired: readiness.extension_paired ?? null,
+      extension_paired: readiness.paired ?? null,
       last_seen_at: timestamp(readiness.last_seen_at ?? undefined),
       readiness_state: readiness.readiness_state ?? null,
     },
@@ -411,6 +399,36 @@ function diagnosticOutput(
   return lines.join("\n");
 }
 
+function createDiagnosticPreflight(
+  settings: ResolvedSettings,
+  context: AppContext,
+  orchestration: GoalOrchestrationPort,
+  server: Server,
+  dependencies: GoalE2EDiagnosticDependencies,
+): GoalPreflightPort {
+  const configured = dependencies.preflight
+    ?? (dependencies.diagnoseConnector === undefined
+      && dependencies.extensionReadiness === undefined
+      && dependencies.bridgeStatus === undefined
+      ? context.goalPreflight
+      : undefined);
+  const preflight = configured ?? new GoalPreflightService({
+    settings,
+    registry: context.registry,
+    storageRoot: orchestration.storageRoot ?? context.storageRoot,
+    diagnoseConnector: dependencies.diagnoseConnector === undefined
+      ? undefined
+      : (currentSettings) => dependencies.diagnoseConnector!(currentSettings),
+    extensionReadiness: dependencies.extensionReadiness,
+    extensionStatus: dependencies.bridgeStatus,
+    now: dependencies.now,
+    wait: dependencies.wait,
+    extensionReadyTimeoutMs: dependencies.extensionReadyTimeoutMs,
+  });
+  preflight.setRuntimeReady?.(server.listening === true);
+  return preflight;
+}
+
 export async function runGoalE2EDiagnostic(
   argv: readonly string[],
   dependencies: GoalE2EDiagnosticDependencies = {},
@@ -426,44 +444,41 @@ export async function runGoalE2EDiagnostic(
 
     const plan = buildDiagnosticGoalPlan(context.registry.active.id, args.conversationId);
     const log = dependencies.log ?? console.log;
-    const connector = await (dependencies.diagnoseConnector ?? diagnoseChatGPTConnector)(settings);
-    const connectorStatus = connector.connector.status;
-    if (!connector.ok || connectorStatus !== "verified" || connector.connector.action !== "none") {
-      const readiness = normalizeReadiness(await (dependencies.extensionReadiness ?? extensionDeliveryReadiness)(
-        args.conversationId,
-      ));
+    const readinessCheck = dependencies.extensionReadiness ?? extensionDeliveryReadiness;
+    const preflight = createDiagnosticPreflight(settings, context, orchestration, server, dependencies);
+    const checked = await preflight.checkGoalPreflight({
+      workspace_id: plan.workspace_id,
+      conversation_id: plan.conversation_id,
+    });
+    const connectorStatus = checked.connector.status ?? "unknown";
+    if (!checked.ready && checked.failure_stage !== "extension") {
       log("E2E Run Summary");
       log(JSON.stringify(blockedRunSummary(
         plan.goal_id,
         connectorStatus,
-        readiness,
-        "connector",
-        connector.connector.reason,
+        checked.extension,
+        checked.failure_stage ?? "preflight",
+        checked.failure_reason ?? "Goal preflight failed",
       ), null, 2));
-      throw new Error(`ChatGPT Connector is not ready: ${connector.connector.reason}`);
+      if (checked.failure_stage === "connector") {
+        throw new Error(`ChatGPT Connector is not ready: ${checked.failure_reason}`);
+      }
+      throw new Error(`Goal preflight failed: ${checked.failure_reason}`);
     }
-    const readinessCheck = dependencies.extensionReadiness ?? extensionDeliveryReadiness;
-    const now = dependencies.now ?? Date.now;
-    const sleep = dependencies.wait ?? ((milliseconds: number) => wait(milliseconds));
-    const readiness = await waitForExtensionReady(readinessCheck, args.conversationId, {
-      timeoutMs: dependencies.extensionReadyTimeoutMs,
-      now,
-      wait: sleep,
-    });
     log("E2E Pre-run Snapshot");
     log(JSON.stringify(await preRunSnapshot(
       orchestration.storageRoot ?? context.storageRoot ?? "",
       plan.goal_id,
       connectorStatus,
-      readiness,
+      checked.extension,
     ), null, 2));
-    if (!readiness.ready) {
-      const reason = readiness.reason ?? "readiness timed out";
+    if (!checked.ready) {
+      const reason = checked.failure_reason ?? "readiness timed out";
       log("E2E Run Summary");
       log(JSON.stringify(blockedRunSummary(
         plan.goal_id,
         connectorStatus,
-        readiness,
+        checked.extension,
         "extension_readiness",
         reason,
       ), null, 2));
@@ -490,8 +505,10 @@ export async function runGoalE2EDiagnostic(
     }
     const terminal = await waitForTerminalGoal(orchestration, started.goal_id, {
       timeoutMs: dependencies.goalTimeoutMs ?? E2E_GOAL_TIMEOUT_MS,
-      now,
-      wait: sleep,
+      now: dependencies.now ?? Date.now,
+      wait: dependencies.wait ?? (async (milliseconds: number): Promise<void> => {
+        await wait(milliseconds);
+      }),
     });
     const summary = await collectRunSummary(
       context,

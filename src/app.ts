@@ -20,6 +20,7 @@ import {
 } from "./control-plane/extension-review-completion.js";
 import { CodexExecutionCompletionService } from "./control-plane/codex-execution-completion.js";
 import { AutoIterationService } from "./control-plane/auto-iteration.js";
+import { GoalPreflightService } from "./control-plane/goal-preflight.js";
 import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
 import { GoalSubmissionService } from "./control-plane/goal-submission.js";
 import { ExtensionReviewCompletionAdapter } from "./delivery/extension-review-completion-adapter.js";
@@ -47,6 +48,7 @@ export interface AppContext extends McpRuntimeContext {
   readonly codexExecutionAdapter?: CodexExecutionAdapter;
   readonly controlledActuation?: ControlledActuationService;
   readonly autoIteration?: AutoIterationService;
+  readonly goalPreflight?: GoalPreflightService;
   readonly goalOrchestration?: GoalOrchestrationService;
   readonly goalSubmission?: GoalSubmissionService;
 }
@@ -112,7 +114,8 @@ export function createAppContext(
     controlledActuation,
     autoIteration,
   });
-  const goalSubmission = new GoalSubmissionService(goalOrchestration);
+  const goalPreflight = new GoalPreflightService({ settings, registry, storageRoot });
+  const goalSubmission = new GoalSubmissionService(goalOrchestration, goalPreflight);
   autoIteration.setTerminalListener((loop) => goalOrchestration.onAutoIterationTerminal(loop));
   codexExecutionCompletion.setTerminalListener((execution) => autoIteration.onExecutionTerminal(execution));
   return {
@@ -127,6 +130,7 @@ export function createAppContext(
     codexExecutionAdapter,
     controlledActuation,
     autoIteration,
+    goalPreflight,
     goalOrchestration,
     goalSubmission,
     tunnel: createTunnelManager(settings.remote, {
@@ -216,6 +220,7 @@ export async function startApp(
       console.warn("Local Control Bridge failed to start; local MCP remains available");
     }
     server.once("close", () => {
+      context.goalPreflight?.setRuntimeReady(false);
       void stopBridge().catch(() => undefined);
       void context.tunnel.stop().catch(() => undefined);
     });
@@ -240,6 +245,7 @@ export async function startApp(
     } catch {
       console.warn("Goal Orchestration recovery failed; local MCP remains available");
     }
+    context.goalPreflight?.setRuntimeReady(true);
     return server;
   } catch (error: unknown) {
     if (isPortInUse(error)) {

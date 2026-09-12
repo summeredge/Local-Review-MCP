@@ -7,6 +7,10 @@ import {
   workspaceIdSchema,
 } from "../context/schema.js";
 import {
+  GoalPreflightError,
+  type GoalPreflightService,
+} from "./goal-preflight.js";
+import {
   createGoalInputSchema,
   goalTaskPlanSchema,
   goalIdSchema,
@@ -46,6 +50,7 @@ export type GoalSubmissionOrchestration = Pick<
   GoalOrchestrationService,
   "createGoal" | "startGoal"
 >;
+export type GoalSubmissionPreflight = Pick<GoalPreflightService, "checkGoalPreflight">;
 
 function generatedId(prefix: string): string {
   return `${prefix}-${randomUUID()}`;
@@ -72,10 +77,18 @@ function buildPlan(request: z.output<typeof goalSubmissionRequestSchema>): Creat
 }
 
 export class GoalSubmissionService {
-  public constructor(private readonly orchestration: GoalSubmissionOrchestration) {}
+  public constructor(
+    private readonly orchestration: GoalSubmissionOrchestration,
+    private readonly preflight: GoalSubmissionPreflight,
+  ) {}
 
   public async submitGoal(request: GoalSubmissionRequest): Promise<GoalSubmissionResult> {
     const parsed = goalSubmissionRequestSchema.parse(request);
+    const preflight = await this.preflight.checkGoalPreflight({
+      workspace_id: parsed.workspace_id,
+      conversation_id: parsed.conversation_id,
+    });
+    if (!preflight.ready) throw new GoalPreflightError(preflight);
     const plan = buildPlan(parsed);
     const created = await this.orchestration.createGoal(plan);
     const started = await this.orchestration.startGoal({ goal_id: created.goal_id });
