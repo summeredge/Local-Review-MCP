@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QLabel, QPlainTextEdit
 
 from gui import LauncherWindow
+from status_checker import OAuthClientStatus, OAuthRegistryStatus
 
 
 class LauncherLogTests(unittest.TestCase):
@@ -44,6 +45,23 @@ class LauncherLogTests(unittest.TestCase):
 
         self.assertEqual(window.log_output.toPlainText(), "")
         process_log.assert_not_called()
+
+    def test_render_oauth_status_shows_client_identity(self) -> None:
+        window = SimpleNamespace(oauth_status_label=QLabel())
+        status = OAuthRegistryStatus(
+            "oauth/clients.json",
+            True,
+            1,
+            (OAuthClientStatus("client-1", "ChatGPT", 123),),
+        )
+
+        LauncherWindow._render_oauth_status(window, status)  # type: ignore[arg-type]
+
+        text = window.oauth_status_label.text()
+        self.assertIn("OAuth Clients: 1", text)
+        self.assertIn("ChatGPT", text)
+        self.assertIn("client_id: client-1", text)
+        self.assertIn("Created: 123", text)
 
 
 if __name__ == "__main__":

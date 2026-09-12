@@ -237,9 +237,15 @@ The health endpoint requires the configured static `Authorization: Bearer <token
 even on localhost and through Cloudflare Tunnel. MCP requests accept either that
 legacy token or an OAuth access token. The health endpoint is
 `http://127.0.0.1:<port>/health`; it returns the status, stable workspace
-identifier, version, `remote_status`, `endpoint_status`, and the public endpoint
-only when it is ready. It never returns tokens, credentials, local IPs, or
-workspace absolute paths.
+identifier, version, `remote_status`, `endpoint_status`, the public endpoint
+only when it is ready, and an `oauth_registry` summary. The health summary uses
+the relative `oauth/clients.json` location so it does not disclose local paths.
+The loopback-only, static-token-protected `GET /oauth/clients` endpoint returns
+the full registry path, load state, client count, and non-secret client summaries.
+`DELETE /oauth/clients/<client_id>` removes one registration and
+`DELETE /oauth/clients` clears registrations without deleting the registry file.
+The health endpoint never returns tokens, credentials, local IPs, or workspace
+absolute paths.
 
 `search_text` accepts an optional `workspace_id`, `query`, workspace-relative
 `path` and `glob`, `regex`, `case_sensitive`, and `limit`. Searches are

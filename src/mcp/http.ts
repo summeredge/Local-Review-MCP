@@ -9,6 +9,7 @@ import {
   OAUTH_TOKEN_PATH,
   OAuthRequestError,
   OAuthService,
+  type OAuthRegistryStatus,
   isValidCodeChallenge,
   validateRedirectUri,
 } from "../auth/oauth.js";
@@ -26,6 +27,8 @@ import { requestIdFromHeader, withInboundRequestOrigin } from "./inbound.js";
 import { createMcpServer, registeredMcpToolsMessage, type McpRuntimeContext } from "./server.js";
 
 export const MAX_MCP_REQUEST_BYTES = 1024 * 1024;
+export const OAUTH_CLIENTS_PATH = "/oauth/clients";
+const SAFE_OAUTH_STORAGE_PATH = "oauth/clients.json";
 
 type HttpRuntimeContext = McpRuntimeContext & {
   readonly tunnel?: Pick<TunnelProvider, "status">;
@@ -101,6 +104,7 @@ async function handleHealthRequest(
   request: IncomingMessage,
   response: ServerResponse,
   context: HttpRuntimeContext,
+  oauth: OAuthService,
 ): Promise<void> {
   if (request.method !== "GET") {
     request.resume();
@@ -129,6 +133,7 @@ async function handleHealthRequest(
           : "stopped"
       : "ready",
     ...(tunnel.endpoint === undefined ? {} : { endpoint: tunnel.endpoint }),
+    oauth_registry: safeOAuthRegistryStatus(oauth),
   });
 }
 
@@ -256,6 +261,22 @@ function sendOAuthError(
   sendOAuthJson(response, statusCode, { error: code, error_description: description });
 }
 
+function isDirectLoopbackRequest(request: IncomingMessage): boolean {
+  const remoteAddress = request.socket.remoteAddress;
+  return (remoteAddress === "127.0.0.1"
+    || remoteAddress === "::1"
+    || remoteAddress === "::ffff:127.0.0.1")
+    && request.headers["cf-connecting-ip"] === undefined
+    && request.headers["x-forwarded-for"] === undefined;
+}
+
+function safeOAuthRegistryStatus(oauth: OAuthService): OAuthRegistryStatus {
+  return {
+    ...oauth.getRegistryStatus(),
+    storage_path: SAFE_OAUTH_STORAGE_PATH,
+  };
+}
+
 function redirectResponse(
   response: ServerResponse,
   redirectUri: string,
@@ -296,7 +317,86 @@ async function handleOAuthRequest(
   path: string,
   urls: OAuthUrls,
   oauth: OAuthService,
+  authToken: string,
 ): Promise<boolean> {
+  const clientPathPrefix = `${OAUTH_CLIENTS_PATH}/`;
+  if (path === OAUTH_CLIENTS_PATH
+    || path === `${OAUTH_CLIENTS_PATH}/`
+    || path.startsWith(clientPathPrefix)) {
+    if (!isDirectLoopbackRequest(request)) {
+      request.resume();
+      sendJson(response, 404, { error: "not_found" });
+      return true;
+    }
+    if (!isAuthenticated(request, authToken)) {
+      request.resume();
+      console.warn("Auth failed");
+      sendUnauthorized(response);
+      return true;
+    }
+
+    if (path === OAUTH_CLIENTS_PATH || path === `${OAUTH_CLIENTS_PATH}/`) {
+      if (request.method === "GET") {
+        sendOAuthJson(response, 200, oauth.getRegistryStatus());
+        return true;
+      }
+      if (request.method === "DELETE") {
+        try {
+          oauth.clearClients();
+          sendOAuthJson(response, 200, {
+            deleted: true,
+            ...oauth.getRegistryStatus(),
+          });
+        } catch {
+          sendOAuthError(response, 500, "server_error", "OAuth server error");
+        }
+        return true;
+      }
+      request.resume();
+      sendOAuthJson(response, 405, { error: "method_not_allowed" });
+      return true;
+    }
+
+    const encodedClientId = path.slice(clientPathPrefix.length);
+    if (encodedClientId === "" || encodedClientId.includes("/")) {
+      request.resume();
+      sendOAuthJson(response, 404, { error: "client_not_found" });
+      return true;
+    }
+    let clientId: string;
+    try {
+      clientId = decodeURIComponent(encodedClientId);
+    } catch {
+      request.resume();
+      sendOAuthJson(response, 400, { error: "invalid_client_id" });
+      return true;
+    }
+    if (clientId === "" || clientId.includes("/")) {
+      request.resume();
+      sendOAuthJson(response, 404, { error: "client_not_found" });
+      return true;
+    }
+    if (request.method !== "DELETE") {
+      request.resume();
+      sendOAuthJson(response, 405, { error: "method_not_allowed" });
+      return true;
+    }
+    try {
+      if (!oauth.deleteClient(clientId)) {
+        sendOAuthJson(response, 404, { error: "client_not_found" });
+      } else {
+        sendOAuthJson(response, 200, {
+          deleted: true,
+          client_id: clientId,
+          ...oauth.getRegistryStatus(),
+        });
+      }
+    } catch {
+      sendOAuthError(response, 500, "server_error", "OAuth server error");
+    }
+    return true;
+  }
+
   const protectedResourcePath = `${OAUTH_PROTECTED_RESOURCE_PATH}${MCP_PATH}`;
   if (path === OAUTH_PROTECTED_RESOURCE_PATH || path === protectedResourcePath) {
     if (request.method !== "GET") {
@@ -554,7 +654,7 @@ export function createHttpServer(
           sendUnauthorized(response);
           return;
         }
-        await handleHealthRequest(request, response, context);
+        await handleHealthRequest(request, response, context, oauth);
         return;
       }
 
@@ -585,7 +685,7 @@ export function createHttpServer(
         || path.startsWith(OAUTH_AUTHORIZATION_SERVER_PATH)
         || path.startsWith("/oauth/")) {
         const urls = await oauthUrls(settings, context, request);
-        if (await handleOAuthRequest(request, response, path, urls, oauth)) return;
+        if (await handleOAuthRequest(request, response, path, urls, oauth, settings.auth.token)) return;
       }
 
       request.resume();

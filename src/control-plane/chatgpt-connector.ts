@@ -586,7 +586,7 @@ export async function migrateLegacyOAuthState(options: {
   const storageRoot = resolve(options.storageRoot ?? defaultTaskContextStorageRoot());
   const paths = workspaceOAuthStatePaths(options.workspaceId, storageRoot);
   const [scopedClientsRaw, scopedTokensRaw, legacy] = await Promise.all([
-    readOptionalJson(paths.clientRegistryPath),
+    readOptionalJson(paths.clientRegistryPath).catch(() => undefined),
     readOptionalJson(paths.tokenStorePath),
     readLegacyOAuthFiles(storageRoot),
   ]);

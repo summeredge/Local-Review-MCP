@@ -49,6 +49,20 @@ export interface OAuthRegisteredClient {
   readonly client_id_issued_at: number;
 }
 
+export interface OAuthClientSummary {
+  readonly client_id: string;
+  readonly client_name: string;
+  readonly created_at: number;
+  readonly redirect_uris: readonly string[];
+}
+
+export interface OAuthRegistryStatus {
+  readonly storage_path: string;
+  readonly loaded: boolean;
+  readonly client_count: number;
+  readonly clients: readonly OAuthClientSummary[];
+}
+
 export interface OAuthServiceOptions {
   readonly clientRegistryPath?: string;
   readonly tokenStorePath?: string;
@@ -352,16 +366,34 @@ export class OAuthService {
 
   private readonly clients: Map<string, OAuthRegisteredClient>;
   private readonly clientRegistryPath: string;
+  private registryLoaded: boolean;
   private readonly authorizationCodes = new Map<string, AuthorizationCode>();
 
   public constructor(options: OAuthServiceOptions = {}) {
     this.clientRegistryPath = resolve(
       options.clientRegistryPath ?? defaultOAuthClientRegistryPath(),
     );
-    this.clients = loadClientRegistry(this.clientRegistryPath);
+    let registryLoaded = true;
+    try {
+      this.clients = loadClientRegistry(this.clientRegistryPath);
+    } catch {
+      registryLoaded = false;
+      this.clients = new Map();
+    }
+    this.registryLoaded = registryLoaded;
     this.tokens = new OAuthTokenStore({
       path: resolve(options.tokenStorePath ?? join(dirname(this.clientRegistryPath), "tokens.json")),
     });
+    if (registryLoaded) {
+      console.log([
+        "OAuth registry loaded",
+        `Storage: ${this.clientRegistryPath}`,
+        `Registered clients: ${this.clients.size}`,
+      ].join("\n"));
+    } else {
+      console.warn("OAuth registry unavailable");
+      console.warn("Using empty registry");
+    }
   }
 
   public registerClient(input: unknown): OAuthRegisteredClient {
@@ -414,11 +446,43 @@ export class OAuthService {
     nextClients.set(client.client_id, client);
     saveClientRegistry(this.clientRegistryPath, nextClients.values());
     this.clients.set(client.client_id, client);
+    this.registryLoaded = true;
     return client;
   }
 
   public getClient(clientId: string): OAuthRegisteredClient | undefined {
     return this.clients.get(clientId);
+  }
+
+  public getRegistryStatus(): OAuthRegistryStatus {
+    const clients = [...this.clients.values()].map((client): OAuthClientSummary => ({
+      client_id: client.client_id,
+      client_name: client.client_name,
+      created_at: client.client_id_issued_at,
+      redirect_uris: [...client.redirect_uris],
+    }));
+    return {
+      storage_path: this.clientRegistryPath,
+      loaded: this.registryLoaded,
+      client_count: clients.length,
+      clients,
+    };
+  }
+
+  public deleteClient(clientId: string): boolean {
+    if (!this.clients.has(clientId)) return false;
+    const nextClients = new Map(this.clients);
+    nextClients.delete(clientId);
+    saveClientRegistry(this.clientRegistryPath, nextClients.values());
+    this.clients.delete(clientId);
+    this.registryLoaded = true;
+    return true;
+  }
+
+  public clearClients(): void {
+    saveClientRegistry(this.clientRegistryPath, []);
+    this.clients.clear();
+    this.registryLoaded = true;
   }
 
   public createAuthorizationCode(request: AuthorizationCodeRequest): string {

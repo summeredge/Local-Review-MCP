@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from config_manager import DEFAULT_REMOTE_ENDPOINT, ConfigManager, LauncherConfig
 
@@ -201,6 +203,23 @@ class ConfigManagerTests(unittest.TestCase):
             info = manager.runtime_info(configuration)
             self.assertEqual(info.tunnel_mode, "missing")
             self.assertEqual(info.remote_endpoint, DEFAULT_REMOTE_ENDPOINT)
+
+    def test_auth_token_uses_the_runtime_configuration_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            self._write_production(root, {
+                "workspace": str(workspace),
+                "auth": {"token": "config-token"},
+            })
+            manager = ConfigManager(root)
+            configuration = self._configuration(workspace)
+
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(manager.auth_token(configuration), "config-token")
+            with patch.dict(os.environ, {"LOCAL_REVIEW_MCP_TOKEN": "environment-token"}, clear=True):
+                self.assertEqual(manager.auth_token(configuration), "environment-token")
 
     def test_backup_is_complete_and_unique(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

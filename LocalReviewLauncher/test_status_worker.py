@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 from PySide6.QtCore import QCoreApplication, QThreadPool
-from status_checker import LauncherStatus, StatusChecker
+from status_checker import OAuthClientStatus, OAuthRegistryStatus, LauncherStatus, StatusChecker
 from status_worker import StatusCheckScheduler, StatusCheckWorker
 
 
@@ -64,6 +65,26 @@ class StatusCheckWorkerTests(unittest.TestCase):
 
         self.assertEqual(results, [LauncherStatus(True, True, False, "2026.8.2")])
 
+    def test_worker_includes_oauth_registry_status(self) -> None:
+        oauth = OAuthRegistryStatus(
+            "oauth/clients.json",
+            True,
+            1,
+            (OAuthClientStatus("client-1", "ChatGPT", 123),),
+        )
+        checker = SimpleNamespace(
+            check=lambda: LauncherStatus(True, True, False),
+            cloudflared_version=lambda: "unavailable",
+            oauth_status=lambda: oauth,
+        )
+        results: list[LauncherStatus] = []
+        worker = StatusCheckWorker(checker)  # type: ignore[arg-type]
+        worker.signals.finished.connect(lambda _generation, status: results.append(status))
+
+        worker.run()
+
+        self.assertEqual(results, [LauncherStatus(True, True, False, "unavailable", oauth)])
+
     def test_worker_runs_outside_the_gui_thread(self) -> None:
         checker = SimpleNamespace(thread_id=None)
 
@@ -79,6 +100,41 @@ class StatusCheckWorkerTests(unittest.TestCase):
 
 
 class StatusCheckerTests(unittest.TestCase):
+    def test_oauth_status_reads_registry_metadata(self) -> None:
+        payload = {
+            "storage_path": "oauth/clients.json",
+            "loaded": True,
+            "client_count": 1,
+            "clients": [{"client_id": "client-1", "client_name": "ChatGPT", "created_at": 123}],
+        }
+        response = MagicMock()
+        response.read.return_value = json.dumps(payload).encode("utf-8")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+        with patch("status_checker.urlopen", return_value=response) as open_url:
+            status = StatusChecker(auth_token="secret").oauth_status()
+
+        self.assertEqual(status, OAuthRegistryStatus(
+            "oauth/clients.json",
+            True,
+            1,
+            (OAuthClientStatus("client-1", "ChatGPT", 123),),
+        ))
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+
+    def test_reset_oauth_clients_uses_delete(self) -> None:
+        response = MagicMock(status=204)
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+        with patch("status_checker.urlopen", return_value=response) as open_url:
+            self.assertTrue(StatusChecker(auth_token="secret").reset_oauth_clients())
+
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+
     def test_remote_timeout_is_offline(self) -> None:
         with patch("status_checker.urlopen", side_effect=TimeoutError("remote timeout")):
             self.assertFalse(StatusChecker._reachable("https://example.invalid/health"))

@@ -47,10 +47,18 @@ class StatusCheckWorker(QRunnable):
             version = self.status_checker.cloudflared_version()
         except Exception:
             version = "unavailable"
+        oauth_registry = None
+        oauth_status = getattr(self.status_checker, "oauth_status", None)
+        if status.mcp_running and callable(oauth_status):
+            try:
+                oauth_registry = oauth_status()
+            except Exception:
+                oauth_registry = None
         status = LauncherStatus(
             status.mcp_running,
             status.tunnel_connected,
             status.remote_online,
             version if isinstance(version, str) else "unavailable",
+            oauth_registry,
         )
         self.signals.finished.emit(self.generation, status)

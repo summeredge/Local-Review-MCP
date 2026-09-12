@@ -269,6 +269,23 @@ class ConfigManager:
         path = Path(config_file)
         return (path if path.is_absolute() else self.project_root / path).resolve()
 
+    def auth_token(self, configuration: LauncherConfig) -> str | None:
+        environment_token = os.environ.get("LOCAL_REVIEW_MCP_TOKEN")
+        if environment_token is not None:
+            return environment_token if _valid_token(environment_token) else None
+        had_config = self.path.exists()
+        saved = self.load()
+        path = self.production_path(saved.config_file if had_config else configuration.config_file)
+        try:
+            source = _read_json_object(path, "Production configuration")
+        except LauncherConfigError:
+            return None
+        auth = source.get("auth")
+        if not isinstance(auth, dict):
+            return None
+        token = auth.get("token")
+        return token if _valid_token(token) else None
+
     def runtime_info(self, configuration: LauncherConfig) -> RuntimeInfo:
         had_config = self.path.exists()
         saved = self.load()

@@ -33,7 +33,7 @@ from config_manager import (
     LauncherConfigError,
 )
 from process_manager import ProductionProcessManager
-from status_checker import LauncherStatus, StatusChecker
+from status_checker import LauncherStatus, OAuthRegistryStatus, StatusChecker
 from status_worker import StatusCheckScheduler, StatusCheckWorker
 
 
@@ -55,7 +55,7 @@ class LauncherWindow(QMainWindow):
         self.config_manager = config_manager
         self.configuration: LauncherConfig = config_manager.load()
         self.process_manager = ProductionProcessManager(project_root, config_manager)
-        self.status_checker = StatusChecker()
+        self.status_checker = StatusChecker(auth_token=config_manager.auth_token(self.configuration))
         self.state = LauncherState.STOPPED
         self._last_status = LauncherStatus(False, False, False)
         self._status_check_scheduler = StatusCheckScheduler()
@@ -71,6 +71,8 @@ class LauncherWindow(QMainWindow):
         self.mcp_status = QLabel()
         self.tunnel_status = QLabel()
         self.remote_status = QLabel()
+        self.oauth_status_label = QLabel("Unavailable")
+        self.oauth_status_label.setWordWrap(True)
         self.workspace_label = QLabel()
         self.workspace_label.setWordWrap(True)
         self.runtime_workspace_label = QLabel()
@@ -96,6 +98,8 @@ class LauncherWindow(QMainWindow):
         self.start_button = QPushButton("启动 MCP")
         self.stop_button = QPushButton("停止 MCP")
         self.refresh_button = QPushButton("刷新状态")
+        self.refresh_oauth_button = QPushButton("Refresh OAuth Status")
+        self.reset_oauth_button = QPushButton("Reset OAuth Clients")
         self.workspace_button = QPushButton("添加 Workspace")
         self.delete_workspace_button = QPushButton("删除 Workspace")
         self.rename_workspace_button = QPushButton("编辑名称")
@@ -109,6 +113,8 @@ class LauncherWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_mcp)
         self.stop_button.clicked.connect(self.stop_mcp)
         self.refresh_button.clicked.connect(self.refresh_status)
+        self.refresh_oauth_button.clicked.connect(self.refresh_oauth_status)
+        self.reset_oauth_button.clicked.connect(self.reset_oauth_clients)
         self.workspace_button.clicked.connect(self.choose_workspace)
         self.delete_workspace_button.clicked.connect(self.delete_workspace)
         self.rename_workspace_button.clicked.connect(self.rename_workspace)
@@ -128,6 +134,7 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(self._row("MCP Runtime:", self.mcp_status))
         layout.addWidget(self._row("Cloudflare Tunnel:", self.tunnel_status))
         layout.addWidget(self._row("Remote Endpoint:", self.remote_status))
+        layout.addWidget(self._row("OAuth Status:", self.oauth_status_label))
         layout.addWidget(self._row("Workspace:", self.workspace_label))
         layout.addSpacing(8)
         layout.addWidget(QLabel("Workspace Registry"))
@@ -149,6 +156,10 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(self.start_button)
         layout.addWidget(self.stop_button)
         layout.addWidget(self.refresh_button)
+        oauth_buttons = QHBoxLayout()
+        oauth_buttons.addWidget(self.refresh_oauth_button)
+        oauth_buttons.addWidget(self.reset_oauth_button)
+        layout.addLayout(oauth_buttons)
         layout.addSpacing(8)
         layout.addWidget(QLabel("配置"))
         config_buttons = QHBoxLayout()
@@ -198,6 +209,9 @@ class LauncherWindow(QMainWindow):
         self._render_runtime_info()
         self._request_status_check("normal")
 
+    def refresh_oauth_status(self) -> None:
+        self.refresh_status()
+
     def _request_status_check(self, source: str) -> None:
         if self._closing or not self._status_check_scheduler.begin(source):
             return
@@ -222,8 +236,29 @@ class LauncherWindow(QMainWindow):
         self._set_status(self.mcp_status, "Running" if status.mcp_running else "Stopped", status.mcp_running)
         self._set_status(self.tunnel_status, "Connected" if status.tunnel_connected else "Offline", status.tunnel_connected)
         self._set_status(self.remote_status, "Online" if status.remote_online else "Offline", status.remote_online)
+        self._render_oauth_status(status.oauth_registry)
         self.workspace_label.setText(self._current_workspace_text())
         self.cloudflared_version_label.setText(getattr(status, "cloudflared_version", "unavailable"))
+
+    def _render_oauth_status(self, status: OAuthRegistryStatus | None) -> None:
+        if status is None:
+            self.oauth_status_label.setText("Unavailable")
+            return
+        lines = [
+            f"OAuth Clients: {status.client_count}",
+            f"Registry: {status.storage_path}",
+            f"Loaded: {'Yes' if status.loaded else 'No'}",
+        ]
+        for client in status.clients:
+            lines.extend([
+                "",
+                client.client_name,
+                f"client_id: {client.client_id}",
+                f"Created: {client.created_at}",
+            ])
+            if client.last_used is not None:
+                lines.append(f"Last used: {client.last_used}")
+        self.oauth_status_label.setText("\n".join(lines))
 
     def _current_workspace_text(self) -> str:
         if not self.configuration.workspace:
@@ -300,6 +335,12 @@ class LauncherWindow(QMainWindow):
             self.set_current_workspace_button,
         ):
             button.setEnabled(self.workspace_button.isEnabled())
+        oauth_available = status.mcp_running and self.state not in (
+            LauncherState.STARTING,
+            LauncherState.STOPPING,
+        )
+        self.refresh_oauth_button.setEnabled(oauth_available)
+        self.reset_oauth_button.setEnabled(oauth_available)
 
     def _set_state(self, state: LauncherState) -> None:
         self.state = state
@@ -406,6 +447,24 @@ class LauncherWindow(QMainWindow):
         finally:
             self.refresh_status()
             self.timer.start(5_000)
+
+    def reset_oauth_clients(self) -> None:
+        if not self._last_status.mcp_running:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Reset OAuth Clients",
+            "Remove all registered OAuth clients from the MCP registry?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self.status_checker.reset_oauth_clients():
+            self._show_error("Could not reset OAuth clients.")
+            return
+        self.message_label.setText("OAuth clients reset.")
+        self.refresh_status()
 
     def choose_workspace(self) -> None:
         initial = self.configuration.workspace if self.configuration.workspace and Path(self.configuration.workspace).is_dir() else ""

@@ -29,4 +29,6 @@
 {"ts":"2026-09-12T14:14:00+08:00","action":"add","type":"error","id":"ERR-20260912-001","summary":"PowerShell foreach 语句需用子表达式包裹后才能连接输出管道"}
 {"ts":"2026-09-12T14:16:00+08:00","action":"add","type":"error","id":"ERR-20260912-002","summary":"Connector 诊断必须在 Runtime 和 Tunnel 运行时执行"}
 {"ts":"2026-09-12T14:19:00+08:00","action":"add","type":"learning","id":"LRN-20260912-001","summary":"Browser receipt、lease 与 ACK retry 必须共用时间预算"}
+{"ts":"2026-09-12T21:48:00+08:00","action":"add","type":"error","id":"ERR-20260912-003","summary":"Launcher unittest 需从 LocalReviewLauncher 目录或 discover 入口运行"}
+{"ts":"2026-09-12T21:50:00+08:00","action":"add","type":"error","id":"ERR-20260912-004","summary":"urlopen 测试响应需使用 MagicMock 或显式上下文管理器"}
 ```

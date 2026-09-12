@@ -70,6 +70,12 @@ describe("health endpoint", () => {
       version: "0.1",
       remote_status: "LOCAL_ONLY",
       endpoint_status: "stopped",
+      oauth_registry: {
+        storage_path: "oauth/clients.json",
+        loaded: true,
+        client_count: 0,
+        clients: [],
+      },
     });
     expect(response.text).not.toContain(workspace);
     expect(response.text).not.toContain(TOKEN);

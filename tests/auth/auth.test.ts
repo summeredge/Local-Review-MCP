@@ -598,6 +598,174 @@ describe("MCP OAuth compatibility", () => {
       .resolves.toMatchObject({ status: 200 });
   });
 
+  it("reports and manages the OAuth client registry without exposing secrets", async () => {
+    const first = await makeServer();
+    const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
+    const register = async (clientName: string) => {
+      const response = await requestText(
+        first.port,
+        "/oauth/register",
+        "POST",
+        JSON.stringify({ client_name: clientName, redirect_uris: [redirectUri] }),
+        { "content-type": "application/json" },
+      );
+      expect(response.status).toBe(201);
+      return JSON.parse(response.text) as { client_id: string };
+    };
+    const chatgpt = await register("ChatGPT");
+    const other = await register("Other Client");
+
+    const unauthorized = await requestText(first.port, "/oauth/clients", "GET");
+    expect(unauthorized.status).toBe(401);
+
+    const listed = await requestText(
+      first.port,
+      "/oauth/clients",
+      "GET",
+      undefined,
+      { authorization: `Bearer ${TOKEN}` },
+    );
+    const registry = JSON.parse(listed.text) as {
+      storage_path: string;
+      loaded: boolean;
+      client_count: number;
+      clients: Array<Record<string, unknown>>;
+    };
+    expect(listed.status).toBe(200);
+    expect(registry).toMatchObject({
+      storage_path: first.registryPath,
+      loaded: true,
+      client_count: 2,
+      clients: [
+        {
+          client_id: chatgpt.client_id,
+          client_name: "ChatGPT",
+          created_at: expect.any(Number),
+          redirect_uris: [redirectUri],
+        },
+        {
+          client_id: other.client_id,
+          client_name: "Other Client",
+          created_at: expect.any(Number),
+          redirect_uris: [redirectUri],
+        },
+      ],
+    });
+    expect(listed.text).not.toContain("client_secret");
+
+    const health = await requestText(
+      first.port,
+      "/health",
+      "GET",
+      undefined,
+      { authorization: `Bearer ${TOKEN}` },
+    );
+    expect(JSON.parse(health.text)).toMatchObject({
+      oauth_registry: { loaded: true, client_count: 2 },
+    });
+    expect(health.text).not.toContain(first.registryPath);
+
+    const deleted = await requestText(
+      first.port,
+      `/oauth/clients/${chatgpt.client_id}`,
+      "DELETE",
+      undefined,
+      { authorization: `Bearer ${TOKEN}` },
+    );
+    expect(deleted.status).toBe(200);
+    expect(JSON.parse(await readFile(first.registryPath, "utf8"))).toMatchObject({
+      version: 1,
+      clients: [{ client_id: other.client_id }],
+    });
+
+    const cleared = await requestText(
+      first.port,
+      "/oauth/clients",
+      "DELETE",
+      undefined,
+      { authorization: `Bearer ${TOKEN}` },
+    );
+    expect(cleared.status).toBe(200);
+    expect(JSON.parse(await readFile(first.registryPath, "utf8"))).toEqual({
+      version: 1,
+      clients: [],
+    });
+
+    const reRegistered = await register("ChatGPT");
+    expect(reRegistered.client_id).not.toBe(chatgpt.client_id);
+  });
+
+  it("keeps the MCP runtime available when the OAuth registry cannot be loaded", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-invalid-registry-"));
+    temporaryDirectories.push(workspace);
+    const registryPath = join(workspace, "oauth", "clients.json");
+    await mkdir(dirname(registryPath), { recursive: true });
+    await writeFile(registryPath, "not-json", "utf8");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { port } = await makeServer({ workspace, registryPath });
+      expect(warning).toHaveBeenCalledWith("OAuth registry unavailable");
+      expect(warning).toHaveBeenCalledWith("Using empty registry");
+
+      const health = await requestText(
+        port,
+        "/health",
+        "GET",
+        undefined,
+        { authorization: `Bearer ${TOKEN}` },
+      );
+      expect(health.status).toBe(200);
+      expect(JSON.parse(health.text)).toMatchObject({
+        oauth_registry: {
+          storage_path: "oauth/clients.json",
+          loaded: false,
+          client_count: 0,
+          clients: [],
+        },
+      });
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it("keeps the workspace-scoped runtime available when registry JSON is malformed", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-invalid-scoped-registry-"));
+    const stateBase = await mkdtemp(join(tmpdir(), "local-review-mcp-invalid-scoped-state-"));
+    temporaryDirectories.push(workspace, stateBase);
+    const identity = { id: "invalid-scoped", name: "Invalid Scoped", path: workspace };
+    const settings = {
+      host: "127.0.0.1" as const,
+      port: 0,
+      workspace,
+      workspaceIdentity: identity,
+      workspaces: [identity],
+      auth: { token: TOKEN },
+      remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
+    };
+    const environment = { ...process.env, LOCALAPPDATA: stateBase, XDG_STATE_HOME: stateBase };
+    const paths = workspaceOAuthStatePaths(identity.id, defaultTaskContextStorageRoot(environment));
+    await mkdir(dirname(paths.clientRegistryPath), { recursive: true });
+    await writeFile(paths.clientRegistryPath, "not-json", "utf8");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const server = await startApp(settings, createAppContext(settings, environment));
+      runningServers.push(server);
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("test server has no port");
+      expect(warning).toHaveBeenCalledWith("OAuth registry unavailable");
+      await expect(requestText(
+        address.port,
+        "/health",
+        "GET",
+        undefined,
+        { authorization: `Bearer ${TOKEN}` },
+      )).resolves.toMatchObject({ status: 200 });
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
   it("completes public-client registration, PKCE code exchange, and MCP access", async () => {
     const { port } = await makeServer();
     const redirectUri = "https://client.example/callback";

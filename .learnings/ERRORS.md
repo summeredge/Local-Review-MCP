@@ -33,6 +33,40 @@ Caused by: SyntaxError: Unexpected end of JSON input
 
 ---
 
+## [ERR-20260912-003] Launcher unittest 从仓库根目录导入失败
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+从仓库根目录按模块名运行 Launcher unittest 时，测试文件中的目录级导入找不到同目录模块。
+
+### 错误信息
+
+```text
+ModuleNotFoundError: No module named 'status_checker'
+ModuleNotFoundError: No module named 'gui'
+ModuleNotFoundError: No module named 'config_manager'
+```
+
+### 上下文
+
+- 使用项目解释器运行 `python -m unittest LocalReviewLauncher.test_status_worker LocalReviewLauncher.test_gui LocalReviewLauncher.test_config_manager`
+- Launcher 测试应从 `LocalReviewLauncher` 目录作为工作目录运行，或使用仓库既有的 discover 入口
+
+### 建议修复
+
+使用 `python -m unittest discover -s .\LocalReviewLauncher -p 'test_*.py'`，工作目录保持在仓库根目录。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
 ## [ERR-20260908-004] Restarted receipt comparison used JSON property order
 
 **Priority**: medium
@@ -499,6 +533,37 @@ http_status: 530
 ### 建议修复
 
 保持 Runtime、Supervisor、Bridge、Tunnel 运行后再执行 Connector 诊断；诊断结束后再停止 Runtime。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
+## [ERR-20260912-004] Python Mock 缺少上下文管理器协议
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+Launcher 状态测试用 `Mock` 模拟 `urlopen` 响应时，普通 Mock 没有 `__enter__`，无法用于 `with`。
+
+### 错误信息
+
+```text
+AttributeError: __enter__
+```
+
+### 上下文
+
+- 新增 OAuth 状态请求测试初次使用普通 `Mock` 作为上下文响应
+
+### 建议修复
+
+使用支持魔术方法的 `MagicMock`，或定义显式的上下文管理器测试响应。
 
 ### 元数据
 
