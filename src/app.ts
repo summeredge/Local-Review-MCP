@@ -21,6 +21,7 @@ import {
 import { CodexExecutionCompletionService } from "./control-plane/codex-execution-completion.js";
 import { AutoIterationService } from "./control-plane/auto-iteration.js";
 import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
+import { GoalSubmissionService } from "./control-plane/goal-submission.js";
 import { ExtensionReviewCompletionAdapter } from "./delivery/extension-review-completion-adapter.js";
 import { ReviewCompletionRouter } from "./router/review-completion-router.js";
 import {
@@ -47,6 +48,7 @@ export interface AppContext extends McpRuntimeContext {
   readonly controlledActuation?: ControlledActuationService;
   readonly autoIteration?: AutoIterationService;
   readonly goalOrchestration?: GoalOrchestrationService;
+  readonly goalSubmission?: GoalSubmissionService;
 }
 
 export interface AppStartOptions extends HttpServerOptions {
@@ -110,6 +112,7 @@ export function createAppContext(
     controlledActuation,
     autoIteration,
   });
+  const goalSubmission = new GoalSubmissionService(goalOrchestration);
   autoIteration.setTerminalListener((loop) => goalOrchestration.onAutoIterationTerminal(loop));
   codexExecutionCompletion.setTerminalListener((execution) => autoIteration.onExecutionTerminal(execution));
   return {
@@ -125,6 +128,7 @@ export function createAppContext(
     controlledActuation,
     autoIteration,
     goalOrchestration,
+    goalSubmission,
     tunnel: createTunnelManager(settings.remote, {
       localEndpoint: localOrigin(settings),
       authToken: settings.auth.token,
