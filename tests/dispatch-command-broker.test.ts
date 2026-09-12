@@ -142,6 +142,10 @@ describe("DispatchCommandBroker", () => {
       delivery_id: claimed.delivery_id,
       logical_delivery_id: delivery.delivery_id,
       conversation_id: conversationId,
+      readiness_check_time: expect.any(Number),
+      readiness_result: "ready",
+      claim_time: expect.any(Number),
+      ack_time: expect.any(Number),
     });
   });
 
@@ -187,7 +191,7 @@ describe("DispatchCommandBroker", () => {
     await expect(deliveries.claim(owner(review.conversation_id, "late"))).resolves.toBeNull();
   });
 
-  it("does not accept a late ACK after an already leased delivery times out", async () => {
+  it("drains a late owner ACK without changing an already timed-out delivery", async () => {
     const root = await makeStorageRoot();
     const deliveries = new ExtensionDeliveryService(root);
     const review = request("delivery-leased-timeout", "conversation-leased-timeout");
@@ -202,13 +206,23 @@ describe("DispatchCommandBroker", () => {
       status: "failed",
       error: { code: "EXTENSION_DELIVERY_TIMEOUT" },
     });
-    await expect(deliveries.get(command.delivery_id)).resolves.toMatchObject({ phase: "ambiguous" });
+    await expect(deliveries.get(command.delivery_id)).resolves.toMatchObject({
+      phase: "ambiguous",
+      timeout_reason: "Extension Delivery timed out before an acknowledgement was recorded.",
+    });
     await expect(deliveries.acknowledge({
       ...claim,
       delivery_id: command.delivery_id,
       status: "sent",
       message_id: "late-message",
-    })).rejects.toBeInstanceOf(ExtensionDeliveryConflictError);
+    })).resolves.toMatchObject({
+      accepted: "existing",
+      receipt: { status: "ambiguous" },
+    });
+    await expect(deliveries.get(command.delivery_id)).resolves.toMatchObject({
+      phase: "ambiguous",
+      ack_time: expect.any(Number),
+    });
   });
 
   it("keeps a not-ready ReviewDelivery failed until a later explicit retry is ready", async () => {

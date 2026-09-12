@@ -667,8 +667,19 @@ export function bridgeStatus(): BridgeStatus {
 
 export function extensionDeliveryReadiness(): ExtensionDeliveryReadiness {
   const status = bridgeStatus();
-  if (!status.available) return { ready: false, reason: "Bridge is not ready." };
-  if (!status.paired) return { ready: false, reason: "Extension is not paired." };
-  if (!status.present) return { ready: false, reason: "Extension is not connected." };
-  return { ready: true };
+  const details = {
+    bridge_available: status.available,
+    extension_paired: status.paired,
+    last_seen_at: status.lastSeenAt,
+  };
+  if (!status.available) {
+    return { ready: false, reason: "Bridge is not ready.", readiness_state: "bridge_unavailable", ...details };
+  }
+  if (!status.paired) {
+    return { ready: false, reason: "Extension is not paired.", readiness_state: "extension_not_paired", ...details };
+  }
+  if (!status.present) {
+    return { ready: false, reason: "Extension is not connected.", readiness_state: "extension_not_present", ...details };
+  }
+  return { ready: true, readiness_state: "ready", ...details };
 }

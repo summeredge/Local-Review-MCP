@@ -441,3 +441,68 @@ Caused by: Error: bad port
 - See Also: ERR-20260908-003
 
 ---
+
+## [ERR-20260912-001] PowerShell foreach 语句不能直接接管道
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+在 PowerShell 中将 `foreach (...) { ... }` 语句直接连接到 `| ConvertTo-Json` 会产生空管道元素解析错误。
+
+### 错误信息
+
+```text
+ParserError: 不允许空管道元素。
+```
+
+### 上下文
+
+- 遍历 Bridge 候选端口并希望将结果统一转换为 JSON
+- `foreach` 是语句而非可直接作为管道左值的表达式
+
+### 建议修复
+
+用 `$(foreach (...) { ... }) | ConvertTo-Json` 包裹语句输出，或先赋值再接管道。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
+## [ERR-20260912-002] Connector 诊断在 Runtime 停止后误报远端不可达
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+`diagnose:chatgpt-connector` 依赖已运行的 Runtime 与 Tunnel；在先停止 Runtime 后执行会返回公网端点 530，即使持久化 Connector 状态仍为 verified。
+
+### 错误信息
+
+```text
+final_state: mcp_endpoint_unreachable
+http_status: 530
+```
+
+### 上下文
+
+- P2.7 收尾时先停止真实 E2E Runtime，再单独运行 Connector 诊断
+- 诊断正确读取到 `connector.status=verified`，但完整就绪检查因远端端点不在线退出 1
+
+### 建议修复
+
+保持 Runtime、Supervisor、Bridge、Tunnel 运行后再执行 Connector 诊断；诊断结束后再停止 Runtime。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---

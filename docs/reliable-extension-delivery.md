@@ -73,6 +73,33 @@ Crash windows fail closed:
 - submit without a stable receipt: the durable `submitting` marker becomes terminal ambiguous,
   never a second send.
 
+## Repeatable Goal E2E diagnostic
+
+Run the existing diagnostic against one concrete Chat conversation:
+
+```powershell
+npm run diagnose:goal-e2e -- --config config.production.json --conversation-id <conversation_id>
+```
+
+The command starts one Runtime, verifies the existing Connector, and waits up to 60 seconds for
+Bridge pairing plus live Extension presence before it creates a Goal. A Bridge restart therefore
+cannot create a false failed delivery while the Extension is still recovering. Keep the target
+Chat page open; its existing polling recovers pairing and presence without changing OAuth,
+Connector binding, workspace identity, or the delivery state machine.
+
+Each run uses its `goal_id` as the `run_id` and marker, prints an `E2E Pre-run Snapshot`, then ends
+with an `E2E Run Summary`. The summary reports runtime, Connector, readiness, delivery, completion,
+verdict, Goal, failure stage, and safe lifecycle timestamps. It never prints the delivery message,
+assistant response, OAuth tokens, or Connector credentials.
+
+Delivery claim and broker timeouts share a 90-second bound so Chromium background timer throttling
+does not consume the entire lease. If an ACK arrives after a local timeout, it is accepted only from
+the original owner to drain the durable outbox; the saved `ambiguous` outcome is never promoted to
+`delivered`.
+
+Diagnostic state is retained. Control Plane arrays and `.task` records contain shared production
+and test relationships, so the command does not guess which historical records are safe to delete.
+
 ## Protocol and manual gate
 
 Bridge protocol `2` adds `POST /delivery/claim` and `POST /delivery/ack`. Both retain Extension

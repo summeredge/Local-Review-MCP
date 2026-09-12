@@ -1,4 +1,5 @@
 import {
+  EXTENSION_DELIVERY_LEASE_MS,
   ExtensionDeliveryNotReadyError,
   ExtensionDeliveryService,
   type ExtensionDeliveryReceipt,
@@ -7,7 +8,7 @@ import {
 import type { ReviewDeliveryRequest } from "../delivery/review-delivery-adapter.js";
 import { buildReviewMessage } from "../delivery/review-message.js";
 
-export const DEFAULT_DISPATCH_COMMAND_TIMEOUT_MS = 30_000;
+export const DEFAULT_DISPATCH_COMMAND_TIMEOUT_MS = EXTENSION_DELIVERY_LEASE_MS;
 
 export interface DispatchCommandBrokerOptions {
   readonly timeoutMs?: number;
@@ -31,6 +32,7 @@ export class DispatchCommandBroker {
   }
 
   public async dispatch(request: ReviewDeliveryRequest): Promise<ExtensionDeliveryReceipt | null> {
+    const readinessCheckTime = Date.now();
     let readiness: Awaited<ReturnType<ExtensionDeliveryReadinessCheck>>;
     try {
       readiness = await this.readiness(request.conversation_id);
@@ -51,6 +53,12 @@ export class DispatchCommandBroker {
       request.conversation_id,
       request.message ?? buildReviewMessage(request),
       request.delivery_id,
+      {
+        readiness_check_time: readinessCheckTime,
+        readiness_result: typeof readiness === "boolean"
+          ? "ready"
+          : readiness.readiness_state ?? "ready",
+      },
     );
     const receipt = await this.extensionDeliveries.awaitResult(command.delivery_id, this.timeoutMs);
     if (receipt !== null) return receipt;

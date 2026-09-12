@@ -26,4 +26,7 @@
 {"ts":"2026-09-08T18:10:00+08:00","action":"add","type":"error","id":"ERR-20260908-004","summary":"Zod 重启恢复重排 receipt 字段；JSON.stringify 误判相同 ACK 冲突"}
 {"ts":"2026-09-08T22:40:00+08:00","action":"add","type":"error","id":"ERR-20260908-005","summary":"异步 execution context 直接覆盖造成截断 JSON；改用同目录临时文件原子 rename"}
 {"ts":"2026-09-10T13:06:00+08:00","action":"add","type":"error","id":"ERR-20260910-001","summary":"Windows listen(0) 偶发分配 Fetch 禁用端口；单文件和单 worker 全量复核"}
+{"ts":"2026-09-12T14:14:00+08:00","action":"add","type":"error","id":"ERR-20260912-001","summary":"PowerShell foreach 语句需用子表达式包裹后才能连接输出管道"}
+{"ts":"2026-09-12T14:16:00+08:00","action":"add","type":"error","id":"ERR-20260912-002","summary":"Connector 诊断必须在 Runtime 和 Tunnel 运行时执行"}
+{"ts":"2026-09-12T14:19:00+08:00","action":"add","type":"learning","id":"LRN-20260912-001","summary":"Browser receipt、lease 与 ACK retry 必须共用时间预算"}
 ```

@@ -7,7 +7,9 @@ import {
   DIAGNOSTIC_MAX_ITERATIONS,
   parseGoalE2EDiagnosticArgs,
   runGoalE2EDiagnostic,
+  waitForExtensionReady,
 } from "../../src/control-plane/goal-e2e-diagnostic.js";
+import { diagnoseChatGPTConnector } from "../../src/control-plane/chatgpt-connector.js";
 import type { GoalOrchestration } from "../../src/control-plane/goal-orchestration.js";
 
 const settings: ResolvedSettings = {
@@ -31,14 +33,17 @@ function server(): Server {
   return value as unknown as Server;
 }
 
-function goal(plan: ReturnType<typeof buildDiagnosticGoalPlan>, status: "pending" | "running"): GoalOrchestration {
+function goal(
+  plan: ReturnType<typeof buildDiagnosticGoalPlan>,
+  status: "pending" | "running" | "completed",
+): GoalOrchestration {
   const phase = plan.phases[0]!;
   const task = phase.tasks[0]!;
   return {
     ...plan,
     phases: [{ ...phase, status }],
     status,
-    ...(status === "running"
+    ...(status !== "pending"
       ? {
         current_phase_id: phase.phase_id,
         current_task_id: task.task_id,
@@ -53,6 +58,41 @@ function goal(plan: ReturnType<typeof buildDiagnosticGoalPlan>, status: "pending
 }
 
 describe("diagnose-goal-e2e", () => {
+  it("waits for Extension presence recovery without weakening readiness", async () => {
+    let now = 0;
+    const states = [
+      { ready: false, reason: "Extension is not paired." },
+      { ready: false, reason: "Extension is not connected." },
+      { ready: true, readiness_state: "ready" as const },
+    ];
+    const readiness = vi.fn(() => states.shift() ?? { ready: true, readiness_state: "ready" as const });
+    const result = await waitForExtensionReady(readiness, "conversation-1", {
+      timeoutMs: 1_000,
+      now: () => now,
+      wait: async (milliseconds) => { now += milliseconds; },
+    });
+    expect(result).toMatchObject({ ready: true, readiness_state: "ready" });
+    expect(readiness).toHaveBeenCalledTimes(3);
+  });
+
+  it("returns the last blocked readiness state after the bounded wait", async () => {
+    let now = 0;
+    const result = await waitForExtensionReady(
+      () => ({ ready: false, reason: "Extension is not connected.", readiness_state: "extension_not_present" }),
+      "conversation-1",
+      {
+        timeoutMs: 500,
+        now: () => now,
+        wait: async (milliseconds) => { now += milliseconds; },
+      },
+    );
+    expect(result).toEqual({
+      ready: false,
+      reason: "Extension is not connected.",
+      readiness_state: "extension_not_present",
+    });
+  });
+
   it("requires conversation identity and rejects max-iteration overrides before runtime startup", async () => {
     expect(() => parseGoalE2EDiagnosticArgs(["--config", "settings.json"]))
       .toThrow("--conversation-id is required");
@@ -79,7 +119,7 @@ describe("diagnose-goal-e2e", () => {
     expect(left.phases[0]!.tasks[0]!.requirements.join("\n")).not.toContain("src/");
   });
 
-  it("starts the real app before creating and starting exactly one Goal", async () => {
+  it("preflights Connector and Extension before one Goal and prints a terminal summary", async () => {
     const events: string[] = [];
     const logs: unknown[][] = [];
     const createdServer = server();
@@ -94,9 +134,10 @@ describe("diagnose-goal-e2e", () => {
       expect(input.goal_id).toBe(plan?.goal_id);
       return goal(plan!, "running");
     });
+    const getGoal = vi.fn(async () => goal(plan!, "completed"));
     const context = {
       registry: { active: { id: "workspace-1" } },
-      goalOrchestration: { storageRoot: "C:\\state", createGoal: created, startGoal: started },
+      goalOrchestration: { storageRoot: "C:\\state", createGoal: created, startGoal: started, getGoal },
     } as unknown as AppContext;
     const load = vi.fn(async () => {
       events.push("loadSettings");
@@ -111,11 +152,26 @@ describe("diagnose-goal-e2e", () => {
       return createdServer;
     });
     const log = vi.fn((...values: unknown[]) => logs.push(values));
+    const diagnoseConnector = vi.fn(async () => {
+      events.push("diagnoseConnector");
+      return {
+        ok: true,
+        connector: { status: "verified", action: "none", reason: "verified_endpoint_matches" },
+      } as Awaited<ReturnType<typeof diagnoseChatGPTConnector>>;
+    });
 
-    await runGoalE2EDiagnostic(["--config", "settings.json", "--conversation-id", "conversation-1"], {
+    const result = await runGoalE2EDiagnostic(["--config", "settings.json", "--conversation-id", "conversation-1"], {
       loadSettings: load,
       createAppContext: createContext,
       startApp: start,
+      diagnoseConnector,
+      extensionReadiness: () => ({
+        ready: true,
+        bridge_available: true,
+        extension_paired: true,
+        last_seen_at: Date.now(),
+        readiness_state: "ready",
+      }),
       log,
       registerShutdown: vi.fn(),
       bridgeStatus: () => ({
@@ -133,6 +189,7 @@ describe("diagnose-goal-e2e", () => {
       "loadSettings",
       "createAppContext",
       "startApp",
+      "diagnoseConnector",
       "createGoal",
       "startGoal",
     ]);
@@ -148,5 +205,13 @@ describe("diagnose-goal-e2e", () => {
     expect(output).toContain("max_iterations=2");
     expect(output).toContain("review_completion_transport: extension");
     expect(output).toContain("browser_worker_required: false");
+    expect(output).toContain("E2E Pre-run Snapshot");
+    expect(output).toContain("E2E Run Summary");
+    expect(result.summary).toMatchObject({
+      runtime_status: "RUNNING",
+      connector_status: "verified",
+      extension_ready: true,
+      goal_status: "completed",
+    });
   });
 });

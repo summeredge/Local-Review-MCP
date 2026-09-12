@@ -6,7 +6,7 @@ import { defaultTaskContextStorageRoot } from "../context/task.js";
 
 const STATE_VERSION = 1;
 const MAX_DELIVERIES = 1_000;
-const LEASE_MS = 30_000;
+export const EXTENSION_DELIVERY_LEASE_MS = 90_000;
 const ID = /^[A-Za-z0-9_-]+$/u;
 const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const logicalDeliveryIdSchema = z.string().min(1).max(128);
@@ -15,6 +15,8 @@ const enqueueSchema = z.object({
   conversation_id: z.string().min(1).max(256).regex(CONVERSATION_ID),
   message: z.string().min(1).max(48 * 1024),
   logical_delivery_id: logicalDeliveryIdSchema.optional(),
+  readiness_check_time: z.number().int().nonnegative().refine(Number.isSafeInteger).optional(),
+  readiness_result: z.string().min(1).max(500).optional(),
 }).strict();
 
 const ownerSchema = z.object({
@@ -69,6 +71,11 @@ export interface ExtensionDelivery {
   readonly conversation_id: string;
   readonly message: string;
   readonly created_at: number;
+  readonly readiness_check_time?: number;
+  readonly readiness_result?: string;
+  readonly claim_time?: number;
+  readonly ack_time?: number;
+  readonly timeout_reason?: string;
   readonly phase: ExtensionDeliveryPhase;
   readonly lease?: ExtensionDeliveryLease;
   readonly receipt?: ExtensionDeliveryReceipt;
@@ -84,6 +91,15 @@ export interface LeasedExtensionDelivery {
 export interface ExtensionDeliveryReadiness {
   readonly ready: boolean;
   readonly reason?: string;
+  readonly bridge_available?: boolean;
+  readonly extension_paired?: boolean;
+  readonly last_seen_at?: number | null;
+  readonly readiness_state?: "bridge_unavailable" | "extension_not_paired" | "extension_not_present" | "ready";
+}
+
+export interface ExtensionDeliveryDiagnostics {
+  readonly readiness_check_time: number;
+  readonly readiness_result: string;
 }
 
 export type ExtensionDeliveryReadinessCheck = (
@@ -121,6 +137,11 @@ const deliverySchema = z.object({
   conversation_id: z.string().min(1).max(256).regex(CONVERSATION_ID),
   message: z.string().min(1).max(48 * 1024),
   created_at: z.number().int().nonnegative().refine(Number.isSafeInteger),
+  readiness_check_time: z.number().int().nonnegative().refine(Number.isSafeInteger).optional(),
+  readiness_result: z.string().min(1).max(500).optional(),
+  claim_time: z.number().int().nonnegative().refine(Number.isSafeInteger).optional(),
+  ack_time: z.number().int().nonnegative().refine(Number.isSafeInteger).optional(),
+  timeout_reason: z.string().min(1).max(500).optional(),
   phase: z.enum(["queued", "leased", "delivered", "failed", "ambiguous"]),
   lease: leaseSchema.optional(),
   receipt: receiptSchema.optional(),
@@ -211,6 +232,14 @@ function sameReceipt(receipt: ExtensionDeliveryReceipt, ack: ExtensionDeliveryAc
     && receipt.completed_at === candidate.completed_at;
 }
 
+function sameReceiptOwner(receipt: ExtensionDeliveryReceipt, ack: ExtensionDeliveryAck): boolean {
+  return receipt.delivery_id === ack.delivery_id
+    && receipt.conversation_id === ack.conversation_id
+    && receipt.client_id === ack.client_id
+    && receipt.document_id === ack.document_id
+    && receipt.navigation_epoch === ack.navigation_epoch;
+}
+
 export class ExtensionDeliveryConflictError extends Error {}
 export class ExtensionDeliveryNotFoundError extends Error {}
 export class ExtensionDeliveryNotReadyError extends Error {}
@@ -252,12 +281,14 @@ export class ExtensionDeliveryService {
     conversationId: string,
     message: string,
     logicalDeliveryId?: string,
+    diagnostics?: ExtensionDeliveryDiagnostics,
   ): Promise<ExtensionDelivery> {
     await this.restore();
     const parsed = enqueueSchema.parse({
       conversation_id: conversationId,
       message,
       ...(logicalDeliveryId === undefined ? {} : { logical_delivery_id: logicalDeliveryId }),
+      ...diagnostics,
     });
     return this.exclusive(async () => {
       const next = new Map(this.deliveries);
@@ -324,9 +355,9 @@ export class ExtensionDeliveryService {
       const lease: ExtensionDeliveryLease = {
         ...owner,
         claimed_at: now,
-        deadline: now + LEASE_MS,
+        deadline: now + EXTENSION_DELIVERY_LEASE_MS,
       };
-      const leased: ExtensionDelivery = { ...delivery, phase: "leased", lease };
+      const leased: ExtensionDelivery = { ...delivery, claim_time: now, phase: "leased", lease };
       next.set(delivery.delivery_id, leased);
       await this.persist(next);
       this.deliveries = next;
@@ -349,6 +380,17 @@ export class ExtensionDeliveryService {
       const current = this.deliveries.get(ack.delivery_id);
       if (!current) throw new ExtensionDeliveryNotFoundError("delivery not found");
       if (current.receipt) {
+        if (current.receipt.status === "ambiguous"
+          && current.receipt.error === current.timeout_reason
+          && sameReceiptOwner(current.receipt, ack)) {
+          if (current.ack_time === undefined) {
+            const next = new Map(this.deliveries);
+            next.set(current.delivery_id, { ...current, ack_time: Date.now() });
+            await this.persist(next);
+            this.deliveries = next;
+          }
+          return { accepted: "existing", receipt: clone(current.receipt) };
+        }
         if (!sameReceipt(current.receipt, ack)) throw new ExtensionDeliveryConflictError("conflicting delivery receipt");
         return { accepted: "existing", receipt: clone(current.receipt) };
       }
@@ -359,6 +401,7 @@ export class ExtensionDeliveryService {
       const next = new Map(this.deliveries);
       next.set(current.delivery_id, {
         ...current,
+        ack_time: receipt.completed_at,
         phase: receipt.status,
         lease: undefined,
         receipt,
@@ -456,6 +499,7 @@ export class ExtensionDeliveryService {
       };
       next.set(parsedDeliveryId, {
         ...current,
+        timeout_reason: receipt.error,
         phase: "ambiguous",
         lease: undefined,
         receipt,

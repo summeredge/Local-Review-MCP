@@ -130,16 +130,49 @@ describe("Local Control Bridge protocol", () => {
     const now = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     try {
-      await expect(request("/pair", { method: "POST", body: {} })).resolves.toMatchObject({ status: 200 });
-      expect(extensionDeliveryReadiness()).toEqual({ ready: true });
+      const pair = await request("/pair", { method: "POST", body: {} });
+      expect(pair).toMatchObject({ status: 200 });
+      const token = (pair.body as { token: string }).token;
+      expect(extensionDeliveryReadiness()).toMatchObject({
+        ready: true,
+        bridge_available: true,
+        extension_paired: true,
+        last_seen_at: now,
+        readiness_state: "ready",
+      });
       expect(bridgeStatus()).toMatchObject({ present: true, lastSeenAt: now });
 
       clock.mockReturnValue(now + EXTENSION_PRESENCE_TIMEOUT_MS);
-      expect(extensionDeliveryReadiness()).toMatchObject({ ready: false });
+      expect(extensionDeliveryReadiness()).toMatchObject({
+        ready: false,
+        extension_paired: true,
+        readiness_state: "extension_not_present",
+      });
       expect(bridgeStatus().present).toBe(false);
+
+      clock.mockReturnValue(now + EXTENSION_PRESENCE_TIMEOUT_MS + 1);
+      await expect(request("/status", { token })).resolves.toMatchObject({ status: 200 });
+      expect(extensionDeliveryReadiness()).toMatchObject({ ready: true, readiness_state: "ready" });
     } finally {
       clock.mockRestore();
     }
+  });
+
+  it("requires a fresh pair and presence proof after a Bridge restart", async () => {
+    const pair = await request("/pair", { method: "POST", body: {} });
+    expect(pair.status).toBe(200);
+    expect(extensionDeliveryReadiness()).toMatchObject({ ready: true });
+
+    await stopBridge();
+    await startBridge({ ports: [0] });
+    expect(extensionDeliveryReadiness()).toMatchObject({
+      ready: false,
+      extension_paired: false,
+      readiness_state: "extension_not_paired",
+    });
+
+    await expect(request("/pair", { method: "POST", body: {} })).resolves.toMatchObject({ status: 200 });
+    expect(extensionDeliveryReadiness()).toMatchObject({ ready: true, readiness_state: "ready" });
   });
 
   it.each([

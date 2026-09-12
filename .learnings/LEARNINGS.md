@@ -194,3 +194,29 @@ receipt、durable ACK 四个边界，并用 lost-ACK 与 submit-without-receipt 
 - See Also: none
 
 ---
+
+## [LRN-20260912-001] Browser receipt、lease 与 ACK retry 必须共用时间预算
+
+**Priority**: high
+**Status**: resolved
+**Area**: infra
+
+### 内容
+
+真实 Chromium 后台页会节流 timer。若 DOM receipt 等待、Bridge 重连/ACK retry 与本地
+delivery lease 各自设置独立短超时，本地可能先写入 timeout ambiguous，随后同 owner 的
+durable ACK 又因 receipt 不同被拒绝，最终永久堵塞 Extension ACK outbox。
+
+### 建议修复
+
+用一个覆盖浏览器节流和 Bridge retry 的共享 lease/broker 时间预算。迟到 ACK 仅在原始
+owner 完全匹配时作为已接收处理并记录 `ack_time`，保持已保存的 ambiguous 终态不变，
+从而既排空 outbox，也不伪造 delivered。
+
+### 元数据
+
+- Source: task_review
+- See Also: LRN-20260908-002
+- Pattern-Key: browser-delivery-time-budget
+
+---

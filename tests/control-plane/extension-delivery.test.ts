@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  EXTENSION_DELIVERY_LEASE_MS,
   ExtensionDeliveryConflictError,
   ExtensionDeliveryService,
   ExtensionDeliveryUnavailableError,
@@ -62,7 +63,11 @@ afterEach(async () => {
 describe("ExtensionDeliveryService", () => {
   it("durably enqueues, atomically claims, and commits one idempotent sent receipt", async () => {
     const { root, deliveries } = await service();
-    const queued = await deliveries.enqueue(conversation, "review this exact change");
+    const readinessCheckTime = Date.now();
+    const queued = await deliveries.enqueue(conversation, "review this exact change", undefined, {
+      readiness_check_time: readinessCheckTime,
+      readiness_result: "ready",
+    });
 
     await expect(deliveries.claim({ ...owner, conversation_id: "wrong-conversation" })).resolves.toBeNull();
     const claimed = await deliveries.claim(owner);
@@ -96,6 +101,10 @@ describe("ExtensionDeliveryService", () => {
     await restarted.restore();
     await expect(restarted.get(queued.delivery_id)).resolves.toMatchObject({
       phase: "delivered",
+      readiness_check_time: readinessCheckTime,
+      readiness_result: "ready",
+      claim_time: expect.any(Number),
+      ack_time: expect.any(Number),
       receipt: { message_id: "message-one" },
     });
     await expect(restarted.claim(owner)).resolves.toBeNull();
@@ -132,7 +141,7 @@ describe("ExtensionDeliveryService", () => {
     });
     await expect(restarted.claim({ ...owner, document_id: "document-two" })).resolves.toBeNull();
 
-    vi.advanceTimersByTime(30_001);
+    vi.advanceTimersByTime(EXTENSION_DELIVERY_LEASE_MS + 1);
     await expect(restarted.claim({ ...owner, document_id: "document-two" })).resolves.toMatchObject({
       delivery_id: queued.delivery_id,
     });
@@ -203,6 +212,39 @@ describe("ExtensionDeliveryService", () => {
       releasePersist();
       persistSpy.mockRestore();
     }
+  });
+
+  it("drains a late owner ACK without changing a timeout ambiguity into success", async () => {
+    const { deliveries } = await service();
+    const queued = await deliveries.enqueue(conversation, "late ack after local timeout");
+    const lateOwner = {
+      conversation_id: conversation,
+      client_id: "client-a",
+      document_id: "document-a",
+      navigation_epoch: 0,
+    };
+    await expect(deliveries.claim(lateOwner)).resolves.toMatchObject({ delivery_id: queued.delivery_id });
+    await expect(deliveries.expire(queued.delivery_id)).resolves.toBeNull();
+    const timeout = (await deliveries.get(queued.delivery_id))?.receipt;
+    expect(timeout).toMatchObject({ delivery_id: queued.delivery_id, status: "ambiguous" });
+
+    await expect(deliveries.acknowledge({
+      ...lateOwner,
+      delivery_id: queued.delivery_id,
+      status: "sent",
+      message_id: "message-late",
+    })).resolves.toMatchObject({ accepted: "existing", receipt: timeout });
+    await expect(deliveries.acknowledge({
+      ...lateOwner,
+      delivery_id: queued.delivery_id,
+      status: "sent",
+      message_id: "message-late",
+    })).resolves.toMatchObject({ accepted: "existing", receipt: timeout });
+    await expect(deliveries.get(queued.delivery_id)).resolves.toMatchObject({
+      phase: "ambiguous",
+      ack_time: expect.any(Number),
+      receipt: { status: "ambiguous" },
+    });
   });
 
   it("wakes a waiter when awaitResult registration reaches the queue before acknowledge", async () => {
