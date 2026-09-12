@@ -23,6 +23,7 @@ import { AutoIterationService } from "./control-plane/auto-iteration.js";
 import { GoalPreflightService } from "./control-plane/goal-preflight.js";
 import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
 import { GoalSubmissionService } from "./control-plane/goal-submission.js";
+import { ExecutionRoutingService } from "./control-plane/execution-routing.js";
 import { ExtensionReviewCompletionAdapter } from "./delivery/extension-review-completion-adapter.js";
 import { ReviewCompletionRouter } from "./router/review-completion-router.js";
 import {
@@ -51,6 +52,7 @@ export interface AppContext extends McpRuntimeContext {
   readonly goalPreflight?: GoalPreflightService;
   readonly goalOrchestration?: GoalOrchestrationService;
   readonly goalSubmission?: GoalSubmissionService;
+  readonly executionRouter?: ExecutionRoutingService;
 }
 
 export interface AppStartOptions extends HttpServerOptions {
@@ -116,8 +118,13 @@ export function createAppContext(
   });
   const goalPreflight = new GoalPreflightService({ settings, registry, storageRoot });
   const goalSubmission = new GoalSubmissionService(goalOrchestration, goalPreflight);
+  const executionRouter = new ExecutionRoutingService(registry, {
+    storageRoot,
+    autoIteration,
+    goalOrchestration,
+  });
   autoIteration.setTerminalListener((loop) => goalOrchestration.onAutoIterationTerminal(loop));
-  codexExecutionCompletion.setTerminalListener((execution) => autoIteration.onExecutionTerminal(execution));
+  codexExecutionCompletion.setTerminalListener((execution) => executionRouter.onExecutionTerminal(execution));
   return {
     settings,
     storageRoot,
@@ -133,6 +140,7 @@ export function createAppContext(
     goalPreflight,
     goalOrchestration,
     goalSubmission,
+    executionRouter,
     tunnel: createTunnelManager(settings.remote, {
       localEndpoint: localOrigin(settings),
       authToken: settings.auth.token,

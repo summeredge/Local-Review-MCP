@@ -86,6 +86,20 @@ export const createGoalInputSchema = z.object({
 
 export const startGoalInputSchema = z.object({ goal_id: goalIdSchema }).strict();
 
+export const startReviewGoalInputSchema = z.object({
+  goal_id: goalIdSchema,
+  phase_id: phaseIdSchema,
+  workspace_id: workspaceIdSchema,
+  task_id: taskIdSchema,
+  conversation_id: conversationIdSchema,
+  execution_id: executionIdSchema,
+  title: instructionItemSchema,
+  goal: instructionItemSchema,
+  requirements: z.array(instructionItemSchema).min(1).max(1_000),
+  acceptance_criteria: z.array(instructionItemSchema).min(1).max(1_000),
+  max_iterations: z.number().int().min(1).max(10_000),
+}).strict();
+
 const phaseSchema = z.object({
   phase_id: phaseIdSchema,
   objective: instructionItemSchema,
@@ -97,6 +111,7 @@ export const goalOrchestrationSchema = z.object({
   goal_id: goalIdSchema,
   workspace_id: workspaceIdSchema,
   conversation_id: conversationIdSchema,
+  review_only: z.boolean().optional(),
   phases: z.array(phaseSchema).min(1).max(1_000),
   status: goalOrchestrationStatusSchema,
   current_phase_id: phaseIdSchema.optional(),
@@ -182,6 +197,7 @@ export const goalOrchestrationStateSchema = z.object({
 
 export type CreateGoalInput = z.input<typeof createGoalInputSchema>;
 export type StartGoalInput = z.input<typeof startGoalInputSchema>;
+export type StartReviewGoalInput = z.input<typeof startReviewGoalInputSchema>;
 export type GoalTaskPlan = z.infer<typeof goalTaskPlanSchema>;
 export type GoalOrchestration = z.infer<typeof goalOrchestrationSchema>;
 
@@ -408,6 +424,15 @@ export class GoalOrchestrationService {
     return this.serial(parsed.goal_id, () => this.startOnce(parsed.goal_id));
   }
 
+  public startReviewGoal(input: StartReviewGoalInput): Promise<GoalOrchestration> {
+    const parsed = startReviewGoalInputSchema.parse(input);
+    return this.serial(parsed.goal_id, () => this.startReviewGoalOnce(parsed));
+  }
+
+  public createReviewGoal(input: StartReviewGoalInput): Promise<GoalOrchestration> {
+    return this.startReviewGoal(input);
+  }
+
   public advanceGoal(goalId: string): Promise<GoalOrchestration> {
     const parsedId = goalIdSchema.parse(goalId);
     return this.serial(parsedId, () => this.advanceOnce(parsedId));
@@ -453,6 +478,84 @@ export class GoalOrchestrationService {
       });
     }
     return this.drive(goal);
+  }
+
+  private async startReviewGoalOnce(input: StartReviewGoalInput): Promise<GoalOrchestration> {
+    this.registry.resolve(input.workspace_id);
+    const task = await this.tasks.getTaskContext(input.task_id);
+    if (task === null) throw new Error(`Task context "${input.task_id}" was not found.`);
+    if (task.workspace_id !== input.workspace_id) {
+      throw new Error("Task context does not belong to the requested workspace.");
+    }
+    if (task.conversation_id !== undefined && task.conversation_id !== input.conversation_id) {
+      throw new Error("TaskContext conversation identity does not match the review Goal.");
+    }
+
+    const execution = await this.executions.getExecutionContext(
+      input.workspace_id,
+      input.task_id,
+      input.execution_id,
+    );
+    if (execution === null) {
+      throw new Error(`Execution context "${input.execution_id}" was not found.`);
+    }
+    if (execution.status !== "passed") {
+      throw new Error(`Execution "${input.execution_id}" is not completed successfully.`);
+    }
+
+    const plan = createGoalInputSchema.parse({
+      goal_id: input.goal_id,
+      workspace_id: input.workspace_id,
+      conversation_id: input.conversation_id,
+      phases: [{
+        phase_id: input.phase_id,
+        objective: input.title,
+        tasks: [{
+          task_id: input.task_id,
+          goal: input.goal,
+          requirements: input.requirements,
+          acceptance_criteria: input.acceptance_criteria,
+          max_iterations: input.max_iterations,
+        }],
+      }],
+    });
+    let goal = await this.store.get(input.goal_id);
+    if (goal !== null) {
+      if (!goal.review_only || JSON.stringify(planIdentity(goal)) !== JSON.stringify(plan)
+        || goal.execution_id !== input.execution_id) {
+        throw new GoalOrchestrationConflictError(
+          `Goal "${input.goal_id}" is bound to another review execution.`,
+        );
+      }
+      if (goal.status === "completed" || goal.status === "failed" || goal.status === "human_required") {
+        return goal;
+      }
+    } else {
+      const timestamp = new Date().toISOString();
+      goal = await this.store.put(goalOrchestrationSchema.parse({
+        ...plan,
+        review_only: true,
+        phases: plan.phases.map((phase) => ({ ...phase, status: "running" as const })),
+        status: "running",
+        current_phase_id: input.phase_id,
+        current_task_id: input.task_id,
+        execution_id: input.execution_id,
+        actuation_id: stableIdentity("actuation", input.goal_id, input.phase_id, input.task_id),
+        loop_id: stableIdentity("loop", input.goal_id, input.phase_id, input.task_id),
+        created_at: timestamp,
+        updated_at: timestamp,
+      }));
+    }
+
+    await this.auto.start({
+      loop_id: goal.loop_id!,
+      workspace_id: input.workspace_id,
+      task_id: input.task_id,
+      conversation_id: input.conversation_id,
+      execution_id: input.execution_id,
+      max_iterations: input.max_iterations,
+    });
+    return this.drive(await this.requiredGoal(input.goal_id));
   }
 
   private async advanceOnce(goalId: string): Promise<GoalOrchestration> {
@@ -520,7 +623,26 @@ export class GoalOrchestrationService {
       acceptance_criteria: task.acceptance_criteria,
     });
     this.assertEvidence(goal, task, instruction, authorization, actuation, loop);
+    if (goal.review_only === true && authorization === null && actuation === null && loop === null) {
+      if (execution === null) throw new Error("Review Goal Execution is missing.");
+      loop = await this.auto.start({
+        loop_id: loopId,
+        workspace_id: goal.workspace_id,
+        task_id: task.task_id,
+        conversation_id: goal.conversation_id,
+        execution_id: executionId,
+        max_iterations: task.max_iterations,
+      });
+      this.assertLoop(goal, task, loop);
+      return this.loopOutcome(loop);
+    }
     if (loop !== null) {
+      if (goal.review_only === true && authorization === null && actuation === null) {
+        if (execution === null) throw new Error("Review Goal Execution is missing.");
+        loop = await this.auto.advance(loopId);
+        this.assertLoop(goal, task, loop);
+        return this.loopOutcome(loop);
+      }
       if (authorization === null || actuation === null || execution === null) {
         throw new Error("AutoIteration exists without its initial actuation evidence");
       }
