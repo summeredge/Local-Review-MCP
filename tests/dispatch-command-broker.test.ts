@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConversationRoutingService } from "../src/context/conversation-routing-service.js";
 import { ExecutionContextService } from "../src/context/execution-service.js";
 import { ReviewDeliveryService } from "../src/context/review-delivery-service.js";
@@ -114,9 +114,13 @@ describe("DispatchCommandBroker", () => {
     const conversationId = "conversation-normal";
     const { routing, delivery } = await makeReviewChain(root, conversationId);
     const extension = new ExtensionDeliveryService(root);
+    const readiness = vi.fn(() => ({ ready: true }));
     const dispatch = new BrowserRouter(
       root,
-      new ExtensionDeliveryAdapter(new DispatchCommandBroker(extension, { timeoutMs: 1_000 })),
+      new ExtensionDeliveryAdapter(new DispatchCommandBroker(extension, {
+        timeoutMs: 1_000,
+        readiness,
+      })),
     ).deliver("workspace-a", routing.routing_id);
     const claimed = await claimWhenReady(extension, owner(conversationId, "normal"));
     await extension.acknowledge({
@@ -133,10 +137,117 @@ describe("DispatchCommandBroker", () => {
       attempt_count: 1,
     });
     expect(claimed.message).toContain("review_request_id: review-conversationnormal");
+    expect(readiness).toHaveBeenCalledWith(conversationId);
     expect((await persistedDeliveries(root))[0]).toMatchObject({
       delivery_id: claimed.delivery_id,
       logical_delivery_id: delivery.delivery_id,
       conversation_id: conversationId,
+    });
+  });
+
+  it("returns EXTENSION_NOT_READY before enqueueing when the Extension is absent", async () => {
+    const root = await makeStorageRoot();
+    const deliveries = new ExtensionDeliveryService(root);
+    const review = request("delivery-not-ready", "conversation-not-ready");
+    const readiness = vi.fn(() => ({ ready: false, reason: "Extension is not connected." }));
+
+    await expect(new ExtensionDeliveryAdapter(
+      new DispatchCommandBroker(deliveries, { readiness }),
+    ).deliver(review)).resolves.toEqual({
+      status: "failed",
+      retryable: true,
+      error: {
+        code: "EXTENSION_NOT_READY",
+        message: "Extension Delivery is not ready: Extension is not connected.",
+      },
+    });
+    expect(readiness).toHaveBeenCalledWith(review.conversation_id);
+    await expect(deliveries.getByLogicalDeliveryId(review.delivery_id)).resolves.toBeNull();
+  });
+
+  it("uses EXTENSION_DELIVERY_TIMEOUT only after readiness and retires the command", async () => {
+    const root = await makeStorageRoot();
+    const deliveries = new ExtensionDeliveryService(root);
+    const review = request("delivery-timeout", "conversation-timeout");
+
+    await expect(new ExtensionDeliveryAdapter(
+      new DispatchCommandBroker(deliveries, {
+        timeoutMs: 10,
+        readiness: () => ({ ready: true }),
+      }),
+    ).deliver(review)).resolves.toEqual({
+      status: "failed",
+      retryable: true,
+      error: {
+        code: "EXTENSION_DELIVERY_TIMEOUT",
+        message: "Extension Delivery did not produce a durable result before the timeout.",
+      },
+    });
+    await expect(deliveries.getByLogicalDeliveryId(review.delivery_id)).resolves.toBeNull();
+    await expect(deliveries.claim(owner(review.conversation_id, "late"))).resolves.toBeNull();
+  });
+
+  it("does not accept a late ACK after an already leased delivery times out", async () => {
+    const root = await makeStorageRoot();
+    const deliveries = new ExtensionDeliveryService(root);
+    const review = request("delivery-leased-timeout", "conversation-leased-timeout");
+    const pending = new ExtensionDeliveryAdapter(new DispatchCommandBroker(deliveries, {
+      timeoutMs: 10,
+      readiness: () => ({ ready: true }),
+    })).deliver(review);
+    const claim = owner(review.conversation_id, "leased-timeout");
+    const command = await claimWhenReady(deliveries, claim);
+
+    await expect(pending).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "EXTENSION_DELIVERY_TIMEOUT" },
+    });
+    await expect(deliveries.get(command.delivery_id)).resolves.toMatchObject({ phase: "ambiguous" });
+    await expect(deliveries.acknowledge({
+      ...claim,
+      delivery_id: command.delivery_id,
+      status: "sent",
+      message_id: "late-message",
+    })).rejects.toBeInstanceOf(ExtensionDeliveryConflictError);
+  });
+
+  it("keeps a not-ready ReviewDelivery failed until a later explicit retry is ready", async () => {
+    const root = await makeStorageRoot();
+    const conversationId = "conversation-delayed";
+    const { routing } = await makeReviewChain(root, conversationId);
+    const deliveries = new ExtensionDeliveryService(root);
+    let ready = false;
+    const router = new BrowserRouter(
+      root,
+      new ExtensionDeliveryAdapter(new DispatchCommandBroker(deliveries, {
+        timeoutMs: 1_000,
+        readiness: () => ready
+          ? { ready: true }
+          : { ready: false, reason: "Extension is not connected." },
+      })),
+    );
+
+    const failed = await router.deliver("workspace-a", routing.routing_id);
+    expect(failed).toMatchObject({
+      status: "failed",
+      attempt_count: 1,
+      last_error: { code: "EXTENSION_NOT_READY" },
+    });
+    await expect(deliveries.claim(owner(conversationId, "delayed"))).resolves.toBeNull();
+
+    ready = true;
+    const retried = router.deliver("workspace-a", routing.routing_id);
+    const command = await claimWhenReady(deliveries, owner(conversationId, "delayed"));
+    await deliveries.acknowledge({
+      ...owner(conversationId, "delayed"),
+      delivery_id: command.delivery_id,
+      status: "sent",
+      message_id: "message-delayed",
+    });
+
+    await expect(retried).resolves.toMatchObject({
+      status: "delivered",
+      attempt_count: 2,
     });
   });
 

@@ -2,6 +2,7 @@ import { DispatchCommandBroker } from "../control-plane/dispatch-command-broker.
 import {
   ExtensionDeliveryConflictError,
   ExtensionDeliveryNotFoundError,
+  ExtensionDeliveryNotReadyError,
   ExtensionDeliveryUnavailableError,
   type ExtensionDeliveryReceipt,
 } from "../control-plane/extension-delivery.js";
@@ -29,12 +30,15 @@ function brokerFailure(error: unknown): ReviewDeliveryResult {
     ? "EXTENSION_DELIVERY_CONFLICT"
     : error instanceof ExtensionDeliveryNotFoundError
       ? "EXTENSION_DELIVERY_NOT_FOUND"
-      : error instanceof ExtensionDeliveryUnavailableError
-        ? "EXTENSION_DELIVERY_UNAVAILABLE"
-        : "EXTENSION_DELIVERY_BROKER_FAILED";
+      : error instanceof ExtensionDeliveryNotReadyError
+        ? "EXTENSION_NOT_READY"
+        : error instanceof ExtensionDeliveryUnavailableError
+          ? "EXTENSION_DELIVERY_UNAVAILABLE"
+          : "EXTENSION_DELIVERY_BROKER_FAILED";
   return {
     status: "failed",
-    retryable: error instanceof ExtensionDeliveryUnavailableError,
+    retryable: error instanceof ExtensionDeliveryNotReadyError
+      || error instanceof ExtensionDeliveryUnavailableError,
     error: { code, message: errorMessage(error) },
   };
 }

@@ -81,6 +81,15 @@ export interface LeasedExtensionDelivery {
   readonly deadline: number;
 }
 
+export interface ExtensionDeliveryReadiness {
+  readonly ready: boolean;
+  readonly reason?: string;
+}
+
+export type ExtensionDeliveryReadinessCheck = (
+  conversationId: string,
+) => ExtensionDeliveryReadiness | boolean | Promise<ExtensionDeliveryReadiness | boolean>;
+
 const leaseSchema = extensionDeliveryClaimSchema.extend({
   claimed_at: z.number().int().nonnegative().refine(Number.isSafeInteger),
   deadline: z.number().int().nonnegative().refine(Number.isSafeInteger),
@@ -204,6 +213,7 @@ function sameReceipt(receipt: ExtensionDeliveryReceipt, ack: ExtensionDeliveryAc
 
 export class ExtensionDeliveryConflictError extends Error {}
 export class ExtensionDeliveryNotFoundError extends Error {}
+export class ExtensionDeliveryNotReadyError extends Error {}
 export class ExtensionDeliveryUnavailableError extends Error {}
 
 export class ExtensionDeliveryService {
@@ -412,6 +422,49 @@ export class ExtensionDeliveryService {
       return Promise.resolve({ receipt: null, pending });
     });
     return registration.pending ?? registration.receipt;
+  }
+
+  public async expire(deliveryId: string): Promise<ExtensionDeliveryReceipt | null> {
+    await this.restore();
+    const parsedDeliveryId = z.string().uuid().parse(deliveryId);
+    return this.exclusive(async () => {
+      const current = this.deliveries.get(parsedDeliveryId);
+      if (current === undefined || current.receipt !== undefined) {
+        return current?.receipt === undefined ? null : clone(current.receipt);
+      }
+
+      const next = new Map(this.deliveries);
+      if (current.phase === "queued") {
+        next.delete(parsedDeliveryId);
+        await this.persist(next);
+        this.deliveries = next;
+        return null;
+      }
+
+      if (current.lease === undefined) {
+        throw new ExtensionDeliveryUnavailableError("extension delivery lease is missing");
+      }
+      const receipt: ExtensionDeliveryReceipt = {
+        delivery_id: current.delivery_id,
+        conversation_id: current.conversation_id,
+        client_id: current.lease.client_id,
+        document_id: current.lease.document_id,
+        navigation_epoch: current.lease.navigation_epoch,
+        status: "ambiguous",
+        error: "Extension Delivery timed out before an acknowledgement was recorded.",
+        completed_at: Date.now(),
+      };
+      next.set(parsedDeliveryId, {
+        ...current,
+        phase: "ambiguous",
+        lease: undefined,
+        receipt,
+      });
+      await this.persist(next);
+      this.deliveries = next;
+      this.wake(receipt);
+      return null;
+    });
   }
 
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {

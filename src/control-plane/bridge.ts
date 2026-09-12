@@ -7,6 +7,7 @@ import {
   ExtensionDeliveryUnavailableError,
   extensionDeliveryAckSchema,
   extensionDeliveryClaimSchema,
+  type ExtensionDeliveryReadiness,
   type ExtensionDeliveryAck,
   type ExtensionDeliveryClaim,
   type ExtensionDeliveryReceipt,
@@ -69,14 +70,19 @@ export interface BridgeStatus {
   readonly address: typeof LOCAL_CONTROL_BRIDGE_HOST;
   readonly port: number | null;
   readonly paired: boolean;
+  readonly present: boolean;
+  readonly lastSeenAt: number | null;
 }
 
 class RequestBodyTooLargeError extends Error {}
+
+export const EXTENSION_PRESENCE_TIMEOUT_MS = 10_000;
 
 let bridgeServer: Server | null = null;
 let activePort: number | null = null;
 let pairedOrigin: string | null = null;
 let bearerToken: string | null = null;
+let lastExtensionSeenAt: number | null = null;
 let onIdentityEvidence: (evidence: ExtensionIdentityEvidence) => void | Promise<void> = () => undefined;
 let claimExtensionDelivery: NonNullable<BridgeStartOptions["claimExtensionDelivery"]> = () => null;
 let ackExtensionDelivery: NonNullable<BridgeStartOptions["ackExtensionDelivery"]> = () => {
@@ -161,6 +167,20 @@ function authorized(request: IncomingMessage, origin: string): boolean {
   return pairedOrigin === origin && bearerToken !== null && safeEqual(token, bearerToken);
 }
 
+function extensionPresent(): boolean {
+  return bridgeServer?.listening === true
+    && lastExtensionSeenAt !== null
+    && Date.now() - lastExtensionSeenAt < EXTENSION_PRESENCE_TIMEOUT_MS;
+}
+
+function noteExtensionSeen(): void {
+  lastExtensionSeenAt = Date.now();
+}
+
+function clearExtensionPresence(): void {
+  lastExtensionSeenAt = null;
+}
+
 function readJson(
   request: IncomingMessage,
   maxBytes = MAX_BRIDGE_REQUEST_BYTES,
@@ -232,6 +252,7 @@ async function pair(request: IncomingMessage, response: ServerResponse, origin: 
     pairedOrigin = origin;
     bearerToken = randomBytes(32).toString("base64url");
   }
+  noteExtensionSeen();
   json(response, 200, { token: bearerToken }, origin);
 }
 
@@ -486,6 +507,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     json(response, 401, { error: "unauthorized" }, origin);
     return;
   }
+  noteExtensionSeen();
   if (route === "/identity-evidence") {
     await receiveIdentityEvidence(request, response, origin);
     return;
@@ -577,6 +599,7 @@ async function startBridgeOnce(options: BridgeStartOptions): Promise<number | nu
         if (bridgeServer === server) {
           bridgeServer = null;
           activePort = null;
+          clearExtensionPresence();
         }
       });
       return activePort;
@@ -611,6 +634,7 @@ export function stopBridge(): Promise<void> {
     activePort = null;
     pairedOrigin = null;
     bearerToken = null;
+    clearExtensionPresence();
     onIdentityEvidence = () => undefined;
     claimExtensionDelivery = () => null;
     ackExtensionDelivery = () => {
@@ -636,5 +660,15 @@ export function bridgeStatus(): BridgeStatus {
     address: LOCAL_CONTROL_BRIDGE_HOST,
     port: activePort,
     paired: pairedOrigin !== null && bearerToken !== null,
+    present: extensionPresent(),
+    lastSeenAt: lastExtensionSeenAt,
   };
+}
+
+export function extensionDeliveryReadiness(): ExtensionDeliveryReadiness {
+  const status = bridgeStatus();
+  if (!status.available) return { ready: false, reason: "Bridge is not ready." };
+  if (!status.paired) return { ready: false, reason: "Extension is not paired." };
+  if (!status.present) return { ready: false, reason: "Extension is not connected." };
+  return { ready: true };
 }

@@ -810,6 +810,7 @@ describe("AutoIterationService", () => {
     const auto = new AutoIterationService(value.registry, {
       storageRoot: value.root,
       extensionDeliveries: extension,
+      extensionDeliveryReadiness: () => ({ ready: true }),
       completionRouter: value.auto.completionRouter,
       controlledActuation: value.auto.controlledActuation,
     });

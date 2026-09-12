@@ -29,7 +29,11 @@ import {
   type ControlledActuationResult,
 } from "./controlled-actuation.js";
 import { DispatchCommandBroker } from "./dispatch-command-broker.js";
-import { ExtensionDeliveryService } from "./extension-delivery.js";
+import {
+  ExtensionDeliveryService,
+  type ExtensionDeliveryReadinessCheck,
+} from "./extension-delivery.js";
+import { extensionDeliveryReadiness } from "./bridge.js";
 import { ExtensionDeliveryAdapter } from "../delivery/extension-delivery-adapter.js";
 import type { ReviewDeliveryAdapter } from "../delivery/review-delivery-adapter.js";
 import { BrowserRouter } from "../router/browser-router.js";
@@ -329,6 +333,7 @@ export interface AutoIterationServiceOptions {
   readonly completionRouter?: Pick<ReviewCompletionRouter, "collect">;
   readonly verdictParser?: Pick<ReviewVerdictParser, "parse">;
   readonly extensionDeliveries?: ExtensionDeliveryService;
+  readonly extensionDeliveryReadiness?: ExtensionDeliveryReadinessCheck;
   readonly dispatchCommandBroker?: Pick<DispatchCommandBroker, "dispatch">;
   readonly reviewDeliveryAdapter?: ReviewDeliveryAdapter;
   readonly authorizationStore?: AuthorizationReader;
@@ -379,7 +384,9 @@ export class AutoIterationService {
     this.deliveries = options.reviewDeliveryService ?? new ReviewDeliveryService(this.storageRoot);
     this.results = options.reviewResultService ?? new ReviewResultService(this.storageRoot);
     this.extensionDeliveries = options.extensionDeliveries ?? new ExtensionDeliveryService(this.storageRoot);
-    const broker = options.dispatchCommandBroker ?? new DispatchCommandBroker(this.extensionDeliveries);
+    const broker = options.dispatchCommandBroker ?? new DispatchCommandBroker(this.extensionDeliveries, {
+      readiness: options.extensionDeliveryReadiness ?? extensionDeliveryReadiness,
+    });
     const adapter = options.reviewDeliveryAdapter ?? new ExtensionDeliveryAdapter(broker);
     this.browserRouter = options.browserRouter ?? new BrowserRouter(this.storageRoot, adapter);
     this.completionRouter = options.completionRouter ?? new ReviewCompletionRouter(this.storageRoot);

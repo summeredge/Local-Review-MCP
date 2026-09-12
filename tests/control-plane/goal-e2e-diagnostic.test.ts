@@ -118,7 +118,14 @@ describe("diagnose-goal-e2e", () => {
       startApp: start,
       log,
       registerShutdown: vi.fn(),
-      bridgeStatus: () => ({ available: false, address: "127.0.0.1", port: null, paired: false }),
+      bridgeStatus: () => ({
+        available: false,
+        address: "127.0.0.1",
+        port: null,
+        paired: false,
+        present: false,
+        lastSeenAt: null,
+      }),
     });
 
     expect(load).toHaveBeenCalledWith(["--config", "settings.json"]);

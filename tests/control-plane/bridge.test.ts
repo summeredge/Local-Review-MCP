@@ -7,8 +7,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAppContext, startApp } from "../../src/app.js";
 import type { ResolvedSettings } from "../../src/config/settings.js";
 import {
+  EXTENSION_PRESENCE_TIMEOUT_MS,
   bridgePort,
   bridgeStatus,
+  extensionDeliveryReadiness,
   startBridge,
   stopBridge,
 } from "../../src/control-plane/bridge.js";
@@ -119,6 +121,25 @@ describe("Local Control Bridge protocol", () => {
     const second = await request("/pair", { method: "POST", body: {} });
     expect(second).toEqual({ status: 200, body: { token } });
     expect((await request("/hello")).body).toMatchObject({ paired: true });
+  });
+
+  it("separates live Extension presence from pairing for the readiness gate", async () => {
+    expect(extensionDeliveryReadiness()).toMatchObject({ ready: false });
+    expect(bridgeStatus()).toMatchObject({ present: false, lastSeenAt: null });
+
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      await expect(request("/pair", { method: "POST", body: {} })).resolves.toMatchObject({ status: 200 });
+      expect(extensionDeliveryReadiness()).toEqual({ ready: true });
+      expect(bridgeStatus()).toMatchObject({ present: true, lastSeenAt: now });
+
+      clock.mockReturnValue(now + EXTENSION_PRESENCE_TIMEOUT_MS);
+      expect(extensionDeliveryReadiness()).toMatchObject({ ready: false });
+      expect(bridgeStatus().present).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it.each([
