@@ -34,6 +34,7 @@ type HttpRuntimeContext = McpRuntimeContext & {
 export interface HttpServerOptions {
   readonly oauthClientRegistryPath?: string;
   readonly oauthTokenStorePath?: string;
+  readonly silent?: boolean;
 }
 
 class RequestBodyTooLargeError extends Error {
@@ -648,7 +649,7 @@ export async function startHttpServer(
     assertLoopbackHost(settings);
     server.listen(settings.port, settings.host);
   });
-  console.log(registeredMcpToolsMessage());
+  if (!options.silent) console.log(registeredMcpToolsMessage());
   return server;
 }
 

@@ -13,6 +13,11 @@ import {
 } from "./router/browser-router-diagnostic.js";
 import { runGoalE2EDiagnostic } from "./control-plane/goal-e2e-diagnostic.js";
 import {
+  goalCliFailure,
+  runGoalStatusCommand,
+  runGoalSubmissionCommand,
+} from "./control-plane/goal-cli.js";
+import {
   parseExtensionReviewCompletionDiagnosticArgs,
   runExtensionReviewCompletionDiagnostic,
 } from "./control-plane/extension-review-completion-diagnostic.js";
@@ -126,6 +131,20 @@ try {
     console.log(JSON.stringify(await generateConversationRoutingExample(identity), null, 2));
   } else if (argv[0] === "diagnose-goal-e2e") {
     await runGoalE2EDiagnostic(argv.slice(1));
+  } else if (argv[0] === "submit-goal") {
+    try {
+      console.log(JSON.stringify(await runGoalSubmissionCommand(argv.slice(1)), null, 2));
+    } catch (error: unknown) {
+      console.log(JSON.stringify(goalCliFailure(error), null, 2));
+      process.exitCode = 1;
+    }
+  } else if (argv[0] === "goal-status") {
+    try {
+      console.log(JSON.stringify(await runGoalStatusCommand(argv.slice(1)), null, 2));
+    } catch (error: unknown) {
+      console.log(JSON.stringify(goalCliFailure(error, "status"), null, 2));
+      process.exitCode = 1;
+    }
   } else {
     const cli = parseCliArgs(argv);
     const settings = await loadSettings(argv);

@@ -162,6 +162,7 @@ export async function startApp(
         ?? (options.oauthClientRegistryPath === undefined
           ? workspaceOAuth?.tokenStorePath
           : join(dirname(options.oauthClientRegistryPath), "tokens.json")),
+      silent: options.silent,
     });
     try {
       const extensionDeliveries = context.extensionDeliveries;
