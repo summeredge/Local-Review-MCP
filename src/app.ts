@@ -254,6 +254,11 @@ export async function startApp(
     } catch {
       console.warn("Goal Orchestration recovery failed; local MCP remains available");
     }
+    try {
+      await context.executionRouter?.recoverCompletedExecutions();
+    } catch {
+      console.warn("Execution Routing recovery failed; local MCP remains available");
+    }
     context.goalPreflight?.setRuntimeReady(true);
     return server;
   } catch (error: unknown) {

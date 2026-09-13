@@ -255,6 +255,66 @@ describe("ExecutionRoutingService", () => {
     });
   });
 
+  it("recovers an orphaned passed Execution through the existing review workflow", async () => {
+    const h = await harness();
+
+    await h.router.recoverCompletedExecutions();
+
+    expect(await h.goals.listGoals()).toHaveLength(1);
+    expect(await new ReviewRequestService(h.root).listReviewRequests(h.workspaceId))
+      .toHaveLength(1);
+  });
+
+  it("skips recovery when the matching ReviewRequest already exists", async () => {
+    const h = await harness();
+    const requests = new ReviewRequestService(h.root);
+    await requests.createReviewRequest({
+      review_request_id: "review-existing",
+      task_id: h.taskId,
+      execution_id: h.executionId,
+      workspace_id: h.workspaceId,
+      conversation_id: "conversation-1",
+    });
+
+    await h.router.recoverCompletedExecutions();
+
+    expect(await requests.listReviewRequests(h.workspaceId)).toHaveLength(1);
+    expect(await h.goals.listGoals()).toHaveLength(0);
+    expect(h.deliveries.requests).toHaveLength(0);
+    expect(h.completions.requests).toHaveLength(0);
+  });
+
+  it("skips failed Executions during recovery", async () => {
+    const h = await harness();
+    await h.executions.updateExecutionContext(h.workspaceId, h.taskId, h.executionId, {
+      status: "failed",
+    });
+
+    await h.router.recoverCompletedExecutions();
+
+    expect(await h.goals.listGoals()).toHaveLength(0);
+    expect(await new ReviewRequestService(h.root).listReviewRequests(h.workspaceId))
+      .toHaveLength(0);
+  });
+
+  it("is idempotent across recovery and duplicate completion events", async () => {
+    const h = await harness();
+
+    await h.router.recoverCompletedExecutions();
+    await h.router.onCompleted(event(h, "conversation-1"));
+    const firstGoal = await h.goals.listGoals();
+    const firstRequest = await new ReviewRequestService(h.root).listReviewRequests(h.workspaceId);
+    await h.router.recoverCompletedExecutions();
+    await h.router.onCompleted(event(h, "conversation-1"));
+    const secondGoal = await h.goals.listGoals();
+    const secondRequest = await new ReviewRequestService(h.root).listReviewRequests(h.workspaceId);
+
+    expect(secondGoal).toEqual(firstGoal);
+    expect(secondRequest).toEqual(firstRequest);
+    expect(h.deliveries.requests).toHaveLength(1);
+    expect(h.completions.requests).toHaveLength(1);
+  });
+
   it.each(["running", "failed"] as const)(
     "does not trigger Review for a %s Execution",
     async (status) => {

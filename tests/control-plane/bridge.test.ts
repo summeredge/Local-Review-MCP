@@ -557,6 +557,16 @@ describe("Local Control Bridge app lifecycle", () => {
       ]);
       events.push("goal-recovery");
     });
+    vi.spyOn(runtime.executionRouter!, "recoverCompletedExecutions").mockImplementation(async () => {
+      expect(events).toEqual([
+        "tunnel-start",
+        "codex-recovery",
+        "auto-terminal",
+        "auto-recovery",
+        "goal-recovery",
+      ]);
+      events.push("execution-routing-recovery");
+    });
 
     let server: Server | null = null;
     try {
@@ -567,6 +577,7 @@ describe("Local Control Bridge app lifecycle", () => {
         "auto-terminal",
         "auto-recovery",
         "goal-recovery",
+        "execution-routing-recovery",
       ]);
     } finally {
       if (server !== null) await close(server);
@@ -621,6 +632,25 @@ describe("Local Control Bridge app lifecycle", () => {
       expect(server.listening).toBe(true);
       expect(warning).toHaveBeenCalledWith(
         "Goal Orchestration recovery failed; local MCP remains available",
+      );
+    } finally {
+      warning.mockRestore();
+      if (server !== null) await close(server);
+    }
+  });
+
+  it("keeps MCP available when Execution Routing recovery fails", async () => {
+    await stopBridge();
+    const runtime = createAppContext(settings());
+    vi.spyOn(runtime.executionRouter!, "recoverCompletedExecutions")
+      .mockRejectedValue(new Error("corrupt"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let server: Server | null = null;
+    try {
+      server = await startApp(settings(), runtime, { bridgePorts: [0] });
+      expect(server.listening).toBe(true);
+      expect(warning).toHaveBeenCalledWith(
+        "Execution Routing recovery failed; local MCP remains available",
       );
     } finally {
       warning.mockRestore();

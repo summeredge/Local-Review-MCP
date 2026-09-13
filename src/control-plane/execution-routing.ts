@@ -59,7 +59,7 @@ export class ExecutionRoutingError extends Error {
 type TaskPort = Pick<TaskContextService, "getTaskContext" | "listTaskContexts"> & {
   readonly storageRoot?: string;
 };
-type ExecutionPort = Pick<ExecutionContextService, "getExecutionContext"> & {
+type ExecutionPort = Pick<ExecutionContextService, "getExecutionContext" | "listExecutions"> & {
   readonly storageRoot?: string;
 };
 type ReviewRequestPort = Pick<ReviewRequestService, "getReviewRequest" | "listReviewRequests"> & {
@@ -194,6 +194,70 @@ export class ExecutionRoutingService {
 
   public notifyExecutionCompleted(event: ExecutionCompletedEvent): Promise<ExecutionRoutingResult> {
     return this.onCompleted(event);
+  }
+
+  public async recoverCompletedExecutions(): Promise<void> {
+    const tasks = await this.tasks.listTaskContexts();
+    for (const task of tasks) {
+      try {
+        this.registry.resolve(task.workspace_id);
+      } catch {
+        continue;
+      }
+
+      let executions: ExecutionContext[];
+      try {
+        executions = await this.executions.listExecutions(task.workspace_id, task.task_id);
+      } catch (error: unknown) {
+        console.warn(
+          "Execution Routing recovery could not inspect Task "
+          + task.task_id
+          + "; skipping",
+          error,
+        );
+        continue;
+      }
+
+      for (const execution of executions) {
+        if (execution.status !== "passed") continue;
+        try {
+          this.assertExecutionIdentity(
+            execution,
+            task.workspace_id,
+            task.task_id,
+            execution.execution_id,
+          );
+          if (await this.findReviewRequest(
+            task.workspace_id,
+            task.task_id,
+            execution.execution_id,
+          ) !== null) continue;
+          if (await this.findGoal(
+            task.workspace_id,
+            task.task_id,
+            execution.execution_id,
+          ) !== null) continue;
+
+          const conversationId = task.conversation_id;
+          if (conversationId === undefined || conversationId.trim() === "") continue;
+          await this.onCompleted({
+            execution_id: execution.execution_id,
+            task_id: task.task_id,
+            workspace_id: task.workspace_id,
+            conversation_id: conversationId,
+            status: "passed",
+            diff_available: false,
+          });
+        } catch (error: unknown) {
+          console.warn(
+            "Execution Routing recovery failed for Execution "
+            + execution.execution_id
+            + "; skipping",
+            error,
+          );
+        }
+      }
+    }
   }
 
   public async onExecutionTerminal(execution: ExecutionContext): Promise<void> {
@@ -366,12 +430,12 @@ export class ExecutionRoutingService {
     workspaceId: string,
     taskId: string,
     executionId: string,
-    conversationId: string,
+    conversationId?: string,
   ): Promise<ReviewRequestContext | null> {
     const matches = (await this.reviewRequests.listReviewRequests(workspaceId)).filter((request) =>
       request.task_id === taskId
       && request.execution_id === executionId
-      && request.conversation_id === conversationId);
+      && (conversationId === undefined || request.conversation_id === conversationId));
     if (matches.length > 1) {
       throw new ExecutionRoutingError(
         "review_request_identity_ambiguous",
