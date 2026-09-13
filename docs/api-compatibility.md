@@ -1,8 +1,9 @@
 # API compatibility
 
 This document defines how the frozen V0.1 MCP contract may evolve. The current
-tool names, input fields, output fields, workspace scope, and read-only
-permission model are the compatibility baseline.
+tool names, input fields, output fields, workspace scope, and permission model
+are the compatibility baseline. The current surface has nine read-only tools
+and the reviewed `submit_goal` Control Plane tool.
 
 ## Allowed additive changes
 
@@ -13,7 +14,10 @@ The following changes are compatible when existing callers keep working:
 - add optional input parameters with behavior-preserving defaults.
 
 New tools must use the existing Workspace Registry boundary and must not add
-write, `apply_patch`, `exec`, `shell`, commit, or push capabilities.
+direct write, `apply_patch`, `exec`, `shell`, commit, or push capabilities.
+`submit_goal` is the explicit exception for creating a Goal through the
+existing controlled execution path; it does not expose a direct file or shell
+operation.
 
 ## Changes requiring careful review
 
@@ -31,8 +35,8 @@ freeze does not make any of these changes.
 
 ## Compatibility expectations
 
-Existing clients may continue to call all nine frozen tools and receive their
-current response structures. `tools/list` therefore remains the same nine-tool
-surface until an explicitly reviewed API change says otherwise. Workspace
+Existing clients may continue to call all nine frozen read-only tools and
+receive their current response structures. `tools/list` additionally exposes
+the explicitly reviewed `submit_goal` Control Plane entry point. Workspace
 selection continues to resolve only registered `workspace_id` values, never an
 arbitrary caller-supplied local path.

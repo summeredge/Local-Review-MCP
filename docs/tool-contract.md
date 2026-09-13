@@ -1,8 +1,9 @@
 # MCP tool contract
 
-This document freezes the V0.1 Release Candidate tool surface. All nine tools
-are read-only. The names and input fields below are the current MCP contract;
-the runtime does not add write, exec, shell, commit, or push operations.
+This document freezes the V0.1 Release Candidate tool surface. Nine tools are
+read-only, and `submit_goal` is the reviewed Control Plane entry point. The
+names and input fields below are the current MCP contract; the runtime does
+not expose direct write, exec, shell, commit, or push operations.
 
 | Tool | Scope | Permission |
 | --- | --- | --- |
@@ -15,6 +16,7 @@ the runtime does not add write, exec, shell, commit, or push operations.
 | `git_diff` | workspace | read-only |
 | `review_summary` | workspace | read-only |
 | `execution_output` | workspace | read-only |
+| `submit_goal` | current ChatGPT conversation | Control Plane |
 
 ## Common rules
 
@@ -179,3 +181,30 @@ the runtime does not add write, exec, shell, commit, or push operations.
 - Workspace scope: selected workspace fixed path `.review/execution_output.json`.
 - Permission: authenticated read-only result access. It never accepts a path,
   runs a command, or exposes an execution capability.
+
+### `submit_goal`
+
+- Purpose: Create and start a Goal through the existing `GoalSubmissionService`.
+- Input:
+
+  ```json
+  {
+    "workspace_id"?: "string",
+    "title": "string",
+    "goal": "string",
+    "requirements": ["string"],
+    "acceptance_criteria": ["string"],
+    "max_iterations"?: "integer, 1..10000"
+  }
+  ```
+
+  `max_iterations` defaults to `2`. `conversation_id` is not an input field;
+  the server resolves it from the exact current inbound request correlation.
+- Output: `{ "goal_id": string, "phase_id": string, "task_id": string, "execution_id": string, "status": string }`
+- Workspace scope: the active registered workspace when `workspace_id` is
+  omitted; an explicitly supplied ID must resolve through the Workspace
+  Registry.
+- Permission: authenticated Control Plane operation. The server first checks
+  the current exact request correlation and waits only for late evidence for
+  that same request ID. If no proven conversation arrives, it returns
+  `conversation_not_correlated` and creates no Goal.

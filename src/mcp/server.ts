@@ -7,6 +7,16 @@ import { z } from "zod";
 import { GitError } from "../git/errors.js";
 import { GitService } from "../git/service.js";
 import type { GitDiffResponse, GitStatusResponse } from "../git/types.js";
+import type { ConversationCorrelationRegistry } from "../control-plane/conversation-correlation.js";
+import {
+  awaitCurrentInboundCorrelation,
+  currentInboundCorrelation,
+} from "../control-plane/request-correlation-integration.js";
+import {
+  goalSubmissionRequestSchema,
+  goalSubmissionResultSchema,
+  type GoalSubmissionService,
+} from "../control-plane/goal-submission.js";
 import { validateWorkspaceIdentityConsistency } from "../workspace/identity.js";
 import { WorkspaceManager, WorkspacePathError } from "../workspace/manager.js";
 import type { WorkspaceRegistry, WorkspaceSelection } from "../workspace/registry.js";
@@ -39,6 +49,8 @@ import {
 export interface McpRuntimeContext {
   readonly workspace?: WorkspaceManager;
   readonly registry: WorkspaceRegistry;
+  readonly correlations?: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">;
+  readonly goalSubmission?: Pick<GoalSubmissionService, "submitGoal">;
   readonly connectorEvidence?: {
     recordEvidence(input: {
       readonly request_id: string;
@@ -63,10 +75,12 @@ export const V01_TOOL_NAMES = [
 
 export const WORKSPACE_REGISTRY_TOOL_NAMES = ["workspace_list"] as const;
 export const REVIEW_CONTEXT_TOOL_NAMES = ["review_summary", "execution_output"] as const;
+export const CONTROL_PLANE_TOOL_NAMES = ["submit_goal"] as const;
 export const REGISTERED_TOOL_NAMES = [
   ...V01_TOOL_NAMES,
   ...WORKSPACE_REGISTRY_TOOL_NAMES,
   ...REVIEW_CONTEXT_TOOL_NAMES,
+  ...CONTROL_PLANE_TOOL_NAMES,
 ] as const;
 
 export type V01ToolName = typeof V01_TOOL_NAMES[number];
@@ -120,6 +134,11 @@ const gitDiffInputSchema = {
   path: z.string().optional().default("."),
   stat: z.boolean().optional().default(false),
 };
+const submitGoalInputSchema = goalSubmissionRequestSchema
+  .omit({ workspace_id: true, conversation_id: true })
+  .extend(workspaceIdInputSchema)
+  .strict();
+export const GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS = 15_000;
 const EXECUTION_OUTPUT_PATH = ".review/execution_output.json";
 
 interface ListedEntry {
@@ -137,6 +156,16 @@ export function toToolError(error: unknown) {
     : {};
   return {
     content: [{ type: "text" as const, text: JSON.stringify({ error: code, ...details }) }],
+    isError: true as const,
+  };
+}
+
+function conversationNotCorrelatedError() {
+  return {
+    content: [{
+      type: "text" as const,
+      text: JSON.stringify({ error: "conversation_not_correlated" }),
+    }],
     isError: true as const,
   };
 }
@@ -638,6 +667,44 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     async (input) => {
       try {
         return structuredResponse(executionOutputOutputSchema, await executionOutput(registry.resolve(input.workspace_id).manager));
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "submit_goal",
+    {
+      description: "Control Plane: create and start a Goal for the current ChatGPT conversation; conversation_id is resolved from the exact inbound request correlation.",
+      inputSchema: submitGoalInputSchema,
+      outputSchema: goalSubmissionResultSchema,
+    },
+    async (input) => {
+      const correlations = context.correlations;
+      const goalSubmission = context.goalSubmission;
+      if (correlations === undefined || goalSubmission === undefined) {
+        return toToolError(new Error("Goal submission runtime is unavailable."));
+      }
+
+      try {
+        const correlation = currentInboundCorrelation(correlations)
+          ?? await awaitCurrentInboundCorrelation(
+            correlations,
+            GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS,
+          );
+        if (correlation === null) return conversationNotCorrelatedError();
+
+        const selection = registry.resolve(input.workspace_id);
+        return structuredResponse(goalSubmissionResultSchema, await goalSubmission.submitGoal({
+          workspace_id: selection.id,
+          conversation_id: correlation.conversation_id,
+          title: input.title,
+          goal: input.goal,
+          requirements: input.requirements,
+          acceptance_criteria: input.acceptance_criteria,
+          max_iterations: input.max_iterations,
+        }));
       } catch (error: unknown) {
         return toToolError(error);
       }

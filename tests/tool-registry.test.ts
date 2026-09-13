@@ -30,7 +30,7 @@ describe("MCP tool registry", () => {
     const result = await client.listTools();
     const names = result.tools.map((tool) => tool.name).sort();
 
-    expect(names).toHaveLength(9);
+    expect(names).toHaveLength(10);
     expect(names).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
     expect(result.tools.find((tool) => tool.name === "workspace_info")?.outputSchema).toMatchObject({
       type: "object",
@@ -110,6 +110,29 @@ describe("MCP tool registry", () => {
         command: expect.any(Object),
         status: expect.any(Object),
         summary: expect.any(Object),
+      },
+    });
+    const submitGoal = result.tools.find((tool) => tool.name === "submit_goal");
+    expect(submitGoal?.inputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        workspace_id: expect.any(Object),
+        title: expect.any(Object),
+        goal: expect.any(Object),
+        requirements: expect.any(Object),
+        acceptance_criteria: expect.any(Object),
+        max_iterations: expect.any(Object),
+      },
+    });
+    expect(submitGoal?.inputSchema).not.toHaveProperty("properties.conversation_id");
+    expect(submitGoal?.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        goal_id: expect.any(Object),
+        phase_id: expect.any(Object),
+        task_id: expect.any(Object),
+        execution_id: expect.any(Object),
+        status: expect.any(Object),
       },
     });
   });

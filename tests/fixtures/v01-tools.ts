@@ -12,4 +12,5 @@ export const EXPECTED_REGISTERED_TOOL_NAMES = [
   "workspace_list",
   "review_summary",
   "execution_output",
+  "submit_goal",
 ] as const;
