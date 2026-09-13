@@ -30,6 +30,11 @@ import {
   MAX_BRIDGE_REQUEST_BYTES,
   MAX_BRIDGE_COMPLETION_ACK_REQUEST_BYTES,
 } from "../../src/control-plane/bridge-protocol.js";
+import {
+  FileRuntimeDiagnosticLogger,
+  type RuntimeDiagnosticEvent,
+  type RuntimeDiagnosticLogger,
+} from "../../src/control-plane/runtime-diagnostic-logger.js";
 
 const ORIGIN_A = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
 const ORIGIN_B = "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -86,6 +91,13 @@ async function listen(server: Server, port = 0): Promise<number> {
 
 async function close(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+}
+
+async function readRuntimeDiagnosticEvents(
+  filePath: string,
+): Promise<readonly RuntimeDiagnosticEvent[]> {
+  return (await readFile(filePath, "utf8")).trim().split("\n")
+    .map((line) => JSON.parse(line) as RuntimeDiagnosticEvent);
 }
 
 beforeEach(async () => {
@@ -572,6 +584,192 @@ describe("Local Control Bridge app lifecycle", () => {
       supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
     };
   }
+
+  it("writes the actual Bridge startup port and protocol to runtime diagnostics", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-runtime-diagnostic-start-"));
+    const logger = new FileRuntimeDiagnosticLogger(root);
+    const runtimeSettings = settings();
+    const runtime = createAppContext(runtimeSettings, {
+      ...process.env,
+      LOCALAPPDATA: join(root, "appdata"),
+    });
+    let server: Server | null = null;
+    try {
+      server = await startApp(runtimeSettings, runtime, {
+        bridgePorts: [0],
+        runtimeDiagnosticLogger: logger,
+      });
+      const events = await readRuntimeDiagnosticEvents(logger.filePath);
+      expect(events).toEqual([{
+        event: "bridge_started",
+        timestamp: expect.any(String),
+        host: LOCAL_CONTROL_BRIDGE_HOST,
+        port: bridgePort(),
+        protocol: LOCAL_CONTROL_BRIDGE_PROTOCOL,
+      }]);
+    } finally {
+      if (server !== null) await close(server);
+      await stopBridge();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("records only one safe diagnostic event for a new capture", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-runtime-diagnostic-capture-"));
+    const logger = new FileRuntimeDiagnosticLogger(root);
+    const runtimeSettings = settings();
+    const runtime = createAppContext(runtimeSettings, {
+      ...process.env,
+      LOCALAPPDATA: join(root, "appdata"),
+    });
+    const handoff = {
+      protocol: "local-review-mcp.goal-handoff",
+      schema_version: "2",
+      handoff_id: "handoff-runtime-diagnostic",
+      request_id: "request-runtime-diagnostic",
+      workspace_id: "workspace-a",
+      goal: {
+        title: "Sensitive title must not be logged",
+        goal: "Sensitive goal body must not be logged",
+        requirements: ["Sensitive requirements must not be logged"],
+        acceptance_criteria: ["Sensitive acceptance criteria must not be logged"],
+        max_iterations: 2,
+      },
+      issued_at: "2026-09-13T10:00:00.000Z",
+      expires_at: "2026-09-13T10:02:00.000Z",
+      signature: "a".repeat(64),
+    };
+    const capture = {
+      handoff,
+      conversation_id: "11111111-2222-3333-4444-555555555555",
+      document_id: "document-runtime-diagnostic",
+      navigation_epoch: 7,
+    };
+    let server: Server | null = null;
+    try {
+      server = await startApp(runtimeSettings, runtime, {
+        bridgePorts: [0],
+        runtimeDiagnosticLogger: logger,
+      });
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+
+      expect(await request("/goal-handoff-capture", {
+        method: "POST",
+        token,
+        body: capture,
+      })).toEqual({
+        status: 202,
+        body: { accepted: "new", handoff_id: handoff.handoff_id },
+      });
+      expect(await request("/goal-handoff-capture", {
+        method: "POST",
+        token,
+        body: capture,
+      })).toEqual({
+        status: 200,
+        body: { accepted: "existing", handoff_id: handoff.handoff_id },
+      });
+      expect(await request("/goal-handoff-capture", {
+        method: "POST",
+        token,
+        body: {
+          ...capture,
+          handoff: { ...handoff, goal: { ...handoff.goal, goal: "conflicting payload" } },
+        },
+      })).toEqual({
+        status: 409,
+        body: { error: "conflicting_goal_handoff" },
+      });
+
+      const log = await readFile(logger.filePath, "utf8");
+      expect(log).not.toContain("signature");
+      expect(log).not.toContain(token);
+      expect(log).not.toContain("Authorization");
+      expect(log).not.toContain("Sensitive title must not be logged");
+      expect(log).not.toContain("Sensitive goal body must not be logged");
+      expect(log).not.toContain("document-runtime-diagnostic");
+      expect(log).not.toContain("requirements");
+      expect(log).not.toContain("acceptance_criteria");
+
+      const events = await readRuntimeDiagnosticEvents(logger.filePath);
+      expect(events).toHaveLength(2);
+      expect(events.filter((event) => event.event === "goal_handoff_captured")).toEqual([{
+        event: "goal_handoff_captured",
+        timestamp: expect.any(String),
+        handoff_id: handoff.handoff_id,
+        workspace_id: handoff.workspace_id,
+        schema_version: handoff.schema_version,
+        conversation_id: capture.conversation_id,
+        navigation_epoch: capture.navigation_epoch,
+        document_id_present: true,
+      }]);
+      expect(capturedGoalHandoffs()).toEqual([capture]);
+    } finally {
+      if (server !== null) await close(server);
+      await stopBridge();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps capture acceptance successful when diagnostic logging fails", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-runtime-diagnostic-failure-"));
+    const runtimeSettings = settings();
+    const runtime = createAppContext(runtimeSettings, {
+      ...process.env,
+      LOCALAPPDATA: join(root, "appdata"),
+    });
+    const write = vi.fn((_event: RuntimeDiagnosticEvent): void => {
+      throw new Error("diagnostic logger unavailable");
+    });
+    const logger: RuntimeDiagnosticLogger = { write };
+    const capture = {
+      handoff: {
+        protocol: "local-review-mcp.goal-handoff",
+        schema_version: "2",
+        handoff_id: "handoff-runtime-diagnostic-failure",
+        request_id: "request-runtime-diagnostic-failure",
+        workspace_id: "workspace-a",
+        goal: {
+          title: "Capture",
+          goal: "Keep Bridge acceptance unchanged.",
+          requirements: ["Do not create a Goal."],
+          acceptance_criteria: ["Return accepted new."],
+          max_iterations: 2,
+        },
+        issued_at: "2026-09-13T10:00:00.000Z",
+        expires_at: "2026-09-13T10:02:00.000Z",
+        signature: "b".repeat(64),
+      },
+      conversation_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      document_id: "document-runtime-diagnostic-failure",
+      navigation_epoch: 1,
+    };
+    let server: Server | null = null;
+    try {
+      server = await startApp(runtimeSettings, runtime, {
+        bridgePorts: [0],
+        runtimeDiagnosticLogger: logger,
+      });
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+      expect(await request("/goal-handoff-capture", {
+        method: "POST",
+        token,
+        body: capture,
+      })).toEqual({
+        status: 202,
+        body: { accepted: "new", handoff_id: capture.handoff.handoff_id },
+      });
+      expect(capturedGoalHandoffs()).toEqual([capture]);
+      expect(write).toHaveBeenCalledTimes(2);
+    } finally {
+      if (server !== null) await close(server);
+      await stopBridge();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   it("starts with MCP and stops when the MCP server closes", async () => {
     await stopBridge();

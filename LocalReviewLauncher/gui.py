@@ -66,7 +66,7 @@ class LauncherWindow(QMainWindow):
         self._startup_started_at: float | None = None
 
         self.setWindowTitle("Local Review MCP Launcher")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(740)
         self.launcher_state = QLabel()
         self.mcp_status = QLabel()
         self.tunnel_status = QLabel()
@@ -100,6 +100,8 @@ class LauncherWindow(QMainWindow):
         self.refresh_button = QPushButton("刷新状态")
         self.refresh_oauth_button = QPushButton("Refresh OAuth Status")
         self.reset_oauth_button = QPushButton("Reset OAuth Clients")
+        self.delete_oauth_button = QPushButton("删除 OAuth Client")
+        self.delete_oauth_button.setEnabled(False)
         self.workspace_button = QPushButton("添加 Workspace")
         self.delete_workspace_button = QPushButton("删除 Workspace")
         self.rename_workspace_button = QPushButton("编辑名称")
@@ -115,6 +117,7 @@ class LauncherWindow(QMainWindow):
         self.refresh_button.clicked.connect(self.refresh_status)
         self.refresh_oauth_button.clicked.connect(self.refresh_oauth_status)
         self.reset_oauth_button.clicked.connect(self.reset_oauth_clients)
+        self.delete_oauth_button.clicked.connect(self.delete_oauth_client)
         self.workspace_button.clicked.connect(self.choose_workspace)
         self.delete_workspace_button.clicked.connect(self.delete_workspace)
         self.rename_workspace_button.clicked.connect(self.rename_workspace)
@@ -159,6 +162,7 @@ class LauncherWindow(QMainWindow):
         oauth_buttons = QHBoxLayout()
         oauth_buttons.addWidget(self.refresh_oauth_button)
         oauth_buttons.addWidget(self.reset_oauth_button)
+        oauth_buttons.addWidget(self.delete_oauth_button)
         layout.addLayout(oauth_buttons)
         layout.addSpacing(8)
         layout.addWidget(QLabel("配置"))
@@ -178,6 +182,7 @@ class LauncherWindow(QMainWindow):
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
+        self.resize(820, self.sizeHint().height())
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_status)
@@ -341,6 +346,12 @@ class LauncherWindow(QMainWindow):
         )
         self.refresh_oauth_button.setEnabled(oauth_available)
         self.reset_oauth_button.setEnabled(oauth_available)
+        self.delete_oauth_button.setEnabled(
+            oauth_available
+            and status.oauth_registry is not None
+            and status.oauth_registry.client_count > 0
+            and bool(status.oauth_registry.clients)
+        )
 
     def _set_state(self, state: LauncherState) -> None:
         self.state = state
@@ -414,6 +425,7 @@ class LauncherWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.workspace_button.setEnabled(False)
+        self.delete_oauth_button.setEnabled(False)
         try:
             self.process_manager.start(self.configuration)
         except (LauncherConfigError, RuntimeError) as error:
@@ -435,6 +447,7 @@ class LauncherWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self.workspace_button.setEnabled(False)
+        self.delete_oauth_button.setEnabled(False)
         try:
             message = self.process_manager.stop()
         except RuntimeError as error:
@@ -464,6 +477,46 @@ class LauncherWindow(QMainWindow):
             self._show_error("Could not reset OAuth clients.")
             return
         self.message_label.setText("OAuth clients reset.")
+        self.refresh_status()
+
+    def delete_oauth_client(self) -> None:
+        status = self._last_status.oauth_registry
+        if (
+            not self._last_status.mcp_running
+            or self.state in (LauncherState.STARTING, LauncherState.STOPPING)
+            or status is None
+            or status.client_count == 0
+            or not status.clients
+        ):
+            return
+        options = [f"{client.client_name} ({client.client_id})" for client in status.clients]
+        selected, accepted = QInputDialog.getItem(
+            self,
+            "删除 OAuth Client",
+            "选择要删除的 OAuth Client:",
+            options,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        client = next((client for option, client in zip(options, status.clients) if option == selected), None)
+        if client is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除 OAuth Client",
+            f"只删除选中的 OAuth Client，不影响其他 Client：\n"
+            f"{client.client_name}\nclient_id: {client.client_id}\n\n继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self.status_checker.delete_oauth_client(client.client_id):
+            self._show_error("Could not delete OAuth client.")
+            return
+        self.message_label.setText(f"OAuth client deleted: {client.client_id}")
         self.refresh_status()
 
     def choose_workspace(self) -> None:

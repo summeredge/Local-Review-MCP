@@ -7,6 +7,7 @@ import subprocess
 import threading
 import unittest
 from types import SimpleNamespace
+from urllib.error import HTTPError, URLError
 from unittest.mock import MagicMock, Mock, patch
 
 from PySide6.QtCore import QCoreApplication, QThreadPool
@@ -134,6 +135,28 @@ class StatusCheckerTests(unittest.TestCase):
         request = open_url.call_args.args[0]
         self.assertEqual(request.get_method(), "DELETE")
         self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+
+    def test_delete_oauth_client_uses_encoded_url_and_auth(self) -> None:
+        response = MagicMock(status=204)
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+        with patch("status_checker.urlopen", return_value=response) as open_url:
+            self.assertTrue(StatusChecker(auth_token="secret").delete_oauth_client("client/id name"))
+
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:12080/oauth/clients/client%2Fid%20name")
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+
+    def test_delete_oauth_client_failures_return_false(self) -> None:
+        failures = (
+            HTTPError("http://example.invalid", 404, "not found", {}, None),
+            URLError("network failure"),
+            TimeoutError("timed out"),
+        )
+        for failure in failures:
+            with self.subTest(type=type(failure).__name__), patch("status_checker.urlopen", side_effect=failure):
+                self.assertFalse(StatusChecker().delete_oauth_client("client-1"))
 
     def test_remote_timeout_is_offline(self) -> None:
         with patch("status_checker.urlopen", side_effect=TimeoutError("remote timeout")):

@@ -7,6 +7,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -74,6 +75,19 @@ class StatusChecker:
         try:
             with urlopen(Request(
                 self.oauth_clients_url,
+                method="DELETE",
+                headers=self._auth_headers(),
+            ), timeout=3) as response:
+                return 200 <= response.status < 300
+        except (HTTPError, URLError, OSError, TimeoutError):
+            return False
+
+    def delete_oauth_client(self, client_id: str) -> bool:
+        if not isinstance(client_id, str) or not client_id:
+            return False
+        try:
+            with urlopen(Request(
+                f"{self.oauth_clients_url.rstrip('/')}/{quote(client_id, safe='')}",
                 method="DELETE",
                 headers=self._auth_headers(),
             ), timeout=3) as response:

@@ -42,6 +42,11 @@ import { defaultTaskContextStorageRoot } from "./context/task.js";
 import { validateWorkspaceIdentityConsistency } from "./workspace/identity.js";
 import { WorkspaceManager } from "./workspace/manager.js";
 import { WorkspaceRegistry } from "./workspace/registry.js";
+import {
+  FileRuntimeDiagnosticLogger,
+  writeRuntimeDiagnostic,
+  type RuntimeDiagnosticLogger,
+} from "./control-plane/runtime-diagnostic-logger.js";
 
 export interface AppContext extends McpRuntimeContext {
   readonly storageRoot?: string;
@@ -65,6 +70,7 @@ export interface AppContext extends McpRuntimeContext {
 export interface AppStartOptions extends HttpServerOptions {
   readonly bridgePorts?: readonly number[];
   readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => void | Promise<void>;
+  readonly runtimeDiagnosticLogger?: RuntimeDiagnosticLogger;
 }
 
 export function createAppContext(
@@ -165,6 +171,7 @@ export async function startApp(
   context: AppContext = createAppContext(settings),
   options: AppStartOptions = {},
 ): Promise<Server> {
+  const runtimeDiagnosticLogger = options.runtimeDiagnosticLogger ?? new FileRuntimeDiagnosticLogger();
   try {
     const workspaceOAuth = context.storageRoot === undefined
       ? undefined
@@ -210,6 +217,18 @@ export async function startApp(
           await context.correlations.observe(evidence);
           await options.onIdentityEvidence?.(evidence);
         },
+        onGoalHandoffCapture: (capture) => {
+          writeRuntimeDiagnostic(runtimeDiagnosticLogger, {
+            event: "goal_handoff_captured",
+            timestamp: new Date().toISOString(),
+            handoff_id: capture.handoff.handoff_id,
+            workspace_id: capture.handoff.workspace_id,
+            schema_version: capture.handoff.schema_version,
+            conversation_id: capture.conversation_id,
+            navigation_epoch: capture.navigation_epoch,
+            document_id_present: capture.document_id.length > 0,
+          });
+        },
         claimExtensionDelivery: async (claim) => {
           if (!deliveryAvailable) throw new ExtensionDeliveryUnavailableError("extension delivery unavailable");
           return extensionDeliveries.claim(claim);
@@ -237,6 +256,13 @@ export async function startApp(
           `Local Control Bridge discovery exhausted ${LOCAL_CONTROL_BRIDGE_HOST}:${(options.bridgePorts ?? LOCAL_CONTROL_BRIDGE_PORTS).join(", ")} (protocol ${LOCAL_CONTROL_BRIDGE_PROTOCOL})`,
         );
       } else {
+        writeRuntimeDiagnostic(runtimeDiagnosticLogger, {
+          event: "bridge_started",
+          timestamp: new Date().toISOString(),
+          host: LOCAL_CONTROL_BRIDGE_HOST,
+          port: bridgePort,
+          protocol: LOCAL_CONTROL_BRIDGE_PROTOCOL,
+        });
         console.info(
           `Local Control Bridge started on ${LOCAL_CONTROL_BRIDGE_HOST}:${bridgePort} (protocol ${LOCAL_CONTROL_BRIDGE_PROTOCOL})`,
         );
