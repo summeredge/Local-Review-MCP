@@ -47,3 +47,8 @@ review_request_id → conversation_id
 
 Correlation does not create or update Task, Execution, ReviewRequest, ConversationRouting, or
 Review Delivery records.
+
+`prepare_goal_handoff` is intentionally outside this join: it signs the Goal, selected workspace,
+MCP request trace, handoff identity, and validity window without resolving or returning a
+`conversation_id`. `submit_goal` retains the exact correlation requirement until a later
+Extension handoff step proves the current ChatGPT conversation identity.

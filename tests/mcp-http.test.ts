@@ -140,6 +140,23 @@ describe("MCP HTTP runtime", () => {
     expect(result.tools).toHaveLength(11);
     expect(result.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
 
+    const handoffCall = await client.callTool({
+      name: "prepare_goal_handoff",
+      arguments: {
+        title: "HTTP Goal",
+        goal: "Prepare a Goal over the MCP HTTP transport.",
+        requirements: ["Do not require conversation correlation."],
+        acceptance_criteria: ["The signed handoff is returned."],
+      },
+    });
+    expect(handoffCall.isError).not.toBe(true);
+    const handoff = structuredJson(handoffCall);
+    expect(handoff).toMatchObject({
+      workspace_id: workspaceIdentity.id,
+      goal: { title: "HTTP Goal" },
+    });
+    expect(handoff).not.toHaveProperty("conversation_id");
+
     const infoCall = await client.callTool({ name: "workspace_info", arguments: {} });
     expect(infoCall.isError).not.toBe(true);
     const info = JSON.parse(toolText(infoCall)) as Record<string, unknown>;

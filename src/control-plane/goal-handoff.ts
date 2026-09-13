@@ -5,14 +5,10 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { z } from "zod";
-import {
-  conversationIdSchema,
-  workspaceIdSchema,
-} from "../context/schema.js";
+import { workspaceIdSchema } from "../context/schema.js";
 import {
   goalSubmissionRequestSchema,
   goalSubmissionToolInputSchema,
-  type GoalSubmissionRequest,
 } from "./goal-submission.js";
 
 export const GOAL_HANDOFF_PROTOCOL = "local-review-mcp.goal-handoff" as const;
@@ -40,7 +36,6 @@ export const goalHandoffEnvelopeV1Schema = z.object({
   handoff_id: handoffIdSchema,
   request_id: requestIdSchema,
   workspace_id: workspaceIdSchema,
-  conversation_id: conversationIdSchema,
   goal: goalHandoffGoalSchema,
   issued_at: timestampSchema,
   expires_at: timestampSchema,
@@ -51,7 +46,6 @@ export type GoalHandoffInput = z.input<typeof goalHandoffInputSchema>;
 export type GoalHandoffPreparationInput = Omit<GoalHandoffInput, "workspace_id"> & {
   readonly request_id: string;
   readonly workspace_id: string;
-  readonly conversation_id: string;
 };
 export type GoalHandoffEnvelopeV1 = z.infer<typeof goalHandoffEnvelopeV1Schema>;
 type GoalHandoffSignedFields = Omit<GoalHandoffEnvelopeV1, "signature">;
@@ -63,7 +57,6 @@ function canonicalGoalHandoffPayload(envelope: GoalHandoffSignedFields): string 
     ["handoff_id", envelope.handoff_id],
     ["request_id", envelope.request_id],
     ["workspace_id", envelope.workspace_id],
-    ["conversation_id", envelope.conversation_id],
     ["goal.title", envelope.goal.title],
     ["goal.goal", envelope.goal.goal],
     ["goal.requirements", envelope.goal.requirements],
@@ -110,9 +103,7 @@ export class GoalHandoffService {
     input: GoalHandoffPreparationInput,
     now = Date.now(),
   ): GoalHandoffEnvelopeV1 {
-    const request: GoalSubmissionRequest = goalSubmissionRequestSchema.parse({
-      workspace_id: input.workspace_id,
-      conversation_id: input.conversation_id,
+    const goal = goalHandoffGoalSchema.parse({
       title: input.title,
       goal: input.goal,
       requirements: input.requirements,
@@ -125,15 +116,8 @@ export class GoalHandoffService {
       schema_version: GOAL_HANDOFF_SCHEMA_VERSION,
       handoff_id: `handoff-${randomUUID()}`,
       request_id: requestIdSchema.parse(input.request_id),
-      workspace_id: workspaceIdSchema.parse(request.workspace_id),
-      conversation_id: conversationIdSchema.parse(request.conversation_id),
-      goal: goalHandoffGoalSchema.parse({
-        title: request.title,
-        goal: request.goal,
-        requirements: request.requirements,
-        acceptance_criteria: request.acceptance_criteria,
-        max_iterations: request.max_iterations,
-      }),
+      workspace_id: workspaceIdSchema.parse(input.workspace_id),
+      goal,
       issued_at: issuedAt.toISOString(),
       expires_at: new Date(now + GOAL_HANDOFF_TTL_MS).toISOString(),
     };

@@ -229,11 +229,11 @@ The current read-only tools are `workspace_info`, `list_files`, `read_file`,
 read-only `prepare_goal_handoff` tool is for an explicit user request to
 establish or start a Goal and hand it to Codex; it returns a signed
 `GoalHandoffEnvelopeV1` but does not create or start a Goal. It accepts Goal
-fields but never accepts `conversation_id`; the server binds the current
-conversation through the exact inbound request correlation and fails closed
-when that proof is unavailable. Its request, conversation, and workspace
-identity fields are server-bound, its HMAC key remains in runtime memory, and
-the fixed envelope TTL is two minutes.
+fields but never accepts or returns `conversation_id`; it binds the exact MCP
+request trace and selected workspace, while the later Extension handoff step
+proves the current ChatGPT document, navigation, and conversation identity.
+Its HMAC key remains in runtime memory, and the fixed envelope TTL is two
+minutes.
 All workspace-scoped tools except `workspace_list` accept an optional
 `workspace_id`; an omitted ID preserves the active-workspace behavior.
 Git tools are bound to the selected registered workspace, do not expose Git

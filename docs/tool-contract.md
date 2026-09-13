@@ -16,7 +16,7 @@ not expose direct write, exec, shell, commit, or push operations.
 | `git_diff` | workspace | read-only |
 | `review_summary` | workspace | read-only |
 | `execution_output` | workspace | read-only |
-| `prepare_goal_handoff` | current ChatGPT conversation and workspace | read-only |
+| `prepare_goal_handoff` | Goal content, MCP request trace, and workspace | read-only |
 | `submit_goal` | current ChatGPT conversation | Control Plane |
 
 ## Common rules
@@ -212,7 +212,6 @@ not expose direct write, exec, shell, commit, or push operations.
     "handoff_id": "string",
     "request_id": "string",
     "workspace_id": "string",
-    "conversation_id": "string",
     "goal": {
       "title": "string",
       "goal": "string",
@@ -229,12 +228,12 @@ not expose direct write, exec, shell, commit, or push operations.
 - Workspace scope: the active registered workspace when `workspace_id` is
   omitted; an explicitly supplied ID must resolve through the Workspace
   Registry.
-- Permission: authenticated read-only preparation. `request_id` and
-  `conversation_id` come from the exact current inbound request correlation;
-  the server waits only for late evidence for that same request ID. If no
-  proven conversation arrives, it returns `conversation_not_correlated` and
-  returns no handoff envelope. The HMAC-SHA256 signing key exists only in the
-  current LRM runtime memory, and the fixed envelope TTL is two minutes.
+- Permission: authenticated read-only preparation. `request_id` is the exact
+  current MCP request trace. Preparation does not resolve, wait for, or return
+  `conversation_id`; the later Extension handoff step proves the current
+  ChatGPT document, navigation, and conversation identity. The HMAC-SHA256
+  signing key exists only in the current LRM runtime memory, and the fixed
+  envelope TTL is two minutes.
 
 ### `submit_goal`
 

@@ -12,14 +12,12 @@ import {
   goalHandoffInputSchema,
   type GoalHandoffEnvelopeV1,
 } from "../../src/control-plane/goal-handoff.js";
-import { ConversationCorrelationRegistry } from "../../src/control-plane/conversation-correlation.js";
 import type {
   GoalSubmissionRequest,
   GoalSubmissionResult,
 } from "../../src/control-plane/goal-submission.js";
 import { withInboundRequestId } from "../../src/mcp/inbound.js";
 import { createMcpServer } from "../../src/mcp/server.js";
-import { WorkspaceManager } from "../../src/workspace/manager.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
 
 const clients: Client[] = [];
@@ -30,15 +28,6 @@ afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) =>
     rm(directory, { recursive: true, force: true })));
 });
-
-function evidence(request_id: string, conversation_id: string) {
-  return {
-    request_id,
-    conversation_id,
-    document_id: "document-a",
-    navigation_epoch: 1,
-  };
-}
 
 function goalArguments() {
   return {
@@ -78,7 +67,6 @@ async function fixture() {
     { id: "workspace-a", name: "Workspace A", path: workspaceA },
     { id: "workspace-b", name: "Workspace B", path: workspaceB },
   ], { activeWorkspaceId: "workspace-a" });
-  const correlations = new ConversationCorrelationRegistry(storageRoot);
   const goalHandoff = new GoalHandoffService();
   const submitGoal = vi.fn(async (request: GoalSubmissionRequest): Promise<GoalSubmissionResult> => ({
     goal_id: `goal-${request.conversation_id}`,
@@ -90,14 +78,13 @@ async function fixture() {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const server = createMcpServer({
     registry,
-    correlations,
     goalHandoff,
     goalSubmission: { submitGoal },
   });
   const client = new Client({ name: "goal-handoff-test", version: "0.1.0" });
   clients.push(client);
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-  return { client, correlations, goalHandoff, submitGoal, registry, storageRoot };
+  return { client, goalHandoff, submitGoal, registry, storageRoot };
 }
 
 function callFor(
@@ -121,9 +108,8 @@ function toolJson(result: unknown): Record<string, unknown> {
 }
 
 describe("prepare_goal_handoff MCP tool", () => {
-  it("returns a complete signed envelope from an existing exact correlation", async () => {
-    const { client, correlations, goalHandoff } = await fixture();
-    await correlations.observe(evidence("request-A", "conversation-A"));
+  it("returns a complete signed envelope without conversation correlation", async () => {
+    const { client, goalHandoff } = await fixture();
 
     const result = await callFor(client, "request-A");
     const envelope = toolJson(result) as unknown as GoalHandoffEnvelopeV1;
@@ -134,71 +120,29 @@ describe("prepare_goal_handoff MCP tool", () => {
       schema_version: GOAL_HANDOFF_SCHEMA_VERSION,
       request_id: "request-A",
       workspace_id: "workspace-a",
-      conversation_id: "conversation-A",
       goal: { ...goalArguments(), max_iterations: 2 },
     });
+    expect(envelope).not.toHaveProperty("conversation_id");
     expect(envelope.handoff_id).toMatch(/^handoff-/u);
     expect(Date.parse(envelope.expires_at) - Date.parse(envelope.issued_at))
       .toBe(GOAL_HANDOFF_TTL_MS);
     expect(goalHandoff.verifyGoalHandoffEnvelope(envelope)).toBe(true);
   });
 
-  it("waits for delayed evidence for the same exact request id", async () => {
-    const { client, correlations } = await fixture();
-    const pending = callFor(client, "request-A");
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-
-    await correlations.observe(evidence("request-A", "conversation-A"));
-    const result = await pending;
-
-    expect(result.isError).not.toBe(true);
-    expect(toolJson(result)).toMatchObject({
-      request_id: "request-A",
-      conversation_id: "conversation-A",
-    });
-  });
-
-  it("fails closed when the current request remains uncorrelated", async () => {
-    const { client, correlations, goalHandoff } = await fixture();
-    await correlations.observe(evidence("request-B", "conversation-B"));
-    const wait = vi.spyOn(correlations, "awaitCorrelation").mockResolvedValue(null);
-    const prepare = vi.spyOn(goalHandoff, "prepareGoalHandoff");
-
-    const result = await callFor(client, "request-A");
-
-    expect(result.isError).toBe(true);
-    expect(toolJson(result)).toEqual({ error: "conversation_not_correlated" });
-    expect(wait).toHaveBeenCalledWith("request-A", 15_000);
-    expect(prepare).not.toHaveBeenCalled();
-  });
-
-  it("keeps concurrent requests bound to their own conversations", async () => {
-    const { client, correlations } = await fixture();
-    await correlations.observe(evidence("request-A", "conversation-A"));
-    await correlations.observe(evidence("request-B", "conversation-B"));
+  it("keeps concurrent calls bound to their own MCP request traces", async () => {
+    const { client } = await fixture();
 
     const results = await Promise.all([
       callFor(client, "request-A"),
       callFor(client, "request-B"),
     ]);
 
-    expect(results.map((result) => toolJson(result).conversation_id).sort())
-      .toEqual(["conversation-A", "conversation-B"]);
-  });
-
-  it("keeps the first proven owner when conflicting evidence arrives", async () => {
-    const { client, correlations } = await fixture();
-    await correlations.observe(evidence("request-A", "conversation-A"));
-    await expect(correlations.observe(evidence("request-A", "conversation-B"))).resolves.toBe("refused");
-
-    const result = await callFor(client, "request-A");
-
-    expect(toolJson(result)).toMatchObject({ conversation_id: "conversation-A" });
+    expect(results.map((result) => toolJson(result).request_id).sort())
+      .toEqual(["request-A", "request-B"]);
   });
 
   it("resolves the selected workspace identity and never accepts conversation_id input", async () => {
-    const { client, correlations } = await fixture();
-    await correlations.observe(evidence("request-A", "conversation-A"));
+    const { client } = await fixture();
 
     const selected = await callFor(client, "request-A", {
       ...goalArguments(),
@@ -235,7 +179,6 @@ describe("prepare_goal_handoff MCP tool", () => {
       ...goalArguments(),
       request_id: "request-A",
       workspace_id: "workspace-a",
-      conversation_id: "conversation-A",
     } as const;
 
     const first = goalHandoff.prepareGoalHandoff(input);
@@ -245,8 +188,7 @@ describe("prepare_goal_handoff MCP tool", () => {
   });
 
   it("rejects any signed-field mutation and preserves read-only state", async () => {
-    const { client, correlations, goalHandoff, submitGoal, storageRoot } = await fixture();
-    await correlations.observe(evidence("request-A", "conversation-A"));
+    const { client, goalHandoff, submitGoal, storageRoot } = await fixture();
     const before = await filesUnder(storageRoot);
     const result = await callFor(client, "request-A");
     const envelope = toolJson(result) as unknown as GoalHandoffEnvelopeV1;
@@ -292,12 +234,12 @@ describe("prepare_goal_handoff MCP tool", () => {
         handoff_id: expect.any(Object),
         request_id: expect.any(Object),
         workspace_id: expect.any(Object),
-        conversation_id: expect.any(Object),
         goal: expect.any(Object),
         issued_at: expect.any(Object),
         expires_at: expect.any(Object),
         signature: expect.any(Object),
       },
     });
+    expect(tool?.outputSchema).not.toHaveProperty("properties.conversation_id");
   });
 });

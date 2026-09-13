@@ -679,34 +679,25 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "prepare_goal_handoff",
     {
-      description: "Use only when the user explicitly asks to establish or start a Goal and hand it to Codex for execution. Convert the request into title, goal, requirements, acceptance_criteria, and max_iterations. This read-only tool only prepares a signed handoff; it does not create or start a Goal. Do not ask the user for conversation_id; the server binds it from the exact inbound request correlation.",
+      description: "Use only when the user explicitly asks to establish or start a Goal and hand it to Codex for execution. Convert the request into title, goal, requirements, acceptance_criteria, and max_iterations. This read-only tool only prepares a signed handoff; it does not create or start a Goal. The handoff includes the MCP request trace; conversation identity is bound later by the Extension.",
       inputSchema: goalHandoffInputSchema,
       outputSchema: goalHandoffEnvelopeV1Schema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async (input) => {
-      const correlations = context.correlations;
       const goalHandoff = context.goalHandoff;
-      if (correlations === undefined || goalHandoff === undefined) {
+      if (goalHandoff === undefined) {
         return toToolError(new Error("Goal handoff runtime is unavailable."));
       }
 
       try {
         const requestId = inboundRequestId();
-        const correlation = currentInboundCorrelation(correlations)
-          ?? await awaitCurrentInboundCorrelation(
-            correlations,
-            GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS,
-          );
-        if (requestId === null || correlation === null || correlation.request_id !== requestId) {
-          return conversationNotCorrelatedError();
-        }
+        if (requestId === null) return toToolError(new Error("MCP request trace is unavailable."));
 
         const selection = registry.resolve(input.workspace_id);
         return structuredResponse(goalHandoffEnvelopeV1Schema, goalHandoff.prepareGoalHandoff({
           request_id: requestId,
           workspace_id: selection.id,
-          conversation_id: correlation.conversation_id,
           title: input.title,
           goal: input.goal,
           requirements: input.requirements,

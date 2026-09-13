@@ -160,12 +160,12 @@ describe("MCP tool registry", () => {
         handoff_id: expect.any(Object),
         request_id: expect.any(Object),
         workspace_id: expect.any(Object),
-        conversation_id: expect.any(Object),
         goal: expect.any(Object),
         issued_at: expect.any(Object),
         expires_at: expect.any(Object),
         signature: expect.any(Object),
       },
     });
+    expect(prepareGoalHandoff?.outputSchema).not.toHaveProperty("properties.conversation_id");
   });
 });
