@@ -30,7 +30,7 @@ describe("MCP tool registry", () => {
     const result = await client.listTools();
     const names = result.tools.map((tool) => tool.name).sort();
 
-    expect(names).toHaveLength(10);
+    expect(names).toHaveLength(11);
     expect(names).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
     expect(result.tools.find((tool) => tool.name === "workspace_info")?.outputSchema).toMatchObject({
       type: "object",
@@ -133,6 +133,38 @@ describe("MCP tool registry", () => {
         task_id: expect.any(Object),
         execution_id: expect.any(Object),
         status: expect.any(Object),
+      },
+    });
+    const prepareGoalHandoff = result.tools.find((tool) => tool.name === "prepare_goal_handoff");
+    expect(prepareGoalHandoff?.annotations).toMatchObject({
+      readOnlyHint: true,
+      destructiveHint: false,
+    });
+    expect(prepareGoalHandoff?.inputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        workspace_id: expect.any(Object),
+        title: expect.any(Object),
+        goal: expect.any(Object),
+        requirements: expect.any(Object),
+        acceptance_criteria: expect.any(Object),
+        max_iterations: expect.any(Object),
+      },
+    });
+    expect(prepareGoalHandoff?.inputSchema).not.toHaveProperty("properties.conversation_id");
+    expect(prepareGoalHandoff?.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        protocol: expect.any(Object),
+        schema_version: expect.any(Object),
+        handoff_id: expect.any(Object),
+        request_id: expect.any(Object),
+        workspace_id: expect.any(Object),
+        conversation_id: expect.any(Object),
+        goal: expect.any(Object),
+        issued_at: expect.any(Object),
+        expires_at: expect.any(Object),
+        signature: expect.any(Object),
       },
     });
   });

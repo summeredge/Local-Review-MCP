@@ -13,6 +13,12 @@ import {
   currentInboundCorrelation,
 } from "../control-plane/request-correlation-integration.js";
 import {
+  goalHandoffEnvelopeV1Schema,
+  goalHandoffInputSchema,
+  type GoalHandoffService,
+} from "../control-plane/goal-handoff.js";
+import {
+  goalSubmissionToolInputSchema,
   goalSubmissionRequestSchema,
   goalSubmissionResultSchema,
   type GoalSubmissionService,
@@ -23,7 +29,7 @@ import type { WorkspaceRegistry, WorkspaceSelection } from "../workspace/registr
 import { searchText } from "../workspace/search.js";
 import { containsNullByte } from "../workspace/text.js";
 import { structuredResponse } from "./respond.js";
-import { inboundRequestOrigin } from "./inbound.js";
+import { inboundRequestId, inboundRequestOrigin } from "./inbound.js";
 import { ROOT_ALIAS } from "./schema/common.js";
 import {
   gitDiffOutputSchema,
@@ -50,6 +56,7 @@ export interface McpRuntimeContext {
   readonly workspace?: WorkspaceManager;
   readonly registry: WorkspaceRegistry;
   readonly correlations?: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">;
+  readonly goalHandoff?: Pick<GoalHandoffService, "prepareGoalHandoff">;
   readonly goalSubmission?: Pick<GoalSubmissionService, "submitGoal">;
   readonly connectorEvidence?: {
     recordEvidence(input: {
@@ -75,7 +82,7 @@ export const V01_TOOL_NAMES = [
 
 export const WORKSPACE_REGISTRY_TOOL_NAMES = ["workspace_list"] as const;
 export const REVIEW_CONTEXT_TOOL_NAMES = ["review_summary", "execution_output"] as const;
-export const CONTROL_PLANE_TOOL_NAMES = ["submit_goal"] as const;
+export const CONTROL_PLANE_TOOL_NAMES = ["prepare_goal_handoff", "submit_goal"] as const;
 export const REGISTERED_TOOL_NAMES = [
   ...V01_TOOL_NAMES,
   ...WORKSPACE_REGISTRY_TOOL_NAMES,
@@ -134,10 +141,6 @@ const gitDiffInputSchema = {
   path: z.string().optional().default("."),
   stat: z.boolean().optional().default(false),
 };
-const submitGoalInputSchema = goalSubmissionRequestSchema
-  .omit({ workspace_id: true, conversation_id: true })
-  .extend(workspaceIdInputSchema)
-  .strict();
 export const GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS = 15_000;
 const EXECUTION_OUTPUT_PATH = ".review/execution_output.json";
 
@@ -674,10 +677,53 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   );
 
   server.registerTool(
+    "prepare_goal_handoff",
+    {
+      description: "Use only when the user explicitly asks to establish or start a Goal and hand it to Codex for execution. Convert the request into title, goal, requirements, acceptance_criteria, and max_iterations. This read-only tool only prepares a signed handoff; it does not create or start a Goal. Do not ask the user for conversation_id; the server binds it from the exact inbound request correlation.",
+      inputSchema: goalHandoffInputSchema,
+      outputSchema: goalHandoffEnvelopeV1Schema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      const correlations = context.correlations;
+      const goalHandoff = context.goalHandoff;
+      if (correlations === undefined || goalHandoff === undefined) {
+        return toToolError(new Error("Goal handoff runtime is unavailable."));
+      }
+
+      try {
+        const requestId = inboundRequestId();
+        const correlation = currentInboundCorrelation(correlations)
+          ?? await awaitCurrentInboundCorrelation(
+            correlations,
+            GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS,
+          );
+        if (requestId === null || correlation === null || correlation.request_id !== requestId) {
+          return conversationNotCorrelatedError();
+        }
+
+        const selection = registry.resolve(input.workspace_id);
+        return structuredResponse(goalHandoffEnvelopeV1Schema, goalHandoff.prepareGoalHandoff({
+          request_id: requestId,
+          workspace_id: selection.id,
+          conversation_id: correlation.conversation_id,
+          title: input.title,
+          goal: input.goal,
+          requirements: input.requirements,
+          acceptance_criteria: input.acceptance_criteria,
+          max_iterations: input.max_iterations,
+        }));
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "submit_goal",
     {
       description: "Control Plane: create and start a Goal for the current ChatGPT conversation; conversation_id is resolved from the exact inbound request correlation.",
-      inputSchema: submitGoalInputSchema,
+      inputSchema: goalSubmissionToolInputSchema,
       outputSchema: goalSubmissionResultSchema,
     },
     async (input) => {

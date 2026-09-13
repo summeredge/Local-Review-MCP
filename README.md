@@ -7,7 +7,7 @@ V0.1 Release Candidate / Task 12
 ## Current capabilities
 
 - MCP Streamable HTTP runtime
-- nine read-only tools, including the workspace registry and review context tools
+- ten read-only tools, including the workspace registry, review context, and Goal handoff preparation tools
 - `submit_goal` Control Plane entry point with automatic current-conversation binding
 - fixed loopback host
 - configurable fixed port
@@ -152,10 +152,10 @@ $env:LOCAL_REVIEW_MCP_REMOTE_TOKEN = $env:LOCAL_REVIEW_MCP_TOKEN
 
 `verify-remote.ps1` checks that unauthenticated and wrong-token health requests
 return HTTP 401, the correct token returns `status=ok`, MCP `initialize` works,
-and `tools/list` contains the nine read-only tools plus `submit_goal`:
+and `tools/list` contains the ten read-only tools plus `submit_goal`:
 `workspace_info`, `list_files`, `read_file`, `search_text`, `git_status`, and
 `git_diff`, plus `workspace_list`, `review_summary`, `execution_output`, and
-`submit_goal`.
+`prepare_goal_handoff`, and `submit_goal`.
 
 ## Remote MCP Setup
 
@@ -207,7 +207,7 @@ hardcodes a tunnel hostname.
 3. Select the connector's OAuth authentication option. The server publishes
    MCP protected-resource metadata, authorization-server metadata, dynamic
    client registration, and PKCE endpoints under the same public origin.
-4. Scan the tools, confirm the nine read-only actions plus `submit_goal`, save the draft app, and
+4. Scan the tools, confirm the ten read-only actions plus `submit_goal`, save the draft app, and
    select it from a new chat. Ask for a code review; ChatGPT should call
    `workspace_list` first, then `review_summary`, `execution_output`,
    `workspace_info`, `git_status`, `git_diff`, `read_file`, and `search_text`
@@ -224,10 +224,16 @@ registered path. Without `workspace_id`, tools use that active workspace.
 
 The current read-only tools are `workspace_info`, `list_files`, `read_file`,
 `search_text`, `git_status`, `git_diff`, `workspace_list`, `review_summary`,
-and `execution_output`. The Control Plane tool `submit_goal` creates and starts
-a Goal through the existing workflow. It accepts Goal fields but never accepts
-`conversation_id`; the server binds the current conversation through the exact
-inbound request correlation and fails closed when that proof is unavailable.
+`execution_output`, and `prepare_goal_handoff`. The Control Plane tool
+`submit_goal` creates and starts a Goal through the existing workflow. The
+read-only `prepare_goal_handoff` tool is for an explicit user request to
+establish or start a Goal and hand it to Codex; it returns a signed
+`GoalHandoffEnvelopeV1` but does not create or start a Goal. It accepts Goal
+fields but never accepts `conversation_id`; the server binds the current
+conversation through the exact inbound request correlation and fails closed
+when that proof is unavailable. Its request, conversation, and workspace
+identity fields are server-bound, its HMAC key remains in runtime memory, and
+the fixed envelope TTL is two minutes.
 All workspace-scoped tools except `workspace_list` accept an optional
 `workspace_id`; an omitted ID preserves the active-workspace behavior.
 Git tools are bound to the selected registered workspace, do not expose Git
@@ -289,7 +295,7 @@ the remote test. No token or public URL is stored in the repository.
 ## Security Notes
 
 Local Review MCP provides `read`, `search`, and `review` capabilities through
-its nine read-only tools, plus the reviewed `submit_goal` Control Plane entry
+its ten read-only tools, plus the reviewed `submit_goal` Control Plane entry
 point. It does not provide:
 
 - `modify` or `write_file` operations;

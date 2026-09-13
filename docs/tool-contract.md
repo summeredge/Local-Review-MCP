@@ -1,6 +1,6 @@
 # MCP tool contract
 
-This document freezes the V0.1 Release Candidate tool surface. Nine tools are
+This document freezes the V0.1 Release Candidate tool surface. Ten tools are
 read-only, and `submit_goal` is the reviewed Control Plane entry point. The
 names and input fields below are the current MCP contract; the runtime does
 not expose direct write, exec, shell, commit, or push operations.
@@ -16,6 +16,7 @@ not expose direct write, exec, shell, commit, or push operations.
 | `git_diff` | workspace | read-only |
 | `review_summary` | workspace | read-only |
 | `execution_output` | workspace | read-only |
+| `prepare_goal_handoff` | current ChatGPT conversation and workspace | read-only |
 | `submit_goal` | current ChatGPT conversation | Control Plane |
 
 ## Common rules
@@ -181,6 +182,59 @@ not expose direct write, exec, shell, commit, or push operations.
 - Workspace scope: selected workspace fixed path `.review/execution_output.json`.
 - Permission: authenticated read-only result access. It never accepts a path,
   runs a command, or exposes an execution capability.
+
+### `prepare_goal_handoff`
+
+- Purpose: Prepare a signed `GoalHandoffEnvelopeV1` for an explicit user
+  request to establish or start a Goal and hand it to Codex. This tool only
+  prepares the handoff; it does not create or start a Goal.
+- Input:
+
+  ```json
+  {
+    "workspace_id"?: "string",
+    "title": "string",
+    "goal": "string",
+    "requirements": ["string"],
+    "acceptance_criteria": ["string"],
+    "max_iterations"?: "integer, 1..10000"
+  }
+  ```
+
+  The Goal field limits and `max_iterations` default of `2` are the same as
+  `submit_goal`. `conversation_id` and `request_id` are not input fields.
+- Output:
+
+  ```json
+  {
+    "protocol": "local-review-mcp.goal-handoff",
+    "schema_version": "1",
+    "handoff_id": "string",
+    "request_id": "string",
+    "workspace_id": "string",
+    "conversation_id": "string",
+    "goal": {
+      "title": "string",
+      "goal": "string",
+      "requirements": ["string"],
+      "acceptance_criteria": ["string"],
+      "max_iterations": "integer"
+    },
+    "issued_at": "RFC3339 timestamp",
+    "expires_at": "RFC3339 timestamp",
+    "signature": "64 lowercase hexadecimal characters"
+  }
+  ```
+
+- Workspace scope: the active registered workspace when `workspace_id` is
+  omitted; an explicitly supplied ID must resolve through the Workspace
+  Registry.
+- Permission: authenticated read-only preparation. `request_id` and
+  `conversation_id` come from the exact current inbound request correlation;
+  the server waits only for late evidence for that same request ID. If no
+  proven conversation arrives, it returns `conversation_not_correlated` and
+  returns no handoff envelope. The HMAC-SHA256 signing key exists only in the
+  current LRM runtime memory, and the fixed envelope TTL is two minutes.
 
 ### `submit_goal`
 

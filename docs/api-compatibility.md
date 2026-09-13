@@ -2,7 +2,7 @@
 
 This document defines how the frozen V0.1 MCP contract may evolve. The current
 tool names, input fields, output fields, workspace scope, and permission model
-are the compatibility baseline. The current surface has nine read-only tools
+are the compatibility baseline. The current surface has ten read-only tools
 and the reviewed `submit_goal` Control Plane tool.
 
 ## Allowed additive changes
@@ -37,6 +37,7 @@ freeze does not make any of these changes.
 
 Existing clients may continue to call all nine frozen read-only tools and
 receive their current response structures. `tools/list` additionally exposes
-the explicitly reviewed `submit_goal` Control Plane entry point. Workspace
-selection continues to resolve only registered `workspace_id` values, never an
-arbitrary caller-supplied local path.
+the read-only `prepare_goal_handoff` tool and the explicitly reviewed
+`submit_goal` Control Plane entry point. Workspace selection continues to
+resolve only registered `workspace_id` values, never an arbitrary
+caller-supplied local path.

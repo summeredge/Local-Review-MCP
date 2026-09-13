@@ -167,13 +167,14 @@ try {
             "workspace_list",
             "review_summary",
             "execution_output",
+            "prepare_goal_handoff",
             "submit_goal"
         )
         $actualTools = @($tools | ForEach-Object { Get-PropertyValue $_ "name" })
         if ($actualTools.Count -ne $expectedTools.Count -or (($actualTools | Sort-Object) -join ",") -ne (($expectedTools | Sort-Object) -join ",")) {
-            throw "tools/list returned an unexpected tool surface; expected nine read-only tools plus submit_goal."
+            throw "tools/list returned an unexpected tool surface; expected ten read-only tools plus submit_goal."
         }
-        Write-Host "tools/list: passed (nine read-only tools plus submit_goal)"
+        Write-Host "tools/list: passed (ten read-only tools plus submit_goal)"
         Write-Host "Remote verification passed."
         exit 0
     } finally {

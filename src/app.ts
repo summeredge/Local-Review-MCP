@@ -20,6 +20,7 @@ import {
 } from "./control-plane/extension-review-completion.js";
 import { CodexExecutionCompletionService } from "./control-plane/codex-execution-completion.js";
 import { AutoIterationService } from "./control-plane/auto-iteration.js";
+import { GoalHandoffService } from "./control-plane/goal-handoff.js";
 import { GoalPreflightService } from "./control-plane/goal-preflight.js";
 import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
 import { GoalSubmissionService } from "./control-plane/goal-submission.js";
@@ -51,6 +52,7 @@ export interface AppContext extends McpRuntimeContext {
   readonly autoIteration?: AutoIterationService;
   readonly goalPreflight?: GoalPreflightService;
   readonly goalOrchestration?: GoalOrchestrationService;
+  readonly goalHandoff?: GoalHandoffService;
   readonly goalSubmission?: GoalSubmissionService;
   readonly executionRouter?: ExecutionRoutingService;
 }
@@ -117,6 +119,7 @@ export function createAppContext(
     autoIteration,
   });
   const goalPreflight = new GoalPreflightService({ settings, registry, storageRoot });
+  const goalHandoff = new GoalHandoffService();
   const goalSubmission = new GoalSubmissionService(goalOrchestration, goalPreflight);
   const executionRouter = new ExecutionRoutingService(registry, {
     storageRoot,
@@ -139,6 +142,7 @@ export function createAppContext(
     autoIteration,
     goalPreflight,
     goalOrchestration,
+    goalHandoff,
     goalSubmission,
     executionRouter,
     tunnel: createTunnelManager(settings.remote, {

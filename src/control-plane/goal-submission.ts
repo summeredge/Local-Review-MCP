@@ -36,6 +36,11 @@ export const goalSubmissionRequestSchema = z.object({
   max_iterations: z.number().int().min(1).max(10_000).default(DEFAULT_GOAL_MAX_ITERATIONS),
 }).strict();
 
+export const goalSubmissionToolInputSchema = goalSubmissionRequestSchema
+  .omit({ workspace_id: true, conversation_id: true })
+  .extend({ workspace_id: z.string().min(1).max(128).optional() })
+  .strict();
+
 export const goalSubmissionResultSchema = z.object({
   goal_id: goalIdSchema,
   phase_id: phaseIdSchema,
