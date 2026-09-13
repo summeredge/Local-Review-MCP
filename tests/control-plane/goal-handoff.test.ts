@@ -10,8 +10,9 @@ import {
   GOAL_HANDOFF_TTL_MS,
   GoalHandoffService,
   goalHandoffInputSchema,
-  type GoalHandoffEnvelopeV1,
+  type GoalHandoffEnvelopeV2,
 } from "../../src/control-plane/goal-handoff.js";
+import { ConversationCorrelationRegistry } from "../../src/control-plane/conversation-correlation.js";
 import type {
   GoalSubmissionRequest,
   GoalSubmissionResult,
@@ -24,10 +25,20 @@ const clients: Client[] = [];
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(clients.splice(0).map((client) => client.close()));
   await Promise.all(temporaryDirectories.splice(0).map((directory) =>
     rm(directory, { recursive: true, force: true })));
 });
+
+function evidence(request_id: string, conversation_id: string) {
+  return {
+    request_id,
+    conversation_id,
+    document_id: "document-a",
+    navigation_epoch: 1,
+  };
+}
 
 function goalArguments() {
   return {
@@ -58,7 +69,7 @@ async function filesUnder(root: string): Promise<string[]> {
   return files.sort();
 }
 
-async function fixture() {
+async function fixture(withCorrelations = false) {
   const workspaceA = await mkdtemp(join(tmpdir(), "local-review-mcp-goal-handoff-a-"));
   const workspaceB = await mkdtemp(join(tmpdir(), "local-review-mcp-goal-handoff-b-"));
   const storageRoot = await mkdtemp(join(tmpdir(), "local-review-mcp-goal-handoff-state-"));
@@ -67,6 +78,9 @@ async function fixture() {
     { id: "workspace-a", name: "Workspace A", path: workspaceA },
     { id: "workspace-b", name: "Workspace B", path: workspaceB },
   ], { activeWorkspaceId: "workspace-a" });
+  const correlations = withCorrelations === true
+    ? new ConversationCorrelationRegistry(storageRoot)
+    : undefined;
   const goalHandoff = new GoalHandoffService();
   const submitGoal = vi.fn(async (request: GoalSubmissionRequest): Promise<GoalSubmissionResult> => ({
     goal_id: `goal-${request.conversation_id}`,
@@ -78,13 +92,14 @@ async function fixture() {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const server = createMcpServer({
     registry,
+    correlations,
     goalHandoff,
     goalSubmission: { submitGoal },
   });
   const client = new Client({ name: "goal-handoff-test", version: "0.1.0" });
   clients.push(client);
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-  return { client, goalHandoff, submitGoal, registry, storageRoot };
+  return { client, correlations, goalHandoff, submitGoal, registry, storageRoot };
 }
 
 function callFor(
@@ -112,7 +127,7 @@ describe("prepare_goal_handoff MCP tool", () => {
     const { client, goalHandoff } = await fixture();
 
     const result = await callFor(client, "request-A");
-    const envelope = toolJson(result) as unknown as GoalHandoffEnvelopeV1;
+    const envelope = toolJson(result) as unknown as GoalHandoffEnvelopeV2;
 
     expect(result.isError).not.toBe(true);
     expect(envelope).toMatchObject({
@@ -122,11 +137,63 @@ describe("prepare_goal_handoff MCP tool", () => {
       workspace_id: "workspace-a",
       goal: { ...goalArguments(), max_iterations: 2 },
     });
+    expect(envelope.schema_version).toBe("2");
     expect(envelope).not.toHaveProperty("conversation_id");
     expect(envelope.handoff_id).toMatch(/^handoff-/u);
     expect(Date.parse(envelope.expires_at) - Date.parse(envelope.issued_at))
       .toBe(GOAL_HANDOFF_TTL_MS);
     expect(goalHandoff.verifyGoalHandoffEnvelope(envelope)).toBe(true);
+  });
+
+  it("ignores a mismatched existing conversation correlation", async () => {
+    const { client, correlations } = await fixture(true);
+    if (correlations === undefined) throw new Error("correlation fixture is unavailable");
+    await correlations.observe(evidence("fiber-request-B", "conversation-X"));
+    const lookup = vi.spyOn(correlations, "correlation");
+    const wait = vi.spyOn(correlations, "awaitCorrelation");
+
+    const result = await callFor(client, "http-request-A");
+    const envelope = toolJson(result) as unknown as GoalHandoffEnvelopeV2;
+
+    expect(result.isError).not.toBe(true);
+    expect(envelope).toMatchObject({
+      request_id: "http-request-A",
+      workspace_id: "workspace-a",
+    });
+    expect(envelope).not.toHaveProperty("conversation_id");
+    expect(lookup).not.toHaveBeenCalled();
+    expect(wait).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for an unknown workspace without generating a handoff", async () => {
+    const { client, goalHandoff } = await fixture();
+    const prepare = vi.spyOn(goalHandoff, "prepareGoalHandoff");
+
+    const result = await callFor(client, "request-A", {
+      ...goalArguments(),
+      workspace_id: "workspace-missing",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(toolJson(result)).toEqual({
+      error: "UNKNOWN_WORKSPACE_ID",
+      message: "Unknown workspace_id",
+    });
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the inbound MCP request trace is missing", async () => {
+    const { client, goalHandoff } = await fixture();
+    const prepare = vi.spyOn(goalHandoff, "prepareGoalHandoff");
+
+    const result = await client.callTool({
+      name: "prepare_goal_handoff",
+      arguments: goalArguments(),
+    });
+
+    expect(result.isError).toBe(true);
+    expect(toolJson(result)).toEqual({ error: "INTERNAL_ERROR" });
+    expect(prepare).not.toHaveBeenCalled();
   });
 
   it("keeps concurrent calls bound to their own MCP request traces", async () => {
@@ -141,7 +208,7 @@ describe("prepare_goal_handoff MCP tool", () => {
       .toEqual(["request-A", "request-B"]);
   });
 
-  it("resolves the selected workspace identity and never accepts conversation_id input", async () => {
+  it("resolves the selected workspace identity", async () => {
     const { client } = await fixture();
 
     const selected = await callFor(client, "request-A", {
@@ -149,22 +216,30 @@ describe("prepare_goal_handoff MCP tool", () => {
       workspace_id: "workspace-b",
     });
     expect(toolJson(selected)).toMatchObject({ workspace_id: "workspace-b" });
+  });
 
-    const invalid = await callFor(client, "request-A", {
+  it("rejects model-supplied identity fields", () => {
+    expect(goalHandoffInputSchema.safeParse({
       ...goalArguments(),
       conversation_id: "model-supplied-conversation",
-    });
-
-    expect(invalid.isError).toBe(true);
+    }).success).toBe(false);
+    expect(goalHandoffInputSchema.safeParse({
+      ...goalArguments(),
+      request_id: "model-supplied-request",
+    }).success).toBe(false);
+    expect(goalHandoffInputSchema.safeParse({
+      ...goalArguments(),
+      handoff_id: "model-supplied-handoff",
+    }).success).toBe(false);
+    expect(goalHandoffInputSchema.safeParse({
+      ...goalArguments(),
+      signature: "0".repeat(64),
+    }).success).toBe(false);
   });
 
   it("uses the existing Goal schema constraints and default max_iterations", () => {
     const valid = goalHandoffInputSchema.parse(goalArguments());
     expect(valid.max_iterations).toBe(2);
-    expect(goalHandoffInputSchema.safeParse({
-      ...goalArguments(),
-      conversation_id: "not-an-input",
-    }).success).toBe(false);
     expect(goalHandoffInputSchema.safeParse({ ...goalArguments(), requirements: [] }).success).toBe(false);
     expect(goalHandoffInputSchema.safeParse({
       ...goalArguments(),
@@ -191,7 +266,7 @@ describe("prepare_goal_handoff MCP tool", () => {
     const { client, goalHandoff, submitGoal, storageRoot } = await fixture();
     const before = await filesUnder(storageRoot);
     const result = await callFor(client, "request-A");
-    const envelope = toolJson(result) as unknown as GoalHandoffEnvelopeV1;
+    const envelope = toolJson(result) as unknown as GoalHandoffEnvelopeV2;
 
     expect(goalHandoff.verifyGoalHandoffEnvelope(envelope)).toBe(true);
     expect(goalHandoff.verifyGoalHandoffEnvelope({
@@ -200,11 +275,19 @@ describe("prepare_goal_handoff MCP tool", () => {
     })).toBe(false);
     expect(goalHandoff.verifyGoalHandoffEnvelope({
       ...envelope,
-      conversation_id: "conversation-other",
+      workspace_id: "workspace-b",
     })).toBe(false);
     expect(goalHandoff.verifyGoalHandoffEnvelope({
       ...envelope,
-      workspace_id: "workspace-b",
+      request_id: "request-B",
+    })).toBe(false);
+    expect(goalHandoff.verifyGoalHandoffEnvelope({
+      ...envelope,
+      handoff_id: "handoff-other",
+    })).toBe(false);
+    expect(goalHandoff.verifyGoalHandoffEnvelope({
+      ...envelope,
+      issued_at: new Date(Date.parse(envelope.issued_at) + 1_000).toISOString(),
     })).toBe(false);
     expect(goalHandoff.verifyGoalHandoffEnvelope({
       ...envelope,

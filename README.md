@@ -228,7 +228,7 @@ The current read-only tools are `workspace_info`, `list_files`, `read_file`,
 `submit_goal` creates and starts a Goal through the existing workflow. The
 read-only `prepare_goal_handoff` tool is for an explicit user request to
 establish or start a Goal and hand it to Codex; it returns a signed
-`GoalHandoffEnvelopeV1` but does not create or start a Goal. It accepts Goal
+`GoalHandoffEnvelopeV2` but does not create or start a Goal. It accepts Goal
 fields but never accepts or returns `conversation_id`; it binds the exact MCP
 request trace and selected workspace, while the later Extension handoff step
 proves the current ChatGPT document, navigation, and conversation identity.

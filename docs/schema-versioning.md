@@ -3,8 +3,9 @@
 ## V0.1 freeze
 
 The V0.1 Release Candidate keeps the existing tool response shapes unchanged.
-There is no `schema_version` field and no `data` wrapper in the current MCP
-responses.
+Ordinary MCP responses have no `schema_version` field and no `data` wrapper.
+The explicitly reviewed `prepare_goal_handoff` exception returns the signed
+`GoalHandoffEnvelopeV2` with `schema_version = "2"`.
 
 Workspace identity remains a flat field in responses that already expose it:
 
@@ -24,14 +25,15 @@ direction is:
 
 ```json
 {
-  "schema_version": "1",
+  "schema_version": "N",
   "data": {}
 }
 ```
 
-That envelope is only a future design. Introducing it requires a separately
-reviewed compatibility change; it must not be added opportunistically to the
-V0.1 tools. Until then, clients consume the existing flat response objects.
+That envelope is only a future design, with the version selected by its own
+contract. Introducing it requires a separately reviewed compatibility change;
+it must not be added opportunistically to the V0.1 tools. Until then, clients
+consume the existing flat response objects.
 
 ## Constraints
 

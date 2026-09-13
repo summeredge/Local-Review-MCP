@@ -185,7 +185,7 @@ not expose direct write, exec, shell, commit, or push operations.
 
 ### `prepare_goal_handoff`
 
-- Purpose: Prepare a signed `GoalHandoffEnvelopeV1` for an explicit user
+- Purpose: Prepare a signed `GoalHandoffEnvelopeV2` for an explicit user
   request to establish or start a Goal and hand it to Codex. This tool only
   prepares the handoff; it does not create or start a Goal.
 - Input:
@@ -208,7 +208,7 @@ not expose direct write, exec, shell, commit, or push operations.
   ```json
   {
     "protocol": "local-review-mcp.goal-handoff",
-    "schema_version": "1",
+    "schema_version": "2",
     "handoff_id": "string",
     "request_id": "string",
     "workspace_id": "string",

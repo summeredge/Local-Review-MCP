@@ -12,7 +12,7 @@ import {
 } from "./goal-submission.js";
 
 export const GOAL_HANDOFF_PROTOCOL = "local-review-mcp.goal-handoff" as const;
-export const GOAL_HANDOFF_SCHEMA_VERSION = "1" as const;
+export const GOAL_HANDOFF_SCHEMA_VERSION = "2" as const;
 export const GOAL_HANDOFF_TTL_MS = 2 * 60 * 1000;
 
 const requestIdSchema = z.string().min(1).max(100).regex(/^[A-Za-z0-9_-]+$/u);
@@ -30,7 +30,7 @@ export const goalHandoffInputSchema = goalSubmissionToolInputSchema;
 
 const goalHandoffGoalSchema = goalSubmissionRequestSchema.pick(goalFields).strict();
 
-export const goalHandoffEnvelopeV1Schema = z.object({
+export const goalHandoffEnvelopeV2Schema = z.object({
   protocol: z.literal(GOAL_HANDOFF_PROTOCOL),
   schema_version: z.literal(GOAL_HANDOFF_SCHEMA_VERSION),
   handoff_id: handoffIdSchema,
@@ -47,8 +47,8 @@ export type GoalHandoffPreparationInput = Omit<GoalHandoffInput, "workspace_id">
   readonly request_id: string;
   readonly workspace_id: string;
 };
-export type GoalHandoffEnvelopeV1 = z.infer<typeof goalHandoffEnvelopeV1Schema>;
-type GoalHandoffSignedFields = Omit<GoalHandoffEnvelopeV1, "signature">;
+export type GoalHandoffEnvelopeV2 = z.infer<typeof goalHandoffEnvelopeV2Schema>;
+type GoalHandoffSignedFields = Omit<GoalHandoffEnvelopeV2, "signature">;
 
 function canonicalGoalHandoffPayload(envelope: GoalHandoffSignedFields): string {
   return [
@@ -73,7 +73,7 @@ function signatureFor(envelope: GoalHandoffSignedFields, secret: Uint8Array): st
     .digest("hex");
 }
 
-function validTimeWindow(envelope: GoalHandoffEnvelopeV1, now: number): boolean {
+function validTimeWindow(envelope: GoalHandoffEnvelopeV2, now: number): boolean {
   const issuedAt = Date.parse(envelope.issued_at);
   const expiresAt = Date.parse(envelope.expires_at);
   return Number.isFinite(now)
@@ -89,7 +89,7 @@ export function verifyGoalHandoffEnvelope(
   secret: Uint8Array,
   now = Date.now(),
 ): boolean {
-  const parsed = goalHandoffEnvelopeV1Schema.safeParse(value);
+  const parsed = goalHandoffEnvelopeV2Schema.safeParse(value);
   if (!parsed.success || !validTimeWindow(parsed.data, now)) return false;
   const expected = Buffer.from(signatureFor(parsed.data, secret), "hex");
   const actual = Buffer.from(parsed.data.signature, "hex");
@@ -102,7 +102,7 @@ export class GoalHandoffService {
   public prepareGoalHandoff(
     input: GoalHandoffPreparationInput,
     now = Date.now(),
-  ): GoalHandoffEnvelopeV1 {
+  ): GoalHandoffEnvelopeV2 {
     const goal = goalHandoffGoalSchema.parse({
       title: input.title,
       goal: input.goal,
@@ -121,7 +121,7 @@ export class GoalHandoffService {
       issued_at: issuedAt.toISOString(),
       expires_at: new Date(now + GOAL_HANDOFF_TTL_MS).toISOString(),
     };
-    return goalHandoffEnvelopeV1Schema.parse({
+    return goalHandoffEnvelopeV2Schema.parse({
       ...unsigned,
       signature: signatureFor(unsigned, this.signingSecret),
     });

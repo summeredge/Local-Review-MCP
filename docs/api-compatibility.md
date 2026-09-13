@@ -31,10 +31,10 @@ ordinary additive updates:
 
 Before accepting one of these changes, update the contract documentation,
 review client impact, and make the schema/version decision explicit. The
-P3.2C-1R correction intentionally removes `conversation_id` from the newly
-introduced `prepare_goal_handoff` preparation envelope before its downstream
-consumer exists; its schema version remains `1`, while `submit_goal` is
-unchanged. See `tool-contract.md` for the current handoff contract.
+P3.2C-1R correction upgrades the newly introduced `prepare_goal_handoff`
+preparation envelope to the formal `GoalHandoffEnvelopeV2` contract with
+`schema_version = "2"`; it contains no `conversation_id`, while `submit_goal`
+is unchanged. See `tool-contract.md` for the current handoff contract.
 
 ## Compatibility expectations
 

@@ -13,7 +13,7 @@ import {
   currentInboundCorrelation,
 } from "../control-plane/request-correlation-integration.js";
 import {
-  goalHandoffEnvelopeV1Schema,
+  goalHandoffEnvelopeV2Schema,
   goalHandoffInputSchema,
   type GoalHandoffService,
 } from "../control-plane/goal-handoff.js";
@@ -681,7 +681,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     {
       description: "Use only when the user explicitly asks to establish or start a Goal and hand it to Codex for execution. Convert the request into title, goal, requirements, acceptance_criteria, and max_iterations. This read-only tool only prepares a signed handoff; it does not create or start a Goal. The handoff includes the MCP request trace; conversation identity is bound later by the Extension.",
       inputSchema: goalHandoffInputSchema,
-      outputSchema: goalHandoffEnvelopeV1Schema,
+      outputSchema: goalHandoffEnvelopeV2Schema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async (input) => {
@@ -695,7 +695,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
         if (requestId === null) return toToolError(new Error("MCP request trace is unavailable."));
 
         const selection = registry.resolve(input.workspace_id);
-        return structuredResponse(goalHandoffEnvelopeV1Schema, goalHandoff.prepareGoalHandoff({
+        return structuredResponse(goalHandoffEnvelopeV2Schema, goalHandoff.prepareGoalHandoff({
           request_id: requestId,
           workspace_id: selection.id,
           title: input.title,
