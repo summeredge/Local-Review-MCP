@@ -10,6 +10,7 @@ import {
   EXTENSION_PRESENCE_TIMEOUT_MS,
   bridgePort,
   bridgeStatus,
+  capturedGoalHandoffs,
   extensionDeliveryReadiness,
   startBridge,
   stopBridge,
@@ -269,6 +270,62 @@ describe("Local Control Bridge protocol", () => {
     expect(sink).toHaveBeenCalledTimes(2);
     expect(sink).toHaveBeenNthCalledWith(1, evidence);
     expect(sink).toHaveBeenNthCalledWith(2, wfrEvidence);
+  });
+
+  it("captures an exact V2 handoff with browser identity, deduplicates it, and never consumes it", async () => {
+    await stopBridge();
+    const sink = vi.fn();
+    await expect(startBridge({ ports: [0], onGoalHandoffCapture: sink })).resolves.toBeGreaterThan(0);
+    const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+    const handoff = {
+      protocol: "local-review-mcp.goal-handoff",
+      schema_version: "2",
+      handoff_id: "handoff-bridge-test",
+      request_id: "request-bridge-test",
+      workspace_id: "workspace-a",
+      goal: {
+        title: "Bridge capture",
+        goal: "Keep this signed payload unchanged.",
+        requirements: ["Do not create a Goal."],
+        acceptance_criteria: ["The original envelope remains available."],
+        max_iterations: 2,
+      },
+      issued_at: "2026-09-13T10:00:00.000Z",
+      expires_at: "2026-09-13T10:02:00.000Z",
+      signature: "a".repeat(64),
+    };
+    const capture = {
+      handoff,
+      conversation_id: "11111111-2222-3333-4444-555555555555",
+      document_id: "document-bridge-test",
+      navigation_epoch: 4,
+    };
+
+    expect((await request("/goal-handoff-capture", {
+      method: "POST", token: "wrong-token", body: capture,
+    })).status).toBe(401);
+    const malformedV2 = await request("/goal-handoff-capture", {
+      method: "POST", token, body: { ...capture, handoff: { ...handoff, schema_version: "1" } },
+    });
+    expect(malformedV2.status).toBe(400);
+    expect(await request("/goal-handoff-capture", { method: "POST", token, body: capture })).toEqual({
+      status: 202,
+      body: { accepted: "new", handoff_id: handoff.handoff_id },
+    });
+    expect(await request("/goal-handoff-capture", { method: "POST", token, body: capture })).toEqual({
+      status: 200,
+      body: { accepted: "existing", handoff_id: handoff.handoff_id },
+    });
+    expect((await request("/goal-handoff-capture", {
+      method: "POST", token, body: { ...capture, handoff: { ...handoff, goal: { ...handoff.goal, goal: "changed" } } },
+    })).status).toBe(409);
+    expect(sink).toHaveBeenCalledTimes(1);
+    expect(sink).toHaveBeenCalledWith(capture);
+    expect(capturedGoalHandoffs()).toEqual([capture]);
+    expect(await request("/goal-handoff-captures", { token })).toEqual({
+      status: 200,
+      body: { captures: [capture] },
+    });
   });
 
   it("validates and transports exact delivery claims and idempotent ACKs", async () => {

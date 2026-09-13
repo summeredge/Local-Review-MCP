@@ -29,6 +29,11 @@ import {
   type ExtensionIdentityEvidence,
 } from "./extension-identity.js";
 import {
+  GoalHandoffCaptureStore,
+  goalHandoffCaptureSchema,
+  type GoalHandoffCapture,
+} from "./goal-handoff-capture.js";
+import {
   BRIDGE_PROTOCOL_HEADER,
   isCompatibleBridgeProtocol,
   LOCAL_CONTROL_BRIDGE_HOST,
@@ -43,6 +48,7 @@ import {
 export interface BridgeStartOptions {
   readonly ports?: readonly number[];
   readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => void | Promise<void>;
+  readonly onGoalHandoffCapture?: (capture: GoalHandoffCapture) => void | Promise<void>;
   readonly claimExtensionDelivery?: (
     claim: ExtensionDeliveryClaim,
   ) => LeasedExtensionDelivery | null | Promise<LeasedExtensionDelivery | null>;
@@ -84,6 +90,8 @@ let pairedOrigin: string | null = null;
 let bearerToken: string | null = null;
 let lastExtensionSeenAt: number | null = null;
 let onIdentityEvidence: (evidence: ExtensionIdentityEvidence) => void | Promise<void> = () => undefined;
+let onGoalHandoffCapture: (capture: GoalHandoffCapture) => void | Promise<void> = () => undefined;
+const goalHandoffCaptures = new GoalHandoffCaptureStore();
 let claimExtensionDelivery: NonNullable<BridgeStartOptions["claimExtensionDelivery"]> = () => null;
 let ackExtensionDelivery: NonNullable<BridgeStartOptions["ackExtensionDelivery"]> = () => {
   throw new ExtensionDeliveryNotFoundError("delivery not found");
@@ -282,6 +290,45 @@ async function receiveIdentityEvidence(
   json(response, 202, { accepted: true }, origin);
 }
 
+async function receiveGoalHandoffCapture(
+  request: IncomingMessage,
+  response: ServerResponse,
+  origin: string,
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = await readJson(request);
+  } catch (error: unknown) {
+    json(response, error instanceof RequestBodyTooLargeError ? 413 : 400, {
+      error: error instanceof RequestBodyTooLargeError ? "body_too_large" : "bad_request",
+    }, origin);
+    return;
+  }
+
+  const parsed = goalHandoffCaptureSchema.safeParse(body);
+  if (!parsed.success) {
+    json(response, 400, { error: "invalid_goal_handoff_capture" }, origin);
+    return;
+  }
+  const accepted = goalHandoffCaptures.capture(parsed.data);
+  if (accepted === "conflict") {
+    json(response, 409, { error: "conflicting_goal_handoff" }, origin);
+    return;
+  }
+  if (accepted === "new") await onGoalHandoffCapture(parsed.data);
+  json(response, accepted === "new" ? 202 : 200, {
+    accepted,
+    handoff_id: parsed.data.handoff.handoff_id,
+  }, origin);
+}
+
+function listGoalHandoffCaptures(
+  response: ServerResponse,
+  origin: string,
+): void {
+  json(response, 200, { captures: goalHandoffCaptures.list() }, origin);
+}
+
 async function receiveDeliveryClaim(
   request: IncomingMessage,
   response: ServerResponse,
@@ -446,6 +493,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   }
 
   if (route !== "/pair" && route !== "/status" && route !== "/identity-evidence"
+    && route !== "/goal-handoff-capture" && route !== "/goal-handoff-captures"
     && route !== "/delivery/claim" && route !== "/delivery/ack"
     && route !== "/completion/claim" && route !== "/completion/ack") {
     request.resume();
@@ -472,6 +520,14 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     return;
   }
   if (route === "/identity-evidence" && request.method !== "POST") {
+    methodNotAllowed(request, response);
+    return;
+  }
+  if (route === "/goal-handoff-capture" && request.method !== "POST") {
+    methodNotAllowed(request, response);
+    return;
+  }
+  if (route === "/goal-handoff-captures" && request.method !== "GET") {
     methodNotAllowed(request, response);
     return;
   }
@@ -510,6 +566,14 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   noteExtensionSeen();
   if (route === "/identity-evidence") {
     await receiveIdentityEvidence(request, response, origin);
+    return;
+  }
+  if (route === "/goal-handoff-capture") {
+    await receiveGoalHandoffCapture(request, response, origin);
+    return;
+  }
+  if (route === "/goal-handoff-captures") {
+    listGoalHandoffCaptures(response, origin);
     return;
   }
   if (route === "/delivery/claim") {
@@ -614,6 +678,7 @@ async function startBridgeOnce(options: BridgeStartOptions): Promise<number | nu
 
 export function startBridge(options: BridgeStartOptions = {}): Promise<number | null> {
   onIdentityEvidence = options.onIdentityEvidence ?? (() => undefined);
+  onGoalHandoffCapture = options.onGoalHandoffCapture ?? (() => undefined);
   claimExtensionDelivery = options.claimExtensionDelivery ?? (() => null);
   ackExtensionDelivery = options.ackExtensionDelivery ?? (() => {
     throw new ExtensionDeliveryNotFoundError("delivery not found");
@@ -635,7 +700,9 @@ export function stopBridge(): Promise<void> {
     pairedOrigin = null;
     bearerToken = null;
     clearExtensionPresence();
+    goalHandoffCaptures.clear();
     onIdentityEvidence = () => undefined;
+    onGoalHandoffCapture = () => undefined;
     claimExtensionDelivery = () => null;
     ackExtensionDelivery = () => {
       throw new ExtensionDeliveryNotFoundError("delivery not found");
@@ -663,6 +730,10 @@ export function bridgeStatus(): BridgeStatus {
     present: extensionPresent(),
     lastSeenAt: lastExtensionSeenAt,
   };
+}
+
+export function capturedGoalHandoffs(): readonly GoalHandoffCapture[] {
+  return goalHandoffCaptures.list();
 }
 
 export function extensionDeliveryReadiness(): ExtensionDeliveryReadiness {

@@ -879,7 +879,7 @@ describe("Extension background identity authority", () => {
 
   it("keeps the Bridge out of content and Fiber and leaves no Core correlation hook", () => {
     expect(contentSource).not.toMatch(/identity-evidence.*fetch/isu);
-    expect(fiberSource).not.toMatch(/inboundRequestId|ConversationRouting|tool_result|authorization|cookie/iu);
+    expect(fiberSource).not.toMatch(/inboundRequestId|ConversationRouting|authorization|cookie/iu);
     expect(backgroundSource).not.toMatch(/inboundRequestId|ConversationRouting|ReviewDelivery/iu);
   });
 

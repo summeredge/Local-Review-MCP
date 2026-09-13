@@ -4,6 +4,13 @@
   const FIBER_ASK = 'lrm-extension-identity-ask';
   const FIBER_REPLY = 'lrm-extension-identity-reply';
   const FIBER_VERSION = 1;
+  const GOAL_HANDOFF_PROTOCOL = 'local-review-mcp.goal-handoff';
+  const GOAL_HANDOFF_SCHEMA_VERSION = '2';
+  const MAX_GOAL_HANDOFF_TEXT = 16 * 1024;
+  const HANDOFF_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+  const WORKSPACE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+  const SIGNATURE = /^[0-9a-f]{64}$/u;
+  const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
   const COMPLETION_FIBER_ASK = 'lrm-extension-review-completion-ask';
   const COMPLETION_FIBER_REPLY = 'lrm-extension-review-completion-reply';
   const COMPLETION_FIBER_VERSION = 1;
@@ -29,6 +36,7 @@
   let completionInFlight = null;
   let completionScanTimer = null;
   const sent = new Set();
+  const sentHandoffs = new Set();
 
   function routeConversation(href = location.href) {
     try {
@@ -148,6 +156,92 @@
     await deliveryInFlight;
   }
 
+  function own(value, key) {
+    return Boolean(value && typeof value === 'object'
+      && Object.prototype.hasOwnProperty.call(value, key));
+  }
+
+  function exactObject(value, keys) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const actual = Object.keys(value);
+    return actual.length === keys.length && keys.every((key) => own(value, key));
+  }
+
+  function validGoalText(value) {
+    return typeof value === 'string' && value.length >= 1 && value.length <= MAX_GOAL_HANDOFF_TEXT;
+  }
+
+  function validGoalHandoffEnvelope(value) {
+    if (!exactObject(value, [
+      'protocol', 'schema_version', 'handoff_id', 'request_id', 'workspace_id',
+      'goal', 'issued_at', 'expires_at', 'signature',
+    ])
+      || value.protocol !== GOAL_HANDOFF_PROTOCOL
+      || value.schema_version !== GOAL_HANDOFF_SCHEMA_VERSION
+      || typeof value.handoff_id !== 'string' || !HANDOFF_ID.test(value.handoff_id)
+      || typeof value.request_id !== 'string' || !REQUEST_ID.test(value.request_id)
+      || typeof value.workspace_id !== 'string' || !WORKSPACE_ID.test(value.workspace_id)
+      || typeof value.issued_at !== 'string' || !ISO_TIMESTAMP.test(value.issued_at)
+      || !Number.isFinite(Date.parse(value.issued_at))
+      || typeof value.expires_at !== 'string' || !ISO_TIMESTAMP.test(value.expires_at)
+      || !Number.isFinite(Date.parse(value.expires_at))
+      || typeof value.signature !== 'string' || !SIGNATURE.test(value.signature)) return false;
+    const goal = value.goal;
+    if (!exactObject(goal, ['title', 'goal', 'requirements', 'acceptance_criteria', 'max_iterations'])
+      || !validGoalText(goal.title) || !validGoalText(goal.goal)
+      || !Array.isArray(goal.requirements) || goal.requirements.length < 1 || goal.requirements.length > 1000
+      || !Array.isArray(goal.acceptance_criteria) || goal.acceptance_criteria.length < 1
+      || goal.acceptance_criteria.length > 1000
+      || !Number.isSafeInteger(goal.max_iterations) || goal.max_iterations < 1
+      || goal.max_iterations > 10_000) return false;
+    return goal.requirements.every(validGoalText) && goal.acceptance_criteria.every(validGoalText);
+  }
+
+  function validGoalHandoffCandidate(value) {
+    if (!exactObject(value, [
+      'handoff', 'fiber_conversation_id', 'turn_index', 'request_message_id',
+      'result_message_id', 'request_order', 'result_order', 'user_orders', 'activation_orders',
+    ])
+      || !validGoalHandoffEnvelope(value.handoff)
+      || typeof value.fiber_conversation_id !== 'string'
+      || !CONVERSATION_ID.test(value.fiber_conversation_id)
+      || !Number.isSafeInteger(value.turn_index) || value.turn_index < 0
+      || typeof value.request_message_id !== 'string' || !MESSAGE_ID.test(value.request_message_id)
+      || (value.result_message_id !== null
+        && (typeof value.result_message_id !== 'string' || !MESSAGE_ID.test(value.result_message_id)))
+      || !Number.isSafeInteger(value.request_order) || value.request_order < 0
+      || !Number.isSafeInteger(value.result_order) || value.result_order < 0
+      || value.result_order <= value.request_order
+      || !Array.isArray(value.user_orders) || value.user_orders.length > 100
+      || !Array.isArray(value.activation_orders) || value.activation_orders.length > 100) return false;
+    const orders = new Set();
+    for (const order of value.user_orders) {
+      if (!Number.isSafeInteger(order) || order < 0 || orders.has(order)) return false;
+      orders.add(order);
+    }
+    for (const order of value.activation_orders) {
+      if (!Number.isSafeInteger(order) || order < 0 || !orders.has(order)) return false;
+    }
+    return true;
+  }
+
+  function goalHandoffKey(value) {
+    return JSON.stringify([
+      value.protocol, value.schema_version, value.handoff_id, value.request_id,
+      value.workspace_id, value.goal.title, value.goal.goal, value.goal.requirements,
+      value.goal.acceptance_criteria, value.goal.max_iterations, value.issued_at,
+      value.expires_at, value.signature,
+    ]);
+  }
+
+  function activationAllowed(candidate) {
+    let latestUserOrder = -1;
+    for (const order of candidate.user_orders) {
+      if (order < candidate.request_order && order > latestUserOrder) latestUserOrder = order;
+    }
+    return latestUserOrder >= 0 && candidate.activation_orders.includes(latestUserOrder);
+  }
+
   function fiberScan() {
     return new Promise((resolve) => {
       const nonce = `${++nonceCounter}-${Math.random().toString(36).slice(2)}`;
@@ -182,15 +276,32 @@
           if (previous !== undefined && previous !== entry.fiber_conversation_id) conflicts.add(entry.request_id);
           else if (previous === undefined) byRequest.set(entry.request_id, entry.fiber_conversation_id);
         }
-        finish([...byRequest].filter(([requestId]) => !conflicts.has(requestId))
-          .map(([request_id, fiber_conversation_id]) => ({ request_id, fiber_conversation_id })));
+        const handoffById = new Map();
+        const handoffConflicts = new Set();
+        if (Array.isArray(data.handoffs)) {
+          for (const candidate of data.handoffs.slice(0, 20)) {
+            if (!validGoalHandoffCandidate(candidate)) continue;
+            const id = candidate.handoff.handoff_id;
+            const key = goalHandoffKey(candidate.handoff);
+            const previous = handoffById.get(id);
+            if (previous && previous.key !== key) handoffConflicts.add(id);
+            else if (!previous) handoffById.set(id, { key, candidate });
+          }
+        }
+        finish({
+          evidence: [...byRequest].filter(([requestId]) => !conflicts.has(requestId))
+            .map(([request_id, fiber_conversation_id]) => ({ request_id, fiber_conversation_id })),
+          handoffs: [...handoffById.values()]
+            .filter(({ candidate }) => !handoffConflicts.has(candidate.handoff.handoff_id))
+            .map(({ candidate }) => candidate),
+        });
       };
-      timer = setTimeout(() => finish([]), FIBER_TIMEOUT_MS);
+      timer = setTimeout(() => finish({ evidence: [], handoffs: [] }), FIBER_TIMEOUT_MS);
       window.addEventListener('message', listener);
       try {
         window.postMessage({ source: FIBER_ASK, nonce }, location.origin);
       } catch {
-        finish([]);
+        finish({ evidence: [], handoffs: [] });
       }
     });
   }
@@ -350,10 +461,13 @@
       const askedUrl = location.href;
       const conversationId = routeConversation(askedUrl);
       if (!conversationId || !(await registerDocument())) return;
-      const entries = await fiberScan();
-      if (askedEpoch !== navigationEpoch || askedUrl !== location.href) return;
-      for (const entry of entries) {
-        if (askedEpoch !== navigationEpoch || askedUrl !== location.href) return;
+      const scan = await fiberScan();
+      const stillCurrent = () => askedEpoch === navigationEpoch
+        && askedUrl === location.href
+        && routeConversation() === conversationId;
+      if (!stillCurrent()) return;
+      for (const entry of scan.evidence) {
+        if (!stillCurrent()) return;
         if (entry.fiber_conversation_id !== conversationId) continue;
         const key = `${askedEpoch}\u0000${conversationId}\u0000${entry.request_id}`;
         if (sent.has(key)) continue;
@@ -364,6 +478,19 @@
           navigation_epoch: askedEpoch
         });
         if (reply?.ok === true) sent.add(key);
+      }
+      for (const candidate of scan.handoffs) {
+        if (!stillCurrent()) return;
+        if (candidate.fiber_conversation_id !== conversationId || !activationAllowed(candidate)) continue;
+        const key = candidate.handoff.handoff_id;
+        if (sentHandoffs.has(key)) continue;
+        const reply = await sendToWorker({
+          type: 'goal_handoff_capture',
+          handoff: candidate.handoff,
+          conversation_id: conversationId,
+          navigation_epoch: askedEpoch,
+        });
+        if (reply?.ok === true) sentHandoffs.add(key);
       }
     })().finally(() => {
       scanInFlight = null;

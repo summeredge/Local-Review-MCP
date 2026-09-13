@@ -8,6 +8,13 @@
   const REQUEST_ID = /^[A-Za-z0-9_-]{1,100}$/u;
   const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
   const DOCUMENT_ID = /^[A-Za-z0-9_-]{1,256}$/u;
+  const GOAL_HANDOFF_PROTOCOL = 'local-review-mcp.goal-handoff';
+  const GOAL_HANDOFF_SCHEMA_VERSION = '2';
+  const HANDOFF_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+  const WORKSPACE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+  const SIGNATURE = /^[0-9a-f]{64}$/u;
+  const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
+  const MAX_GOAL_TEXT = 16 * 1024;
   const DELIVERY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
   const COMPLETION_ID = DELIVERY_ID;
   const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
@@ -102,6 +109,39 @@
       && Number.isSafeInteger(entry.deadline)
       && entry.deadline >= 0
       && Object.keys(entry).length === 9;
+  }
+
+  function validGoalHandoffEnvelope(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).length !== 9
+      || !['protocol', 'schema_version', 'handoff_id', 'request_id', 'workspace_id',
+        'goal', 'issued_at', 'expires_at', 'signature'].every((key) =>
+        Object.prototype.hasOwnProperty.call(value, key))
+      || value.protocol !== GOAL_HANDOFF_PROTOCOL
+      || value.schema_version !== GOAL_HANDOFF_SCHEMA_VERSION
+      || typeof value.handoff_id !== 'string' || !HANDOFF_ID.test(value.handoff_id)
+      || typeof value.request_id !== 'string' || !REQUEST_ID.test(value.request_id)
+      || typeof value.workspace_id !== 'string' || !WORKSPACE_ID.test(value.workspace_id)
+      || typeof value.issued_at !== 'string' || !ISO_TIMESTAMP.test(value.issued_at)
+      || !Number.isFinite(Date.parse(value.issued_at))
+      || typeof value.expires_at !== 'string' || !ISO_TIMESTAMP.test(value.expires_at)
+      || !Number.isFinite(Date.parse(value.expires_at))
+      || typeof value.signature !== 'string' || !SIGNATURE.test(value.signature)) return false;
+    const goal = value.goal;
+    if (!goal || typeof goal !== 'object' || Array.isArray(goal) || Object.keys(goal).length !== 5
+      || !['title', 'goal', 'requirements', 'acceptance_criteria', 'max_iterations'].every((key) =>
+        Object.prototype.hasOwnProperty.call(goal, key))
+      || typeof goal.title !== 'string' || goal.title.length < 1 || goal.title.length > MAX_GOAL_TEXT
+      || typeof goal.goal !== 'string' || goal.goal.length < 1 || goal.goal.length > MAX_GOAL_TEXT
+      || !Array.isArray(goal.requirements) || goal.requirements.length < 1 || goal.requirements.length > 1000
+      || !Array.isArray(goal.acceptance_criteria) || goal.acceptance_criteria.length < 1
+      || goal.acceptance_criteria.length > 1000
+      || !Number.isSafeInteger(goal.max_iterations) || goal.max_iterations < 1
+      || goal.max_iterations > 10_000) return false;
+    return goal.requirements.every((item) => typeof item === 'string'
+      && item.length >= 1 && item.length <= MAX_GOAL_TEXT)
+      && goal.acceptance_criteria.every((item) => typeof item === 'string'
+        && item.length >= 1 && item.length <= MAX_GOAL_TEXT);
   }
 
   function serialState(task) {
@@ -318,12 +358,18 @@
       if (documents[key] !== source.documentId) return { ok: false, error: 'document_unregistered' };
       const currentEpoch = Number.isSafeInteger(epochs[key]) ? epochs[key] : 0;
       if (requested < currentEpoch) return { ok: false, error: 'stale_navigation' };
+      const currentConversation = conversations[key];
+      const senderConversationId = senderConversation(sender);
+      if (requested === currentEpoch && currentConversation !== undefined
+        && currentConversation !== null && currentConversation !== senderConversationId) {
+        return { ok: false, error: 'conversation_changed' };
+      }
       let changed = false;
       if (requested > currentEpoch) {
         epochs[key] = requested;
         changed = true;
       }
-      const conversationId = senderConversation(sender);
+      const conversationId = senderConversationId;
       if (conversations[key] !== conversationId) {
         conversations[key] = conversationId;
         changed = true;
@@ -499,6 +545,37 @@
     if (!evidence) return { ok: false, error: 'invalid_evidence' };
     const delivered = await postEvidence(evidence);
     return delivered.ok ? { ok: true, evidence } : delivered;
+  }
+
+  async function receiveGoalHandoffCapture(message, sender) {
+    const source = senderSource(sender);
+    const conversationId = senderConversation(sender);
+    const requested = requestedEpoch(message);
+    const handoff = message && message.handoff;
+    if (!source || requested === null || !conversationId
+      || message.conversation_id !== conversationId
+      || !validGoalHandoffEnvelope(handoff)) {
+      return { ok: false, error: 'invalid_goal_handoff_capture' };
+    }
+    const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
+    if (!authority.ok || authority.conversation_id !== conversationId) {
+      return { ok: false, error: authority.error || 'wrong_conversation' };
+    }
+    await load();
+    const key = String(source.tabId);
+    if (documents[key] !== source.documentId || epochs[key] !== requested
+      || conversations[key] !== conversationId
+      || (Array.isArray(retired[key]) && retired[key].includes(source.documentId))) {
+      return { ok: false, error: 'document_identity_changed' };
+    }
+    const capture = {
+      handoff,
+      conversation_id: conversationId,
+      document_id: source.documentId,
+      navigation_epoch: requested,
+    };
+    const delivered = await postBridge('/goal-handoff-capture', capture);
+    return delivered.ok ? { ok: true, capture, bridge: delivered.data } : delivered;
   }
 
   let flushingDeliveryAcks = null;
@@ -853,6 +930,7 @@
     register_document: registerDocument,
     navigation: receiveNavigation,
     identity_evidence: receiveEvidence,
+    goal_handoff_capture: receiveGoalHandoffCapture,
     delivery_claim: claimDelivery,
     delivery_submit_started: deliverySubmitStarted,
     delivery_ack: receiveDeliveryAck,

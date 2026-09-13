@@ -13,9 +13,21 @@
   const MAX_REQUESTS = 200;
   const MAX_COMPLETION_MESSAGE_CANDIDATES = 20;
   const MAX_COMPLETION_CONTENT = 256 * 1024;
+  const GOAL_HANDOFF_PROTOCOL = 'local-review-mcp.goal-handoff';
+  const GOAL_HANDOFF_SCHEMA_VERSION = '2';
+  const MAX_GOAL_HANDOFFS = 20;
+  const MAX_GOAL_HANDOFF_TEXT = 16 * 1024;
   const REQUEST_ID = /^[A-Za-z0-9_-]{1,100}$/u;
   const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
   const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+  const HANDOFF_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+  const WORKSPACE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+  const SIGNATURE = /^[0-9a-f]{64}$/u;
+  const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
+  const GOAL_START = /(?:建立|创建|启动)\s*一个\s*Goal\b/iu;
+  const GOAL_HANDOFF = /(?:交给|交由)\s*Codex\s*(?:(?:来|去|进行)\s*)?(?:执行|实施|实现|处理|完成|运行)|(?:让|请)\s*Codex\s*(?:(?:来|去|进行)\s*)?(?:执行|实施|实现|处理|完成|运行)|Codex\s*(?:(?:来|去|进行)\s*)?(?:执行|实施|实现|处理|完成|运行)/iu;
+  const GOAL_START_EN = /(?:establish|create|start)\s+(?:a\s+)?Goal\b/iu;
+  const GOAL_HANDOFF_EN = /(?:(?:hand|give|send)\s+(?:it\s+)?to\s+Codex\s+for\s+(?:execution|implementation))|(?:Codex\s+(?:to\s+)?(?:execute|implement|run))/iu;
 
   const post = window.postMessage.bind(window);
 
@@ -391,6 +403,233 @@
     return ids;
   }
 
+  function own(value, key) {
+    return Boolean(value && typeof value === 'object'
+      && Object.prototype.hasOwnProperty.call(value, key));
+  }
+
+  function exactObject(value, keys) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const actual = Object.keys(value);
+    return actual.length === keys.length && keys.every((key) => own(value, key));
+  }
+
+  function validGoalText(value) {
+    return typeof value === 'string' && value.length >= 1 && value.length <= MAX_GOAL_HANDOFF_TEXT;
+  }
+
+  function validGoalHandoffEnvelope(value) {
+    const envelopeKeys = [
+      'protocol', 'schema_version', 'handoff_id', 'request_id', 'workspace_id',
+      'goal', 'issued_at', 'expires_at', 'signature',
+    ];
+    if (!exactObject(value, envelopeKeys)
+      || value.protocol !== GOAL_HANDOFF_PROTOCOL
+      || value.schema_version !== GOAL_HANDOFF_SCHEMA_VERSION
+      || typeof value.handoff_id !== 'string' || !HANDOFF_ID.test(value.handoff_id)
+      || typeof value.request_id !== 'string' || !REQUEST_ID.test(value.request_id)
+      || typeof value.workspace_id !== 'string' || !WORKSPACE_ID.test(value.workspace_id)
+      || typeof value.issued_at !== 'string' || !ISO_TIMESTAMP.test(value.issued_at)
+      || !Number.isFinite(Date.parse(value.issued_at))
+      || typeof value.expires_at !== 'string' || !ISO_TIMESTAMP.test(value.expires_at)
+      || !Number.isFinite(Date.parse(value.expires_at))
+      || typeof value.signature !== 'string' || !SIGNATURE.test(value.signature)) return false;
+    const goal = value.goal;
+    if (!exactObject(goal, ['title', 'goal', 'requirements', 'acceptance_criteria', 'max_iterations'])
+      || !validGoalText(goal.title) || !validGoalText(goal.goal)
+      || !Array.isArray(goal.requirements) || goal.requirements.length < 1 || goal.requirements.length > 1000
+      || !Array.isArray(goal.acceptance_criteria) || goal.acceptance_criteria.length < 1
+      || goal.acceptance_criteria.length > 1000
+      || !Number.isSafeInteger(goal.max_iterations) || goal.max_iterations < 1
+      || goal.max_iterations > 10_000) return false;
+    return goal.requirements.every(validGoalText) && goal.acceptance_criteria.every(validGoalText);
+  }
+
+  function goalHandoffKey(value) {
+    return JSON.stringify([
+      value.protocol, value.schema_version, value.handoff_id, value.request_id,
+      value.workspace_id, value.goal.title, value.goal.goal, value.goal.requirements,
+      value.goal.acceptance_criteria, value.goal.max_iterations, value.issued_at,
+      value.expires_at, value.signature,
+    ]);
+  }
+
+  function toolNameFromPath(value) {
+    if (typeof value !== 'string' || value.length === 0 || value.length > 2000
+      || value.charAt(0) !== '/' || value.includes('?') || value.includes('#')) return null;
+    const parts = value.split('/');
+    if (parts.length < 2 || parts.slice(1).some((part) => part.length === 0)) return null;
+    return parts[parts.length - 1];
+  }
+
+  function goalToolRequestOf(message) {
+    if (!message || typeof message !== 'object' || message.author?.role !== 'assistant'
+      || typeof message.recipient !== 'string' || !message.recipient.startsWith('api_tool')) return null;
+    const id = validMessageId(message.id);
+    if (!id) return null;
+    const text = message.content && typeof message.content === 'object'
+      && typeof message.content.text === 'string' ? message.content.text : '';
+    const path = /^\s*\{\s*"path"\s*:\s*"([^"\\]{1,2000})"/u.exec(text)?.[1] || null;
+    return { id, tool: path === null ? null : toolNameFromPath(path) };
+  }
+
+  function parseGoalResultValue(value) {
+    if (value && typeof value === 'object') return value;
+    if (typeof value !== 'string' || value.length === 0 || value.length > 512 * 1024) return null;
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+  function addGoalResultValue(value, candidates) {
+    const parsed = parseGoalResultValue(value);
+    if (!parsed || typeof parsed !== 'object') return;
+    if (validGoalHandoffEnvelope(parsed)) {
+      candidates.push(parsed);
+      return;
+    }
+    if (parsed.type === 'text' && own(parsed, 'text')) {
+      addGoalResultValue(parsed.text, candidates);
+    }
+    for (const key of ['structured_content', 'structuredContent', 'result', 'tool_result']) {
+      if (own(parsed, key)) addGoalResultValue(parsed[key], candidates);
+    }
+  }
+
+  function goalResultValuesOf(message) {
+    if (!message || typeof message !== 'object' || message.author?.role !== 'tool') return [];
+    const metadata = metadataOf(message);
+    const resource = metadata?.invoked_resource;
+    if (!resource || typeof resource !== 'object'
+      || toolNameFromPath(resource.resource_uri) !== 'prepare_goal_handoff') return [];
+    const values = [];
+    const content = message.content;
+    if (content && typeof content === 'object') {
+      for (const key of ['structured_content', 'structuredContent', 'result', 'tool_result', 'text']) {
+        if (own(content, key)) addGoalResultValue(content[key], values);
+      }
+      if (Array.isArray(content.parts)) {
+        for (const part of content.parts) addGoalResultValue(part, values);
+      } else if (Array.isArray(content)) {
+        for (const part of content) addGoalResultValue(part, values);
+      }
+    }
+    for (const key of ['structured_content', 'structuredContent', 'result', 'tool_result']) {
+      if (own(message, key)) addGoalResultValue(message[key], values);
+    }
+    return values;
+  }
+
+  function goalToolResultOf(message) {
+    if (!message || typeof message !== 'object') return null;
+    const metadata = metadataOf(message);
+    const parentId = validMessageId(metadata?.parent_id);
+    const resource = metadata?.invoked_resource;
+    if (!parentId || !resource || typeof resource !== 'object'
+      || toolNameFromPath(resource.resource_uri) !== 'prepare_goal_handoff') return null;
+    return {
+      parentId,
+      messageId: validMessageId(message.id),
+      values: goalResultValuesOf(message),
+    };
+  }
+
+  function userTextOf(message) {
+    if (!message || typeof message !== 'object' || message.author?.role !== 'user') return null;
+    const content = message.content;
+    if (!content || typeof content !== 'object' || content.content_type !== 'text') return null;
+    if (Array.isArray(content.parts)) {
+      if (!content.parts.every((part) => typeof part === 'string')) return null;
+      const text = content.parts.join('\n');
+      return text.length <= MAX_GOAL_HANDOFF_TEXT ? text : null;
+    }
+    return typeof content.text === 'string' && content.text.length <= MAX_GOAL_HANDOFF_TEXT
+      ? content.text : null;
+  }
+
+  function goalActivationOf(message) {
+    const text = userTextOf(message);
+    if (!text) return false;
+    return (GOAL_START.test(text) && GOAL_HANDOFF.test(text))
+      || (GOAL_START_EN.test(text) && GOAL_HANDOFF_EN.test(text));
+  }
+
+  function goalHandoffCandidatesOf(messages, conversationId, turnIndex) {
+    if (!Array.isArray(messages)) return [];
+    const requests = new Map();
+    const requestConflicts = new Set();
+    const userOrders = [];
+    const activationOrders = [];
+    for (let index = 0; index < messages.length; index += 1) {
+      const message = messages[index];
+      if (message?.author?.role === 'user') {
+        userOrders.push(index);
+        if (goalActivationOf(message)) activationOrders.push(index);
+      }
+      const request = goalToolRequestOf(message);
+      if (!request) continue;
+      const previous = requests.get(request.id);
+      if (previous && previous.tool !== request.tool) requestConflicts.add(request.id);
+      else if (!previous) requests.set(request.id, { ...request, order: index });
+    }
+    const candidates = [];
+    for (let index = 0; index < messages.length; index += 1) {
+      const result = goalToolResultOf(messages[index]);
+      if (!result || requestConflicts.has(result.parentId)) continue;
+      const request = requests.get(result.parentId);
+      if (!request || (request.tool !== null && request.tool !== 'prepare_goal_handoff')) continue;
+      if (request.order >= index) continue;
+      const values = result.values;
+      const unique = new Map();
+      for (const value of values) unique.set(goalHandoffKey(value), value);
+      if (unique.size === 0) continue;
+      if (unique.size > 1) continue;
+      const handoff = unique.values().next().value;
+      candidates.push({
+        handoff,
+        fiber_conversation_id: conversationId,
+        turn_index: turnIndex,
+        request_message_id: request.id,
+        result_message_id: result.messageId,
+        request_order: request.order,
+        result_order: index,
+        user_orders: userOrders,
+        activation_orders: activationOrders,
+      });
+    }
+
+    const byRequest = new Map();
+    const requestConflictingResults = new Set();
+    for (const candidate of candidates) {
+      const list = byRequest.get(candidate.request_message_id) ?? [];
+      list.push(candidate);
+      byRequest.set(candidate.request_message_id, list);
+    }
+    for (const [requestId, list] of byRequest) {
+      const keys = new Set(list.map((candidate) => goalHandoffKey(candidate.handoff)));
+      if (keys.size > 1) requestConflictingResults.add(requestId);
+    }
+
+    const byHandoff = new Map();
+    const handoffConflicts = new Set();
+    const kept = [];
+    for (const candidate of candidates) {
+      if (requestConflictingResults.has(candidate.request_message_id)) continue;
+      const id = candidate.handoff.handoff_id;
+      const key = goalHandoffKey(candidate.handoff);
+      const previous = byHandoff.get(id);
+      if (previous && previous.key !== key) handoffConflicts.add(id);
+      else if (!previous) byHandoff.set(id, { key, candidate });
+    }
+    for (const { candidate } of byHandoff.values()) {
+      if (!handoffConflicts.has(candidate.handoff.handoff_id)) kept.push(candidate);
+      if (kept.length >= MAX_GOAL_HANDOFFS) break;
+    }
+    return kept;
+  }
+
   function turnsOf(sections) {
     const groups = [];
     for (let index = 0; index < sections.length; index += 1) {
@@ -414,6 +653,7 @@
   function scan(nonce) {
     const byRequest = new Map();
     const conflicts = new Set();
+    const handoffs = [];
     let sections;
     try {
       sections = document.querySelectorAll(TURN_SELECTOR);
@@ -427,13 +667,18 @@
       const turn = turns[turnIndex];
       try {
         const fiber = fiberOf(turn.sections[0]);
-        const conversationId = fiber ? conversationEvidenceOf(fiber) : null;
+        const conversation = fiber ? conversationEvidenceDetailsOf(fiber) : null;
+        const conversationId = conversation && !conversation.conflict && !conversation.unreadable
+          ? conversation.conversationId : null;
         const messages = fiber ? turnMessagesOf(fiber) : null;
         if (!conversationId || !messages) continue;
         for (const requestId of requestIdsOf(messages)) {
           const previous = byRequest.get(requestId);
           if (previous !== undefined && previous !== conversationId) conflicts.add(requestId);
           else if (previous === undefined) byRequest.set(requestId, conversationId);
+        }
+        if (turnIndex === turns.length - 1) {
+          handoffs.push(...goalHandoffCandidatesOf(messages, conversationId, turnIndex));
         }
       } catch {
         // One unreadable turn must not turn into guessed identity evidence.
@@ -445,7 +690,7 @@
       if (conflicts.has(requestId)) continue;
       evidence.push({ request_id: requestId, fiber_conversation_id: conversationId });
     }
-    post({ source: REPLY, nonce, version: VERSION, evidence }, location.origin);
+    post({ source: REPLY, nonce, version: VERSION, evidence, handoffs }, location.origin);
   }
 
   function conversationIdFromLocation() {
@@ -846,7 +1091,7 @@
       scan(nonce);
     } catch {
       try {
-        post({ source: REPLY, nonce, version: VERSION, evidence: [] }, location.origin);
+        post({ source: REPLY, nonce, version: VERSION, evidence: [], handoffs: [] }, location.origin);
       } catch {
         // The isolated world will fail closed on timeout.
       }
