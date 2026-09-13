@@ -25,6 +25,11 @@ import { GoalPreflightService } from "./control-plane/goal-preflight.js";
 import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
 import { GoalSubmissionService } from "./control-plane/goal-submission.js";
 import { ExecutionRoutingService } from "./control-plane/execution-routing.js";
+import {
+  LOCAL_CONTROL_BRIDGE_HOST,
+  LOCAL_CONTROL_BRIDGE_PORTS,
+  LOCAL_CONTROL_BRIDGE_PROTOCOL,
+} from "./control-plane/bridge-protocol.js";
 import { ExtensionReviewCompletionAdapter } from "./delivery/extension-review-completion-adapter.js";
 import { ReviewCompletionRouter } from "./router/review-completion-router.js";
 import {
@@ -228,9 +233,20 @@ export async function startApp(
       });
       if (bridgePort === null) {
         console.warn("Local Control Bridge unavailable; local MCP remains available");
+        console.warn(
+          `Local Control Bridge discovery exhausted ${LOCAL_CONTROL_BRIDGE_HOST}:${(options.bridgePorts ?? LOCAL_CONTROL_BRIDGE_PORTS).join(", ")} (protocol ${LOCAL_CONTROL_BRIDGE_PROTOCOL})`,
+        );
+      } else {
+        console.info(
+          `Local Control Bridge started on ${LOCAL_CONTROL_BRIDGE_HOST}:${bridgePort} (protocol ${LOCAL_CONTROL_BRIDGE_PROTOCOL})`,
+        );
       }
-    } catch {
+    } catch (error: unknown) {
       console.warn("Local Control Bridge failed to start; local MCP remains available");
+      console.warn(
+        "Local Control Bridge startup error:",
+        error instanceof Error ? error.message : String(error),
+      );
     }
     server.once("close", () => {
       context.goalPreflight?.setRuntimeReady(false);

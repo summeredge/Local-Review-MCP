@@ -183,8 +183,14 @@
         'completionAckOutbox', 'completionInFlight'
       ])
         .then((stored) => {
-          port = PORTS.includes(stored.port) ? stored.port : null;
-          token = typeof stored.token === 'string' && stored.token.length > 0 ? stored.token : null;
+          const hasStoredPort = Object.prototype.hasOwnProperty.call(stored, 'port');
+          const hasStoredToken = Object.prototype.hasOwnProperty.call(stored, 'token');
+          const storedPort = PORTS.includes(stored.port) ? stored.port : null;
+          const storedToken = typeof stored.token === 'string' && stored.token.length > 0 ? stored.token : null;
+          port = storedPort;
+          token = storedPort === null ? null : storedToken;
+          const bridgeStateChanged = (hasStoredPort && stored.port !== port)
+            || (hasStoredToken && stored.token !== token);
           documents = stored.tabDocuments && typeof stored.tabDocuments === 'object' ? { ...stored.tabDocuments } : {};
           epochs = stored.tabEpochs && typeof stored.tabEpochs === 'object' ? { ...stored.tabEpochs } : {};
           conversations = stored.tabConversations && typeof stored.tabConversations === 'object' ? { ...stored.tabConversations } : {};
@@ -214,6 +220,10 @@
             deliveryInFlight = hasStoredInFlight ? storedInFlight.slice() : [];
           }
           const initialState = { extensionClientId: clientId };
+          if (bridgeStateChanged) {
+            initialState.port = port;
+            initialState.token = token;
+          }
           if (!deliveryRecoveryBlocked) {
             initialState.deliveryAckOutbox = deliveryAckOutbox;
             initialState.deliveryInFlight = deliveryInFlight;
@@ -260,6 +270,10 @@
   }
 
   async function persistBridge() {
+    if (port === null) {
+      token = null;
+      trustedUntil = 0;
+    }
     await chrome.storage.local.set({ port, token });
   }
 
@@ -435,7 +449,7 @@
       }
       return { port: candidate, body };
     }
-    if (port !== null) {
+    if (port !== null || token !== null) {
       port = null;
       await persistBridge();
     }

@@ -585,6 +585,47 @@ describe("Extension background identity authority", () => {
     expect(storage.writes.filter((write) => "token" in write)).toHaveLength(2);
   });
 
+  it("drops the cached token when discovery loses the Bridge and re-pairs after restart", async () => {
+    const storage = new Storage({ port: 12081, token: "stale-token" });
+    let available = false;
+    const responder = async (url: URL) => {
+      if (!available) throw new Error("bridge unavailable");
+      if (url.pathname === "/hello") return response(200, { ...bridgeHello, paired: false });
+      if (url.pathname === "/pair") return response(200, { token: "fresh-token" });
+      return response(202, { accepted: true });
+    };
+    const first = loadBackground(storage, responder);
+
+    await first.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    expect(await first.send(evidenceMessage(CONVERSATION_A, 0), "document-1"))
+      .toMatchObject({ ok: false, error: "bridge_unavailable" });
+    expect(storage.data).toMatchObject({ port: null, token: null });
+
+    available = true;
+    const afterWorkerRestart = loadBackground(storage, responder);
+    await afterWorkerRestart.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    expect(await afterWorkerRestart.send(evidenceMessage(CONVERSATION_A, 0), "document-1"))
+      .toMatchObject({ ok: true });
+    expect(afterWorkerRestart.calls.map((call) => `${String(call.init.method ?? "GET")} ${new URL(call.input).pathname}`))
+      .toEqual(["GET /hello", "POST /pair", "POST /identity-evidence"]);
+    expect(storage.data).toMatchObject({ port: 12081, token: "fresh-token" });
+  });
+
+  it("normalizes a portless cached token when the service worker reloads", async () => {
+    const storage = new Storage({ port: null, token: "stale-token" });
+    const worker = loadBackground(storage, async (url) => {
+      if (url.pathname === "/hello") return response(200, { ...bridgeHello, paired: false });
+      if (url.pathname === "/pair") return response(200, { token: "fresh-token" });
+      return response(202, { accepted: true });
+    });
+
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    expect(storage.data).toMatchObject({ port: null, token: null });
+    expect(await worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1"))
+      .toMatchObject({ ok: true });
+    expect(storage.data).toMatchObject({ port: 12081, token: "fresh-token" });
+  });
+
   it("clears a stale token after 401, re-pairs once, and retries", async () => {
     const storage = new Storage({ port: 12081, token: "stale-token" });
     let evidenceAttempts = 0;
