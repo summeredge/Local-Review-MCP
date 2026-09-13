@@ -58,6 +58,7 @@ export class ReviewCompletionRouter {
   private readonly deliveries: ReviewDeliveryService;
   private readonly reviewRequests: ReviewRequestService;
   private readonly results: ReviewResultService;
+  private readonly inFlight = new Map<string, Promise<ReviewResult>>();
 
   public constructor(
     storageRoot: string = defaultTaskContextStorageRoot(),
@@ -70,7 +71,19 @@ export class ReviewCompletionRouter {
     this.results = new ReviewResultService(storageRoot, runtimeIdentity);
   }
 
-  public async collect(workspaceId: string, routingId: string): Promise<ReviewResult> {
+  public collect(workspaceId: string, routingId: string): Promise<ReviewResult> {
+    const key = `${workspaceId}\0${routingId}`;
+    const pending = this.inFlight.get(key);
+    if (pending !== undefined) return pending;
+    const operation = this.collectOnce(workspaceId, routingId);
+    this.inFlight.set(key, operation);
+    void operation.finally(() => {
+      if (this.inFlight.get(key) === operation) this.inFlight.delete(key);
+    }).catch(() => undefined);
+    return operation;
+  }
+
+  private async collectOnce(workspaceId: string, routingId: string): Promise<ReviewResult> {
     const routing = await this.routings.getRouting(workspaceId, routingId);
     if (routing === null) throw new Error(`Conversation routing "${routingId}" was not found.`);
     await this.routings.validateRouting(routing);
@@ -92,7 +105,16 @@ export class ReviewCompletionRouter {
       workspaceId,
       request.review_request_id,
     );
-    if (existing?.status === "COMPLETED") return existing;
+    if (existing?.status === "COMPLETED") {
+      if (request.status !== "completed") {
+        await this.reviewRequests.updateReviewRequest(
+          workspaceId,
+          request.review_request_id,
+          { status: "completed" },
+        );
+      }
+      return existing;
+    }
 
     await this.reviewRequests.updateReviewRequest(
       workspaceId,
@@ -126,7 +148,7 @@ export class ReviewCompletionRouter {
     await this.reviewRequests.updateReviewRequest(
       workspaceId,
       request.review_request_id,
-      { status: completion.status === "COMPLETED" ? "completed" : "requested" },
+      { status: result.status === "COMPLETED" ? "completed" : "requested" },
     );
     return result;
   }

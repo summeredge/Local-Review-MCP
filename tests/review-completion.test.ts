@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "playwright";
 import { ChatGPTCompletionDetector } from "../src/browser-worker/completion/detector.js";
 import { ChatGPTResultExtractor } from "../src/browser-worker/completion/extractor.js";
@@ -277,6 +277,27 @@ describe("ReviewResultService", () => {
     await expect(service.listReviewResults("workspace-a")).resolves.toHaveLength(1);
   });
 
+  it("coalesces concurrent result creation for one review request", async () => {
+    const storageRoot = await makeStorageRoot();
+    const { request, delivery } = await makeDeliveredChain(storageRoot);
+    const service = new ReviewResultService(storageRoot);
+    const input = {
+      review_request_id: request.review_request_id,
+      delivery_id: delivery.delivery_id,
+      workspace_id: "workspace-a",
+      status: "COMPLETED" as const,
+      content: "review result",
+    };
+
+    const [left, right] = await Promise.all([
+      service.createReviewResult(input),
+      service.createReviewResult({ ...input, content: "duplicate result" }),
+    ]);
+
+    expect(right).toEqual(left);
+    await expect(service.listReviewResults("workspace-a")).resolves.toHaveLength(1);
+  });
+
   it("rejects a stored result whose identity does not match its file", async () => {
     const storageRoot = await makeStorageRoot();
     const { request, delivery } = await makeDeliveredChain(storageRoot);
@@ -335,6 +356,39 @@ describe("ReviewCompletionRouter", () => {
     expect(second).toEqual(first);
     expect(calls).toBe(1);
     expect(requestedReviewId).toBe(request.review_request_id);
+    await expect(new ReviewRequestService(storageRoot)
+      .getReviewRequest("workspace-a", request.review_request_id))
+      .resolves.toMatchObject({ status: "completed" });
+  });
+
+  it("coalesces concurrent completion collection for one routing", async () => {
+    const storageRoot = await makeStorageRoot();
+    const { request, routing } = await makeDeliveredChain(storageRoot);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const collectCompletion = vi.fn(async (conversationId: string, reviewRequestId: string) => {
+      await gate;
+      return {
+        conversationId,
+        status: "COMPLETED" as const,
+        content: "review result",
+        extractedAt: new Date().toISOString(),
+      };
+    });
+    const router = new ReviewCompletionRouter(storageRoot, new BrowserWorkerReviewCompletionAdapter({
+      collectCompletion,
+    }));
+
+    const first = router.collect("workspace-a", routing.routing_id);
+    const second = router.collect("workspace-a", routing.routing_id);
+    await vi.waitFor(() => expect(collectCompletion).toHaveBeenCalledTimes(1));
+    release();
+    const [left, right] = await Promise.all([first, second]);
+
+    expect(right).toEqual(left);
+    expect(collectCompletion).toHaveBeenCalledTimes(1);
+    await expect(new ReviewResultService(storageRoot).listReviewResults("workspace-a"))
+      .resolves.toHaveLength(1);
     await expect(new ReviewRequestService(storageRoot)
       .getReviewRequest("workspace-a", request.review_request_id))
       .resolves.toMatchObject({ status: "completed" });

@@ -1,5 +1,41 @@
 # Errors
 
+## [ERR-20260913-001] Closure audit exposed non-atomic review completion recovery
+
+**Priority**: medium
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+Closure audit regression tests exposed that concurrent Review Completion collection
+entered the adapter twice, concurrent ReviewResult creation produced two records,
+and recovery from a persisted completed ReviewResult did not repair the ReviewRequest status.
+
+### 错误信息
+
+```text
+expected "spy" to be called 1 times, but got 2 times
+expected { status: "pending" } to match object { status: "completed" }
+```
+
+### 上下文
+
+- `npm test -- --run tests/control-plane/auto-iteration.test.ts tests/review-completion.test.ts`
+- Closure audit scenarios for duplicate completion and a crash after ReviewResult persistence
+
+### 建议修复
+
+Serialize collection and Result creation per logical review, and reconcile
+ReviewRequest to `completed` when recovery finds a valid completed ReviewResult.
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
 ## [ERR-20260908-005] 异步 execution context 直接覆盖造成截断 JSON
 
 **Priority**: medium

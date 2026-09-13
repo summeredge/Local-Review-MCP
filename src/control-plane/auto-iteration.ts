@@ -799,9 +799,19 @@ export class AutoIterationService {
       }
 
       if (result.status !== "COMPLETED") {
+        await this.reviewRequests.updateReviewRequest(
+          loop.workspace_id,
+          reviewRequestId,
+          { status: "requested" },
+        );
         await this.humanRequired(loop, `REVIEW_COMPLETION_${result.status}`, result.error);
         return;
       }
+      await this.reviewRequests.updateReviewRequest(
+        loop.workspace_id,
+        reviewRequestId,
+        { status: "completed" },
+      );
       const current = loop.review_result_id === result.result_id
         ? loop
         : await this.update(loop, { review_result_id: result.result_id });

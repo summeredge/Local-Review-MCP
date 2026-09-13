@@ -34,6 +34,8 @@ function workspaceMismatch(message: string): WorkspacePathError {
   );
 }
 
+const reviewResultFlights = new Map<string, Promise<ReviewResult>>();
+
 export class ReviewResultService {
   public readonly storageRoot: string;
   private readonly runtimeIdentity: WorkspaceIdentity | undefined;
@@ -53,7 +55,18 @@ export class ReviewResultService {
   public async createReviewResult(input: CreateReviewResultInput): Promise<ReviewResult> {
     const parsed = createReviewResultInputSchema.parse(input);
     this.validateRuntimeIdentity(parsed.workspace_id);
+    const key = `${this.storageRoot}\0${parsed.workspace_id}\0${parsed.review_request_id}`;
+    const pending = reviewResultFlights.get(key);
+    if (pending !== undefined) return pending;
+    const operation = this.createReviewResultOnce(parsed);
+    reviewResultFlights.set(key, operation);
+    void operation.finally(() => {
+      if (reviewResultFlights.get(key) === operation) reviewResultFlights.delete(key);
+    }).catch(() => undefined);
+    return operation;
+  }
 
+  private async createReviewResultOnce(parsed: CreateReviewResultInput): Promise<ReviewResult> {
     const request = await this.reviewRequests.getReviewRequest(
       parsed.workspace_id,
       parsed.review_request_id,

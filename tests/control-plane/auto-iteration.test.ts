@@ -539,6 +539,9 @@ describe("AutoIterationService", () => {
       stage: "completed",
       review_result_id: result.result_id,
     });
+    await expect(new ReviewRequestService(value.root)
+      .getReviewRequest("workspace-a", chain.request.review_request_id))
+      .resolves.toMatchObject({ status: "completed" });
     expect(collect).not.toHaveBeenCalled();
     expect(await new ReviewResultService(value.root).listReviewResults("workspace-a"))
       .toHaveLength(1);

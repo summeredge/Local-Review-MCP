@@ -263,6 +263,9 @@ describe("ExecutionRoutingService", () => {
     expect(await h.goals.listGoals()).toHaveLength(1);
     expect(await new ReviewRequestService(h.root).listReviewRequests(h.workspaceId))
       .toHaveLength(1);
+    expect(h.starts).toEqual([]);
+    expect(h.deliveries.requests).toHaveLength(1);
+    expect(h.completions.requests).toHaveLength(1);
   });
 
   it("skips recovery when the matching ReviewRequest already exists", async () => {
