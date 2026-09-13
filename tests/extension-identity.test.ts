@@ -504,6 +504,35 @@ const evidenceMessage = (conversationId: string, navigation_epoch: number, extra
   ...extra,
 });
 
+function goalHandoffEnvelope(handoffId: string): Record<string, unknown> {
+  return {
+    protocol: "local-review-mcp.goal-handoff",
+    schema_version: "2",
+    handoff_id: handoffId,
+    request_id: `request-${handoffId}`,
+    workspace_id: "workspace-goal-recovery",
+    goal: {
+      title: "Recover Goal handoff",
+      goal: "Verify automatic Bridge recovery for Goal handoff capture.",
+      requirements: ["Preserve the signed handoff envelope."],
+      acceptance_criteria: ["The Bridge receives the same envelope after recovery."],
+      max_iterations: 2,
+    },
+    issued_at: "2026-09-13T10:00:00.000Z",
+    expires_at: "2026-09-13T10:02:00.000Z",
+    signature: "a".repeat(64),
+  };
+}
+
+function goalHandoffCaptureMessage(handoffId: string): Record<string, unknown> {
+  return {
+    type: "goal_handoff_capture",
+    handoff: goalHandoffEnvelope(handoffId),
+    conversation_id: CONVERSATION_A,
+    navigation_epoch: 0,
+  };
+}
+
 describe("Extension background identity authority", () => {
   it("discovers only the fixed Bridge ports, pairs, and stores the token", async () => {
     const storage = new Storage();
@@ -623,6 +652,75 @@ describe("Extension background identity authority", () => {
     expect(storage.data).toMatchObject({ port: null, token: null });
     expect(await worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1"))
       .toMatchObject({ ok: true });
+    expect(storage.data).toMatchObject({ port: 12081, token: "fresh-token" });
+  });
+
+  it("recovers Goal handoff capture after a cached port disappears during Bridge restart", async () => {
+    const storage = new Storage({ port: 12081, token: "stale-token" });
+    let available = false;
+    const responder = async (url: URL) => {
+      if (!available) throw new Error("bridge unavailable");
+      if (url.pathname === "/hello") return response(200, { ...bridgeHello, paired: false });
+      if (url.pathname === "/pair") return response(200, { token: "fresh-token" });
+      if (url.pathname === "/goal-handoff-capture") {
+        return response(202, { accepted: "new", handoff_id: "handoff-goal-recovery-a" });
+      }
+      return response(404, {});
+    };
+    const worker = loadBackground(storage, responder);
+    const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+    const capture = goalHandoffCaptureMessage("handoff-goal-recovery-a");
+
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-goal", 7, url);
+    expect(await worker.send(capture, "document-goal", 7, url))
+      .toMatchObject({ ok: false, error: "bridge_unavailable" });
+    expect(storage.data).toMatchObject({ port: null, token: null });
+    expect(worker.calls.filter((call) => new URL(call.input).pathname === "/goal-handoff-capture"))
+      .toHaveLength(0);
+
+    available = true;
+    const recoveryStart = worker.calls.length;
+    expect(await worker.send(capture, "document-goal", 7, url)).toMatchObject({ ok: true });
+    expect(worker.calls.slice(recoveryStart).map((call) => `${String(call.init.method ?? "GET")} ${new URL(call.input).pathname}`))
+      .toEqual(["GET /hello", "POST /pair", "POST /goal-handoff-capture"]);
+    const posted = worker.calls.at(-1)!;
+    expect((posted.init.headers as Record<string, string>).authorization).toBe("Bearer fresh-token");
+    expect(JSON.parse(String(posted.init.body))).toMatchObject({
+      handoff: capture.handoff,
+      conversation_id: CONVERSATION_A,
+      document_id: "document-goal",
+      navigation_epoch: 0,
+    });
+    expect(storage.data).toMatchObject({ port: 12081, token: "fresh-token" });
+  });
+
+  it("recovers Goal handoff capture from a portless stale-token state in the same worker", async () => {
+    const storage = new Storage({ port: null, token: "stale-token" });
+    let available = false;
+    const responder = async (url: URL) => {
+      if (!available) throw new Error("bridge unavailable");
+      if (url.pathname === "/hello") return response(200, { ...bridgeHello, paired: false });
+      if (url.pathname === "/pair") return response(200, { token: "fresh-token" });
+      if (url.pathname === "/goal-handoff-capture") return response(202, {
+        accepted: "new",
+        handoff_id: "handoff-goal-recovery-b",
+      });
+      return response(404, {});
+    };
+    const worker = loadBackground(storage, responder);
+    const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+    const capture = goalHandoffCaptureMessage("handoff-goal-recovery-b");
+
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-goal", 7, url);
+    expect(await worker.send(capture, "document-goal", 7, url))
+      .toMatchObject({ ok: false, error: "bridge_unavailable" });
+    expect(storage.data).toMatchObject({ port: null, token: null });
+
+    available = true;
+    const recoveryStart = worker.calls.length;
+    expect(await worker.send(capture, "document-goal", 7, url)).toMatchObject({ ok: true });
+    expect(worker.calls.slice(recoveryStart).map((call) => `${String(call.init.method ?? "GET")} ${new URL(call.input).pathname}`))
+      .toEqual(["GET /hello", "POST /pair", "POST /goal-handoff-capture"]);
     expect(storage.data).toMatchObject({ port: 12081, token: "fresh-token" });
   });
 
