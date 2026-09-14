@@ -243,6 +243,7 @@ not expose direct write, exec, shell, commit, or push operations.
   ```json
   {
     "workspace_id"?: "string",
+    "correlation_key": "strict UUID v4",
     "title": "string",
     "goal": "string",
     "requirements": ["string"],
@@ -251,13 +252,17 @@ not expose direct write, exec, shell, commit, or push operations.
   }
   ```
 
-  `max_iterations` defaults to `2`. `conversation_id` is not an input field;
-  the server resolves it from the exact current inbound request correlation.
+  `max_iterations` defaults to `2`. `conversation_id` is not an input field. The
+  model must generate a new UUID v4 `correlation_key` for every invocation and
+  never reuse one; users do not need to provide it manually. The server resolves
+  `conversation_id` from the exact matching Extension evidence for that key.
 - Output: `{ "goal_id": string, "phase_id": string, "task_id": string, "execution_id": string, "status": string }`
 - Workspace scope: the active registered workspace when `workspace_id` is
   omitted; an explicitly supplied ID must resolve through the Workspace
   Registry.
-- Permission: authenticated Control Plane operation. The server first checks
-  the current exact request correlation and waits only for late evidence for
-  that same request ID. If no proven conversation arrives, it returns
-  `conversation_not_correlated` and creates no Goal.
+- Permission: authenticated Control Plane operation. The server first checks the
+  exact `correlation_key` and waits only for late evidence for that same key. It
+  does not use HTTP `x-request-id`, JSON-RPC body `id`, or
+  `message.metadata.request_id` as conversation authority. If no proven
+  conversation arrives, it returns `conversation_not_correlated` and creates no
+  Goal.

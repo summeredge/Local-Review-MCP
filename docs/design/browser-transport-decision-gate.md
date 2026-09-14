@@ -170,7 +170,8 @@ The Extension identity path and Review Delivery routing path are related but
 not interchangeable:
 
 ```text
-MCP x-request-id == Fiber message.metadata.request_id
+submit_goal arguments.correlation_key
+        == Fiber assistant api_tool submit_goal args.correlation_key
         |
         v
 ConversationCorrelationRegistry
@@ -183,6 +184,10 @@ ReviewRequest -> ConversationRouting
         v
 conversation_id                     (authoritative Delivery target)
 ```
+
+HTTP `x-request-id`, JSON-RPC body `id`, and Fiber `message.metadata.request_id`
+remain platform or transport diagnostics. They are not the authority for a
+`submit_goal` conversation join.
 
 `ConversationCorrelationRegistry` uses exact, first-owner-wins evidence and
 persists it under the Control Plane state directory. A later different

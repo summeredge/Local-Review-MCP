@@ -1,23 +1,28 @@
 # Extension Identity PoC
 
-This extension captures browser identity evidence and the explicitly activated
-`GoalHandoffEnvelopeV2`. It does not correlate MCP requests, create or start Goals, deliver
-reviews, or control the browser.
+This extension captures browser identity evidence, `submit_goal` correlation evidence, and the
+explicitly activated `GoalHandoffEnvelopeV2`. It does not create or start Goals, deliver reviews,
+or control the browser.
 
 ## Evidence chain
 
-The MCP HTTP server keeps the existing `x-request-id` behavior in
-`src/mcp/inbound.ts`. ChatGPT's page model exposes the same normalized base ID at
-`message.metadata.request_id`.
+The existing platform diagnostic path keeps the MCP HTTP `x-request-id` behavior in
+`src/mcp/inbound.ts`. ChatGPT's page model may expose a corresponding normalized base ID at
+`message.metadata.request_id`, but that platform ID is not the `submit_goal` conversation key.
 
-`request_id` is an opaque normalized identifier. Its concrete appearance is not protocol
-semantics: ChatGPT may expose a `wfr_*` value, a UUID value such as
+For `submit_goal`, the MCP input's strict UUID v4 `correlation_key` is matched to the same key in
+the real assistant `api_tool` request payload: `content.text` JSON names the `submit_goal` path
+and carries `args.correlation_key`. Fiber emits that key through the existing identity-evidence
+shape; no new endpoint or evidence schema is used.
+
+Platform `request_id` values are opaque normalized identifiers. Their concrete appearance is not
+protocol semantics: ChatGPT may expose a `wfr_*` value, a UUID value such as
 `32ca0d45-8b29-414a-bbe4-8e26c3aae911`, or another future value that satisfies the
 `[A-Za-z0-9_-]{1,100}` lexical boundary. LRM does not require a prefix, require a UUID, or
 infer identity from the ID's format. The browser-side authority is
 `message.metadata.request_id`; the MCP-side authority is the normalized value returned by
-`src/mcp/inbound.ts::requestIdFromHeader()` from `x-request-id`. Any future correlation must
-use exact string equality.
+`src/mcp/inbound.ts::requestIdFromHeader()` from `x-request-id`. The platform-ID path uses exact
+string equality; it remains separate from the direct `submit_goal` key path above.
 
 The unpacked MV3 extension then performs this bounded flow:
 
@@ -37,11 +42,13 @@ ExtensionIdentityEvidence
 POST /identity-evidence
 ```
 
-For the existing identity-evidence path, `fiber.js` emits only
-`{ request_id, fiber_conversation_id }`. It reads no prompt, assistant text, tool arguments,
-cookies, authorization, or full Fiber/message objects. Missing or conflicting Fiber conversation
-identities are dropped. The separate Goal handoff path reads only the allowlisted user activation
-text and the target tool result envelope described below.
+For the existing platform identity-evidence path, `fiber.js` emits only
+`{ request_id, fiber_conversation_id }` from `message.metadata.request_id`. For the direct
+`submit_goal` path it additionally emits the same shape with `request_id` set to the strict key
+read from the assistant tool request's `args`; it does not read user text, ordinary assistant text,
+tool-result text, reasoning, or metadata to obtain that key. Missing or conflicting Fiber
+conversation identities are dropped. The separate Goal handoff path reads only the allowlisted
+user activation text and the target tool result envelope described below.
 
 For Goal handoff capture, the same bounded `turn.messages` scan additionally requires an
 assistant `api_tool` request and a `tool` result whose `metadata.invoked_resource.resource_uri`
@@ -158,14 +165,17 @@ extension/fiber.js
 }
 ```
 
-The `request_id` must equal the normalized base ID from the same MCP HTTP
-`x-request-id`. The Bridge does not perform that join in this phase.
+For platform-ID evidence, `request_id` equals the normalized base ID from the same MCP HTTP
+`x-request-id`. For direct `submit_goal` evidence, `request_id` equals the invocation's
+`correlation_key`; `x-request-id` and `metadata.request_id` are not required. The Bridge does not
+perform either join in this phase.
 
 ## Explicit non-goals
 
 Implemented: evidence capture and authenticated local transport.
 
-Identity remains separate from the request-to-conversation correlation registry and the reliable
-delivery transport documented in `reliable-extension-delivery.md`. Neither changes
+The existing identity-evidence path feeds the request-to-conversation correlation registry; this
+change adds no separate registry or endpoint. The reliable delivery transport documented in
+`reliable-extension-delivery.md` remains separate. Neither path changes
 TaskContext/ReviewRequest/ReviewDelivery, publishes a CRX, installs automatically, or changes the
 browser-worker path.

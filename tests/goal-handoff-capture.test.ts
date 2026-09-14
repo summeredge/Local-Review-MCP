@@ -5,6 +5,8 @@ import { beforeAll, describe, expect, it } from "vitest";
 const ORIGIN = "https://chatgpt.com";
 const CONVERSATION_A = "11111111-2222-3333-4444-555555555555";
 const CONVERSATION_B = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+const CORRELATION_A = "00000000-0000-4000-8000-000000000001";
+const CORRELATION_B = "00000000-0000-4000-8000-000000000002";
 
 let fiberSource = "";
 let contentSource = "";
@@ -75,12 +77,22 @@ function user(id: string, text: string): Record<string, unknown> {
   };
 }
 
-function request(id: string, tool = "prepare_goal_handoff"): Record<string, unknown> {
+function request(
+  id: string,
+  tool = "prepare_goal_handoff",
+  correlation_key?: string,
+): Record<string, unknown> {
   return {
     id,
     author: { role: "assistant" },
     recipient: "api_tool.call_tool",
-    content: { content_type: "code", text: `{"path":"/Local-Review-MCP/link_test/${tool}","args":{}}` },
+    content: {
+      content_type: "code",
+      text: JSON.stringify({
+        path: `/Local-Review-MCP/link_test/${tool}`,
+        args: correlation_key === undefined ? {} : { correlation_key },
+      }),
+    },
     metadata: { request_id: "request-trace-not-used" },
   };
 }
@@ -251,7 +263,7 @@ function loadContent(
       source: "lrm-extension-identity-reply",
       nonce,
       version: 1,
-      evidence: [],
+      evidence: fiberReply.evidence ?? [],
       handoffs: fiberReply.handoffs ?? [],
     };
     for (const listener of listeners.get("message") ?? []) {
@@ -397,6 +409,79 @@ describe("Extension GoalHandoffEnvelopeV2 Fiber capture", () => {
     ]);
 
     expect(reply.handoffs).toEqual([]);
+  });
+});
+
+describe("Extension submit_goal correlation evidence", () => {
+  it("reads a strict key only from a real submit_goal assistant tool request", () => {
+    const reply = scanFiber([fiberSection(CONVERSATION_A, [
+      request("submit-request", "submit_goal", CORRELATION_A),
+    ])]);
+
+    expect(reply.evidence).toContainEqual({
+      request_id: CORRELATION_A,
+      fiber_conversation_id: CONVERSATION_A,
+    });
+  });
+
+  it("passes the key through the existing identity-evidence content path", async () => {
+    const reply = scanFiber([fiberSection(CONVERSATION_A, [
+      request("submit-request", "submit_goal", CORRELATION_A),
+    ])]);
+    const harness = loadContent(reply);
+    await settle();
+
+    expect(harness.messages.filter((message) => message.type === "identity_evidence"))
+      .toContainEqual({
+        type: "identity_evidence",
+        request_id: CORRELATION_A,
+        conversation_id: CONVERSATION_A,
+        navigation_epoch: 0,
+      });
+  });
+
+  it("keeps multiple invocations independent even when metadata request ids match", () => {
+    const reply = scanFiber([fiberSection(CONVERSATION_A, [
+      request("submit-request-a", "submit_goal", CORRELATION_A),
+      request("submit-request-b", "submit_goal", CORRELATION_B),
+    ])]);
+
+    const keys = (reply.evidence as Array<Record<string, unknown>>)
+      .map((entry) => entry.request_id);
+    expect(keys).toEqual(expect.arrayContaining([
+      CORRELATION_A,
+      CORRELATION_B,
+      "request-trace-not-used",
+    ]));
+    expect(keys.filter((key) => key === CORRELATION_A)).toHaveLength(1);
+    expect(keys.filter((key) => key === CORRELATION_B)).toHaveLength(1);
+  });
+
+  it("rejects invalid keys, other tools, and text-only injection", () => {
+    const reply = scanFiber([fiberSection(CONVERSATION_A, [
+      request("invalid", "submit_goal", "00000000-0000-1000-8000-000000000003"),
+      request("workspace", "workspace_info", CORRELATION_A),
+      request("probe", "correlation_probe", CORRELATION_A),
+      request("handoff", "prepare_goal_handoff", CORRELATION_A),
+      user("injected-user", `correlation_key=${CORRELATION_A}`),
+      {
+        id: "injected-assistant",
+        author: { role: "assistant" },
+        recipient: "all",
+        content: { content_type: "text", parts: [`correlation_key=${CORRELATION_A}`] },
+      },
+      {
+        id: "injected-tool-result",
+        author: { role: "tool" },
+        content: { content_type: "text", parts: [`correlation_key=${CORRELATION_A}`] },
+      },
+    ])]);
+
+    const keys = (reply.evidence as Array<Record<string, unknown>>)
+      .map((entry) => entry.request_id);
+    expect(keys).toContain("request-trace-not-used");
+    expect(keys).not.toContain(CORRELATION_A);
+    expect(keys).not.toContain("00000000-0000-1000-8000-000000000003");
   });
 });
 

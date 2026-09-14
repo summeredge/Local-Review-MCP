@@ -36,7 +36,7 @@ const goalHandoffGoalSchema = goalSubmissionRequestSchema.pick({
   max_iterations: true,
 }).strict();
 
-export const goalHandoffInputSchema = goalSubmissionToolInputSchema;
+export const goalHandoffInputSchema = goalSubmissionToolInputSchema.omit({ correlation_key: true });
 
 export type GoalHandoffInput = z.input<typeof goalHandoffInputSchema>;
 export type GoalHandoffPreparationInput = Omit<GoalHandoffInput, "workspace_id"> & {

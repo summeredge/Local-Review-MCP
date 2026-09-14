@@ -32,4 +32,5 @@
 {"ts":"2026-09-12T21:48:00+08:00","action":"add","type":"error","id":"ERR-20260912-003","summary":"Launcher unittest 需从 LocalReviewLauncher 目录或 discover 入口运行"}
 {"ts":"2026-09-12T21:50:00+08:00","action":"add","type":"error","id":"ERR-20260912-004","summary":"urlopen 测试响应需使用 MagicMock 或显式上下文管理器"}
 {"ts":"2026-09-13T08:41:00+08:00","action":"add","type":"error","id":"ERR-20260913-001","summary":"Closure audit 发现并发 Completion 重复进入适配器，且重启未修复已落盘结果对应的 ReviewRequest 状态"}
+{"ts":"2026-09-14T09:22:00+08:00","action":"add","type":"error","id":"ERR-20260914-001","summary":"PowerShell 下 node --check 通配符需逐文件展开"}
 ```

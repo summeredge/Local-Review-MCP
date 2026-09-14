@@ -136,9 +136,12 @@ describe("MCP tool registry", () => {
         requirements: expect.any(Object),
         acceptance_criteria: expect.any(Object),
         max_iterations: expect.any(Object),
+        correlation_key: expect.any(Object),
       },
     });
     expect(submitGoal?.inputSchema).not.toHaveProperty("properties.conversation_id");
+    expect(submitGoal?.description).toContain("new UUID v4 correlation_key");
+    expect(submitGoal?.description).toContain("never reuse one");
     expect(submitGoal?.outputSchema).toMatchObject({
       type: "object",
       properties: {

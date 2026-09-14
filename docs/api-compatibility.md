@@ -34,7 +34,8 @@ review client impact, and make the schema/version decision explicit. The
 P3.2C-1R correction upgrades the newly introduced `prepare_goal_handoff`
 preparation envelope to the formal `GoalHandoffEnvelopeV2` contract with
 `schema_version = "2"`; it contains no `conversation_id`, while `submit_goal`
-is unchanged. See `tool-contract.md` for the current handoff contract.
+now requires a new strict UUID v4 `correlation_key` per invocation. See
+`tool-contract.md` for the current handoff and submission contracts.
 
 ## Compatibility expectations
 

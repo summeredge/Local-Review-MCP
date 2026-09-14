@@ -22,6 +22,7 @@
   const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
   const HANDOFF_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
   const WORKSPACE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+  const CORRELATION_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
   const SIGNATURE = /^[0-9a-f]{64}$/u;
   const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
   const GOAL_START = /(?:建立|创建|启动)\s*一个\s*Goal\b/iu;
@@ -462,6 +463,40 @@
     return parts[parts.length - 1];
   }
 
+  function submitGoalCorrelationKeyOf(message) {
+    if (!message || typeof message !== 'object' || message.author?.role !== 'assistant'
+      || typeof message.recipient !== 'string' || !message.recipient.startsWith('api_tool')) return null;
+    const content = message.content;
+    const text = content && typeof content === 'object' ? content.text : null;
+    if (typeof text !== 'string' || text.length === 0 || text.length > 512 * 1024) return null;
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+      || !own(payload, 'path') || toolNameFromPath(payload.path) !== 'submit_goal') return null;
+    const args = payload.args;
+    const key = args && typeof args === 'object' && !Array.isArray(args) && own(args, 'correlation_key')
+      ? args.correlation_key : null;
+    return typeof key === 'string' && CORRELATION_KEY.test(key) ? key : null;
+  }
+
+  function submitGoalCorrelationKeysOf(messages) {
+    if (!Array.isArray(messages)) return [];
+    const keys = [];
+    const seen = new Set();
+    for (const message of messages) {
+      const key = submitGoalCorrelationKeyOf(message);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      keys.push(key);
+      if (keys.length >= MAX_REQUESTS) break;
+    }
+    return keys;
+  }
+
   function goalToolRequestOf(message) {
     if (!message || typeof message !== 'object' || message.author?.role !== 'assistant'
       || typeof message.recipient !== 'string' || !message.recipient.startsWith('api_tool')) return null;
@@ -672,7 +707,7 @@
           ? conversation.conversationId : null;
         const messages = fiber ? turnMessagesOf(fiber) : null;
         if (!conversationId || !messages) continue;
-        for (const requestId of requestIdsOf(messages)) {
+        for (const requestId of submitGoalCorrelationKeysOf(messages).concat(requestIdsOf(messages))) {
           const previous = byRequest.get(requestId);
           if (previous !== undefined && previous !== conversationId) conflicts.add(requestId);
           else if (previous === undefined) byRequest.set(requestId, conversationId);

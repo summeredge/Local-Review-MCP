@@ -21,6 +21,8 @@ import { WorkspaceRegistry } from "../../src/workspace/registry.js";
 
 const clients: Client[] = [];
 const temporaryDirectories: string[] = [];
+const CORRELATION_A = "00000000-0000-4000-8000-000000000001";
+const CORRELATION_B = "00000000-0000-4000-8000-000000000002";
 
 afterEach(async () => {
   await Promise.all(clients.splice(0).map((client) => client.close()));
@@ -37,8 +39,9 @@ function evidence(request_id: string, conversation_id: string) {
   };
 }
 
-function goalArguments() {
+function goalArguments(correlation_key = CORRELATION_A) {
   return {
+    correlation_key,
     title: "MCP Goal",
     goal: "Run the requested Goal through Codex.",
     requirements: ["Use the existing Goal workflow."],
@@ -69,10 +72,10 @@ async function fixture() {
 
 function callFor(
   client: Client,
-  requestId: string,
+  inboundRequestId: string | null,
   arguments_: Record<string, unknown> = goalArguments(),
 ) {
-  return withInboundRequestId(requestId, () => client.callTool({
+  return withInboundRequestId(inboundRequestId, () => client.callTool({
     name: "submit_goal",
     arguments: arguments_,
   }));
@@ -90,9 +93,9 @@ function toolJson(result: unknown): Record<string, unknown> {
 describe("submit_goal MCP tool", () => {
   it("binds an existing exact correlation and reuses GoalSubmissionService", async () => {
     const { client, correlations, submitGoal, workspaceId } = await fixture();
-    await correlations.observe(evidence("request-A", "conversation-A"));
+    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
 
-    const result = await callFor(client, "request-A");
+    const result = await callFor(client, "transport-A");
 
     expect(result.isError).not.toBe(true);
     expect(toolJson(result)).toEqual({
@@ -102,20 +105,21 @@ describe("submit_goal MCP tool", () => {
       execution_id: "execution-1",
       status: "running",
     });
+    const { correlation_key: _correlationKey, ...domainArguments } = goalArguments();
     expect(submitGoal).toHaveBeenCalledWith({
-      ...goalArguments(),
+      ...domainArguments,
       workspace_id: workspaceId,
       conversation_id: "conversation-A",
     });
   });
 
-  it("waits for late evidence for the same exact request id", async () => {
+  it("waits for late evidence for the same exact correlation key", async () => {
     const { client, correlations, submitGoal } = await fixture();
-    const pending = callFor(client, "request-A");
+    const pending = callFor(client, "transport-A");
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     expect(submitGoal).not.toHaveBeenCalled();
 
-    await correlations.observe(evidence("request-A", "conversation-A"));
+    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
     const result = await pending;
     expect(result.isError).not.toBe(true);
     expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
@@ -125,25 +129,25 @@ describe("submit_goal MCP tool", () => {
 
   it("fails closed when the current request remains uncorrelated", async () => {
     const { client, correlations, submitGoal } = await fixture();
-    await correlations.observe(evidence("request-B", "conversation-B"));
+    await correlations.observe(evidence(CORRELATION_B, "conversation-B"));
     const wait = vi.spyOn(correlations, "awaitCorrelation").mockResolvedValue(null);
 
-    const result = await callFor(client, "request-A");
+    const result = await callFor(client, "transport-A");
 
     expect(result.isError).toBe(true);
     expect(toolJson(result)).toEqual({ error: "conversation_not_correlated" });
-    expect(wait).toHaveBeenCalledWith("request-A", GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS);
+    expect(wait).toHaveBeenCalledWith(CORRELATION_A, GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS);
     expect(submitGoal).not.toHaveBeenCalled();
   });
 
   it("keeps concurrent calls bound to their own conversations", async () => {
     const { client, correlations, submitGoal } = await fixture();
-    await correlations.observe(evidence("request-A", "conversation-A"));
-    await correlations.observe(evidence("request-B", "conversation-B"));
+    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
+    await correlations.observe(evidence(CORRELATION_B, "conversation-B"));
 
     await Promise.all([
-      callFor(client, "request-A"),
-      callFor(client, "request-B"),
+      callFor(client, "transport-A", goalArguments(CORRELATION_A)),
+      callFor(client, "transport-B", goalArguments(CORRELATION_B)),
     ]);
 
     expect(submitGoal.mock.calls.map(([request]) => request.conversation_id).sort())
@@ -152,10 +156,10 @@ describe("submit_goal MCP tool", () => {
 
   it("keeps the first proven owner when conflicting evidence arrives", async () => {
     const { client, correlations, submitGoal } = await fixture();
-    await correlations.observe(evidence("request-A", "conversation-A"));
-    await expect(correlations.observe(evidence("request-A", "conversation-B"))).resolves.toBe("refused");
+    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
+    await expect(correlations.observe(evidence(CORRELATION_A, "conversation-B"))).resolves.toBe("refused");
 
-    await callFor(client, "request-A");
+    await callFor(client, "transport-A");
 
     expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
       conversation_id: "conversation-A",
@@ -163,5 +167,40 @@ describe("submit_goal MCP tool", () => {
     expect(submitGoal).not.toHaveBeenCalledWith(expect.objectContaining({
       conversation_id: "conversation-B",
     }));
+  });
+
+  it("ignores transport request ids, including a missing id, when the key is proven", async () => {
+    const { client, correlations, submitGoal } = await fixture();
+    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
+
+    await callFor(client, "transport-A");
+    await callFor(client, "transport-B");
+    await callFor(client, null);
+
+    expect(submitGoal).toHaveBeenCalledTimes(3);
+    expect(submitGoal.mock.calls.map(([request]) => request.conversation_id))
+      .toEqual(["conversation-A", "conversation-A", "conversation-A"]);
+  });
+
+  it("rejects caller-supplied conversation identity and invalid correlation keys", async () => {
+    const { client, submitGoal } = await fixture();
+    const callerConversation = await client.callTool({
+      name: "submit_goal",
+      arguments: {
+        ...goalArguments(),
+        conversation_id: "caller-conversation",
+      },
+    });
+    const invalidKey = await client.callTool({
+      name: "submit_goal",
+      arguments: {
+        ...goalArguments(),
+        correlation_key: "00000000-0000-1000-8000-000000000003",
+      },
+    });
+
+    expect(callerConversation.isError).toBe(true);
+    expect(invalidKey.isError).toBe(true);
+    expect(submitGoal).not.toHaveBeenCalled();
   });
 });

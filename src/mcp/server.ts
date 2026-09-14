@@ -9,17 +9,12 @@ import { GitService } from "../git/service.js";
 import type { GitDiffResponse, GitStatusResponse } from "../git/types.js";
 import type { ConversationCorrelationRegistry } from "../control-plane/conversation-correlation.js";
 import {
-  awaitCurrentInboundCorrelation,
-  currentInboundCorrelation,
-} from "../control-plane/request-correlation-integration.js";
-import {
   goalHandoffEnvelopeV2Schema,
   goalHandoffInputSchema,
   type GoalHandoffService,
 } from "../control-plane/goal-handoff.js";
 import {
   goalSubmissionToolInputSchema,
-  goalSubmissionRequestSchema,
   goalSubmissionResultSchema,
   type GoalSubmissionService,
 } from "../control-plane/goal-submission.js";
@@ -30,7 +25,7 @@ import { searchText } from "../workspace/search.js";
 import { containsNullByte } from "../workspace/text.js";
 import { structuredResponse } from "./respond.js";
 import { inboundRequestId, inboundRequestOrigin } from "./inbound.js";
-import { ROOT_ALIAS } from "./schema/common.js";
+import { correlationKeySchema, ROOT_ALIAS } from "./schema/common.js";
 import {
   gitDiffOutputSchema,
   gitStatusOutputSchema,
@@ -144,10 +139,7 @@ const gitDiffInputSchema = {
   stat: z.boolean().optional().default(false),
 };
 const correlationProbeSchema = z.object({
-  correlation_key: z.string().regex(
-    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu,
-    "correlation_key must be a UUID v4",
-  ),
+  correlation_key: correlationKeySchema,
 }).strict();
 export const GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS = 15_000;
 const EXECUTION_OUTPUT_PATH = ".review/execution_output.json";
@@ -734,7 +726,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "submit_goal",
     {
-      description: "Control Plane: create and start a Goal for the current ChatGPT conversation; conversation_id is resolved from the exact inbound request correlation.",
+      description: "Control Plane: create and start a Goal for the current ChatGPT conversation. The model must generate a new UUID v4 correlation_key for every invocation and never reuse one; users do not need to provide it manually. conversation_id is resolved from exact matching Extension evidence.",
       inputSchema: goalSubmissionToolInputSchema,
       outputSchema: goalSubmissionResultSchema,
     },
@@ -746,9 +738,9 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
       }
 
       try {
-        const correlation = currentInboundCorrelation(correlations)
-          ?? await awaitCurrentInboundCorrelation(
-            correlations,
+        const correlation = correlations.correlation(input.correlation_key)
+          ?? await correlations.awaitCorrelation(
+            input.correlation_key,
             GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS,
           );
         if (correlation === null) return conversationNotCorrelatedError();

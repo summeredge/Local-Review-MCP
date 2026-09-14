@@ -6,6 +6,7 @@ import {
   taskIdSchema,
   workspaceIdSchema,
 } from "../context/schema.js";
+import { correlationKeySchema } from "../mcp/schema/common.js";
 import {
   GoalPreflightError,
   type GoalPreflightService,
@@ -39,6 +40,7 @@ export const goalSubmissionRequestSchema = z.object({
 export const goalSubmissionToolInputSchema = goalSubmissionRequestSchema
   .omit({ workspace_id: true, conversation_id: true })
   .extend({ workspace_id: z.string().min(1).max(128).optional() })
+  .extend({ correlation_key: correlationKeySchema })
   .strict();
 
 export const goalSubmissionResultSchema = z.object({

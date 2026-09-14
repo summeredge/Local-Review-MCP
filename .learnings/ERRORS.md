@@ -36,6 +36,40 @@ ReviewRequest to `completed` when recovery finds a valid completed ReviewResult.
 
 ---
 
+## [ERR-20260914-001] PowerShell wildcard passed literally to node --check
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+在 PowerShell 中将 `extension/*.js` 直接作为参数传给 `node --check` 时，Node
+收到的是字面路径而不是展开后的文件列表。
+
+### 错误信息
+
+```text
+Error: Cannot find module 'C:\Users\shaoy\Documents\Local-Review-MCP\extension\*.js'
+```
+
+### 上下文
+
+- 完整扩展语法检查使用了 `node --check extension/*.js`
+- PowerShell 调用 Node 时没有按预期展开该通配符
+
+### 建议修复
+
+使用 `Get-ChildItem extension/*.js | ForEach-Object { node --check $_.FullName }`
+逐文件检查。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: ERR-20260907-002
+
+---
+
 ## [ERR-20260908-005] 异步 execution context 直接覆盖造成截断 JSON
 
 **Priority**: medium
