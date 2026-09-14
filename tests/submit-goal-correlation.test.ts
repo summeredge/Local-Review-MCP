@@ -6,6 +6,7 @@ const ORIGIN = "https://chatgpt.com";
 const CONVERSATION = "11111111-2222-3333-4444-555555555555";
 const KEY_A = "00000000-0000-4000-8000-000000000001";
 const KEY_B = "00000000-0000-4000-8000-000000000002";
+const PLATFORM_REQUEST_ID = "platform-request-id";
 
 let fiberSource = "";
 let contentSource = "";
@@ -58,6 +59,22 @@ function request(id: string, tool: string, correlationKey?: string): Record<stri
       }),
     },
     metadata: { request_id: "request-trace-not-used" },
+  };
+}
+
+function currentConnectorRequest(id: string, tool: string, correlationKey?: string): Record<string, unknown> {
+  return {
+    id,
+    author: { role: "assistant" },
+    recipient: `Local_MCP_Connector.${tool}`,
+    content: {
+      content_type: "code",
+      text: JSON.stringify({
+        name: tool,
+        arguments: JSON.stringify(correlationKey === undefined ? {} : { correlation_key: correlationKey }),
+      }),
+    },
+    metadata: { request_id: PLATFORM_REQUEST_ID },
   };
 }
 
@@ -147,18 +164,60 @@ describe("Extension submit_goal correlation evidence", () => {
     expect(keys.filter((key: string) => key === KEY_B)).toHaveLength(1);
   });
 
-  it("rejects invalid keys, other tools, and text-only injection", () => {
+  it("extracts a valid key from the current direct Connector request shape", () => {
+    const reply = scanFiber([currentConnectorRequest("submit-current", "submit_goal", KEY_A)]);
+    expect(reply.evidence).toContainEqual({
+      request_id: KEY_A,
+      fiber_conversation_id: CONVERSATION,
+    });
+  });
+
+  it("does not use another current Connector tool as submit_goal correlation", () => {
+    const reply = scanFiber([
+      currentConnectorRequest("workspace", "workspace_info", KEY_A),
+      currentConnectorRequest("other", "review_summary", KEY_B),
+    ]);
+    const keys = reply.evidence.map((entry: Record<string, unknown>) => entry.request_id);
+    expect(keys).not.toContain(KEY_A);
+    expect(keys).not.toContain(KEY_B);
+  });
+
+  it("rejects invalid keys, text-only injection, and non-request messages", () => {
     const reply = scanFiber([
       request("invalid", "submit_goal", "00000000-0000-1000-8000-000000000003"),
+      currentConnectorRequest("invalid-current", "submit_goal", "00000000-0000-1000-8000-000000000004"),
       request("other", "workspace_info", KEY_A),
       { author: { role: "user" }, content: { content_type: "text", parts: [`correlation_key=${KEY_A}`] } },
+      { author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: [KEY_A] } },
+      { author: { role: "tool" }, recipient: "all", content: {
+        content_type: "code",
+        text: JSON.stringify({ name: "submit_goal", arguments: JSON.stringify({ correlation_key: KEY_A }) }),
+      } },
     ]);
     const keys = reply.evidence.map((entry: Record<string, unknown>) => entry.request_id);
     expect(keys).toContain("request-trace-not-used");
     expect(keys).not.toContain(KEY_A);
   });
 
-  it("passes the submit_goal key through the identity-evidence content path", async () => {
+  it("keeps metadata.request_id separate from the submit_goal key", async () => {
+    const messages = await contentMessages(scanFiber([
+      currentConnectorRequest("submit-current", "submit_goal", KEY_A),
+    ]));
+    expect(messages).toContainEqual({
+      type: "identity_evidence",
+      request_id: PLATFORM_REQUEST_ID,
+      conversation_id: CONVERSATION,
+      navigation_epoch: 0,
+    });
+    expect(messages).toContainEqual({
+      type: "identity_evidence",
+      request_id: KEY_A,
+      conversation_id: CONVERSATION,
+      navigation_epoch: 0,
+    });
+  });
+
+  it("passes the legacy submit_goal key through identity evidence", async () => {
     const messages = await contentMessages(scanFiber([request("submit", "submit_goal", KEY_A)]));
     expect(messages).toContainEqual({
       type: "identity_evidence",

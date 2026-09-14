@@ -205,11 +205,15 @@
       && str(message.id));
   }
 
+  function toolRequestRecipientOf(recipient) {
+    return typeof recipient === 'string'
+      && (recipient.startsWith('api_tool') || recipient.startsWith('Local_MCP_Connector.'));
+  }
+
   function requestOf(message) {
     return Boolean(message && typeof message === 'object'
       && message.author?.role === 'assistant'
-      && typeof message.recipient === 'string'
-      && message.recipient.startsWith('api_tool'));
+      && toolRequestRecipientOf(message.recipient));
   }
 
   function resultOf(message) {
@@ -406,9 +410,13 @@
   }
 
   function submitGoalCorrelationKeyOf(message) {
-    if (!message || typeof message !== 'object' || message.author?.role !== 'assistant'
-      || typeof message.recipient !== 'string' || !message.recipient.startsWith('api_tool')) return null;
+    if (!message || typeof message !== 'object' || message.author?.role !== 'assistant') return null;
+    const recipient = message.recipient;
+    const legacy = recipient === 'api_tool.call_tool';
+    const current = recipient === 'Local_MCP_Connector.submit_goal';
+    if (!legacy && !current) return null;
     const content = message.content;
+    if (!content || typeof content !== 'object' || !['code', 'tool_call'].includes(content.content_type)) return null;
     const text = content && typeof content === 'object' ? content.text : null;
     if (typeof text !== 'string' || text.length === 0 || text.length > 512 * 1024) return null;
     let payload;
@@ -417,9 +425,24 @@
     } catch {
       return null;
     }
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)
-      || !own(payload, 'path') || toolNameFromPath(payload.path) !== 'submit_goal') return null;
-    const args = payload.args;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    const pathName = own(payload, 'path') ? toolNameFromPath(payload.path) : null;
+    if (legacy && pathName !== 'submit_goal') return null;
+    if (own(payload, 'path') && pathName !== 'submit_goal') return null;
+    for (const key of ['name', 'tool', 'tool_name']) {
+      if (own(payload, key) && payload[key] !== 'submit_goal') return null;
+    }
+    const argumentKeys = ['args', 'arguments'].filter((key) => own(payload, key));
+    if (argumentKeys.length !== 1) return null;
+    let args = payload[argumentKeys[0]];
+    if (typeof args === 'string') {
+      if (args.length === 0 || args.length > 512 * 1024) return null;
+      try {
+        args = JSON.parse(args);
+      } catch {
+        return null;
+      }
+    }
     const key = args && typeof args === 'object' && !Array.isArray(args) && own(args, 'correlation_key')
       ? args.correlation_key : null;
     return typeof key === 'string' && CORRELATION_KEY.test(key) ? key : null;
