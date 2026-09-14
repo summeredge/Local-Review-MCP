@@ -137,7 +137,7 @@ describe("MCP HTTP runtime", () => {
 
     await client.connect(transport);
     const result = await client.listTools();
-    expect(result.tools).toHaveLength(11);
+    expect(result.tools).toHaveLength(12);
     expect(result.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
 
     const handoffCall = await client.callTool({

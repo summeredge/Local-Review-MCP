@@ -82,11 +82,13 @@ export const V01_TOOL_NAMES = [
 
 export const WORKSPACE_REGISTRY_TOOL_NAMES = ["workspace_list"] as const;
 export const REVIEW_CONTEXT_TOOL_NAMES = ["review_summary", "execution_output"] as const;
+export const DIAGNOSTIC_TOOL_NAMES = ["correlation_probe"] as const;
 export const CONTROL_PLANE_TOOL_NAMES = ["prepare_goal_handoff", "submit_goal"] as const;
 export const REGISTERED_TOOL_NAMES = [
   ...V01_TOOL_NAMES,
   ...WORKSPACE_REGISTRY_TOOL_NAMES,
   ...REVIEW_CONTEXT_TOOL_NAMES,
+  ...DIAGNOSTIC_TOOL_NAMES,
   ...CONTROL_PLANE_TOOL_NAMES,
 ] as const;
 
@@ -141,6 +143,12 @@ const gitDiffInputSchema = {
   path: z.string().optional().default("."),
   stat: z.boolean().optional().default(false),
 };
+const correlationProbeSchema = z.object({
+  correlation_key: z.string().regex(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu,
+    "correlation_key must be a UUID v4",
+  ),
+}).strict();
 export const GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS = 15_000;
 const EXECUTION_OUTPUT_PATH = ".review/execution_output.json";
 
@@ -674,6 +682,19 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
         return toToolError(error);
       }
     },
+  );
+
+  server.registerTool(
+    "correlation_probe",
+    {
+      description: "Return the supplied UUID v4 correlation key without accessing the workspace or changing state.",
+      inputSchema: correlationProbeSchema,
+      outputSchema: correlationProbeSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => structuredResponse(correlationProbeSchema, {
+      correlation_key: input.correlation_key,
+    }),
   );
 
   server.registerTool(
