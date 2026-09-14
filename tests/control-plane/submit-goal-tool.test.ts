@@ -8,6 +8,9 @@ import {
   ConversationCorrelationRegistry,
 } from "../../src/control-plane/conversation-correlation.js";
 import {
+  extensionIdentityEvidenceSchema,
+} from "../../src/control-plane/extension-identity.js";
+import {
   PendingGoalSubmissionService,
   pendingGoalSubmissionStateFile,
   PENDING_GOAL_SUBMISSION_TTL_MS,
@@ -149,14 +152,32 @@ describe("submit_goal MCP tool", () => {
     expect((await pending.get(CORRELATION_A))?.state).toBe("started");
   });
 
-  it("keeps a provisional new-chat identity pending", async () => {
-    const { client, pending, submitGoal } = await fixture();
+  it("rejects WEB provisional identity before consuming the later canonical identity", async () => {
+    const { client, correlations, pending, submitGoal } = await fixture();
 
     await callFor(client);
-    await new Promise((resolve) => setTimeout(resolve, 10));
 
+    const provisional = evidence(CORRELATION_A, "WEB:temporary-id");
+    expect(extensionIdentityEvidenceSchema.safeParse(provisional).success).toBe(false);
+    await expect(correlations.observe(provisional as never)).rejects.toThrow();
+    expect(correlations.correlation(CORRELATION_A)).toBeNull();
     expect((await pending.get(CORRELATION_A))?.state).toBe("pending_identity");
     expect(submitGoal).not.toHaveBeenCalled();
+
+    await expect(correlations.observe(evidence(CORRELATION_A, "conversation-A")))
+      .resolves.toBe("stored");
+    pending.scheduleResolve(CORRELATION_A);
+    await waitFor(() => submitGoal.mock.calls.length === 1);
+    await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "started");
+
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+    expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
+      conversation_id: "conversation-A",
+    }));
+    expect(submitGoal).not.toHaveBeenCalledWith(expect.objectContaining({
+      conversation_id: "WEB:temporary-id",
+    }));
+    expect((await pending.get(CORRELATION_A))?.state).toBe("started");
   });
 
   it("starts only once when evidence is duplicated", async () => {
