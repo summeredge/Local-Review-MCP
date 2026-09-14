@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -66,7 +67,7 @@ class LauncherWindow(QMainWindow):
         self._startup_started_at: float | None = None
 
         self.setWindowTitle("Local Review MCP Launcher")
-        self.setMinimumWidth(740)
+        self.setMinimumSize(740, 520)
         self.launcher_state = QLabel()
         self.mcp_status = QLabel()
         self.tunnel_status = QLabel()
@@ -184,8 +185,11 @@ class LauncherWindow(QMainWindow):
         layout.addLayout(log_buttons)
         container = QWidget()
         container.setLayout(layout)
-        self.setCentralWidget(container)
-        self.resize(820, self.sizeHint().height())
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(container)
+        self.setCentralWidget(scroll_area)
+        self.resize(820, 680)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_status)
