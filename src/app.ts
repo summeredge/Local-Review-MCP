@@ -20,7 +20,6 @@ import {
 } from "./control-plane/extension-review-completion.js";
 import { CodexExecutionCompletionService } from "./control-plane/codex-execution-completion.js";
 import { AutoIterationService } from "./control-plane/auto-iteration.js";
-import { GoalHandoffService } from "./control-plane/goal-handoff.js";
 import { GoalPreflightService } from "./control-plane/goal-preflight.js";
 import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
 import { GoalSubmissionService } from "./control-plane/goal-submission.js";
@@ -63,7 +62,6 @@ export interface AppContext extends McpRuntimeContext {
   readonly autoIteration?: AutoIterationService;
   readonly goalPreflight?: GoalPreflightService;
   readonly goalOrchestration?: GoalOrchestrationService;
-  readonly goalHandoff?: GoalHandoffService;
   readonly goalSubmission?: GoalSubmissionService;
   readonly pendingGoalSubmission?: PendingGoalSubmissionService;
   readonly executionRouter?: ExecutionRoutingService;
@@ -132,7 +130,6 @@ export function createAppContext(
     autoIteration,
   });
   const goalPreflight = new GoalPreflightService({ settings, registry, storageRoot });
-  const goalHandoff = new GoalHandoffService();
   const goalSubmission = new GoalSubmissionService(goalOrchestration, goalPreflight);
   const correlations = new ConversationCorrelationRegistry(storageRoot);
   const pendingGoalSubmission = new PendingGoalSubmissionService(correlations, goalSubmission, {
@@ -159,7 +156,6 @@ export function createAppContext(
     autoIteration,
     goalPreflight,
     goalOrchestration,
-    goalHandoff,
     goalSubmission,
     pendingGoalSubmission,
     executionRouter,
@@ -229,18 +225,6 @@ export async function startApp(
           const result = await context.correlations.observe(evidence);
           if (result !== "refused") context.pendingGoalSubmission?.scheduleResolve(evidence.request_id);
           await options.onIdentityEvidence?.(evidence);
-        },
-        onGoalHandoffCapture: (capture) => {
-          writeRuntimeDiagnostic(runtimeDiagnosticLogger, {
-            event: "goal_handoff_captured",
-            timestamp: new Date().toISOString(),
-            handoff_id: capture.handoff.handoff_id,
-            workspace_id: capture.handoff.workspace_id,
-            schema_version: capture.handoff.schema_version,
-            conversation_id: capture.conversation_id,
-            navigation_epoch: capture.navigation_epoch,
-            document_id_present: capture.document_id.length > 0,
-          });
         },
         claimExtensionDelivery: async (claim) => {
           if (!deliveryAvailable) throw new ExtensionDeliveryUnavailableError("extension delivery unavailable");

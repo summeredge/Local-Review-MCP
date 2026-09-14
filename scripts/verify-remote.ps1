@@ -167,7 +167,6 @@ try {
             "workspace_list",
             "review_summary",
             "execution_output",
-            "prepare_goal_handoff",
             "submit_goal"
         )
         $actualTools = @($tools | ForEach-Object { Get-PropertyValue $_ "name" })

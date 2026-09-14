@@ -1,8 +1,7 @@
 # Extension Identity PoC
 
-This extension captures browser identity evidence, `submit_goal` correlation evidence, and the
-explicitly activated `GoalHandoffEnvelopeV2`. It does not create or start Goals, deliver reviews,
-or control the browser.
+This extension captures browser identity evidence and `submit_goal` correlation evidence. It
+does not create or start Goals, deliver reviews, or control the browser.
 
 ## Evidence chain
 
@@ -47,15 +46,7 @@ For the existing platform identity-evidence path, `fiber.js` emits only
 `submit_goal` path it additionally emits the same shape with `request_id` set to the strict key
 read from the assistant tool request's `args`; it does not read user text, ordinary assistant text,
 tool-result text, reasoning, or metadata to obtain that key. Missing or conflicting Fiber
-conversation identities are dropped. The separate Goal handoff path reads only the allowlisted
-user activation text and the target tool result envelope described below.
-
-For Goal handoff capture, the same bounded `turn.messages` scan additionally requires an
-assistant `api_tool` request and a `tool` result whose `metadata.invoked_resource.resource_uri`
-names `prepare_goal_handoff`; the result is paired by `metadata.parent_id` to the request's
-message id. Its structured result is accepted only when it is exactly V2 and has no
-`conversation_id`. The signed envelope is carried through unchanged; the Extension does not
-verify its HMAC or authoritative TTL.
+conversation identities are dropped.
 
 `content.js` reads the real current URL and accepts an entry only when the Fiber
 conversation equals the concrete `/c/<id>` or `/g/<project>/c/<id>` route. The project
@@ -81,28 +72,6 @@ validated value to the injectable `onIdentityEvidence` sink. In the production a
 durably stores the first canonical owner in `ConversationCorrelationRegistry`, then schedules
 any matching `PendingGoalSubmission` in the background. The Bridge returns `202` without waiting
 for Goal/Task/Execution startup. A default no-op sink remains available for isolated PoC tests.
-
-## Goal handoff capture gate
-
-The Extension considers only the latest Fiber turn. The latest user message before the paired
-tool request must match a fixed explicit activation pattern such as `建立一个 Goal`、`创建一个
-Goal` or `启动一个 Goal`, and must also contain a direct Codex execution handoff such as
-`交给 Codex 执行`. Assistant and tool messages never satisfy this gate. The current URL must
-match the Fiber conversation, and the existing document/epoch checks must still pass before the
-handoff is sent to the Bridge as:
-
-```json
-{
-  "handoff": { "...": "GoalHandoffEnvelopeV2" },
-  "conversation_id": "<URL conversation>",
-  "document_id": "<Chrome sender documentId>",
-  "navigation_epoch": 0
-}
-```
-
-The Bridge stores captures temporarily and de-duplicates by `handoff_id`; a conflicting payload
-for the same id is rejected. This phase never calls `GoalSubmissionService`, creates a Goal,
-Task, or Execution, starts Codex, or performs HMAC/TTL consume verification.
 
 ## Manual unpacked installation
 

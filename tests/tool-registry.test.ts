@@ -30,7 +30,7 @@ describe("MCP tool registry", () => {
     const result = await client.listTools();
     const names = result.tools.map((tool) => tool.name).sort();
 
-    expect(names).toHaveLength(12);
+    expect(names).toHaveLength(10);
     expect(names).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
     expect(result.tools.find((tool) => tool.name === "workspace_info")?.outputSchema).toMatchObject({
       type: "object",
@@ -112,20 +112,6 @@ describe("MCP tool registry", () => {
         summary: expect.any(Object),
       },
     });
-    expect(result.tools.find((tool) => tool.name === "correlation_probe")?.annotations).toMatchObject({
-      readOnlyHint: true,
-      destructiveHint: false,
-    });
-    expect(result.tools.find((tool) => tool.name === "correlation_probe")?.inputSchema).toMatchObject({
-      type: "object",
-      properties: { correlation_key: expect.any(Object) },
-      additionalProperties: false,
-    });
-    expect(result.tools.find((tool) => tool.name === "correlation_probe")?.outputSchema).toMatchObject({
-      type: "object",
-      properties: { correlation_key: expect.any(Object) },
-      additionalProperties: false,
-    });
     const submitGoal = result.tools.find((tool) => tool.name === "submit_goal");
     expect(submitGoal?.inputSchema).toMatchObject({
       type: "object",
@@ -151,65 +137,5 @@ describe("MCP tool registry", () => {
         expires_at: expect.any(Object),
       },
     });
-    const prepareGoalHandoff = result.tools.find((tool) => tool.name === "prepare_goal_handoff");
-    expect(prepareGoalHandoff?.annotations).toMatchObject({
-      readOnlyHint: true,
-      destructiveHint: false,
-    });
-    expect(prepareGoalHandoff?.inputSchema).toMatchObject({
-      type: "object",
-      properties: {
-        workspace_id: expect.any(Object),
-        title: expect.any(Object),
-        goal: expect.any(Object),
-        requirements: expect.any(Object),
-        acceptance_criteria: expect.any(Object),
-        max_iterations: expect.any(Object),
-      },
-    });
-    expect(prepareGoalHandoff?.inputSchema).not.toHaveProperty("properties.conversation_id");
-    expect(prepareGoalHandoff?.outputSchema).toMatchObject({
-      type: "object",
-      properties: {
-        protocol: expect.any(Object),
-        schema_version: expect.any(Object),
-        handoff_id: expect.any(Object),
-        request_id: expect.any(Object),
-        workspace_id: expect.any(Object),
-        goal: expect.any(Object),
-        issued_at: expect.any(Object),
-        expires_at: expect.any(Object),
-        signature: expect.any(Object),
-      },
-    });
-    expect(prepareGoalHandoff?.outputSchema).not.toHaveProperty("properties.conversation_id");
-  });
-
-  it("echoes only strict UUID v4 keys and keeps concurrent calls separate", async () => {
-    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-probe-"));
-    temporaryDirectories.push(workspace);
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const server = createMcpServer({ registry: WorkspaceRegistry.fromManager(new WorkspaceManager(workspace)) });
-    const client = new Client({ name: "correlation-probe-test", version: "0.1.0" });
-    clients.push(client);
-
-    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-    const keyA = "00000000-0000-4000-8000-000000000001";
-    const keyB = "00000000-0000-4000-8000-000000000002";
-    const [resultA, resultB] = await Promise.all([
-      client.callTool({ name: "correlation_probe", arguments: { correlation_key: keyA } }),
-      client.callTool({ name: "correlation_probe", arguments: { correlation_key: keyB } }),
-    ]);
-
-    expect(resultA.isError).not.toBe(true);
-    expect(resultB.isError).not.toBe(true);
-    expect(resultA.structuredContent).toEqual({ correlation_key: keyA });
-    expect(resultB.structuredContent).toEqual({ correlation_key: keyB });
-
-    const invalid = await client.callTool({
-      name: "correlation_probe",
-      arguments: { correlation_key: "00000000-0000-1000-8000-000000000003" },
-    });
-    expect(invalid.isError).toBe(true);
   });
 });

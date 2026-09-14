@@ -9,11 +9,6 @@ import { GitService } from "../git/service.js";
 import type { GitDiffResponse, GitStatusResponse } from "../git/types.js";
 import type { ConversationCorrelationRegistry } from "../control-plane/conversation-correlation.js";
 import {
-  goalHandoffEnvelopeV2Schema,
-  goalHandoffInputSchema,
-  type GoalHandoffService,
-} from "../control-plane/goal-handoff.js";
-import {
   goalSubmissionToolInputSchema,
   goalSubmissionAcceptedSchema,
   type GoalSubmissionService,
@@ -28,7 +23,7 @@ import type { WorkspaceRegistry, WorkspaceSelection } from "../workspace/registr
 import { searchText } from "../workspace/search.js";
 import { containsNullByte } from "../workspace/text.js";
 import { structuredResponse } from "./respond.js";
-import { inboundRequestId, inboundRequestOrigin } from "./inbound.js";
+import { inboundRequestOrigin } from "./inbound.js";
 import { correlationKeySchema, ROOT_ALIAS } from "./schema/common.js";
 import {
   gitDiffOutputSchema,
@@ -55,7 +50,6 @@ export interface McpRuntimeContext {
   readonly workspace?: WorkspaceManager;
   readonly registry: WorkspaceRegistry;
   readonly correlations?: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">;
-  readonly goalHandoff?: Pick<GoalHandoffService, "prepareGoalHandoff">;
   readonly goalSubmission?: Pick<GoalSubmissionService, "submitGoal">;
   readonly pendingGoalSubmission?: Pick<PendingGoalSubmissionService, "accept">;
   readonly connectorEvidence?: {
@@ -82,13 +76,11 @@ export const V01_TOOL_NAMES = [
 
 export const WORKSPACE_REGISTRY_TOOL_NAMES = ["workspace_list"] as const;
 export const REVIEW_CONTEXT_TOOL_NAMES = ["review_summary", "execution_output"] as const;
-export const DIAGNOSTIC_TOOL_NAMES = ["correlation_probe"] as const;
-export const CONTROL_PLANE_TOOL_NAMES = ["prepare_goal_handoff", "submit_goal"] as const;
+export const CONTROL_PLANE_TOOL_NAMES = ["submit_goal"] as const;
 export const REGISTERED_TOOL_NAMES = [
   ...V01_TOOL_NAMES,
   ...WORKSPACE_REGISTRY_TOOL_NAMES,
   ...REVIEW_CONTEXT_TOOL_NAMES,
-  ...DIAGNOSTIC_TOOL_NAMES,
   ...CONTROL_PLANE_TOOL_NAMES,
 ] as const;
 
@@ -143,9 +135,6 @@ const gitDiffInputSchema = {
   path: z.string().optional().default("."),
   stat: z.boolean().optional().default(false),
 };
-const correlationProbeSchema = z.object({
-  correlation_key: correlationKeySchema,
-}).strict();
 const EXECUTION_OUTPUT_PATH = ".review/execution_output.json";
 
 interface ListedEntry {
@@ -666,53 +655,6 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     async (input) => {
       try {
         return structuredResponse(executionOutputOutputSchema, await executionOutput(registry.resolve(input.workspace_id).manager));
-      } catch (error: unknown) {
-        return toToolError(error);
-      }
-    },
-  );
-
-  server.registerTool(
-    "correlation_probe",
-    {
-      description: "Return the supplied UUID v4 correlation key without accessing the workspace or changing state.",
-      inputSchema: correlationProbeSchema,
-      outputSchema: correlationProbeSchema,
-      annotations: READ_ONLY_ANNOTATIONS,
-    },
-    async (input) => structuredResponse(correlationProbeSchema, {
-      correlation_key: input.correlation_key,
-    }),
-  );
-
-  server.registerTool(
-    "prepare_goal_handoff",
-    {
-      description: "Use only when the user explicitly asks to establish or start a Goal and hand it to Codex for execution. Convert the request into title, goal, requirements, acceptance_criteria, and max_iterations. This read-only tool only prepares a signed handoff; it does not create or start a Goal. The handoff includes the MCP request trace; conversation identity is bound later by the Extension.",
-      inputSchema: goalHandoffInputSchema,
-      outputSchema: goalHandoffEnvelopeV2Schema,
-      annotations: READ_ONLY_ANNOTATIONS,
-    },
-    async (input) => {
-      const goalHandoff = context.goalHandoff;
-      if (goalHandoff === undefined) {
-        return toToolError(new Error("Goal handoff runtime is unavailable."));
-      }
-
-      try {
-        const requestId = inboundRequestId();
-        if (requestId === null) return toToolError(new Error("MCP request trace is unavailable."));
-
-        const selection = registry.resolve(input.workspace_id);
-        return structuredResponse(goalHandoffEnvelopeV2Schema, goalHandoff.prepareGoalHandoff({
-          request_id: requestId,
-          workspace_id: selection.id,
-          title: input.title,
-          goal: input.goal,
-          requirements: input.requirements,
-          acceptance_criteria: input.acceptance_criteria,
-          max_iterations: input.max_iterations,
-        }));
       } catch (error: unknown) {
         return toToolError(error);
       }

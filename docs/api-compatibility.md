@@ -2,7 +2,7 @@
 
 This document defines how the frozen V0.1 MCP contract may evolve. The current
 tool names, input fields, output fields, workspace scope, and permission model
-are the compatibility baseline. The current surface has ten read-only tools
+are the compatibility baseline. The current surface has nine read-only tools
 and the reviewed `submit_goal` Control Plane tool.
 
 ## Allowed additive changes
@@ -30,21 +30,17 @@ ordinary additive updates:
 - change the permission model.
 
 Before accepting one of these changes, update the contract documentation,
-review client impact, and make the schema/version decision explicit. The
-P3.2C-1R correction upgrades the newly introduced `prepare_goal_handoff`
-preparation envelope to the formal `GoalHandoffEnvelopeV2` contract with
-`schema_version = "2"`; it contains no `conversation_id`, while `submit_goal`
-now requires a new strict UUID v4 `correlation_key` per invocation. The pending
+review client impact, and make the schema/version decision explicit. `submit_goal`
+requires a new strict UUID v4 `correlation_key` per invocation. The pending
 direct-submit change also intentionally changes the `submit_goal` output from
 workflow IDs to an asynchronous durable acceptance receipt. See
-`tool-contract.md` for the current handoff and submission contracts.
+`tool-contract.md` for the current submission contract.
 
 ## Compatibility expectations
 
 Existing clients may continue to call all nine frozen read-only tools and
 receive their current response structures. `tools/list` additionally exposes
-the read-only `prepare_goal_handoff` tool and the explicitly reviewed
-`submit_goal` Control Plane entry point. Workspace selection continues to
+the explicitly reviewed `submit_goal` Control Plane entry point. Workspace selection continues to
 resolve only registered `workspace_id` values, never an arbitrary
 caller-supplied local path.
 

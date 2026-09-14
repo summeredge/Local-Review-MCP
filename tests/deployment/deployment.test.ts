@@ -191,7 +191,6 @@ async function makeRemoteServer(): Promise<string> {
                 "workspace_list",
                 "review_summary",
                 "execution_output",
-                "prepare_goal_handoff",
                 "submit_goal",
               ].map((name) => ({ name })),
             }

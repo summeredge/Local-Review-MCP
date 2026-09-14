@@ -54,9 +54,6 @@ or Review Delivery records. The separate pending Control Plane consumer may call
 `GoalSubmissionService` only after `correlation(correlation_key)` returns the registry's proven
 canonical owner.
 
-`prepare_goal_handoff` is intentionally outside this join: it signs the Goal, selected workspace,
-MCP request trace, handoff identity, and validity window without resolving or returning a
-`conversation_id`. `submit_goal` uses the exact UUID v4 key supplied in its invocation as a
-pending-submission key until the Extension proves the matching current ChatGPT conversation
-identity. A `WEB:*` provisional identity is never stored as a canonical owner or passed to Goal
-domain services.
+`submit_goal` uses the exact UUID v4 key supplied in its invocation as a pending-submission key
+until the Extension proves the matching current ChatGPT conversation identity. A `WEB:*`
+provisional identity is never stored as a canonical owner or passed to Goal domain services.
