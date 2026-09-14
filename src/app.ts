@@ -24,6 +24,7 @@ import { GoalHandoffService } from "./control-plane/goal-handoff.js";
 import { GoalPreflightService } from "./control-plane/goal-preflight.js";
 import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
 import { GoalSubmissionService } from "./control-plane/goal-submission.js";
+import { PendingGoalSubmissionService } from "./control-plane/pending-goal-submission.js";
 import { ExecutionRoutingService } from "./control-plane/execution-routing.js";
 import {
   LOCAL_CONTROL_BRIDGE_HOST,
@@ -64,6 +65,7 @@ export interface AppContext extends McpRuntimeContext {
   readonly goalOrchestration?: GoalOrchestrationService;
   readonly goalHandoff?: GoalHandoffService;
   readonly goalSubmission?: GoalSubmissionService;
+  readonly pendingGoalSubmission?: PendingGoalSubmissionService;
   readonly executionRouter?: ExecutionRoutingService;
 }
 
@@ -132,6 +134,10 @@ export function createAppContext(
   const goalPreflight = new GoalPreflightService({ settings, registry, storageRoot });
   const goalHandoff = new GoalHandoffService();
   const goalSubmission = new GoalSubmissionService(goalOrchestration, goalPreflight);
+  const correlations = new ConversationCorrelationRegistry(storageRoot);
+  const pendingGoalSubmission = new PendingGoalSubmissionService(correlations, goalSubmission, {
+    storageRoot,
+  });
   const executionRouter = new ExecutionRoutingService(registry, {
     storageRoot,
     autoIteration,
@@ -143,7 +149,7 @@ export function createAppContext(
     settings,
     storageRoot,
     connectorEvidence,
-    correlations: new ConversationCorrelationRegistry(),
+    correlations,
     extensionDeliveries,
     extensionReviewCompletions,
     codexExecutionCompletion,
@@ -155,6 +161,7 @@ export function createAppContext(
     goalOrchestration,
     goalHandoff,
     goalSubmission,
+    pendingGoalSubmission,
     executionRouter,
     tunnel: createTunnelManager(settings.remote, {
       localEndpoint: localOrigin(settings),
@@ -192,6 +199,11 @@ export async function startApp(
       const extensionDeliveries = context.extensionDeliveries;
       await context.correlations.restore();
       try {
+        await context.pendingGoalSubmission?.restore();
+      } catch {
+        console.warn("Pending Goal submission unavailable; durable state could not be restored");
+      }
+      try {
         await context.controlledActuation?.restore();
       } catch {
         console.warn("Controlled Actuation unavailable; durable state could not be restored");
@@ -214,7 +226,8 @@ export async function startApp(
       const bridgePort = await startBridge({
         ports: options.bridgePorts,
         onIdentityEvidence: async (evidence) => {
-          await context.correlations.observe(evidence);
+          const result = await context.correlations.observe(evidence);
+          if (result !== "refused") context.pendingGoalSubmission?.scheduleResolve(evidence.request_id);
           await options.onIdentityEvidence?.(evidence);
         },
         onGoalHandoffCapture: (capture) => {
@@ -306,6 +319,11 @@ export async function startApp(
       console.warn("Execution Routing recovery failed; local MCP remains available");
     }
     context.goalPreflight?.setRuntimeReady(true);
+    try {
+      await context.pendingGoalSubmission?.recover();
+    } catch {
+      console.warn("Pending Goal submission recovery failed; local MCP remains available");
+    }
     return server;
   } catch (error: unknown) {
     if (isPortInUse(error)) {

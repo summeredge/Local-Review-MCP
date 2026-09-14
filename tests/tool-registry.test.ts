@@ -145,11 +145,10 @@ describe("MCP tool registry", () => {
     expect(submitGoal?.outputSchema).toMatchObject({
       type: "object",
       properties: {
-        goal_id: expect.any(Object),
-        phase_id: expect.any(Object),
-        task_id: expect.any(Object),
-        execution_id: expect.any(Object),
-        status: expect.any(Object),
+        accepted: expect.any(Object),
+        correlation_key: expect.any(Object),
+        accepted_at: expect.any(Object),
+        expires_at: expect.any(Object),
       },
     });
     const prepareGoalHandoff = result.tools.find((tool) => tool.name === "prepare_goal_handoff");

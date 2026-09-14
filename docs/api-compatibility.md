@@ -34,7 +34,9 @@ review client impact, and make the schema/version decision explicit. The
 P3.2C-1R correction upgrades the newly introduced `prepare_goal_handoff`
 preparation envelope to the formal `GoalHandoffEnvelopeV2` contract with
 `schema_version = "2"`; it contains no `conversation_id`, while `submit_goal`
-now requires a new strict UUID v4 `correlation_key` per invocation. See
+now requires a new strict UUID v4 `correlation_key` per invocation. The pending
+direct-submit change also intentionally changes the `submit_goal` output from
+workflow IDs to an asynchronous durable acceptance receipt. See
 `tool-contract.md` for the current handoff and submission contracts.
 
 ## Compatibility expectations
@@ -45,3 +47,9 @@ the read-only `prepare_goal_handoff` tool and the explicitly reviewed
 `submit_goal` Control Plane entry point. Workspace selection continues to
 resolve only registered `workspace_id` values, never an arbitrary
 caller-supplied local path.
+
+`submit_goal` accepts and durably stores the Goal payload before returning
+`{accepted, correlation_key, accepted_at, expires_at}`. The canonical
+`conversation_id` may be established later by Extension identity evidence;
+`WEB:*` provisional identity is not authority, and Goal startup happens only
+after the existing canonical Fiber/URL/document/navigation checks succeed.

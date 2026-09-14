@@ -28,10 +28,11 @@ The versioned JSON snapshot is written through a temporary file and atomic renam
 are ignored; an unreadable or invalid snapshot restores no guessed ownership and does not stop
 the MCP Data Plane.
 
-`correlation(requestId)` performs an exact lookup. `awaitCorrelation(requestId, timeoutMs)` only
-waits for late evidence for that same exact ID; the timeout bounds the waiter, not ownership.
-`submit_goal` passes its input `correlation_key` directly to these lookup methods and does not
-use the AsyncLocalStorage inbound request ID.
+`correlation(requestId)` performs an exact lookup. `awaitCorrelation(requestId, timeoutMs)` remains
+available for other diagnostic or integration paths and only waits for late evidence for that same
+exact ID; the timeout bounds the waiter, not ownership. Direct `submit_goal` no longer waits on
+this method. It durably records a `PendingGoalSubmission` and returns an acceptance receipt, then
+the registry observation schedules asynchronous pending consumption.
 
 `document_id`, `navigation_epoch`, and observation times describe the browser evidence source.
 They are diagnostics and freshness metadata, never conversation-guessing signals.
@@ -48,10 +49,14 @@ ConversationRouting
 review_request_id → conversation_id
 ```
 
-Correlation does not create or update Task, Execution, ReviewRequest, ConversationRouting, or
-Review Delivery records.
+Correlation does not itself create or update Task, Execution, ReviewRequest, ConversationRouting,
+or Review Delivery records. The separate pending Control Plane consumer may call the existing
+`GoalSubmissionService` only after `correlation(correlation_key)` returns the registry's proven
+canonical owner.
 
 `prepare_goal_handoff` is intentionally outside this join: it signs the Goal, selected workspace,
 MCP request trace, handoff identity, and validity window without resolving or returning a
-`conversation_id`. `submit_goal` uses the exact UUID v4 key supplied in its invocation until
-the Extension proves the matching current ChatGPT conversation identity.
+`conversation_id`. `submit_goal` uses the exact UUID v4 key supplied in its invocation as a
+pending-submission key until the Extension proves the matching current ChatGPT conversation
+identity. A `WEB:*` provisional identity is never stored as a canonical owner or passed to Goal
+domain services.

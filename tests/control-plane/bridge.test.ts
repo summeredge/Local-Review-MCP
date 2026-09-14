@@ -18,6 +18,11 @@ import {
 import { ConversationCorrelationRegistry } from "../../src/control-plane/conversation-correlation.js";
 import { CodexExecutionCompletionService } from "../../src/control-plane/codex-execution-completion.js";
 import { ExtensionDeliveryService } from "../../src/control-plane/extension-delivery.js";
+import { PendingGoalSubmissionService } from "../../src/control-plane/pending-goal-submission.js";
+import type {
+  GoalSubmissionRequest,
+  GoalSubmissionResult,
+} from "../../src/control-plane/goal-submission.js";
 import {
   ExtensionReviewCompletionService,
   extensionReviewCompletionStateFile,
@@ -282,6 +287,68 @@ describe("Local Control Bridge protocol", () => {
     expect(sink).toHaveBeenCalledTimes(2);
     expect(sink).toHaveBeenNthCalledWith(1, evidence);
     expect(sink).toHaveBeenNthCalledWith(2, wfrEvidence);
+  });
+
+  it("returns identity evidence 202 while pending Goal startup is still running", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-bridge-pending-goal-"));
+    let release!: () => void;
+    const correlations = new ConversationCorrelationRegistry(root);
+    const blocked = new Promise<GoalSubmissionResult>((resolve) => {
+      release = () => resolve({
+        goal_id: "goal-bridge-pending",
+        phase_id: "phase-bridge-pending",
+        task_id: "task-bridge-pending",
+        execution_id: "execution-bridge-pending",
+        status: "running",
+      });
+    });
+    const submitGoal = vi.fn(async (_request: GoalSubmissionRequest) => blocked);
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    const correlationKey = "00000000-0000-4000-8000-000000000003";
+    await pending.accept({
+      correlation_key: correlationKey,
+      workspace_id: "workspace-a",
+      title: "Bridge pending Goal",
+      goal: "Start after canonical identity evidence.",
+      requirements: ["Keep Bridge responsive."],
+      acceptance_criteria: ["Identity evidence receives 202."],
+      max_iterations: 2,
+    });
+    await expect(startBridge({
+      ports: [0],
+      onIdentityEvidence: async (evidence) => {
+        const observation = await correlations.observe(evidence);
+        if (observation !== "refused") pending.scheduleResolve(evidence.request_id);
+      },
+    })).resolves.toBeGreaterThan(0);
+    const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+
+    try {
+      const response = await Promise.race([
+        request("/identity-evidence", {
+          method: "POST",
+          token,
+          body: {
+            request_id: correlationKey,
+            conversation_id: "conversation-bridge-pending",
+            document_id: "document-bridge-pending",
+            navigation_epoch: 1,
+          },
+        }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Bridge response timed out")), 500)),
+      ]);
+      expect(response).toEqual({ status: 202, body: { accepted: true } });
+      const deadline = Date.now() + 1_000;
+      while (submitGoal.mock.calls.length === 0 && Date.now() < deadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      expect(submitGoal).toHaveBeenCalledTimes(1);
+    } finally {
+      release();
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("captures an exact V2 handoff with browser identity, deduplicates it, and never consumes it", async () => {

@@ -1,5 +1,29 @@
 # Learnings
 
+## [LRN-20260914-001] New Chat 在首条消息后才获得 conversation_id
+
+**Priority**: medium
+**Status**: resolved
+**Area**: tools
+
+### 内容
+
+ChatGPT 点击“新聊天”时地址仍是 `chatgpt.com/`；发送首条消息后才生成真实的
+`/c/<conversation_id>` 路由。Live identity 诊断必须从根地址发送首条消息，再使用
+随后生成的会话 URL 做 document、Fiber 和 registry 关联。
+
+### 建议修复
+
+不要要求新聊天在发送前已经出现 `/c/<conversation_id>`；发送后重新读取当前 URL，
+并在确认路由稳定后继续 direct `submit_goal` 诊断。
+
+### 元数据
+
+- Source: correction
+- See Also: none
+
+---
+
 ## [LRN-20260907-002] 真实 ChatGPT Fiber 的会话身份位于 turn 同级 conversation
 
 **Priority**: high

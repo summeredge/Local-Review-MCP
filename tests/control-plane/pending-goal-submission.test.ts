@@ -1,0 +1,186 @@
+import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  ConversationCorrelationRegistry,
+} from "../../src/control-plane/conversation-correlation.js";
+import {
+  GoalPreflightError,
+  type GoalPreflightResult,
+} from "../../src/control-plane/goal-preflight.js";
+import {
+  PendingGoalSubmissionService,
+  pendingGoalSubmissionStateFile,
+  type PendingGoalSubmissionInput,
+} from "../../src/control-plane/pending-goal-submission.js";
+import type {
+  GoalSubmissionRequest,
+  GoalSubmissionResult,
+} from "../../src/control-plane/goal-submission.js";
+
+const temporaryDirectories: string[] = [];
+const CORRELATION_A = "00000000-0000-4000-8000-000000000001";
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) =>
+    rm(directory, { recursive: true, force: true })));
+});
+
+function input(correlation_key = CORRELATION_A): PendingGoalSubmissionInput {
+  return {
+    correlation_key,
+    workspace_id: "workspace-a",
+    title: "Pending Goal",
+    goal: "Run this Goal after the canonical conversation is known.",
+    requirements: ["Keep the existing workflow."],
+    acceptance_criteria: ["The Goal starts exactly once."],
+    max_iterations: 2,
+  };
+}
+
+function evidence(request_id = CORRELATION_A) {
+  return {
+    request_id,
+    conversation_id: "conversation-a",
+    document_id: "document-a",
+    navigation_epoch: 1,
+  };
+}
+
+function result(conversation_id = "conversation-a"): GoalSubmissionResult {
+  return {
+    goal_id: `goal-${conversation_id}`,
+    phase_id: "phase-1",
+    task_id: "task-1",
+    execution_id: "execution-1",
+    status: "running",
+  };
+}
+
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await predicate())) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting for pending Goal submission");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+async function makeRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "local-review-mcp-pending-goal-"));
+  temporaryDirectories.push(root);
+  return root;
+}
+
+function preflightFailure(): GoalPreflightResult {
+  return {
+    ready: false,
+    runtime: { ready: true },
+    connector: { ready: false, status: "unconfigured", action: "none" },
+    extension: { ready: false },
+    workspace: { valid: true, workspace_id: "workspace-a" },
+    conversation: { valid: true, conversation_id: "conversation-a" },
+    failure_stage: "connector",
+    failure_reason: "remote_not_configured",
+  };
+}
+
+describe("PendingGoalSubmissionService", () => {
+  it("recovers a pending submission when canonical correlation was restored", async () => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const first = new PendingGoalSubmissionService(correlations, {
+      submitGoal: vi.fn(async () => result()),
+    }, { storageRoot: root });
+    await first.accept(input());
+    await correlations.observe(evidence());
+
+    const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => result(request.conversation_id));
+    const restarted = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    await restarted.restore();
+    await restarted.recover();
+    await waitFor(() => submitGoal.mock.calls.length === 1);
+
+    expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
+      workspace_id: "workspace-a",
+      conversation_id: "conversation-a",
+    }));
+    expect((await restarted.get(CORRELATION_A))?.state).toBe("started");
+  });
+
+  it("converts restored starting work to indeterminate without retrying", async () => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const first = new PendingGoalSubmissionService(correlations, {
+      submitGoal: vi.fn(async () => result()),
+    }, { storageRoot: root });
+    await first.accept(input());
+    await correlations.observe(evidence());
+    const file = pendingGoalSubmissionStateFile(root);
+    const state = JSON.parse(await readFile(file, "utf8")) as {
+      submissions: Array<Record<string, unknown>>;
+    };
+    state.submissions[0]!.state = "starting";
+    await writeFile(file, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+    const submitGoal = vi.fn(async () => result());
+    const restarted = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    await restarted.restore();
+    await restarted.recover();
+
+    expect((await restarted.get(CORRELATION_A))?.state).toBe("indeterminate");
+    expect(submitGoal).not.toHaveBeenCalled();
+  });
+
+  it("stores a terminal result and ignores later duplicate evidence", async () => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const submitGoal = vi.fn(async () => result());
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    await pending.accept(input());
+    await correlations.observe(evidence());
+    await Promise.all([pending.resolve(CORRELATION_A), pending.resolve(CORRELATION_A)]);
+    await correlations.observe(evidence());
+    await pending.resolve(CORRELATION_A);
+
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+    expect((await pending.get(CORRELATION_A))?.state).toBe("started");
+    expect((await pending.get(CORRELATION_A)) as Record<string, unknown>).toMatchObject({
+      goal_id: "goal-conversation-a",
+      phase_id: "phase-1",
+      task_id: "task-1",
+      execution_id: "execution-1",
+      status: "running",
+    });
+  });
+
+  it("marks a known preflight failure failed and an uncertain failure indeterminate", async () => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const knownFailure = new PendingGoalSubmissionService(correlations, {
+      submitGoal: vi.fn(async () => {
+        throw new GoalPreflightError(preflightFailure());
+      }),
+    }, { storageRoot: root });
+    await knownFailure.accept(input());
+    await correlations.observe(evidence());
+    await knownFailure.resolve(CORRELATION_A);
+    expect((await knownFailure.get(CORRELATION_A))?.state).toBe("failed");
+
+    const uncertainRoot = await makeRoot();
+    const uncertainCorrelations = new ConversationCorrelationRegistry(uncertainRoot);
+    const uncertainSubmit = vi.fn(async () => {
+      throw new Error("startup outcome is unknown");
+    });
+    const uncertain = new PendingGoalSubmissionService(uncertainCorrelations, {
+      submitGoal: uncertainSubmit,
+    }, { storageRoot: uncertainRoot });
+    await uncertain.accept(input());
+    await uncertainCorrelations.observe(evidence());
+    await uncertain.resolve(CORRELATION_A);
+    await uncertain.resolve(CORRELATION_A);
+    expect((await uncertain.get(CORRELATION_A))?.state).toBe("indeterminate");
+    expect(uncertainSubmit).toHaveBeenCalledTimes(1);
+  });
+
+});

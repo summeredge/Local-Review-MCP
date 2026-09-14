@@ -237,7 +237,8 @@ not expose direct write, exec, shell, commit, or push operations.
 
 ### `submit_goal`
 
-- Purpose: Create and start a Goal through the existing `GoalSubmissionService`.
+- Purpose: Reliably accept a Goal submission for asynchronous Control Plane
+  startup through the existing `GoalSubmissionService`.
 - Input:
 
   ```json
@@ -254,15 +255,35 @@ not expose direct write, exec, shell, commit, or push operations.
 
   `max_iterations` defaults to `2`. `conversation_id` is not an input field. The
   model must generate a new UUID v4 `correlation_key` for every invocation and
-  never reuse one; users do not need to provide it manually. The server resolves
-  `conversation_id` from the exact matching Extension evidence for that key.
-- Output: `{ "goal_id": string, "phase_id": string, "task_id": string, "execution_id": string, "status": string }`
+  never reuse one; users do not need to provide it manually. The key is the
+  durable pending-submission id.
+- Output:
+
+  ```json
+  {
+    "accepted": true,
+    "correlation_key": "strict UUID v4",
+    "accepted_at": "RFC3339 timestamp",
+    "expires_at": "RFC3339 timestamp"
+  }
+  ```
+
+  This receipt only means that LRM durably saved the request. It deliberately
+  does not return `goal_id`, `phase_id`, `task_id`, or `execution_id`, because
+  the canonical conversation may not exist when `submit_goal` returns.
 - Workspace scope: the active registered workspace when `workspace_id` is
   omitted; an explicitly supplied ID must resolve through the Workspace
   Registry.
-- Permission: authenticated Control Plane operation. The server first checks the
-  exact `correlation_key` and waits only for late evidence for that same key. It
-  does not use HTTP `x-request-id`, JSON-RPC body `id`, or
-  `message.metadata.request_id` as conversation authority. If no proven
-  conversation arrives, it returns `conversation_not_correlated` and creates no
-  Goal.
+- Permission: authenticated Control Plane operation. The server resolves the
+  workspace through `WorkspaceRegistry`, durably stores a
+  `PendingGoalSubmission`, and returns without waiting for identity evidence.
+  After the Extension proves the exact canonical ChatGPT route, the existing
+  `ConversationCorrelationRegistry` triggers asynchronous consumption and
+  `GoalSubmissionService.submitGoal()`.
+
+  Only a real `https://chatgpt.com/c/<conversation_id>` or exact one-segment
+  Project route, after the existing Fiber, URL, document, and navigation
+  authority checks, may supply `conversation_id`. `WEB:*` provisional identity
+  is never an authority. Pending identity expires after two minutes; missing
+  evidence therefore creates no Goal. The same `correlation_key` with the same
+  payload is idempotent, while a different payload is rejected.

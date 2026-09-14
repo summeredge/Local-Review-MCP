@@ -51,8 +51,18 @@ export const goalSubmissionResultSchema = z.object({
   status: goalOrchestrationStatusSchema,
 }).strict();
 
+const goalSubmissionTimestampSchema = z.string().datetime({ offset: true });
+
+export const goalSubmissionAcceptedSchema = z.object({
+  accepted: z.literal(true),
+  correlation_key: correlationKeySchema,
+  accepted_at: goalSubmissionTimestampSchema,
+  expires_at: goalSubmissionTimestampSchema,
+}).strict();
+
 export type GoalSubmissionRequest = z.input<typeof goalSubmissionRequestSchema>;
 export type GoalSubmissionResult = z.infer<typeof goalSubmissionResultSchema>;
+export type GoalSubmissionAccepted = z.infer<typeof goalSubmissionAcceptedSchema>;
 export type GoalSubmissionOrchestration = Pick<
   GoalOrchestrationService,
   "createGoal" | "startGoal"

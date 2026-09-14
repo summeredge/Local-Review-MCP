@@ -1,6 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -8,10 +8,14 @@ import {
   ConversationCorrelationRegistry,
 } from "../../src/control-plane/conversation-correlation.js";
 import {
-  GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS,
+  PendingGoalSubmissionService,
+  pendingGoalSubmissionStateFile,
+  PENDING_GOAL_SUBMISSION_TTL_MS,
+  type PendingGoalSubmissionInput,
+} from "../../src/control-plane/pending-goal-submission.js";
+import {
   createMcpServer,
 } from "../../src/mcp/server.js";
-import { withInboundRequestId } from "../../src/mcp/inbound.js";
 import type {
   GoalSubmissionRequest,
   GoalSubmissionResult,
@@ -50,11 +54,20 @@ function goalArguments(correlation_key = CORRELATION_A) {
   };
 }
 
-async function fixture() {
-  const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-submit-goal-"));
-  temporaryDirectories.push(workspace);
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await predicate())) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting for pending Goal submission");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+async function fixture(options: { readonly now?: () => number } = {}) {
+  const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-submit-goal-workspace-"));
+  const storageRoot = await mkdtemp(join(tmpdir(), "local-review-mcp-submit-goal-state-"));
+  temporaryDirectories.push(workspace, storageRoot);
   const registry = WorkspaceRegistry.fromManager(new WorkspaceManager(workspace));
-  const correlations = new ConversationCorrelationRegistry(workspace);
+  const correlations = new ConversationCorrelationRegistry(storageRoot);
   const submitGoal = vi.fn(async (request: GoalSubmissionRequest): Promise<GoalSubmissionResult> => ({
     goal_id: `goal-${request.conversation_id}`,
     phase_id: "phase-1",
@@ -62,23 +75,34 @@ async function fixture() {
     execution_id: "execution-1",
     status: "running",
   }));
+  const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {
+    storageRoot,
+    now: options.now,
+  });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const server = createMcpServer({ registry, correlations, goalSubmission: { submitGoal } });
+  const server = createMcpServer({
+    registry,
+    correlations,
+    pendingGoalSubmission: pending,
+  });
   const client = new Client({ name: "submit-goal-test", version: "0.1.0" });
   clients.push(client);
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-  return { client, correlations, submitGoal, workspaceId: registry.active.id };
+  return {
+    client,
+    correlations,
+    pending,
+    submitGoal,
+    storageRoot,
+    workspaceId: registry.active.id,
+  };
 }
 
 function callFor(
   client: Client,
-  inboundRequestId: string | null,
   arguments_: Record<string, unknown> = goalArguments(),
 ) {
-  return withInboundRequestId(inboundRequestId, () => client.callTool({
-    name: "submit_goal",
-    arguments: arguments_,
-  }));
+  return client.callTool({ name: "submit_goal", arguments: arguments_ });
 }
 
 function toolJson(result: unknown): Record<string, unknown> {
@@ -91,112 +115,126 @@ function toolJson(result: unknown): Record<string, unknown> {
 }
 
 describe("submit_goal MCP tool", () => {
-  it("binds an existing exact correlation and reuses GoalSubmissionService", async () => {
-    const { client, correlations, submitGoal, workspaceId } = await fixture();
-    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
+  it("durably accepts without correlation and does not start a Goal", async () => {
+    const { client, pending, submitGoal, storageRoot } = await fixture();
 
-    const result = await callFor(client, "transport-A");
+    const result = await callFor(client);
 
     expect(result.isError).not.toBe(true);
-    expect(toolJson(result)).toEqual({
-      goal_id: "goal-conversation-A",
-      phase_id: "phase-1",
-      task_id: "task-1",
-      execution_id: "execution-1",
-      status: "running",
-    });
-    const { correlation_key: _correlationKey, ...domainArguments } = goalArguments();
+    expect(toolJson(result)).toMatchObject({ accepted: true, correlation_key: CORRELATION_A });
+    expect(submitGoal).not.toHaveBeenCalled();
+    expect((await pending.get(CORRELATION_A))?.state).toBe("pending_identity");
+    await expect(readFile(pendingGoalSubmissionStateFile(storageRoot), "utf8"))
+      .resolves.toContain(CORRELATION_A);
+  });
+
+  it("consumes a pending submission after late canonical evidence", async () => {
+    const { client, correlations, pending, submitGoal, workspaceId } = await fixture();
+
+    await callFor(client);
+    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
+    pending.scheduleResolve(CORRELATION_A);
+    await waitFor(() => submitGoal.mock.calls.length === 1);
+    await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "started");
+
     expect(submitGoal).toHaveBeenCalledWith({
-      ...domainArguments,
       workspace_id: workspaceId,
       conversation_id: "conversation-A",
+      title: "MCP Goal",
+      goal: "Run the requested Goal through Codex.",
+      requirements: ["Use the existing Goal workflow."],
+      acceptance_criteria: ["The Goal workflow starts."],
+      max_iterations: 2,
     });
+    expect((await pending.get(CORRELATION_A))?.state).toBe("started");
   });
 
-  it("waits for late evidence for the same exact correlation key", async () => {
-    const { client, correlations, submitGoal } = await fixture();
-    const pending = callFor(client, "transport-A");
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  it("keeps a provisional new-chat identity pending", async () => {
+    const { client, pending, submitGoal } = await fixture();
+
+    await callFor(client);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect((await pending.get(CORRELATION_A))?.state).toBe("pending_identity");
     expect(submitGoal).not.toHaveBeenCalled();
-
-    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
-    const result = await pending;
-    expect(result.isError).not.toBe(true);
-    expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
-      conversation_id: "conversation-A",
-    }));
   });
 
-  it("fails closed when the current request remains uncorrelated", async () => {
-    const { client, correlations, submitGoal } = await fixture();
-    await correlations.observe(evidence(CORRELATION_B, "conversation-B"));
-    const wait = vi.spyOn(correlations, "awaitCorrelation").mockResolvedValue(null);
+  it("starts only once when evidence is duplicated", async () => {
+    const { correlations, pending, submitGoal, workspaceId } = await fixture();
+    await pending.accept({
+      ...goalArguments(),
+      workspace_id: workspaceId,
+    } as PendingGoalSubmissionInput);
+    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
+    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
+    pending.scheduleResolve(CORRELATION_A);
+    pending.scheduleResolve(CORRELATION_A);
+    await waitFor(() => submitGoal.mock.calls.length === 1);
+    await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "started");
 
-    const result = await callFor(client, "transport-A");
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+  });
+
+  it("is idempotent for duplicate submission payloads", async () => {
+    const { client, pending, submitGoal } = await fixture();
+
+    const first = await callFor(client);
+    const second = await callFor(client);
+
+    expect(toolJson(second)).toEqual(toolJson(first));
+    expect(await pending.list()).toHaveLength(1);
+    expect(submitGoal).not.toHaveBeenCalled();
+  });
+
+  it("rejects the same key with a different payload", async () => {
+    const { client, submitGoal } = await fixture();
+    await callFor(client);
+
+    const result = await callFor(client, {
+      ...goalArguments(),
+      goal: "Different Goal payload.",
+    });
 
     expect(result.isError).toBe(true);
-    expect(toolJson(result)).toEqual({ error: "conversation_not_correlated" });
-    expect(wait).toHaveBeenCalledWith(CORRELATION_A, GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS);
+    expect(toolJson(result)).toEqual({ error: "CONFLICTING_PENDING_GOAL_SUBMISSION" });
     expect(submitGoal).not.toHaveBeenCalled();
   });
 
-  it("keeps concurrent calls bound to their own conversations", async () => {
-    const { client, correlations, submitGoal } = await fixture();
-    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
-    await correlations.observe(evidence(CORRELATION_B, "conversation-B"));
+  it("expires pending identity without creating a Goal", async () => {
+    let now = Date.now();
+    const { client, pending, submitGoal } = await fixture({ now: () => now });
+    await callFor(client);
 
-    await Promise.all([
-      callFor(client, "transport-A", goalArguments(CORRELATION_A)),
-      callFor(client, "transport-B", goalArguments(CORRELATION_B)),
-    ]);
+    now += PENDING_GOAL_SUBMISSION_TTL_MS;
+    await pending.resolve(CORRELATION_A);
 
-    expect(submitGoal.mock.calls.map(([request]) => request.conversation_id).sort())
-      .toEqual(["conversation-A", "conversation-B"]);
+    expect((await pending.get(CORRELATION_A))?.state).toBe("failed");
+    expect(submitGoal).not.toHaveBeenCalled();
   });
 
-  it("keeps the first proven owner when conflicting evidence arrives", async () => {
-    const { client, correlations, submitGoal } = await fixture();
-    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
-    await expect(correlations.observe(evidence(CORRELATION_A, "conversation-B"))).resolves.toBe("refused");
+  it("does not guess a conversation while canonical evidence is missing", async () => {
+    const { pending, submitGoal, workspaceId } = await fixture();
+    await pending.accept({
+      ...goalArguments(CORRELATION_B),
+      workspace_id: workspaceId,
+    });
 
-    await callFor(client, "transport-A");
+    await pending.resolve(CORRELATION_B);
 
-    expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
-      conversation_id: "conversation-A",
-    }));
-    expect(submitGoal).not.toHaveBeenCalledWith(expect.objectContaining({
-      conversation_id: "conversation-B",
-    }));
-  });
-
-  it("ignores transport request ids, including a missing id, when the key is proven", async () => {
-    const { client, correlations, submitGoal } = await fixture();
-    await correlations.observe(evidence(CORRELATION_A, "conversation-A"));
-
-    await callFor(client, "transport-A");
-    await callFor(client, "transport-B");
-    await callFor(client, null);
-
-    expect(submitGoal).toHaveBeenCalledTimes(3);
-    expect(submitGoal.mock.calls.map(([request]) => request.conversation_id))
-      .toEqual(["conversation-A", "conversation-A", "conversation-A"]);
+    expect((await pending.get(CORRELATION_B))?.state).toBe("pending_identity");
+    expect(submitGoal).not.toHaveBeenCalled();
   });
 
   it("rejects caller-supplied conversation identity and invalid correlation keys", async () => {
     const { client, submitGoal } = await fixture();
-    const callerConversation = await client.callTool({
-      name: "submit_goal",
-      arguments: {
-        ...goalArguments(),
-        conversation_id: "caller-conversation",
-      },
+
+    const callerConversation = await callFor(client, {
+      ...goalArguments(),
+      conversation_id: "caller-conversation",
     });
-    const invalidKey = await client.callTool({
-      name: "submit_goal",
-      arguments: {
-        ...goalArguments(),
-        correlation_key: "00000000-0000-1000-8000-000000000003",
-      },
+    const invalidKey = await callFor(client, {
+      ...goalArguments(),
+      correlation_key: "00000000-0000-1000-8000-000000000003",
     });
 
     expect(callerConversation.isError).toBe(true);

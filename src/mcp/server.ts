@@ -15,9 +15,13 @@ import {
 } from "../control-plane/goal-handoff.js";
 import {
   goalSubmissionToolInputSchema,
-  goalSubmissionResultSchema,
+  goalSubmissionAcceptedSchema,
   type GoalSubmissionService,
 } from "../control-plane/goal-submission.js";
+import {
+  PendingGoalSubmissionConflictError,
+  type PendingGoalSubmissionService,
+} from "../control-plane/pending-goal-submission.js";
 import { validateWorkspaceIdentityConsistency } from "../workspace/identity.js";
 import { WorkspaceManager, WorkspacePathError } from "../workspace/manager.js";
 import type { WorkspaceRegistry, WorkspaceSelection } from "../workspace/registry.js";
@@ -53,6 +57,7 @@ export interface McpRuntimeContext {
   readonly correlations?: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">;
   readonly goalHandoff?: Pick<GoalHandoffService, "prepareGoalHandoff">;
   readonly goalSubmission?: Pick<GoalSubmissionService, "submitGoal">;
+  readonly pendingGoalSubmission?: Pick<PendingGoalSubmissionService, "accept">;
   readonly connectorEvidence?: {
     recordEvidence(input: {
       readonly request_id: string;
@@ -141,7 +146,6 @@ const gitDiffInputSchema = {
 const correlationProbeSchema = z.object({
   correlation_key: correlationKeySchema,
 }).strict();
-export const GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS = 15_000;
 const EXECUTION_OUTPUT_PATH = ".review/execution_output.json";
 
 interface ListedEntry {
@@ -151,7 +155,9 @@ interface ListedEntry {
 }
 
 export function toToolError(error: unknown) {
-  const code = error instanceof WorkspacePathError || error instanceof GitError
+  const code = error instanceof PendingGoalSubmissionConflictError
+    ? "CONFLICTING_PENDING_GOAL_SUBMISSION"
+    : error instanceof WorkspacePathError || error instanceof GitError
     ? error.code
     : "INTERNAL_ERROR";
   const details = code === "UNKNOWN_WORKSPACE_ID"
@@ -159,16 +165,6 @@ export function toToolError(error: unknown) {
     : {};
   return {
     content: [{ type: "text" as const, text: JSON.stringify({ error: code, ...details }) }],
-    isError: true as const,
-  };
-}
-
-function conversationNotCorrelatedError() {
-  return {
-    content: [{
-      type: "text" as const,
-      text: JSON.stringify({ error: "conversation_not_correlated" }),
-    }],
     isError: true as const,
   };
 }
@@ -726,29 +722,21 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "submit_goal",
     {
-      description: "Control Plane: create and start a Goal for the current ChatGPT conversation. The model must generate a new UUID v4 correlation_key for every invocation and never reuse one; users do not need to provide it manually. conversation_id is resolved from exact matching Extension evidence.",
+      description: "Control Plane: durably accept a Goal for the current ChatGPT conversation. The model must generate a new UUID v4 correlation_key for every invocation and never reuse one; users do not need to provide it manually. The Goal starts asynchronously after exact canonical Extension evidence proves the conversation.",
       inputSchema: goalSubmissionToolInputSchema,
-      outputSchema: goalSubmissionResultSchema,
+      outputSchema: goalSubmissionAcceptedSchema,
     },
     async (input) => {
-      const correlations = context.correlations;
-      const goalSubmission = context.goalSubmission;
-      if (correlations === undefined || goalSubmission === undefined) {
+      const pendingGoalSubmission = context.pendingGoalSubmission;
+      if (pendingGoalSubmission === undefined) {
         return toToolError(new Error("Goal submission runtime is unavailable."));
       }
 
       try {
-        const correlation = correlations.correlation(input.correlation_key)
-          ?? await correlations.awaitCorrelation(
-            input.correlation_key,
-            GOAL_SUBMISSION_CORRELATION_TIMEOUT_MS,
-          );
-        if (correlation === null) return conversationNotCorrelatedError();
-
         const selection = registry.resolve(input.workspace_id);
-        return structuredResponse(goalSubmissionResultSchema, await goalSubmission.submitGoal({
+        return structuredResponse(goalSubmissionAcceptedSchema, await pendingGoalSubmission.accept({
+          correlation_key: input.correlation_key,
           workspace_id: selection.id,
-          conversation_id: correlation.conversation_id,
           title: input.title,
           goal: input.goal,
           requirements: input.requirements,

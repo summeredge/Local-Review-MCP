@@ -77,8 +77,10 @@ the stored token, re-pairs, and retries once. A `403` after `hello.paired === tr
 closed and does not attempt to take pairing ownership from another Extension Origin.
 
 The Bridge validates all four required fields with a strict schema and passes the exact
-validated value to the injectable `onIdentityEvidence` sink. The default sink is a no-op,
-so this PoC does not persist evidence or modify Core state.
+validated value to the injectable `onIdentityEvidence` sink. In the production app, that sink
+durably stores the first canonical owner in `ConversationCorrelationRegistry`, then schedules
+any matching `PendingGoalSubmission` in the background. The Bridge returns `202` without waiting
+for Goal/Task/Execution startup. A default no-op sink remains available for isolated PoC tests.
 
 ## Goal handoff capture gate
 
@@ -174,8 +176,10 @@ perform either join in this phase.
 
 Implemented: evidence capture and authenticated local transport.
 
-The existing identity-evidence path feeds the request-to-conversation correlation registry; this
-change adds no separate registry or endpoint. The reliable delivery transport documented in
-`reliable-extension-delivery.md` remains separate. Neither path changes
+The existing identity-evidence path feeds the request-to-conversation correlation registry; the
+production direct `submit_goal` path keeps its payload in the separate durable
+`PendingGoalSubmission` state until that registry proves the same canonical key. New Chat and
+`WEB:*` provisional identity produce no canonical evidence. The reliable delivery transport
+documented in `reliable-extension-delivery.md` remains separate. Neither path changes
 TaskContext/ReviewRequest/ReviewDelivery, publishes a CRX, installs automatically, or changes the
 browser-worker path.
