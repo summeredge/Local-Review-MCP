@@ -29,6 +29,11 @@ turn_failed
 未知 provider event 不向调用方暴露。Server-request（approval、user input
 等）暂未实现，原型会返回明确的 unsupported RPC error，避免静默放行。
 
+当前明确不支持：
+
+- approval request；
+- user input request。
+
 ## 使用
 
 先编译 TypeScript，再运行独立 smoke test：
@@ -37,6 +42,31 @@ turn_failed
 npm run build
 node scripts/test_codex_app_server.mjs
 ```
+
+## Phase 1 验证结果
+
+2026-09-15 已验证：
+
+- `npm run build`：PASS；
+- smoke test：PASS；
+- `initialize` / `initialized`：PASS；
+- `model/list`：PASS，动态读取 8 个模型及 reasoning effort；
+- `thread/start`：PASS；
+- `turn/start`：PASS；
+- `agent_message_completed`：PASS；
+- `turn_completed`（provider `turn/completed`）：PASS；
+- 最终输出：`CODEX_APP_SERVER_BACKEND_PASS`；
+- app-server 子进程正常关闭。
+
+纯本地自动化测试：
+
+```powershell
+npm test -- tests/codex-app-server.test.ts
+```
+
+覆盖 request id 匹配、response resolve、RPC error、timeout、异常退出、
+无效 response、未知 event 和内部 event parser；测试使用 fake stdio process，
+不会启动真实 Codex。
 
 可选环境变量：
 

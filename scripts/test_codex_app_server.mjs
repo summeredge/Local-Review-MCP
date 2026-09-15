@@ -57,6 +57,7 @@ try {
 
   let deltaText = "";
   let completedText = "";
+  let receivedAgentMessageCompleted = false;
   let receivedCompleted = false;
   for await (const event of client.events()) {
     switch (event.type) {
@@ -65,6 +66,7 @@ try {
         break;
       case "agent_message_completed":
         completedText = event.content;
+        receivedAgentMessageCompleted = true;
         break;
       case "turn_completed":
         receivedCompleted = true;
@@ -76,8 +78,10 @@ try {
     }
     if (receivedCompleted) break;
   }
+  if (!receivedAgentMessageCompleted) throw new Error("agent_message_completed event was not received.");
+  pass("agent_message_completed");
   if (!receivedCompleted) throw new Error("turn/completed event was not received.");
-  pass("event turn/completed");
+  pass("turn_completed");
 
   const reply = (deltaText || completedText).trim();
   if (reply !== EXPECTED_REPLY) {
