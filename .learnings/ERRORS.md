@@ -641,3 +641,35 @@ AttributeError: __enter__
 - See Also: none
 
 ---
+
+## [ERR-20260915-001] PowerShell 双引号中的正则管道符被当作管道
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+在 PowerShell 命令字符串中使用含 `|` 的双引号 `rg` 正则时，PowerShell 将管道符解析为命令管道，导致后续片段被当成命令执行。
+
+### 错误信息
+
+```text
+术语 'get_info' 不会被识别为 cmdlet、函数、脚本文件或可执行程序的名称。
+```
+
+### 上下文
+
+- 使用 `rg -n "workspace_(get_info|list_files|...)"` 核查工具注册
+- 正则本应整体作为 `rg` 参数
+
+### 建议修复
+
+PowerShell 中含 `|` 的正则使用单引号包裹，或将参数通过变量传给 `rg`。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: ERR-20260912-001
+
+---

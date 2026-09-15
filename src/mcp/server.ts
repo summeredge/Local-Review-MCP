@@ -7,6 +7,7 @@ import { z } from "zod";
 import { GitError } from "../git/errors.js";
 import { GitService } from "../git/service.js";
 import type { GitDiffResponse, GitStatusResponse } from "../git/types.js";
+import { ReviewContextService } from "../review/review-context.js";
 import type { ConversationCorrelationRegistry } from "../control-plane/conversation-correlation.js";
 import {
   executionStatusQueryInputSchema,
@@ -41,6 +42,11 @@ import {
 import {
   executionOutputOutputSchema,
   reviewSummaryOutputSchema,
+  workspaceReviewContextOutputSchema,
+  workspaceReviewInfoOutputSchema,
+  workspaceReviewListFilesOutputSchema,
+  workspaceReviewReadFileOutputSchema,
+  workspaceReviewSearchOutputSchema,
   type ExecutionOutputOutput,
   type ReviewSummaryOutput,
 } from "./schema/review.js";
@@ -89,6 +95,13 @@ export const V01_TOOL_NAMES = [
 
 export const WORKSPACE_REGISTRY_TOOL_NAMES = ["workspace_list"] as const;
 export const REVIEW_CONTEXT_TOOL_NAMES = ["review_summary", "execution_output"] as const;
+export const WORKSPACE_REVIEW_TOOL_NAMES = [
+  "workspace_get_info",
+  "workspace_list_files",
+  "workspace_read_file",
+  "workspace_search",
+  "workspace_review_context",
+] as const;
 export const CONTROL_PLANE_TOOL_NAMES = ["submit_goal"] as const;
 export const STATUS_QUERY_TOOL_NAMES = [
   "get_session_status",
@@ -99,6 +112,7 @@ export const REGISTERED_TOOL_NAMES = [
   ...V01_TOOL_NAMES,
   ...WORKSPACE_REGISTRY_TOOL_NAMES,
   ...REVIEW_CONTEXT_TOOL_NAMES,
+  ...WORKSPACE_REVIEW_TOOL_NAMES,
   ...CONTROL_PLANE_TOOL_NAMES,
   ...STATUS_QUERY_TOOL_NAMES,
 ] as const;
@@ -118,6 +132,10 @@ const MAX_VISITED_ENTRIES = 10_000;
 export const MAX_READ_SCAN_BYTES = 8 * 1024 * 1024;
 const workspaceIdInputSchema = {
   workspace_id: z.string().min(1).max(128).optional(),
+};
+
+const requiredWorkspaceIdInputSchema = {
+  workspace_id: z.string().min(1).max(128),
 };
 
 const listFilesInputSchema = {
@@ -146,6 +164,28 @@ const searchTextInputSchema = {
   glob: z.string().min(1).max(1000).optional(),
   regex: z.boolean().optional().default(false),
   case_sensitive: z.boolean().optional().default(false),
+  limit: z.number().finite().int().min(1).max(200).optional().default(100),
+};
+
+const workspaceReviewListFilesInputSchema = {
+  ...requiredWorkspaceIdInputSchema,
+  path: z.string().optional().default("."),
+  depth: z.number().finite().int().min(1).max(4).optional().default(4),
+  offset: z.number().finite().int().min(0).optional().default(0),
+  limit: z.number().finite().int().min(1).max(1000).optional().default(200),
+};
+
+const workspaceReviewReadFileInputSchema = {
+  ...requiredWorkspaceIdInputSchema,
+  path: z.string(),
+  start_line: z.number().finite().int().min(1).optional().default(1),
+  end_line: z.number().finite().int().min(1).optional(),
+};
+
+const workspaceReviewSearchInputSchema = {
+  ...requiredWorkspaceIdInputSchema,
+  query: searchTextInputSchema.query,
+  path: z.string().optional().default("."),
   limit: z.number().finite().int().min(1).max(200).optional().default(100),
 };
 
@@ -578,6 +618,137 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
           caseSensitive: input.case_sensitive,
           limit: input.limit,
         }));
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "workspace_get_info",
+    {
+      description: "Return the read-only Git state of one explicitly authorized workspace.",
+      inputSchema: requiredWorkspaceIdInputSchema,
+      outputSchema: workspaceReviewInfoOutputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        return structuredResponse(
+          workspaceReviewInfoOutputSchema,
+          await new ReviewContextService(registry.resolve(input.workspace_id)).info(),
+        );
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "workspace_list_files",
+    {
+      description: "List workspace-relative non-sensitive files below a directory in one explicitly authorized workspace.",
+      inputSchema: workspaceReviewListFilesInputSchema,
+      outputSchema: workspaceReviewListFilesOutputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        const selection = registry.resolve(input.workspace_id);
+        const output = await listFiles(selection.manager, input);
+        return structuredResponse(workspaceReviewListFilesOutputSchema, {
+          workspace_id: selection.id,
+          path: output.path,
+          files: output.entries.filter((entry) => entry.type === "file").map((entry) => entry.path),
+          has_more: output.has_more,
+        });
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "workspace_read_file",
+    {
+      description: "Read at most 200 lines by default and 1000 lines per call from a non-sensitive workspace text file.",
+      inputSchema: workspaceReviewReadFileInputSchema,
+      outputSchema: workspaceReviewReadFileOutputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        const endLine = input.end_line ?? input.start_line + 199;
+        const maxLines = endLine - input.start_line + 1;
+        if (maxLines < 1 || maxLines > 1000) {
+          throw new WorkspacePathError("INVALID_PATH", "Requested line range must contain between 1 and 1000 lines.");
+        }
+        const selection = registry.resolve(input.workspace_id);
+        const output = await readFilePage(selection.manager, {
+          workspace_id: input.workspace_id,
+          path: input.path,
+          start_line: input.start_line,
+          max_lines: maxLines,
+          max_bytes: 256 * 1024,
+        });
+        return structuredResponse(workspaceReviewReadFileOutputSchema, {
+          workspace_id: selection.id,
+          path: output.path,
+          content: output.content,
+          start_line: output.start_line,
+          end_line: output.end_line,
+          truncated: output.has_more,
+          ...(output.has_more ? { next_start_line: output.end_line + 1 } : {}),
+        });
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "workspace_search",
+    {
+      description: "Search bounded non-sensitive text within one explicitly authorized workspace.",
+      inputSchema: workspaceReviewSearchInputSchema,
+      outputSchema: workspaceReviewSearchOutputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        const selection = registry.resolve(input.workspace_id);
+        const output = await searchText(selection.manager, {
+          query: input.query,
+          path: input.path,
+          regex: false,
+          caseSensitive: false,
+          limit: input.limit,
+        });
+        return structuredResponse(workspaceReviewSearchOutputSchema, {
+          workspace_id: selection.id,
+          results: output.results.map(({ path, line, preview }) => ({ path, line, text: preview })),
+          truncated: output.has_more,
+        });
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "workspace_review_context",
+    {
+      description: "Return bounded staged and unstaged Git context plus review candidates for one explicitly authorized workspace.",
+      inputSchema: requiredWorkspaceIdInputSchema,
+      outputSchema: workspaceReviewContextOutputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        return structuredResponse(
+          workspaceReviewContextOutputSchema,
+          await new ReviewContextService(registry.resolve(input.workspace_id)).context(),
+        );
       } catch (error: unknown) {
         return toToolError(error);
       }

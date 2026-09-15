@@ -427,10 +427,12 @@ export class GitService {
   public async diff(options: GitDiffOptions = {}): Promise<GitDiffResponse> {
     const scope = this.workspace.resolvePath(options.path ?? ".");
     const stat = options.stat ?? false;
+    const cached = options.cached ?? false;
     if (typeof stat !== "boolean") throw new GitError("GIT_COMMAND_FAILED");
+    if (typeof cached !== "boolean") throw new GitError("GIT_COMMAND_FAILED");
     await this.assertRepository();
 
-    const files = await this.changedFiles(scope);
+    const files = await this.changedFiles(scope, cached);
     if (files.length === 0) {
       return { path: scope.relativePath, stat, diff: "", files, binary: false };
     }
@@ -438,6 +440,7 @@ export class GitService {
     const output = await this.run([
       ...BASE_GIT_ARGS,
       "diff",
+      ...(cached ? ["--cached"] : []),
       "--no-renames",
       "--no-ext-diff",
       "--no-textconv",

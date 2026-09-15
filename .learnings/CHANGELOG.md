@@ -34,4 +34,5 @@
 {"ts":"2026-09-13T08:41:00+08:00","action":"add","type":"error","id":"ERR-20260913-001","summary":"Closure audit 发现并发 Completion 重复进入适配器，且重启未修复已落盘结果对应的 ReviewRequest 状态"}
 {"ts":"2026-09-14T09:22:00+08:00","action":"add","type":"error","id":"ERR-20260914-001","summary":"PowerShell 下 node --check 通配符需逐文件展开"}
 {"ts":"2026-09-14T13:00:00+08:00","action":"add","type":"learning","id":"LRN-20260914-001","summary":"ChatGPT 新聊天需发送首条消息后才生成真实 conversation_id 路由"}
+{"ts":"2026-09-15T18:53:56+08:00","action":"add","type":"error","id":"ERR-20260915-001","summary":"PowerShell 中含管道符的 rg 正则应使用单引号或变量传参"}
 ```

@@ -31,6 +31,7 @@ export function sameReviewSnapshot(
 export interface GitDiffOptions {
   readonly path?: string;
   readonly stat?: boolean;
+  readonly cached?: boolean;
 }
 
 export interface GitDiffResponse {

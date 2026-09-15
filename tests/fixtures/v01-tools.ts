@@ -9,6 +9,11 @@ export const EXPECTED_V01_TOOL_NAMES = [
 
 export const EXPECTED_REGISTERED_TOOL_NAMES = [
   ...EXPECTED_V01_TOOL_NAMES,
+  "workspace_get_info",
+  "workspace_list_files",
+  "workspace_read_file",
+  "workspace_search",
+  "workspace_review_context",
   "workspace_list",
   "review_summary",
   "execution_output",
