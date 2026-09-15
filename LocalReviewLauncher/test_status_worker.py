@@ -11,7 +11,13 @@ from urllib.error import HTTPError, URLError
 from unittest.mock import MagicMock, Mock, patch
 
 from PySide6.QtCore import QCoreApplication, QThreadPool
-from status_checker import OAuthClientStatus, OAuthRegistryStatus, LauncherStatus, StatusChecker
+from status_checker import (
+    OAuthClientStatus,
+    OAuthRegistryStatus,
+    LauncherStatus,
+    SessionViewModel,
+    StatusChecker,
+)
 from status_worker import StatusCheckScheduler, StatusCheckWorker
 
 
@@ -86,6 +92,35 @@ class StatusCheckWorkerTests(unittest.TestCase):
 
         self.assertEqual(results, [LauncherStatus(True, True, False, "unavailable", oauth)])
 
+    def test_worker_includes_dashboard_sessions(self) -> None:
+        session = SessionViewModel(
+            "Goal",
+            "Task",
+            "running_turn",
+            "codex_app_server",
+            "gpt-5.6-luna",
+            "max",
+            "session-1",
+            "thread-1",
+            "2026-09-15T12:34:56+08:00",
+            "goal-1",
+            "task-1",
+            None,
+            (),
+        )
+        checker = SimpleNamespace(
+            check=lambda: LauncherStatus(True, True, False),
+            cloudflared_version=lambda: "unavailable",
+            dashboard_sessions=lambda: (session,),
+        )
+        results: list[LauncherStatus] = []
+        worker = StatusCheckWorker(checker)  # type: ignore[arg-type]
+        worker.signals.finished.connect(lambda _generation, status: results.append(status))
+
+        worker.run()
+
+        self.assertEqual(results[0].sessions, (session,))
+
     def test_worker_runs_outside_the_gui_thread(self) -> None:
         checker = SimpleNamespace(thread_id=None)
 
@@ -101,6 +136,78 @@ class StatusCheckWorkerTests(unittest.TestCase):
 
 
 class StatusCheckerTests(unittest.TestCase):
+    def test_mcp_sse_tool_response_is_decoded(self) -> None:
+        response = MagicMock()
+        response.read.return_value = (
+            b'event: message\n'
+            b'data: {"jsonrpc":"2.0","id":"1","result":{"structuredContent":{"session_id":"session-1"}}}\n\n'
+        )
+        response.headers.get.return_value = "text/event-stream"
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+
+        with patch("status_checker.urlopen", return_value=response) as open_url:
+            result = StatusChecker(auth_token="secret")._call_tool(
+                "get_session_status", {"session_id": "session-1"}
+            )
+
+        self.assertEqual(result, {"session_id": "session-1"})
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:12080/mcp")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+
+    def test_dashboard_uses_status_query_tools_for_each_session(self) -> None:
+        timestamp = "2026-09-15T12:34:56+08:00"
+        summary = {
+            "session_id": "session-1",
+            "goal_name": "Goal",
+            "task_name": "Task",
+            "updated_at": timestamp,
+        }
+        session = {
+            "session_id": "session-1",
+            "goal_id": "goal-1",
+            "task_id": "task-1",
+            "backend_type": "codex_app_server",
+            "status": "running_turn",
+            "thread_id": "thread-1",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "current_execution": {"execution_id": "execution-1", "status": "running", "turn_id": "turn-1"},
+        }
+        execution = {
+            "execution_id": "execution-1",
+            "workspace_id": "workspace-1",
+            "task_id": "task-1",
+            "status": "running",
+            "started_at": timestamp,
+            "session_id": "session-1",
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+        }
+        events = {"session_id": "session-1", "events": []}
+        checker = StatusChecker(auth_token="secret", workspace_id="workspace-1")
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        def call_tool(name: str, arguments: dict[str, object]) -> dict[str, object]:
+            calls.append((name, arguments))
+            return {"get_session_status": session, "get_execution_status": execution, "list_session_events": events}[name]
+
+        with patch.object(checker, "_session_catalog", return_value=(summary,)), patch.object(
+            checker, "_call_tool", side_effect=call_tool
+        ):
+            result = checker.dashboard_sessions()
+
+        self.assertEqual([name for name, _arguments in calls], [
+            "get_session_status",
+            "get_execution_status",
+            "list_session_events",
+        ])
+        self.assertTrue(all(arguments["workspace_id"] == "workspace-1" for _name, arguments in calls))
+        self.assertEqual(result[0].session_id, "session-1")
+        self.assertEqual(result[0].execution.started_at, timestamp)
+
     def test_oauth_status_reads_registry_metadata(self) -> None:
         payload = {
             "storage_path": "oauth/clients.json",

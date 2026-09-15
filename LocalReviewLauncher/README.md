@@ -28,3 +28,6 @@ Run the launcher-only configuration check with:
 ```powershell
 & "C:\Users\shaoy\Documents\PythonEnvs\local-review-launcher\Scripts\python.exe" .\LocalReviewLauncher\test_config_manager.py
 ```
+
+The read-only Task Dashboard, Session Viewer, Event Stream, and Codex Task
+locator are documented in [`docs/launcher-dashboard.md`](../docs/launcher-dashboard.md).

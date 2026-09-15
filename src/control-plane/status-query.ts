@@ -98,6 +98,22 @@ export type SessionStatusOutput = z.infer<typeof sessionStatusOutputSchema>;
 export type ExecutionStatusOutput = z.infer<typeof executionStatusOutputSchema>;
 export type SessionEventsOutput = z.infer<typeof sessionEventsOutputSchema>;
 
+export interface LauncherSessionSummary {
+  readonly session_id: string;
+  readonly goal_id: string;
+  readonly task_id: string;
+  readonly goal_name: string;
+  readonly task_name: string;
+  readonly backend_type: SessionStatusOutput["backend_type"];
+  readonly status: SessionStatusOutput["status"];
+  readonly thread_id?: string;
+  readonly model?: string;
+  readonly reasoning_effort?: string;
+  readonly goal_status?: SessionStatusOutput["goal_status"];
+  readonly current_execution?: SessionStatusOutput["current_execution"];
+  readonly updated_at: string;
+}
+
 type GoalReader = Pick<GoalOrchestrationService, "getGoal"> & {
   readonly listGoals?: GoalOrchestrationService["listGoals"];
 };
@@ -317,6 +333,35 @@ export class StatusQueryService {
       returned: selected.length,
       has_more: available.length > selected.length,
     });
+  }
+
+  public async listSessionSummaries(workspaceId?: string): Promise<LauncherSessionSummary[]> {
+    const summaries: LauncherSessionSummary[] = [];
+    for (const session of await this.sessions.listSessions()) {
+      const goal = await this.optionalGoal(session.goal_id);
+      if (workspaceId !== undefined && (goal === undefined || goal.workspace_id !== workspaceId)) continue;
+
+      let status: SessionStatusOutput;
+      try {
+        status = await this.getSessionStatus({
+          session_id: session.session_id,
+          ...(workspaceId === undefined ? {} : { workspace_id: workspaceId }),
+        });
+      } catch {
+        continue;
+      }
+      if (status.backend_type !== "codex_app_server") continue;
+
+      const phase = goal?.phases.find((candidate) => candidate.phase_id === goal.current_phase_id);
+      const task = phase?.tasks.find((candidate) => candidate.task_id === session.task_id);
+      summaries.push({
+        ...status,
+        goal_name: phase?.objective.slice(0, 256) || status.goal_id,
+        task_name: task?.goal.slice(0, 256) || status.task_id,
+        updated_at: session.updated_at,
+      });
+    }
+    return summaries.sort((left, right) => right.updated_at.localeCompare(left.updated_at));
   }
 
   private async resolveExecution(input: z.output<typeof executionStatusQueryInputSchema>): Promise<ExecutionMatch> {

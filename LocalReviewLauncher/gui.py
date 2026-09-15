@@ -34,7 +34,7 @@ from config_manager import (
     LauncherConfigError,
 )
 from process_manager import ProductionProcessManager
-from status_checker import LauncherStatus, OAuthRegistryStatus, StatusChecker
+from status_checker import LauncherStatus, OAuthRegistryStatus, SessionViewModel, StatusChecker
 from status_worker import StatusCheckScheduler, StatusCheckWorker
 
 
@@ -56,7 +56,10 @@ class LauncherWindow(QMainWindow):
         self.config_manager = config_manager
         self.configuration: LauncherConfig = config_manager.load()
         self.process_manager = ProductionProcessManager(project_root, config_manager)
-        self.status_checker = StatusChecker(auth_token=config_manager.auth_token(self.configuration))
+        self.status_checker = StatusChecker(
+            auth_token=config_manager.auth_token(self.configuration),
+            workspace_id=self.configuration.active_workspace_id,
+        )
         self.state = LauncherState.STOPPED
         self._last_status = LauncherStatus(False, False, False)
         self._status_check_scheduler = StatusCheckScheduler()
@@ -90,6 +93,33 @@ class LauncherWindow(QMainWindow):
         self.workspace_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.workspace_table.horizontalHeader().setStretchLastSection(True)
         self.workspace_table.setMinimumHeight(120)
+        self.session_table = QTableWidget(0, 8)
+        self.session_table.setHorizontalHeaderLabels([
+            "Goal / Task",
+            "状态",
+            "Backend",
+            "Model",
+            "Reasoning",
+            "Session ID",
+            "Thread ID",
+            "更新时间",
+        ])
+        self.session_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.session_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.session_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.session_table.horizontalHeader().setStretchLastSection(True)
+        self.session_table.setMinimumHeight(160)
+        self.session_empty_label = QLabel("No active sessions")
+        self.session_details_label = QLabel("Select a Session to view details.")
+        self.session_details_label.setWordWrap(True)
+        self.execution_details_label = QLabel("Execution: —")
+        self.execution_details_label.setWordWrap(True)
+        self.event_table = QTableWidget(0, 3)
+        self.event_table.setHorizontalHeaderLabels(["时间", "事件类型", "内容"])
+        self.event_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.event_table.horizontalHeader().setStretchLastSection(True)
+        self.event_table.setMinimumHeight(180)
+        self._session_view_models: tuple[SessionViewModel, ...] = ()
         self.message_label = QLabel()
         self.message_label.setWordWrap(True)
         self.log_output = QPlainTextEdit()
@@ -111,6 +141,8 @@ class LauncherWindow(QMainWindow):
         self.open_config_button = QPushButton("打开配置文件")
         self.backup_config_button = QPushButton("备份配置")
         self.validate_config_button = QPushButton("校验配置")
+        self.open_codex_task_button = QPushButton("Open Codex Task")
+        self.open_codex_task_button.setEnabled(False)
         self.copy_log_button = QPushButton("复制日志")
         self.clear_log_button = QPushButton("清空显示")
         self.save_log_button = QPushButton("保存日志")
@@ -127,6 +159,8 @@ class LauncherWindow(QMainWindow):
         self.open_config_button.clicked.connect(self.open_config)
         self.backup_config_button.clicked.connect(self.backup_config)
         self.validate_config_button.clicked.connect(self.validate_config)
+        self.open_codex_task_button.clicked.connect(self.open_codex_task)
+        self.session_table.itemSelectionChanged.connect(self._render_selected_session)
         self.copy_log_button.clicked.connect(self.copy_log)
         self.clear_log_button.clicked.connect(self.clear_log)
         self.save_log_button.clicked.connect(self.save_log)
@@ -150,6 +184,16 @@ class LauncherWindow(QMainWindow):
         workspace_buttons.addWidget(self.rename_workspace_button)
         workspace_buttons.addWidget(self.set_current_workspace_button)
         layout.addLayout(workspace_buttons)
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("Task Dashboard"))
+        layout.addWidget(self.session_table)
+        layout.addWidget(self.session_empty_label)
+        layout.addWidget(self.open_codex_task_button)
+        layout.addWidget(QLabel("Session Viewer"))
+        layout.addWidget(self.session_details_label)
+        layout.addWidget(self.execution_details_label)
+        layout.addWidget(QLabel("Event Stream"))
+        layout.addWidget(self.event_table)
         layout.addSpacing(8)
         layout.addWidget(QLabel("运行信息"))
         layout.addWidget(self._row("Workspace:", self.runtime_workspace_label))
@@ -199,6 +243,7 @@ class LauncherWindow(QMainWindow):
         self.startup_timer.timeout.connect(self._poll_startup)
         self._set_state(LauncherState.STOPPED)
         self._render_workspace_registry()
+        self._render_session_dashboard(())
         self._render_runtime_info()
         self.refresh_status()
         if self.configuration.auto_start:
@@ -249,6 +294,7 @@ class LauncherWindow(QMainWindow):
         self._set_status(self.tunnel_status, "Connected" if status.tunnel_connected else "Offline", status.tunnel_connected)
         self._set_status(self.remote_status, "Online" if status.remote_online else "Offline", status.remote_online)
         self._render_oauth_status(status.oauth_registry)
+        self._render_session_dashboard(getattr(status, "sessions", ()))
         self.workspace_label.setText(self._current_workspace_text())
         self.cloudflared_version_label.setText(getattr(status, "cloudflared_version", "unavailable"))
 
@@ -303,6 +349,117 @@ class LauncherWindow(QMainWindow):
         row = self.workspace_table.currentRow()
         item = self.workspace_table.item(row, 0) if row >= 0 else None
         return item.text() if item is not None else None
+
+    def _selected_session_id(self) -> str | None:
+        row = self.session_table.currentRow()
+        item = self.session_table.item(row, 5) if row >= 0 else None
+        return item.text() if item is not None else None
+
+    def _selected_session(self) -> SessionViewModel | None:
+        session_id = self._selected_session_id()
+        return next(
+            (session for session in self._session_view_models if session.session_id == session_id),
+            None,
+        )
+
+    def _render_session_dashboard(self, sessions: tuple[SessionViewModel, ...]) -> None:
+        selected_id = self._selected_session_id()
+        self._session_view_models = tuple(sessions)
+        self.session_table.blockSignals(True)
+        try:
+            self.session_table.setRowCount(0)
+            for row, session in enumerate(self._session_view_models):
+                self.session_table.insertRow(row)
+                values = (
+                    f"{session.goal_name} / {session.task_name}",
+                    session.status,
+                    session.backend_type,
+                    session.model or "—",
+                    session.reasoning_effort or "—",
+                    session.session_id,
+                    session.thread_id or "—",
+                    self._format_timestamp(session.updated_at),
+                )
+                for column, value in enumerate(values):
+                    self.session_table.setItem(row, column, QTableWidgetItem(value))
+            self.session_table.resizeColumnsToContents()
+            self.session_table.clearSelection()
+            self.session_table.setCurrentCell(-1, -1)
+            if selected_id is not None:
+                for row, session in enumerate(self._session_view_models):
+                    if session.session_id == selected_id:
+                        self.session_table.selectRow(row)
+                        break
+        finally:
+            self.session_table.blockSignals(False)
+        self.session_empty_label.setText("No active sessions")
+        self.session_empty_label.setVisible(not self._session_view_models)
+        self._render_selected_session()
+
+    def _render_selected_session(self) -> None:
+        session = self._selected_session()
+        if session is None:
+            self._clear_session_view()
+            return
+
+        self.open_codex_task_button.setEnabled(True)
+        self.session_details_label.setText("\n".join([
+            f"session_id: {session.session_id}",
+            f"goal_id: {session.goal_id}",
+            f"task_id: {session.task_id}",
+            f"backend_type: {session.backend_type}",
+            f"thread_id: {session.thread_id or '—'}",
+            f"model: {session.model or '—'}",
+            f"reasoning_effort: {session.reasoning_effort or '—'}",
+            f"status: {session.status}",
+            f"updated_at: {self._format_timestamp(session.updated_at)}",
+        ]))
+        execution = session.execution
+        if execution is None:
+            self.execution_details_label.setText("Execution: —")
+        else:
+            self.execution_details_label.setText("\n".join([
+                f"execution_id: {execution.execution_id}",
+                f"status: {execution.status}",
+                f"current turn: {execution.turn_id or '—'}",
+                f"started_at: {self._format_timestamp(execution.started_at)}",
+                f"finished_at: {self._format_timestamp(execution.finished_at)}",
+            ]))
+
+        self.event_table.setRowCount(0)
+        for row, event in enumerate(session.events):
+            self.event_table.insertRow(row)
+            values = (event.display_time, event.event_type, event.content or "—")
+            for column, value in enumerate(values):
+                self.event_table.setItem(row, column, QTableWidgetItem(value))
+        self.event_table.resizeRowsToContents()
+
+    def _clear_session_view(self) -> None:
+        self.open_codex_task_button.setEnabled(False)
+        self.session_details_label.setText("Select a Session to view details.")
+        self.execution_details_label.setText("Execution: —")
+        self.event_table.setRowCount(0)
+
+    @staticmethod
+    def _format_timestamp(timestamp: str | None) -> str:
+        if timestamp is None:
+            return "—"
+        try:
+            return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return timestamp
+
+    def open_codex_task(self) -> None:
+        session = self._selected_session()
+        if session is None:
+            return
+        QMessageBox.information(
+            self,
+            "Open Codex Task",
+            "Codex Desktop opening is not available from this launcher.\n\n"
+            f"thread_id: {session.thread_id or '—'}\n"
+            f"session_id: {session.session_id}",
+        )
 
     def _render_runtime_info(self) -> None:
         try:
@@ -536,6 +693,7 @@ class LauncherWindow(QMainWindow):
         except LauncherConfigError as error:
             self._show_error(str(error))
             return
+        self.status_checker.workspace_id = self.configuration.active_workspace_id
         self._render_workspace_registry()
         self.message_label.setText("Workspace added and set as current. It will be used on the next MCP start.")
         self.refresh_status()
@@ -566,6 +724,7 @@ class LauncherWindow(QMainWindow):
         except LauncherConfigError as error:
             self._show_error(str(error))
             return
+        self.status_checker.workspace_id = self.configuration.active_workspace_id
         self._render_workspace_registry()
         self.message_label.setText("Workspace removed from the Registry. The directory was kept.")
         self.refresh_status()
@@ -604,6 +763,7 @@ class LauncherWindow(QMainWindow):
         except LauncherConfigError as error:
             self._show_error(str(error))
             return
+        self.status_checker.workspace_id = self.configuration.active_workspace_id
         self._render_workspace_registry()
         self.message_label.setText("Current Workspace saved. It will be used on the next MCP start.")
         self.refresh_status()

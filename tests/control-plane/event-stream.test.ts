@@ -349,6 +349,17 @@ describe("Codex Event Adapter and LRM event stream", () => {
       returned: 2,
       has_more: true,
     });
+    await expect(query.listSessionSummaries("workspace-1")).resolves.toMatchObject([{
+      session_id: "session-1",
+      goal_id: "goal-1",
+      task_id: "task-1",
+      goal_name: "Phase",
+      task_name: "Reply",
+      backend_type: "codex_app_server",
+      model: "gpt-5.6-luna",
+      reasoning_effort: "max",
+      updated_at: expect.any(String),
+    }]);
 
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const server = createMcpServer({

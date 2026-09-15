@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { startApp } from "../src/app.js";
 import { createHttpServer } from "../src/mcp/http.js";
 import { inboundRequestId } from "../src/mcp/inbound.js";
+import { StatusQueryService } from "../src/control-plane/status-query.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
 import { EXPECTED_REGISTERED_TOOL_NAMES } from "./fixtures/v01-tools.js";
 
@@ -55,6 +56,37 @@ function structuredJson(result: unknown): Record<string, unknown> {
 }
 
 describe("MCP HTTP runtime", () => {
+  it("serves the authenticated loopback launcher Session catalog without adding an MCP tool", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-launcher-catalog-"));
+    temporaryDirectories.push(workspace);
+    const registry = new WorkspaceRegistry([{
+      id: "catalog-workspace",
+      name: "Catalog Workspace",
+      path: workspace,
+    }]);
+    const server = createHttpServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
+    }, {
+      registry,
+      statusQuery: new StatusQueryService({ storageRoot: workspace }),
+    });
+    runningServers.push(server);
+    const port = await listen(server);
+
+    const unauthorized = await fetch(`http://127.0.0.1:${port}/launcher/sessions`);
+    expect(unauthorized.status).toBe(401);
+    const response = await fetch(`http://127.0.0.1:${port}/launcher/sessions`, {
+      headers: { authorization: "Bearer test-token" },
+    });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ sessions: [] });
+  });
+
   it("propagates the normalized request id into an MCP tool call", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-inbound-http-"));
     temporaryDirectories.push(workspace);

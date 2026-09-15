@@ -11,10 +11,16 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPlainTextEdit
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QTableWidget
 
 from gui import LauncherState, LauncherWindow
-from status_checker import LauncherStatus, OAuthClientStatus, OAuthRegistryStatus
+from status_checker import (
+    LauncherStatus,
+    OAuthClientStatus,
+    OAuthRegistryStatus,
+    SessionViewModel,
+    build_session_view_model,
+)
 
 
 class LauncherLogTests(unittest.TestCase):
@@ -153,6 +159,168 @@ class LauncherLogTests(unittest.TestCase):
             LauncherWindow.delete_oauth_client(window)  # type: ignore[arg-type]
 
         get_item.assert_not_called()
+
+
+class LauncherDashboardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    @staticmethod
+    def _window():
+        window = LauncherWindow.__new__(LauncherWindow)
+        window.session_table = QTableWidget(0, 8)
+        window.session_empty_label = QLabel()
+        window.session_details_label = QLabel()
+        window.execution_details_label = QLabel()
+        window.event_table = QTableWidget(0, 3)
+        window.open_codex_task_button = QPushButton()
+        window._session_view_models = ()
+        return window
+
+    @staticmethod
+    def _payloads() -> tuple[dict, dict, dict, dict]:
+        timestamp = "2026-09-15T12:34:56+08:00"
+        session = {
+            "session_id": "session-1",
+            "goal_id": "goal-1",
+            "task_id": "task-1",
+            "backend_type": "codex_app_server",
+            "status": "running_turn",
+            "thread_id": "thread-1",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "current_execution": {
+                "execution_id": "execution-1",
+                "status": "running",
+                "turn_id": "turn-1",
+            },
+        }
+        execution = {
+            "execution_id": "execution-1",
+            "workspace_id": "workspace-1",
+            "task_id": "task-1",
+            "status": "running",
+            "started_at": timestamp,
+            "session_id": "session-1",
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+        }
+        events = {
+            "session_id": "session-1",
+            "events": [
+                {
+                    "sequence": 1,
+                    "session_id": "session-1",
+                    "execution_id": "execution-1",
+                    "thread_id": "thread-1",
+                    "timestamp": timestamp,
+                    "event_type": "session_started",
+                    "payload": {},
+                },
+                {
+                    "sequence": 2,
+                    "session_id": "session-1",
+                    "execution_id": "execution-1",
+                    "thread_id": "thread-1",
+                    "timestamp": timestamp,
+                    "event_type": "turn_started",
+                    "turn_id": "turn-1",
+                    "payload": {},
+                },
+                {
+                    "sequence": 3,
+                    "session_id": "session-1",
+                    "execution_id": "execution-1",
+                    "thread_id": "thread-1",
+                    "timestamp": timestamp,
+                    "event_type": "agent_message_delta",
+                    "turn_id": "turn-1",
+                    "item_id": "item-1",
+                    "payload": {"content": "Hello"},
+                },
+                {
+                    "sequence": 4,
+                    "session_id": "session-1",
+                    "execution_id": "execution-1",
+                    "thread_id": "thread-1",
+                    "timestamp": timestamp,
+                    "event_type": "turn_completed",
+                    "turn_id": "turn-1",
+                    "payload": {},
+                },
+            ],
+        }
+        summary = {
+            "session_id": "session-1",
+            "goal_name": "DataProject APC Analysis",
+            "task_name": "Analyze APC",
+            "updated_at": timestamp,
+        }
+        return session, execution, events, summary
+
+    def test_status_maps_to_dashboard_view_model(self) -> None:
+        session, execution, events, summary = self._payloads()
+
+        view = build_session_view_model(session, execution, events, summary=summary)
+
+        self.assertEqual(view, SessionViewModel(
+            goal_name="DataProject APC Analysis",
+            task_name="Analyze APC",
+            status="running_turn",
+            backend_type="codex_app_server",
+            model="gpt-5.6-luna",
+            reasoning_effort="max",
+            session_id="session-1",
+            thread_id="thread-1",
+            updated_at="2026-09-15T12:34:56+08:00",
+            goal_id="goal-1",
+            task_id="task-1",
+            execution=view.execution,
+            events=view.events,
+        ))
+        self.assertEqual(view.execution_id, "execution-1")
+        self.assertEqual(view.current_turn_id, "turn-1")
+        self.assertEqual([event.event_type for event in view.events], [
+            "session_started",
+            "turn_started",
+            "agent_message_delta",
+            "turn_completed",
+        ])
+        self.assertEqual(view.events[2].content, "Hello")
+        self.assertEqual(view.events[2].display_time, "12:34:56")
+
+    def test_empty_dashboard_shows_no_active_sessions(self) -> None:
+        window = self._window()
+
+        LauncherWindow._render_session_dashboard(window, ())  # type: ignore[arg-type]
+
+        self.assertEqual(window.session_empty_label.text(), "No active sessions")
+        self.assertTrue(window.session_empty_label.isVisible())
+        self.assertEqual(window.session_table.rowCount(), 0)
+        self.assertFalse(window.open_codex_task_button.isEnabled())
+
+    def test_failed_session_is_visible_with_status_and_event_reason(self) -> None:
+        session, execution, events, summary = self._payloads()
+        session["status"] = "failed"
+        session["current_execution"]["status"] = "failed"
+        execution["status"] = "failed"
+        execution["finished_at"] = "2026-09-15T12:35:00+08:00"
+        events["events"][-1] = {
+            **events["events"][-1],
+            "event_type": "execution_failed",
+            "payload": {"reason": "provider failed"},
+        }
+        view = build_session_view_model(session, execution, events, summary=summary)
+        window = self._window()
+
+        LauncherWindow._render_session_dashboard(window, (view,))  # type: ignore[arg-type]
+        window.session_table.selectRow(0)
+        LauncherWindow._render_selected_session(window)  # type: ignore[arg-type]
+
+        self.assertEqual(window.session_table.item(0, 1).text(), "failed")
+        self.assertEqual(window.event_table.item(3, 1).text(), "execution_failed")
+        self.assertEqual(window.event_table.item(3, 2).text(), "provider failed")
 
 
 if __name__ == "__main__":

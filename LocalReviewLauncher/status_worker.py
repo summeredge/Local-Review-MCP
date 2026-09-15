@@ -54,11 +54,19 @@ class StatusCheckWorker(QRunnable):
                 oauth_registry = oauth_status()
             except Exception:
                 oauth_registry = None
+        sessions = ()
+        dashboard_sessions = getattr(self.status_checker, "dashboard_sessions", None)
+        if status.mcp_running and callable(dashboard_sessions):
+            try:
+                sessions = dashboard_sessions()
+            except Exception:
+                sessions = ()
         status = LauncherStatus(
             status.mcp_running,
             status.tunnel_connected,
             status.remote_online,
             version if isinstance(version, str) else "unavailable",
             oauth_registry,
+            sessions,
         )
         self.signals.finished.emit(self.generation, status)

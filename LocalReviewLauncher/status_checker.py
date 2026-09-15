@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
+from uuid import uuid4
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -13,8 +16,88 @@ from urllib.request import Request, urlopen
 
 LOCAL_HEALTH_URL = "http://127.0.0.1:12080/health"
 LOCAL_OAUTH_CLIENTS_URL = "http://127.0.0.1:12080/oauth/clients"
+LOCAL_MCP_URL = "http://127.0.0.1:12080/mcp"
+LOCAL_SESSION_CATALOG_URL = "http://127.0.0.1:12080/launcher/sessions"
 REMOTE_STATUS_URL = "https://review.syqiu.kdns.fr/.well-known/oauth-protected-resource"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+MAX_STATUS_RESPONSE_BYTES = 2 * 1024 * 1024
+SESSION_STATUSES = frozenset({
+    "created",
+    "starting",
+    "active",
+    "running_turn",
+    "waiting_input",
+    "completed",
+    "failed",
+    "terminated",
+})
+EXECUTION_STATUSES = frozenset({"running", "passed", "failed"})
+EVENT_TYPES = frozenset({
+    "session_started",
+    "turn_started",
+    "agent_message_delta",
+    "agent_message_completed",
+    "turn_completed",
+    "execution_failed",
+})
+IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+class StatusQueryError(RuntimeError):
+    """The read-only Status Query API returned an unusable result."""
+
+
+def _display_event_time(timestamp: str) -> str:
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).strftime("%H:%M:%S")
+    except ValueError:
+        return "--:--:--"
+
+
+@dataclass(frozen=True)
+class SessionEventViewModel:
+    sequence: int
+    timestamp: str
+    event_type: str
+    content: str
+
+    @property
+    def display_time(self) -> str:
+        return _display_event_time(self.timestamp)
+
+
+@dataclass(frozen=True)
+class ExecutionViewModel:
+    execution_id: str
+    status: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    turn_id: str | None = None
+
+
+@dataclass(frozen=True)
+class SessionViewModel:
+    goal_name: str
+    task_name: str
+    status: str
+    backend_type: str
+    model: str | None
+    reasoning_effort: str | None
+    session_id: str
+    thread_id: str | None
+    updated_at: str | None
+    goal_id: str
+    task_id: str
+    execution: ExecutionViewModel | None
+    events: tuple[SessionEventViewModel, ...]
+
+    @property
+    def execution_id(self) -> str | None:
+        return self.execution.execution_id if self.execution is not None else None
+
+    @property
+    def current_turn_id(self) -> str | None:
+        return self.execution.turn_id if self.execution is not None else None
 
 
 @dataclass(frozen=True)
@@ -40,6 +123,209 @@ class LauncherStatus:
     remote_online: bool
     cloudflared_version: str = "unavailable"
     oauth_registry: OAuthRegistryStatus | None = None
+    sessions: tuple[SessionViewModel, ...] = ()
+
+
+def _object(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise StatusQueryError(f"{label} must be an object")
+    return dict(value)
+
+
+def _text(value: object, label: str, maximum: int = 256) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise StatusQueryError(f"{label} must be a non-empty string")
+    return value
+
+
+def _identifier(value: object, label: str) -> str:
+    text = _text(value, label, 128)
+    if not IDENTIFIER_PATTERN.fullmatch(text):
+        raise StatusQueryError(f"{label} has an invalid identity")
+    return text
+
+
+def _optional_text(value: object, label: str, maximum: int = 256) -> str | None:
+    if value is None:
+        return None
+    return _text(value, label, maximum)
+
+
+def _timestamp(value: object, label: str) -> str:
+    text = _text(value, label, 64)
+    try:
+        datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise StatusQueryError(f"{label} must be an RFC3339 timestamp") from error
+    return text
+
+
+def _status(value: object, label: str, allowed: frozenset[str]) -> str:
+    text = _text(value, label, 64)
+    if text not in allowed:
+        raise StatusQueryError(f"{label} is not recognized")
+    return text
+
+
+def _parse_session_status(payload: object) -> dict[str, object]:
+    document = _object(payload, "Session status")
+    current_value = document.get("current_execution")
+    current: dict[str, object] | None = None
+    if current_value is not None:
+        current_document = _object(current_value, "current_execution")
+        current = {
+            "execution_id": _identifier(current_document.get("execution_id"), "current_execution.execution_id"),
+            "status": _status(current_document.get("status"), "current_execution.status", EXECUTION_STATUSES),
+            "turn_id": _optional_text(current_document.get("turn_id"), "current_execution.turn_id"),
+        }
+    return {
+        "session_id": _identifier(document.get("session_id"), "session_id"),
+        "goal_id": _identifier(document.get("goal_id"), "goal_id"),
+        "task_id": _identifier(document.get("task_id"), "task_id"),
+        "backend_type": _status(document.get("backend_type"), "backend_type", frozenset({"cli", "codex_app_server"})),
+        "status": _status(document.get("status"), "status", SESSION_STATUSES),
+        "thread_id": _optional_text(document.get("thread_id"), "thread_id"),
+        "model": _optional_text(document.get("model"), "model"),
+        "reasoning_effort": _optional_text(document.get("reasoning_effort"), "reasoning_effort", 64),
+        "current_execution": current,
+    }
+
+
+def _parse_execution_status(
+    payload: object,
+    session: Mapping[str, object],
+) -> ExecutionViewModel:
+    document = _object(payload, "Execution status")
+    execution_id = _identifier(document.get("execution_id"), "execution_id")
+    expected_execution_id = session.get("current_execution_id")
+    if expected_execution_id is not None and execution_id != expected_execution_id:
+        raise StatusQueryError("Execution does not match the Session")
+    if _identifier(document.get("task_id"), "task_id") != session["task_id"]:
+        raise StatusQueryError("Execution task does not match the Session")
+    session_id = document.get("session_id")
+    if session_id is not None and _identifier(session_id, "session_id") != session["session_id"]:
+        raise StatusQueryError("Execution Session does not match")
+    thread_id = _optional_text(document.get("thread_id"), "thread_id")
+    if thread_id is not None and session.get("thread_id") is not None and thread_id != session["thread_id"]:
+        raise StatusQueryError("Execution Thread does not match the Session")
+    return ExecutionViewModel(
+        execution_id=execution_id,
+        status=_status(document.get("status"), "status", EXECUTION_STATUSES),
+        started_at=_timestamp(document.get("started_at"), "started_at"),
+        finished_at=None if document.get("finished_at") is None else _timestamp(document.get("finished_at"), "finished_at"),
+        turn_id=_optional_text(document.get("turn_id"), "turn_id"),
+    )
+
+
+def _parse_events(payload: object, session: Mapping[str, object]) -> tuple[SessionEventViewModel, ...]:
+    document = _object(payload, "Session events")
+    if _identifier(document.get("session_id"), "session_id") != session["session_id"]:
+        raise StatusQueryError("Events do not match the Session")
+    events_value = document.get("events")
+    if not isinstance(events_value, list):
+        raise StatusQueryError("events must be an array")
+    events: list[SessionEventViewModel] = []
+    for value in events_value:
+        event = _object(value, "event")
+        sequence = event.get("sequence")
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+            raise StatusQueryError("event.sequence must be a positive integer")
+        if _identifier(event.get("session_id"), "event.session_id") != session["session_id"]:
+            raise StatusQueryError("event Session does not match")
+        event_thread_id = _text(event.get("thread_id"), "event.thread_id")
+        if session.get("thread_id") is not None and event_thread_id != session["thread_id"]:
+            raise StatusQueryError("event Thread does not match the Session")
+        _identifier(event.get("execution_id"), "event.execution_id")
+        event_type = _text(event.get("event_type"), "event.event_type", 64)
+        if event_type not in EVENT_TYPES:
+            raise StatusQueryError("event.event_type is not recognized")
+        event_payload = _object(event.get("payload"), "event.payload")
+        content = ""
+        if event_type in {"agent_message_delta", "agent_message_completed"}:
+            content = _text(event_payload.get("content", ""), "event.payload.content", 4_000) if event_payload.get("content", "") != "" else ""
+        elif event_type == "execution_failed":
+            reason = event_payload.get("reason")
+            content = "" if reason is None else _text(reason, "event.payload.reason", 4_000)
+        events.append(SessionEventViewModel(
+            sequence=sequence,
+            timestamp=_timestamp(event.get("timestamp"), "event.timestamp"),
+            event_type=event_type,
+            content=content,
+        ))
+    return tuple(sorted(events, key=lambda event: event.sequence))
+
+
+def build_session_view_model(
+    session_status: object,
+    execution_status: object | None = None,
+    session_events: object | None = None,
+    *,
+    summary: Mapping[str, object] | None = None,
+) -> SessionViewModel:
+    session = _parse_session_status(session_status)
+    current = session["current_execution"]
+    current_execution_id = current["execution_id"] if isinstance(current, dict) else None
+    session_for_execution = {
+        **session,
+        "current_execution_id": current_execution_id,
+    }
+    execution: ExecutionViewModel | None = None
+    if execution_status is not None:
+        execution = _parse_execution_status(execution_status, session_for_execution)
+        if execution.turn_id is None and isinstance(current, dict):
+            execution = ExecutionViewModel(
+                execution_id=execution.execution_id,
+                status=execution.status,
+                started_at=execution.started_at,
+                finished_at=execution.finished_at,
+                turn_id=current["turn_id"],
+            )
+    elif isinstance(current, dict):
+        execution = ExecutionViewModel(
+            execution_id=current["execution_id"],
+            status=current["status"],
+            turn_id=current["turn_id"],
+        )
+    events = () if session_events is None else _parse_events(session_events, session_for_execution)
+    summary_document = {} if summary is None else _object(summary, "Session summary")
+    summary_session_id = summary_document.get("session_id")
+    if summary_session_id is not None and _identifier(summary_session_id, "summary.session_id") != session["session_id"]:
+        raise StatusQueryError("Session summary does not match the Session")
+    goal_name = _optional_text(summary_document.get("goal_name"), "summary.goal_name", 256) or session["goal_id"]
+    task_name = _optional_text(summary_document.get("task_name"), "summary.task_name", 256) or session["task_id"]
+    updated_at = None
+    if summary_document.get("updated_at") is not None:
+        updated_at = _timestamp(summary_document.get("updated_at"), "summary.updated_at")
+    elif events:
+        updated_at = events[-1].timestamp
+    return SessionViewModel(
+        goal_name=goal_name,
+        task_name=task_name,
+        status=session["status"],
+        backend_type=session["backend_type"],
+        model=session["model"],
+        reasoning_effort=session["reasoning_effort"],
+        session_id=session["session_id"],
+        thread_id=session["thread_id"],
+        updated_at=updated_at,
+        goal_id=session["goal_id"],
+        task_id=session["task_id"],
+        execution=execution,
+        events=events,
+    )
+
+
+def _decode_json_response(raw: bytes, content_type: str | None) -> object:
+    text = raw.decode("utf-8")
+    if content_type is not None and "text/event-stream" in content_type.casefold():
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data:
+                return json.loads(data)
+        raise StatusQueryError("MCP response contained no event data")
+    return json.loads(text)
 
 
 class StatusChecker:
@@ -47,9 +333,15 @@ class StatusChecker:
         self,
         auth_token: str | None = None,
         oauth_clients_url: str = LOCAL_OAUTH_CLIENTS_URL,
+        mcp_url: str = LOCAL_MCP_URL,
+        session_catalog_url: str = LOCAL_SESSION_CATALOG_URL,
+        workspace_id: str | None = None,
     ) -> None:
         self.auth_token = auth_token
         self.oauth_clients_url = oauth_clients_url
+        self.mcp_url = mcp_url
+        self.session_catalog_url = session_catalog_url
+        self.workspace_id = workspace_id
 
     def check(self) -> LauncherStatus:
         mcp_running = self._reachable(LOCAL_HEALTH_URL)
@@ -94,6 +386,122 @@ class StatusChecker:
                 return 200 <= response.status < 300
         except (HTTPError, URLError, OSError, TimeoutError):
             return False
+
+    def dashboard_sessions(self) -> tuple[SessionViewModel, ...]:
+        catalog = self._session_catalog()
+        sessions: list[SessionViewModel] = []
+        for summary in catalog:
+            try:
+                session_status = self._call_tool("get_session_status", {
+                    "session_id": summary["session_id"],
+                    **({"workspace_id": self.workspace_id} if self.workspace_id else {}),
+                })
+            except StatusQueryError:
+                continue
+            if session_status.get("backend_type") != "codex_app_server":
+                continue
+
+            current = session_status.get("current_execution")
+            execution_status = None
+            if isinstance(current, dict) and isinstance(current.get("execution_id"), str):
+                try:
+                    execution_status = self._call_tool("get_execution_status", {
+                        "execution_id": current["execution_id"],
+                        "session_id": summary["session_id"],
+                        **({"workspace_id": self.workspace_id} if self.workspace_id else {}),
+                    })
+                except StatusQueryError:
+                    execution_status = None
+
+            try:
+                session_events = self._call_tool("list_session_events", {
+                    "session_id": summary["session_id"],
+                    **({"workspace_id": self.workspace_id} if self.workspace_id else {}),
+                })
+            except StatusQueryError:
+                session_events = None
+
+            try:
+                sessions.append(build_session_view_model(
+                    session_status,
+                    execution_status,
+                    session_events,
+                    summary=summary,
+                ))
+            except StatusQueryError:
+                continue
+        return tuple(sessions)
+
+    def _session_catalog(self) -> tuple[dict[str, object], ...]:
+        payload = self._request_json(self.session_catalog_url)
+        document = _object(payload, "Session catalog")
+        values = document.get("sessions")
+        if not isinstance(values, list):
+            raise StatusQueryError("Session catalog sessions must be an array")
+        summaries: list[dict[str, object]] = []
+        for value in values:
+            summary = _object(value, "Session catalog entry")
+            summaries.append({
+                "session_id": _identifier(summary.get("session_id"), "session_id"),
+                "goal_name": _text(summary.get("goal_name"), "goal_name"),
+                "task_name": _text(summary.get("task_name"), "task_name"),
+                "updated_at": _timestamp(summary.get("updated_at"), "updated_at"),
+            })
+        return tuple(summaries)
+
+    def _call_tool(self, name: str, arguments: Mapping[str, object]) -> dict[str, object]:
+        payload = self._request_json(self.mcp_url, method="POST", body={
+            "jsonrpc": "2.0",
+            "id": str(uuid4()),
+            "method": "tools/call",
+            "params": {"name": name, "arguments": dict(arguments)},
+        }, mcp=True)
+        document = _object(payload, "MCP response")
+        if document.get("error") is not None:
+            raise StatusQueryError(f"MCP tool {name} failed")
+        result = _object(document.get("result"), "MCP result")
+        if result.get("isError") is True:
+            raise StatusQueryError(f"MCP tool {name} failed")
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            return structured
+        content = result.get("content")
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            text = content[0].get("text")
+            if isinstance(text, str):
+                try:
+                    return _object(json.loads(text), f"MCP tool {name} output")
+                except json.JSONDecodeError as error:
+                    raise StatusQueryError(f"MCP tool {name} output is not JSON") from error
+        raise StatusQueryError(f"MCP tool {name} returned no structured output")
+
+    def _request_json(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        body: Mapping[str, object] | None = None,
+        mcp: bool = False,
+    ) -> object:
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        headers = self._auth_headers()
+        if mcp:
+            headers.update({
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+            })
+        request = Request(url, data=data, method=method, headers=headers)
+        try:
+            with urlopen(request, timeout=3) as response:
+                raw = response.read(MAX_STATUS_RESPONSE_BYTES + 1)
+                if len(raw) > MAX_STATUS_RESPONSE_BYTES:
+                    raise StatusQueryError("Status Query response is too large")
+                content_type = response.headers.get("content-type", "")
+                return _decode_json_response(raw, content_type)
+        except StatusQueryError:
+            raise
+        except (HTTPError, URLError, OSError, TimeoutError, UnicodeDecodeError, ValueError) as error:
+            raise StatusQueryError("Status Query request failed") from error
 
     def _auth_headers(self) -> dict[str, str]:
         return {} if self.auth_token is None else {"Authorization": f"Bearer {self.auth_token}"}

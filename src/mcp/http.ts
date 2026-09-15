@@ -28,9 +28,15 @@ import { createMcpServer, registeredMcpToolsMessage, type McpRuntimeContext } fr
 
 export const MAX_MCP_REQUEST_BYTES = 1024 * 1024;
 export const OAUTH_CLIENTS_PATH = "/oauth/clients";
+export const LAUNCHER_SESSION_CATALOG_PATH = "/launcher/sessions";
 const SAFE_OAUTH_STORAGE_PATH = "oauth/clients.json";
 
-type HttpRuntimeContext = McpRuntimeContext & {
+type HttpStatusQuery = NonNullable<McpRuntimeContext["statusQuery"]> & {
+  readonly listSessionSummaries: (workspaceId?: string) => Promise<readonly unknown[]>;
+};
+
+type HttpRuntimeContext = Omit<McpRuntimeContext, "statusQuery"> & {
+  readonly statusQuery?: HttpStatusQuery;
   readonly tunnel?: Pick<TunnelProvider, "status">;
 };
 
@@ -135,6 +141,39 @@ async function handleHealthRequest(
     ...(tunnel.endpoint === undefined ? {} : { endpoint: tunnel.endpoint }),
     oauth_registry: safeOAuthRegistryStatus(oauth),
   });
+}
+
+async function handleLauncherSessionCatalogRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: HttpRuntimeContext,
+  authToken: string,
+): Promise<void> {
+  if (!isDirectLoopbackRequest(request)) {
+    request.resume();
+    sendJson(response, 404, { error: "not_found" });
+    return;
+  }
+  if (!isAuthenticated(request, authToken)) {
+    request.resume();
+    sendUnauthorized(response);
+    return;
+  }
+  if (request.method !== "GET") {
+    request.resume();
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+  if (context.statusQuery === undefined) {
+    sendJson(response, 503, { error: "status_query_unavailable" });
+    return;
+  }
+  try {
+    const sessions = await context.statusQuery.listSessionSummaries(context.registry.active.id);
+    sendJson(response, 200, { sessions });
+  } catch {
+    sendJson(response, 500, { error: "session_catalog_unavailable" });
+  }
 }
 
 async function handleMcpRequest(
@@ -655,6 +694,11 @@ export function createHttpServer(
           return;
         }
         await handleHealthRequest(request, response, context, oauth);
+        return;
+      }
+
+      if (path === LAUNCHER_SESSION_CATALOG_PATH) {
+        await handleLauncherSessionCatalogRequest(request, response, context, settings.auth.token);
         return;
       }
 
