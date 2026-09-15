@@ -67,6 +67,61 @@ export interface UpdateExecutionContextInput {
   readonly summary?: string;
 }
 
+export const SESSION_BACKEND_TYPES = [
+  "cli",
+  "codex_app_server",
+] as const;
+
+export type SessionBackendType = typeof SESSION_BACKEND_TYPES[number];
+
+export const SESSION_STATUSES = [
+  "created",
+  "starting",
+  "active",
+  "waiting_input",
+  "completed",
+  "failed",
+  "terminated",
+] as const;
+
+export type SessionStatus = typeof SESSION_STATUSES[number];
+
+export interface Session {
+  readonly session_id: string;
+  readonly goal_id: string;
+  readonly task_id: string;
+  readonly backend_type: SessionBackendType;
+  readonly status: SessionStatus;
+  /** Canonical workspace path or registered workspace reference. */
+  readonly workspace: string;
+  /** Omitted for CLI sessions; populated with the provider Thread ID for app-server sessions. */
+  readonly thread_id?: string;
+  readonly model?: string;
+  /** Saved default; mapped to a future app-server turn/start.effort field. */
+  readonly reasoning_effort?: string;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface CreateSessionInput {
+  readonly session_id?: string;
+  readonly goal_id: string;
+  readonly task_id: string;
+  readonly backend_type: SessionBackendType;
+  readonly status?: SessionStatus;
+  readonly workspace: string;
+  readonly thread_id?: string;
+  readonly model?: string;
+  readonly reasoning_effort?: string;
+}
+
+export interface UpdateSessionInput {
+  readonly status?: SessionStatus;
+  readonly thread_id?: string;
+  readonly model?: string;
+  readonly reasoning_effort?: string;
+}
+
 export const REVIEW_REQUEST_STATUSES = [
   "pending",
   "requested",

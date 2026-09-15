@@ -1,9 +1,10 @@
-# Interactive Backend 架构约束（Phase 0）
+# Interactive Backend 架构约束（Phase 2）
 
-状态：冻结设计，文档阶段。本文不表示 Interactive Backend 已经实现。
+状态：Phase 2 Session Model Foundation 已实现；本文仍不表示 Interactive
+Backend 已经接入或可以调度。
 
-本阶段只冻结边界、生命周期、兼容规则、状态和事件的归属；不修改
-LRM Core、MCP schema、持久化实现或现有执行行为。
+本阶段新增 Session 类型、schema 和基础 filesystem Store；不修改 LRM Core、
+MCP schema 或现有执行行为。
 
 ## 1. 当前基线与目标结构
 
@@ -18,6 +19,16 @@ MCP submit_goal
   -> CodexExecutionAdapter              # 当前仅支持 codex exec
   -> codex exec --json -
 ```
+
+Phase 2 的新增路径是独立的 Session record：
+
+```text
+SessionStore
+  -> .task/sessions/<session_id>.json
+```
+
+它不插入上面的 CLI 调用链。`submit_goal` 仍按原路径执行，Session Store
+只为后续 interactive backend 保存必要的长期 context 字段。
 
 CLI 入口直接调用 `GoalSubmissionService`，但仍经过同一套 Goal、Task、
 Actuation 和 Execution 持久化逻辑。`ExecutionContextService` 目前只是
@@ -95,6 +106,21 @@ provider thread                          ==  LRM interactive Session reference
 provider turn                            ==  one interactive Execution unit
 ```
 
+未来映射关系：
+
+```text
+LRM Session
+    |
+    +-- Codex app-server Thread
+          |
+          +-- Turn
+                |
+                +-- Execution Event
+```
+
+`Session` 是长期上下文，`Turn` 是一次 interactive 交互，`Execution Event`
+是该次交互的事件投影；本阶段只保存 Session 字段，不创建这些 provider 对象。
+
 provider 返回的 `sessionId`、transport connection id 或 UI/window reference
 都是 provider metadata；只有经明确绑定的 provider `thread.id` 才能作为
 LRM Session 的外部 identity。窗口是否可见不能证明 Session 所属关系。
@@ -104,7 +130,7 @@ LRM Session 的外部 identity。窗口是否可见不能证明 Session 所属�
 | 维度 | `CliBackend` | `CodexAppServerBackend` |
 | --- | --- | --- |
 | 环境 | 一个 `codex exec --json -` 进程 | 长期 app-server 进程/连接，可承载多个 Thread |
-| LRM Session | 无持久 Session；`session_id` 为空或仅为一次性内部 handle | 持久 Session，绑定一个 provider Thread |
+| LRM Session | 当前 CLI 链路不自动创建；显式保存时 `thread_id` 可为空 | 持久 Session，绑定一个 provider Thread |
 | 一次执行 | 进程 lifetime 是一个 Execution | 一个 `turn/start` 是一个 Execution |
 | 输入 | 通过 stdin 发送完整 instruction | 通过 `turn/start` 发送 input |
 | 事件 | CLI JSONL stdout/stderr，经现有 completion observer 解析 | JSON-RPC response/notification，经 Backend 转换 |
@@ -116,6 +142,9 @@ LRM Session 的外部 identity。窗口是否可见不能证明 Session 所属�
 app-server 的 Thread 仍然保存上下文，后续可拥有多个 Turn/Execution。
 
 ## 5. `submit_goal` 兼容性冻结
+
+以下仍是未来 interactive backend 的设计边界，不是 Phase 2 的新增 API。当前
+`submit_goal` contract、receipt 和 CLI execution 行为保持不变。
 
 现有公开工具 contract 继续保持：
 
@@ -146,7 +175,7 @@ app-server 的 Thread 仍然保存上下文，后续可拥有多个 Turn/Executi
 `execution_id` 或 provider Thread id；公开工具返回时 canonical conversation
 可能尚未建立。
 
-唯一的 Phase 0 additive API 字段是：
+未来可能增加的 additive API 字段是：
 
 ```json
 {
@@ -218,10 +247,24 @@ codex app-server generate-json-schema --out <temporary-directory>
 Schema、handshake 或必需方法不匹配时，Backend 必须 fail closed；不得通过
 字段猜测、未识别事件或 provider-specific fallback 继续执行。
 
-## 8. Phase 0 非目标
+## 8. Phase 2 实现内容与非目标
 
-- 本阶段不增加 `ExecutionBackend`、Session store、App-server client 或 MCP tool 的代码。
-- 不迁移既有 `.task` record，不改 `ExecutionContextService` 的现有字段含义。
+本阶段已经实现：
+
+- `Session`、`SessionStatus`、`SessionBackendType` 及其 create/update 输入类型；
+- Session 的严格 Zod schema；
+- `SessionStore.createSession()`、`getSession()`、`updateSession()` 和
+  `listSessions()`；
+- `.task/sessions/<session_id>.json` 的 application-local 持久化。
+
+本阶段非目标：
+
+- 不增加 `ExecutionBackend` 调度层，不调用 app-server，不修改 App-server client
+  的现有协议代码，也不增加 MCP tool。
+- 不迁移既有 `.task` record，不改 `ExecutionContextService` 的现有字段含义，
+  不把 `thread_id` 直接塞入 Execution。
+- 不修改 `submit_goal`、Goal API、Task API、现有 Execution API、CLI backend 或
+  Extension delivery。
 - 不把 app-server 原始 JSON-RPC 事件传给 LRM caller。
 - 不增加自动重试、自动选模、隐式 Thread 复用或浏览器窗口推断。
 - 不把 `ReviewRequest`、`ConversationRouting` 或现有 Auto Iteration 逻辑搬进 Backend。
