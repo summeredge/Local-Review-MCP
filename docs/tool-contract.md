@@ -1,6 +1,6 @@
 # MCP tool contract
 
-This document freezes the V0.1 Release Candidate tool surface. Nine tools are
+This document freezes the V0.1 Release Candidate tool surface. Twelve tools are
 read-only, and `submit_goal` is the reviewed Control Plane entry point. The
 names and input fields below are the current MCP contract; the runtime does
 not expose direct write, exec, shell, commit, or push operations.
@@ -16,6 +16,9 @@ not expose direct write, exec, shell, commit, or push operations.
 | `git_diff` | workspace | read-only |
 | `review_summary` | workspace | read-only |
 | `execution_output` | workspace | read-only |
+| `get_session_status` | workspace | read-only |
+| `get_execution_status` | workspace | read-only |
+| `list_session_events` | workspace | read-only |
 | `submit_goal` | current ChatGPT conversation | Control Plane |
 
 ## Common rules
@@ -181,6 +184,30 @@ not expose direct write, exec, shell, commit, or push operations.
 - Workspace scope: selected workspace fixed path `.review/execution_output.json`.
 - Permission: authenticated read-only result access. It never accepts a path,
   runs a command, or exposes an execution capability.
+
+### `get_session_status`
+
+- Purpose: Return the normalized read-only Session, Thread, model, effort, Goal,
+  and current Execution status.
+- Input: `{ "session_id"?: "string", "goal_id"?: "string", "workspace_id"?: "string" }`;
+  one of `session_id` or `goal_id` is required.
+- Permission: authenticated read-only; the requested record must belong to the
+  selected registered workspace.
+
+### `get_execution_status`
+
+- Purpose: Return the read-only Execution status and its proven Session/Thread/
+  Turn association, including bounded normalized agent output.
+- Input: `{ "execution_id": "string", "session_id"?: "string", "goal_id"?: "string", "workspace_id"?: "string" }`.
+- Permission: authenticated read-only; identity mismatches fail closed.
+
+### `list_session_events`
+
+- Purpose: Return the bounded, ordered LRM event stream for one Session.
+- Input: `{ "session_id": "string", "workspace_id"?: "string", "after_sequence"?: "integer", "limit"?: "integer" }`.
+- Output: `{ "session_id": "string", "events": [], "returned": "integer", "has_more": "boolean" }`.
+- Permission: authenticated read-only. Only normalized LRM event fields are
+  returned; app-server JSON-RPC payloads are never exposed.
 
 ### `submit_goal`
 

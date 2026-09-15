@@ -1,7 +1,7 @@
-# Interactive Backend 架构约束（Phase 3）
+# Interactive Backend 架构约束（Phase 4）
 
-状态：Phase 3 `submit_goal` interactive 路由已接入，已完成 Session、Thread、
-Turn 的基础启动链路；approval、user input、pause/resume 仍未实现。
+状态：Phase 4 `submit_goal` interactive 路由已接入 Event Adapter、Session 状态
+同步、Event Store 和只读 Status Query；approval、user input、pause/resume 仍未实现。
 
 本阶段在 Phase 2 Session 类型、schema 和 filesystem Store 的基础上增加
 interactive backend 路由；默认 batch 执行行为保持不变。
@@ -24,6 +24,8 @@ MCP submit_goal
        -> CodexAppServerBackend           # interactive
             -> SessionStore
             -> thread/start -> turn/start
+            -> CodexEventAdapter -> LRM EventStore
+            -> Session / Execution status projection
 ```
 
 Session record 的持久化路径是：
@@ -72,8 +74,8 @@ submit_goal -> Goal / Task -> ControlledActuationService
 | `GoalSubmissionService` | 校验兼容的 Goal 请求、创建/启动 Goal | 解析 provider 协议、选择 Thread、读取模型目录 |
 | `GoalOrchestrationService` | Goal、Phase、Task、review/iteration 关系及状态 | 直接 spawn、JSON-RPC、UI 或 provider 事件 |
 | `ControlledActuationService` | permission gate、authorization、reservation、重复调用保护 | 解释 CLI 或 app-server 的事件 |
-| `ExecutionService` | 选择 Backend、绑定 LRM identity、持久化生命周期、规范化事件、恢复和幂等 | 直接依赖某个 provider 的 wire payload |
-| `ExecutionBackend` | 启动环境、创建/恢复 Session、发送任务、读取事件、停止/恢复 | 创建 Goal/Task、决定 LRM 权限、写入 LRM record |
+| `ExecutionService` | 选择 Backend、绑定 LRM identity、持久化生命周期、协调规范化事件、恢复和幂等 | 直接依赖某个 provider 的 wire payload |
+| `ExecutionBackend` | 启动环境、创建/恢复 Session、发送任务、读取并适配事件、停止/恢复 | 创建 Goal/Task、决定 LRM 权限、写入 LRM record |
 | `ExecutionContextService` | 校验并持久化 Execution record | 启动进程、连接 app-server、推断状态 |
 | LRM Core | Goal、Task、权限、Workspace、用户请求、状态持久化 | 把 provider 原始事件暴露给 MCP |
 
@@ -104,7 +106,8 @@ browser 或 agent 子系统。
 `startExecution` 合并为一次进程启动，但语义上仍返回同一套 neutral result。
 不支持的 `resumeSession` 必须明确返回 unsupported，不能伪造一个长期 Session。
 
-`CodexAppServerBackend` 必须把连接、Thread、Turn 三种对象分开：
+`CodexAppServerBackend` 必须把连接、Thread、Turn 三种对象分开，并把 provider
+event 交给 `CodexEventAdapter`：
 
 ```text
 app-server process / JSON-RPC connection  !=  LRM Session
@@ -125,8 +128,8 @@ LRM Session
 ```
 
 `Session` 是长期上下文，`Turn` 是一次 interactive 交互，`Execution Event`
-是该次交互的事件投影；Phase 3 创建一个 Thread 和一个首 Turn，并同步基础
-Session/Execution 生命周期。
+是该次交互的事件投影；Phase 4 创建一个 Thread 和一个首 Turn，将 event 转换
+后写入 EventStore，并同步基础 Session/Execution 生命周期。
 
 provider 返回的 `sessionId`、transport connection id 或 UI/window reference
 都是 provider metadata；只有经明确绑定的 provider `thread.id` 才能作为
@@ -257,7 +260,7 @@ codex app-server generate-json-schema --out <temporary-directory>
 Schema、handshake 或必需方法不匹配时，Backend 必须 fail closed；不得通过
 字段猜测、未识别事件或 provider-specific fallback 继续执行。
 
-## 8. Phase 3 实现内容与非目标
+## 8. Phase 4 实现内容与非目标
 
 本阶段已经实现：
 
@@ -266,9 +269,12 @@ Schema、handshake 或必需方法不匹配时，Backend 必须 fail closed；�
   `CodexAppServerBackend`；
 - interactive 的 `model/list` capability discovery、provider default/model
   选择、`thread/start` 和 `turn/start`；
-- interactive Session 的 `created -> starting -> active -> completed|failed`
-  同步，以及 provider Thread ID 持久化；
+- interactive Session 的 `created -> starting -> active -> running_turn ->
+  completed|failed` 同步，以及 provider Thread ID 持久化；
 - `.task/sessions/<session_id>.json` 的 Session 绑定。
+- app-server provider event 到 LRM event 的转换和
+  `.task/events/<session_id>.json` 文件事件存储；
+- `get_session_status`、`get_execution_status` 和 `list_session_events` 只读查询。
 
 人工真实 smoke 入口为 `npm run test:interactive-goal`。为避免测试新建
 Codex Thread 时使用其他模型，运行前必须设置：
@@ -294,3 +300,27 @@ Backend 本身仍通过 `model/list` 校验实际 catalog，不硬编码模型�
 
 - [`session-model.md`](session-model.md)
 - [`event-model.md`](event-model.md)
+
+## 9. Phase 4 Event Flow 与 Status Query
+
+```text
+Codex app-server
+  -> turn/started, item/agentMessage/delta, item/completed, turn/completed
+  -> CodexEventAdapter
+  -> LRM Event
+  -> EventStore + Session/Execution status
+  -> StatusQueryService
+```
+
+`CodexEventAdapter` 的输出只使用 LRM 字段：`event_type`、`session_id`、
+`execution_id`、`timestamp`、已验证的 `thread_id`/`turn_id`/`item_id` 和受约束
+的 `payload`。`turn/started` 使 Session 进入 `running_turn`；成功的
+`turn/completed` 写入 `turn_completed` 并把旧 `ExecutionContext.status` 写为
+`passed`；失败事件写入 `execution_failed` 并写为 `failed`。事件存储通过
+`appendEvent()` 和 `listEvents(session_id)` 提供有序的 JSON 文件记录，不引入
+数据库。
+
+只读接口返回当前 Session 的 Thread、model、reasoning effort 和
+`current_execution`，以及当前 Execution 的状态、Session/Turn 关联和已记录的
+agent output。它们不改变 `submit_goal` receipt，也不改变默认 `execution_mode=batch`
+或 CLI `codex exec --json -` 路径。

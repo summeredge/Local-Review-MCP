@@ -192,6 +192,9 @@ async function makeRemoteServer(): Promise<string> {
                 "review_summary",
                 "execution_output",
                 "submit_goal",
+                "get_session_status",
+                "get_execution_status",
+                "list_session_events",
               ].map((name) => ({ name })),
             }
           : undefined;
@@ -327,7 +330,7 @@ describe("deployment scripts", () => {
     expect(result.code).toBe(0);
     expect(result.output).toMatch(/health: passed.*status=ok/i);
     expect(result.output).toMatch(/mcp initialize: passed/i);
-    expect(result.output).toMatch(/tools\/list: passed.*ten read-only tools plus submit_goal/i);
+    expect(result.output).toMatch(/tools\/list: passed.*thirteen tools/i);
     expect(result.output).toMatch(/remote verification passed/i);
     expect(result.output).not.toContain(REMOTE_TOKEN);
   });

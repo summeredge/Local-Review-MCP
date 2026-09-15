@@ -9,6 +9,15 @@ import { GitService } from "../git/service.js";
 import type { GitDiffResponse, GitStatusResponse } from "../git/types.js";
 import type { ConversationCorrelationRegistry } from "../control-plane/conversation-correlation.js";
 import {
+  executionStatusQueryInputSchema,
+  executionStatusOutputSchema,
+  sessionEventsOutputSchema,
+  sessionEventsQueryInputSchema,
+  sessionStatusOutputSchema,
+  sessionStatusQueryInputSchema,
+  type StatusQueryService,
+} from "../control-plane/status-query.js";
+import {
   goalSubmissionToolInputSchema,
   goalSubmissionAcceptedSchema,
   type GoalSubmissionService,
@@ -52,6 +61,10 @@ export interface McpRuntimeContext {
   readonly correlations?: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">;
   readonly goalSubmission?: Pick<GoalSubmissionService, "submitGoal">;
   readonly pendingGoalSubmission?: Pick<PendingGoalSubmissionService, "accept">;
+  readonly statusQuery?: Pick<
+    StatusQueryService,
+    "getSessionStatus" | "getExecutionStatus" | "listSessionEvents"
+  >;
   readonly connectorEvidence?: {
     recordEvidence(input: {
       readonly request_id: string;
@@ -77,11 +90,17 @@ export const V01_TOOL_NAMES = [
 export const WORKSPACE_REGISTRY_TOOL_NAMES = ["workspace_list"] as const;
 export const REVIEW_CONTEXT_TOOL_NAMES = ["review_summary", "execution_output"] as const;
 export const CONTROL_PLANE_TOOL_NAMES = ["submit_goal"] as const;
+export const STATUS_QUERY_TOOL_NAMES = [
+  "get_session_status",
+  "get_execution_status",
+  "list_session_events",
+] as const;
 export const REGISTERED_TOOL_NAMES = [
   ...V01_TOOL_NAMES,
   ...WORKSPACE_REGISTRY_TOOL_NAMES,
   ...REVIEW_CONTEXT_TOOL_NAMES,
   ...CONTROL_PLANE_TOOL_NAMES,
+  ...STATUS_QUERY_TOOL_NAMES,
 ] as const;
 
 export type V01ToolName = typeof V01_TOOL_NAMES[number];
@@ -655,6 +674,78 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     async (input) => {
       try {
         return structuredResponse(executionOutputOutputSchema, await executionOutput(registry.resolve(input.workspace_id).manager));
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_session_status",
+    {
+      description: "Return the read-only status of an interactive Session by session_id or goal_id.",
+      inputSchema: sessionStatusQueryInputSchema,
+      outputSchema: sessionStatusOutputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        if (context.statusQuery === undefined) {
+          return toToolError(new Error("Status query runtime is unavailable."));
+        }
+        const selection = registry.resolve(input.workspace_id);
+        return structuredResponse(sessionStatusOutputSchema, await context.statusQuery.getSessionStatus({
+          ...input,
+          workspace_id: selection.id,
+        }));
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_execution_status",
+    {
+      description: "Return the read-only status of an Execution by execution_id.",
+      inputSchema: executionStatusQueryInputSchema,
+      outputSchema: executionStatusOutputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        if (context.statusQuery === undefined) {
+          return toToolError(new Error("Status query runtime is unavailable."));
+        }
+        const selection = registry.resolve(input.workspace_id);
+        return structuredResponse(executionStatusOutputSchema, await context.statusQuery.getExecutionStatus({
+          ...input,
+          workspace_id: selection.id,
+        }));
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_session_events",
+    {
+      description: "List bounded normalized LRM events for an interactive Session.",
+      inputSchema: sessionEventsQueryInputSchema,
+      outputSchema: sessionEventsOutputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        if (context.statusQuery === undefined) {
+          return toToolError(new Error("Status query runtime is unavailable."));
+        }
+        const selection = registry.resolve(input.workspace_id);
+        return structuredResponse(sessionEventsOutputSchema, await context.statusQuery.listSessionEvents({
+          ...input,
+          workspace_id: selection.id,
+        }));
       } catch (error: unknown) {
         return toToolError(error);
       }

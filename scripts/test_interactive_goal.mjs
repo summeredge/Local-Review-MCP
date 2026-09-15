@@ -31,6 +31,7 @@ const submission = new GoalSubmissionService(context.goalOrchestration, {
   }),
 });
 const sessions = new SessionStore(context.storageRoot);
+const statusQuery = context.statusQuery;
 const smokeModel = process.env.CODEX_INTERACTIVE_MODEL?.trim();
 const smokeEffort = process.env.CODEX_INTERACTIVE_EFFORT?.trim();
 
@@ -52,7 +53,7 @@ try {
     workspace_id: "interactive-smoke",
     conversation_id: "interactive-smoke-conversation",
     title: "Interactive Codex app-server smoke test",
-    goal: "请只回复：LRM_INTERACTIVE_GOAL_PASS\n不要修改文件。不要执行命令。",
+    goal: "请只回复：LRM_PHASE4_EVENT_PASS\n不要修改文件。不要执行命令。",
     requirements: ["Use the interactive Codex app-server backend."],
     acceptance_criteria: ["The Codex Thread is created and the requested reply is returned."],
     execution_mode: "interactive",
@@ -64,6 +65,39 @@ try {
     throw new Error("Interactive Session or thread_id was not persisted.");
   }
   const terminal = await waitForTerminal(session.session_id);
+  if (terminal.status !== "completed") {
+    throw new Error(`Interactive Session ended with status=${terminal.status}.`);
+  }
+  if (statusQuery === undefined) throw new Error("Status query runtime was not created.");
+  const sessionStatus = await statusQuery.getSessionStatus({
+    session_id: terminal.session_id,
+    workspace_id: "interactive-smoke",
+  });
+  const executionStatus = await statusQuery.getExecutionStatus({
+    execution_id: result.execution_id,
+    session_id: terminal.session_id,
+    workspace_id: "interactive-smoke",
+  });
+  const eventResult = await statusQuery.listSessionEvents({
+    session_id: terminal.session_id,
+    workspace_id: "interactive-smoke",
+  });
+  const eventTypes = eventResult.events.map((event) => event.event_type);
+  for (const expected of [
+    "session_started",
+    "turn_started",
+    "agent_message_delta",
+    "agent_message_completed",
+    "turn_completed",
+  ]) {
+    if (!eventTypes.includes(expected)) throw new Error(`Normalized event was not recorded: ${expected}.`);
+  }
+  if (executionStatus.status !== "passed") {
+    throw new Error(`Interactive Execution ended with status=${executionStatus.status}.`);
+  }
+  if (!executionStatus.agent_output?.includes("LRM_PHASE4_EVENT_PASS")) {
+    throw new Error("Interactive agent output was not recorded.");
+  }
   console.log(JSON.stringify({
     goal_id: result.goal_id,
     task_id: result.task_id,
@@ -76,6 +110,11 @@ try {
       model: terminal.model,
       reasoning_effort: terminal.reasoning_effort,
       status: terminal.status,
+    },
+    query: {
+      session_status: sessionStatus.status,
+      execution_status: executionStatus.status,
+      event_types: eventTypes,
     },
   }, null, 2));
 } finally {

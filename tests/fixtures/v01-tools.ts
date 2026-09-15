@@ -13,4 +13,7 @@ export const EXPECTED_REGISTERED_TOOL_NAMES = [
   "review_summary",
   "execution_output",
   "submit_goal",
+  "get_session_status",
+  "get_execution_status",
+  "list_session_events",
 ] as const;

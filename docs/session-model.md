@@ -1,6 +1,7 @@
-# Goal / Task / Session / Execution / Turn 模型（Phase 3）
+# Goal / Task / Session / Execution / Turn 模型（Phase 4）
 
-状态：Session Model Foundation 和 interactive `submit_goal` 基础调度已实现。
+状态：Session Model、interactive `submit_goal` 基础调度、normalized event stream
+和只读 status query 已实现。
 Session 是为长期 Agent context 保留的 Control Plane 对象；本阶段只打通首个
 Thread/Turn，不实现完整交互平台。
 
@@ -14,7 +15,7 @@ Goal
         +-- Session
               +-- Execution       # 一次执行生命周期
               +-- Turn            # interactive backend 的一次交互
-                    +-- Execution Event  # future provider event projection
+                    +-- Execution Event  # normalized LRM event projection
 ```
 
 Goal/Phase 的现有规划层仍然保留；上图省略 Phase 以突出本阶段新增的
@@ -54,7 +55,7 @@ Task 仍然使用当前 `TaskContext` 的 identity 和兼容字段。尤其是
 
 - `session_id`、`goal_id`、`task_id`；
 - `backend_type`：`cli` 或 `codex_app_server`；
-- `status`：`created`、`starting`、`active`、`waiting_input`、`completed`、
+- `status`：`created`、`starting`、`active`、`running_turn`、`waiting_input`、`completed`、
   `failed` 或 `terminated`；
 - `workspace`：canonical workspace path 或 registered workspace reference；
 - `thread_id`：CLI 可以省略，app-server 保存 provider Codex Thread ID；
@@ -162,15 +163,17 @@ starting
   ↓
 active
   ↓
+running_turn
+  ↓
 waiting_input
   ↓
 completed
 ```
 
-`failed` 和 `terminated` 是异常终态。Phase 3 interactive backend 使用
-`created -> starting -> active -> completed|failed`；`waiting_input` 仍只定义
-在模型中，收到 approval/user-input 后的恢复调度不在本阶段。Store 校验状态值，
-不调用 provider，也不替现有 Execution API 推断状态。
+`failed` 和 `terminated` 是异常终态。Phase 4 interactive backend 使用
+`created -> starting -> active -> running_turn -> completed|failed`；
+`waiting_input` 已纳入状态模型，但 approval/user-input 的 provider 调度仍不在
+本阶段。Store 校验状态值，不调用 provider，也不替现有 Execution API 推断状态。
 
 ## 6. Submission 与 runtime 分层
 
@@ -237,7 +240,7 @@ Session 只能保存已确认的 selection。若恢复后该 model/effort 已不
 2. 不自动替换成第一个模型或另一个 effort；
 3. 阻止新的 Turn，并要求重新选择有效配置。
 
-## 8. Session Store 与 Phase 3 边界
+## 8. Session Store 与 Phase 4 边界
 
 `SessionStore` 使用现有 application-local filesystem state，不引入数据库：
 
@@ -253,11 +256,14 @@ listSessions()                        -> Promise<Session[]>
 `updated_at`；列表按 `session_id` 排序。所有读写均经过现有 Zod 风格的严格
 schema 校验。
 
-Phase 3 已打通：
+Phase 4 已打通：
 
 - `submit_goal.execution_mode` 缺省为 `batch`；
 - `interactive` 创建 Session，持久化 `thread_id`，并发送首个 `turn/start`；
-- Session 和 Execution 在 turn terminal event 后同步为 `completed` 或 `failed`。
+- Session 和 Execution 在 normalized turn terminal event 后同步为 `completed` 或 `failed`。
+- `CodexEventAdapter` 将 app-server event 转换为 LRM event；`EventStore` 将事件
+  按 Session 写入 `.task/events/<session_id>.json`。
+- `StatusQueryService` 提供 Session、Execution 和 Session event 的只读查询。
 
 本阶段的非目标：
 
@@ -267,3 +273,48 @@ Phase 3 已打通：
   id、浏览器 tab 或用户可见窗口当作 Codex Thread id。
 - 不实现 approval、user input、pause/resume、Launcher UI、多 Agent 或
   Extension delivery 变化。
+
+## 9. Phase 4 Event Flow 与 Status Query
+
+事件和状态的实际链路为：
+
+```text
+Codex Thread
+      |
+      v
+Codex app-server event
+      |
+      v
+CodexEventAdapter
+      |
+      v
+LRM Event (event_type/session_id/execution_id/payload)
+      |
+      +--> EventStore: .task/events/<session_id>.json
+      |
+      +--> Session status: active -> running_turn -> completed|failed
+      |
+      +--> Execution status: running -> passed|failed
+      |
+      v
+StatusQueryService / MCP read-only tools
+```
+
+规范化事件至少支持：`session_started`、`turn_started`、
+`agent_message_delta`、`agent_message_completed`、`turn_completed` 和
+`execution_failed`。事件保留 LRM `session_id`、`execution_id`、provider
+`thread_id`/`turn_id` 的已验证关联；provider `sessionId` 和原始 JSON-RPC
+payload 不写入 LRM event。
+
+只读查询接口为：
+
+```text
+getSessionStatus({ session_id } | { goal_id })
+getExecutionStatus({ execution_id, session_id?, goal_id? })
+listSessionEvents({ session_id, after_sequence?, limit? })
+```
+
+对应 MCP 工具为 `get_session_status`、`get_execution_status` 和
+`list_session_events`。`ExecutionContext.status` 继续只使用
+`running|passed|failed`；`running_turn` 和 `waiting_input` 只属于 Session
+生命周期。

@@ -45,6 +45,8 @@ import {
 import type { ExtensionIdentityEvidence } from "./control-plane/extension-identity.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
 import { defaultTaskContextStorageRoot } from "./context/task.js";
+import { EventStore } from "./control-plane/events/index.js";
+import { StatusQueryService } from "./control-plane/status-query.js";
 import { validateWorkspaceIdentityConsistency } from "./workspace/identity.js";
 import { WorkspaceManager } from "./workspace/manager.js";
 import { WorkspaceRegistry } from "./workspace/registry.js";
@@ -66,6 +68,8 @@ export interface AppContext extends McpRuntimeContext {
   readonly codexExecutionAdapter?: CodexExecutionAdapter;
   readonly codexAppServerBackend?: CodexAppServerBackend;
   readonly executionService?: ExecutionService;
+  readonly eventStore?: EventStore;
+  readonly statusQuery?: StatusQueryService;
   readonly controlledActuation?: ControlledActuationService;
   readonly autoIteration?: AutoIterationService;
   readonly goalPreflight?: GoalPreflightService;
@@ -109,6 +113,7 @@ export function createAppContext(
   const extensionDeliveries = new ExtensionDeliveryService(storageRoot);
   const extensionReviewCompletions = new ExtensionReviewCompletionService(storageRoot);
   const codexExecutionCompletion = new CodexExecutionCompletionService(storageRoot);
+  const eventStore = new EventStore(storageRoot);
   const codexExecutionAdapter = new CodexExecutionAdapter(registry, {
     storageRoot,
     completionService: codexExecutionCompletion,
@@ -117,6 +122,7 @@ export function createAppContext(
   const codexAppServerBackend = new CodexAppServerBackend(registry, {
     storageRoot,
     environment,
+    eventStore,
   });
   const executionService = new ExecutionService(new ExecutionBackendRouter({
     batch: new CliExecutionBackend(codexExecutionAdapter),
@@ -158,6 +164,12 @@ export function createAppContext(
   });
   autoIteration.setTerminalListener((loop) => goalOrchestration.onAutoIterationTerminal(loop));
   codexExecutionCompletion.setTerminalListener((execution) => executionRouter.onExecutionTerminal(execution));
+  executionService.setTerminalListener((execution) => executionRouter.onExecutionTerminal(execution));
+  const statusQuery = new StatusQueryService({
+    storageRoot,
+    goals: goalOrchestration,
+    eventStore,
+  });
   return {
     settings,
     storageRoot,
@@ -170,6 +182,8 @@ export function createAppContext(
     codexExecutionAdapter,
     codexAppServerBackend,
     executionService,
+    eventStore,
+    statusQuery,
     controlledActuation,
     autoIteration,
     goalPreflight,

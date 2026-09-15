@@ -4,6 +4,9 @@ import { SessionStore } from "../../context/session-store.js";
 import type { ExecutionContext, Session } from "../../context/types.js";
 import { defaultTaskContextStorageRoot } from "../../context/task.js";
 import type { WorkspaceRegistry } from "../../workspace/registry.js";
+import { EventStore } from "../../control-plane/events/store.js";
+import type { LrmEvent } from "../../control-plane/events/model.js";
+import { CodexEventAdapter } from "./event-adapter.js";
 import { CodexAppServerClient } from "./client.js";
 import type {
   AppServerModel,
@@ -33,6 +36,7 @@ export type AppServerClientFactory = (
 
 export interface CodexAppServerBackendOptions {
   readonly storageRoot?: string;
+  readonly eventStore?: Pick<EventStore, "appendEvent" | "listEvents"> & { readonly storageRoot?: string };
   readonly executable?: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly requestTimeoutMs?: number;
@@ -108,6 +112,7 @@ export class CodexAppServerBackend implements ExecutionBackend {
   public readonly storageRoot: string;
   private readonly sessions: SessionStore;
   private readonly executions: ExecutionContextService;
+  private readonly events: Pick<EventStore, "appendEvent" | "listEvents">;
   private readonly environment: NodeJS.ProcessEnv;
   private readonly clientFactory: AppServerClientFactory;
   private readonly executable: string | undefined;
@@ -124,6 +129,7 @@ export class CodexAppServerBackend implements ExecutionBackend {
     this.storageRoot = resolve(options.storageRoot ?? defaultTaskContextStorageRoot());
     this.sessions = new SessionStore(this.storageRoot);
     this.executions = new ExecutionContextService(this.storageRoot);
+    this.events = options.eventStore ?? new EventStore(this.storageRoot);
     this.environment = { ...process.env, ...(options.environment ?? {}) };
     this.executable = options.executable?.trim() || undefined;
     this.requestTimeoutMs = options.requestTimeoutMs;
@@ -229,13 +235,29 @@ export class CodexAppServerBackend implements ExecutionBackend {
       });
 
       const turn = await client.startTurn(turnInput(thread.thread_id, request.instruction, model, effort));
+      const eventAdapter = new CodexEventAdapter({
+        session_id: session.session_id,
+        execution_id: request.execution_id,
+        thread_id: thread.thread_id,
+        turn_id: turn.turn_id,
+      });
       if (turn.status === "completed") {
+        await this.recordEvent(eventAdapter.adapt({
+          type: "turn_completed",
+          thread_id: thread.thread_id,
+          turn_id: turn.turn_id,
+        }));
         await this.complete(request, session.session_id, thread.thread_id, turn.turn_id);
       } else if (turn.status === "failed") {
+        await this.recordEvent(eventAdapter.adapt({
+          type: "turn_failed",
+          thread_id: thread.thread_id,
+          turn_id: turn.turn_id,
+        }));
         await this.fail(request, session.session_id, turn.turn_id);
         throw new Error("Codex app-server turn failed to start.");
       } else {
-        void this.watch(client, request, session.session_id, thread.thread_id, turn.turn_id);
+        void this.watch(client, request, session.session_id, thread.thread_id, turn.turn_id, eventAdapter);
       }
 
       return {
@@ -292,17 +314,28 @@ export class CodexAppServerBackend implements ExecutionBackend {
     sessionId: string,
     threadId: string,
     turnId: string,
+    eventAdapter: CodexEventAdapter,
   ): Promise<void> {
     try {
-      for await (const event of client.events()) {
-        if (event.type === "thread_started") continue;
-        if (event.thread_id !== threadId || event.turn_id !== turnId) continue;
-        if (event.type === "turn_completed") {
+      for await (const providerEvent of client.events()) {
+        const event = eventAdapter.adapt(providerEvent);
+        if (event === undefined) continue;
+        if (event.event_type === "turn_started") {
+          await this.executions.updateExecutionContext(
+            request.workspace_id,
+            request.task_id,
+            request.execution_id,
+            { status: "running" },
+          );
+          await this.sessions.updateSession(sessionId, { status: "running_turn" });
+        }
+        await this.recordEvent(event);
+        if (event.event_type === "turn_completed") {
           await this.complete(request, sessionId, threadId, turnId);
           return;
         }
-        if (event.type === "turn_failed") {
-          await this.fail(request, sessionId, turnId, event.reason);
+        if (event.event_type === "execution_failed") {
+          await this.fail(request, sessionId, turnId, event.payload.reason);
           return;
         }
       }
@@ -387,6 +420,10 @@ export class CodexAppServerBackend implements ExecutionBackend {
     } catch (error: unknown) {
       console.warn("Interactive execution terminal notification failed", errorMessage(error));
     }
+  }
+
+  private async recordEvent(event: LrmEvent | undefined): Promise<void> {
+    if (event !== undefined) await this.events.appendEvent(event);
   }
 }
 

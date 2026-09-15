@@ -78,6 +78,7 @@ export const SESSION_STATUSES = [
   "created",
   "starting",
   "active",
+  "running_turn",
   "waiting_input",
   "completed",
   "failed",
