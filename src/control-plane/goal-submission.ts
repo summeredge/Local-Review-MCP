@@ -22,6 +22,7 @@ import type {
   CreateGoalInput,
   GoalOrchestrationService,
 } from "./goal-orchestration.js";
+import { executionModeSchema } from "./execution-service.js";
 
 export const DEFAULT_GOAL_MAX_ITERATIONS = 2;
 const submissionTextSchema = goalTaskPlanSchema.shape.goal;
@@ -35,6 +36,9 @@ export const goalSubmissionRequestSchema = z.object({
   requirements: submissionItemsSchema,
   acceptance_criteria: submissionItemsSchema,
   max_iterations: z.number().int().min(1).max(10_000).default(DEFAULT_GOAL_MAX_ITERATIONS),
+  execution_mode: executionModeSchema.default("batch"),
+  model: z.string().min(1).max(256).optional(),
+  reasoning_effort: z.string().min(1).max(64).optional(),
 }).strict();
 
 export const goalSubmissionToolInputSchema = goalSubmissionRequestSchema
@@ -90,6 +94,9 @@ function buildPlan(request: z.output<typeof goalSubmissionRequestSchema>): Creat
         max_iterations: request.max_iterations,
       }],
     }],
+    execution_mode: request.execution_mode,
+    ...(request.model === undefined ? {} : { model: request.model }),
+    ...(request.reasoning_effort === undefined ? {} : { reasoning_effort: request.reasoning_effort }),
   });
 }
 

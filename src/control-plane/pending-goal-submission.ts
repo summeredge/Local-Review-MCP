@@ -16,6 +16,7 @@ import {
   GoalPreflightError,
 } from "./goal-preflight.js";
 import type { ConversationCorrelationRegistry } from "./conversation-correlation.js";
+import { executionModeSchema } from "./execution-service.js";
 
 export const PENDING_GOAL_SUBMISSION_TTL_MS = 2 * 60 * 1000;
 
@@ -32,6 +33,9 @@ const pendingPayloadSchema = goalSubmissionRequestSchema.pick({
   max_iterations: true,
 }).extend({
   workspace_id: workspaceIdSchema,
+  execution_mode: executionModeSchema.optional(),
+  model: z.string().min(1).max(256).optional(),
+  reasoning_effort: z.string().min(1).max(64).optional(),
 }).strict();
 
 export const pendingGoalSubmissionInputSchema = pendingPayloadSchema.extend({
@@ -120,6 +124,9 @@ function payloadFingerprint(value: PendingGoalSubmission | z.output<typeof pendi
     requirements: value.requirements,
     acceptance_criteria: value.acceptance_criteria,
     max_iterations: value.max_iterations,
+    execution_mode: value.execution_mode ?? "batch",
+    model: value.model ?? null,
+    reasoning_effort: value.reasoning_effort ?? null,
   });
 }
 
@@ -320,6 +327,13 @@ export class PendingGoalSubmissionService {
         requirements: claimed.record.requirements,
         acceptance_criteria: claimed.record.acceptance_criteria,
         max_iterations: claimed.record.max_iterations,
+        ...(claimed.record.execution_mode === undefined
+          ? {}
+          : { execution_mode: claimed.record.execution_mode }),
+        ...(claimed.record.model === undefined ? {} : { model: claimed.record.model }),
+        ...(claimed.record.reasoning_effort === undefined
+          ? {}
+          : { reasoning_effort: claimed.record.reasoning_effort }),
       });
       await this.finishStarted(key, result);
     } catch (error: unknown) {

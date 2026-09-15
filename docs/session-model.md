@@ -1,8 +1,8 @@
-# Goal / Task / Session / Execution / Turn 模型（Phase 2）
+# Goal / Task / Session / Execution / Turn 模型（Phase 3）
 
-状态：Session Model Foundation 已实现。Session 是为长期 Agent context
-保留的 Control Plane 对象；本阶段只落地模型、schema 和基础 Store，不接入
-真实 app-server 调度。
+状态：Session Model Foundation 和 interactive `submit_goal` 基础调度已实现。
+Session 是为长期 Agent context 保留的 Control Plane 对象；本阶段只打通首个
+Thread/Turn，不实现完整交互平台。
 
 ## 1. 关系
 
@@ -25,8 +25,8 @@ interactive:  Task -> Session -> Turn -> Execution
 batch:        Task -> Execution          (当前 CLI 链路不自动创建 Session)
 ```
 
-本阶段只保存这些关系需要的 Session 字段；interactive 的 `thread/start`、
-`turn/start` 和事件关联属于后续 Phase。
+interactive 的 `thread/start`、`turn/start` 和基础 terminal event 关联已由
+`CodexAppServerBackend` 执行；batch 仍沿用既有 CLI 链路。
 
 ## 2. 五个 LRM 对象的语义
 
@@ -167,10 +167,10 @@ waiting_input
 completed
 ```
 
-`failed` 和 `terminated` 是异常终态。后续 interactive backend 可以在收到
-用户输入后从 `waiting_input` 回到 `active`，但本阶段只定义状态和保存能力，
-不实现该调度。Store 校验状态值，不调用 provider，也不替现有 Execution API
-推断状态。
+`failed` 和 `terminated` 是异常终态。Phase 3 interactive backend 使用
+`created -> starting -> active -> completed|failed`；`waiting_input` 仍只定义
+在模型中，收到 approval/user-input 后的恢复调度不在本阶段。Store 校验状态值，
+不调用 provider，也不替现有 Execution API 推断状态。
 
 ## 6. Submission 与 runtime 分层
 
@@ -226,9 +226,10 @@ CLI 的 `waiting_identity` 只在 Connector pending submission 层可能出现�
 ## 7. Model/effort 与 Session
 
 model 和 effort 是 Session/Turn 的 provider configuration，不是 Goal 的业务
-语义，也不由 LRM 常量默认。`reasoning_effort` 保存 Session 默认设置，未来
-映射到 app-server 的 `turn/start.effort`，不是 Thread 创建参数。本阶段不请求
-`model/list`，也不自动选择第一个 model。
+语义，也不由 LRM 常量默认。`reasoning_effort` 保存 Session 默认设置，映射到
+app-server 的 `turn/start.effort`，不是 Thread 创建参数。Phase 3 在启动
+interactive backend 后请求 `model/list`，优先使用 provider 明确标记的默认
+model；用户指定 model/effort 时必须在 catalog 中精确匹配，不静默选择列表第一项。
 
 Session 只能保存已确认的 selection。若恢复后该 model/effort 已不在新 catalog：
 
@@ -236,7 +237,7 @@ Session 只能保存已确认的 selection。若恢复后该 model/effort 已不
 2. 不自动替换成第一个模型或另一个 effort；
 3. 阻止新的 Turn，并要求重新选择有效配置。
 
-## 8. Session Store 与 Phase 2 边界
+## 8. Session Store 与 Phase 3 边界
 
 `SessionStore` 使用现有 application-local filesystem state，不引入数据库：
 
@@ -252,11 +253,17 @@ listSessions()                        -> Promise<Session[]>
 `updated_at`；列表按 `session_id` 排序。所有读写均经过现有 Zod 风格的严格
 schema 校验。
 
+Phase 3 已打通：
+
+- `submit_goal.execution_mode` 缺省为 `batch`；
+- `interactive` 创建 Session，持久化 `thread_id`，并发送首个 `turn/start`；
+- Session 和 Execution 在 turn terminal event 后同步为 `completed` 或 `failed`。
+
 本阶段的非目标：
 
 - 不把 Session metadata 加到当前 `submit_goal` receipt。
-- 不改变 Goal API、Task API、现有 Execution API、MCP tool interface 或 Extension delivery。
+- 不改变现有 Execution record 的字段含义或把 `thread_id` 复制到 Execution。
 - 不把一个 Goal 的 Session 自动共享给另一个 Goal，也不把 ChatGPT conversation
   id、浏览器 tab 或用户可见窗口当作 Codex Thread id。
-- 不调用 `thread/start`、`turn/start`，不接入 interactive execution、Desktop UI
-  或真实 app-server 调度。
+- 不实现 approval、user input、pause/resume、Launcher UI、多 Agent 或
+  Extension delivery 变化。

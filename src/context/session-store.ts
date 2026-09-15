@@ -1,5 +1,6 @@
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import {
   createSessionId,
   sessionFile,
@@ -24,6 +25,16 @@ function errorCode(error: unknown): string | undefined {
 
 function json(session: Session): string {
   return `${JSON.stringify(session, null, 2)}\n`;
+}
+
+async function writeSession(file: string, session: Session): Promise<void> {
+  const temporary = join(dirname(file), `.session-${process.pid}-${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporary, json(session), { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, file);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
 }
 
 export class SessionStore {
@@ -108,10 +119,7 @@ export class SessionStore {
       updated_at: new Date().toISOString(),
     });
     try {
-      await writeFile(sessionFile(this.storageRoot, sessionId), json(next), {
-        encoding: "utf8",
-        mode: 0o600,
-      });
+      await writeSession(sessionFile(this.storageRoot, sessionId), next);
     } catch (error: unknown) {
       throw new Error("Session could not be saved.", { cause: error });
     }

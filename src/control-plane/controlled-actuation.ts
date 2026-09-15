@@ -5,6 +5,8 @@ import { z } from "zod";
 import { ExecutionContextService } from "../context/execution-service.js";
 import {
   executionIdSchema,
+  goalIdSchema,
+  sessionIdSchema,
   taskIdSchema,
   workspaceIdSchema,
 } from "../context/schema.js";
@@ -14,9 +16,14 @@ import { isReservedWindowsName } from "../workspace/path.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
 import {
   CodexExecutionAdapter,
-  type CodexExecutionStartResult,
-  type CodexExecutionStartRequest,
 } from "./codex-execution-adapter.js";
+import {
+  executionModeSchema,
+  type ExecutionBackend,
+  type ExecutionBackendStartRequest,
+  type ExecutionStartResult,
+  type ExecutionMode,
+} from "./execution-service.js";
 
 const STATE_VERSION = 1;
 const ACTUATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
@@ -38,10 +45,14 @@ export const controlledActuationStateFile = (storageRoot: string): string =>
 
 export interface ActuationAuthorizationInput {
   readonly actuation_id: string;
+  readonly goal_id?: string;
   readonly workspace_id: string;
   readonly task_id: string;
   readonly execution_id: string;
   readonly instruction: string;
+  readonly execution_mode?: ExecutionMode;
+  readonly model?: string;
+  readonly reasoning_effort?: string;
 }
 
 export interface ActuationAuthorization extends ActuationAuthorizationInput {
@@ -66,16 +77,20 @@ export interface ControlledActuation {
   readonly updated_at: string;
 }
 
-export interface ControlledActuationResult extends CodexExecutionStartResult {
+export interface ControlledActuationResult extends ExecutionStartResult {
   readonly actuation: ControlledActuation;
 }
 
 export const actuationAuthorizationInputSchema = z.object({
   actuation_id: actuationIdSchema,
+  goal_id: goalIdSchema.optional(),
   workspace_id: workspaceIdSchema,
   task_id: taskIdSchema,
   execution_id: executionIdSchema,
   instruction: instructionSchema,
+  execution_mode: executionModeSchema.optional(),
+  model: z.string().min(1).max(256).optional(),
+  reasoning_effort: z.string().min(1).max(64).optional(),
 }).strict();
 
 export const actuationAuthorizationSchema = actuationAuthorizationInputSchema.extend({
@@ -186,6 +201,9 @@ export const controlledActuationStartResultSchema = z.object({
   process_id: z.number().int().positive(),
   started_at: timestampSchema,
   accepted: z.enum(["new", "existing"]),
+  session_id: sessionIdSchema.optional(),
+  thread_id: z.string().max(256).optional(),
+  turn_id: z.string().max(256).optional(),
 }).strict();
 
 type DurableState = z.infer<typeof stateSchema>;
@@ -427,13 +445,13 @@ export interface ControlledActuationServiceOptions {
   readonly authorizationStore?: ActuationAuthorizationStore;
   readonly taskContextService?: TaskContextService;
   readonly executionContextService?: ExecutionContextService;
-  readonly adapter?: Pick<CodexExecutionAdapter, "start">;
+  readonly adapter?: ExecutionBackend;
 }
 
 export class ControlledActuationService {
   public readonly storageRoot: string;
   public readonly authorizationStore: ActuationAuthorizationStore;
-  public readonly adapter: Pick<CodexExecutionAdapter, "start">;
+  public readonly adapter: ExecutionBackend;
   private readonly tasks: TaskContextService;
   private readonly executions: ExecutionContextService;
 
@@ -532,13 +550,19 @@ export class ControlledActuationService {
     authorization: ActuationAuthorization,
     actuation: ControlledActuation,
   ): Promise<ControlledActuationResult> {
-    let started: CodexExecutionStartResult;
+    let started: ExecutionStartResult;
     try {
-      const request: CodexExecutionStartRequest = {
+      const request: ExecutionBackendStartRequest = {
+        ...(authorization.goal_id === undefined ? {} : { goal_id: authorization.goal_id }),
         workspace_id: authorization.workspace_id,
         task_id: authorization.task_id,
         execution_id: authorization.execution_id,
         instruction: authorization.instruction,
+        ...(authorization.execution_mode === undefined ? {} : { execution_mode: authorization.execution_mode }),
+        ...(authorization.model === undefined ? {} : { model: authorization.model }),
+        ...(authorization.reasoning_effort === undefined
+          ? {}
+          : { reasoning_effort: authorization.reasoning_effort }),
       };
       started = await this.adapter.start(request);
     } catch (error: unknown) {

@@ -684,6 +684,9 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
           requirements: input.requirements,
           acceptance_criteria: input.acceptance_criteria,
           max_iterations: input.max_iterations,
+          ...(input.execution_mode === "interactive" ? { execution_mode: input.execution_mode } : {}),
+          ...(input.model === undefined ? {} : { model: input.model }),
+          ...(input.reasoning_effort === undefined ? {} : { reasoning_effort: input.reasoning_effort }),
         }));
       } catch (error: unknown) {
         return toToolError(error);

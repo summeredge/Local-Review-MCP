@@ -1,10 +1,10 @@
-# Interactive Backend 架构约束（Phase 2）
+# Interactive Backend 架构约束（Phase 3）
 
-状态：Phase 2 Session Model Foundation 已实现；本文仍不表示 Interactive
-Backend 已经接入或可以调度。
+状态：Phase 3 `submit_goal` interactive 路由已接入，已完成 Session、Thread、
+Turn 的基础启动链路；approval、user input、pause/resume 仍未实现。
 
-本阶段新增 Session 类型、schema 和基础 filesystem Store；不修改 LRM Core、
-MCP schema 或现有执行行为。
+本阶段在 Phase 2 Session 类型、schema 和 filesystem Store 的基础上增加
+interactive backend 路由；默认 batch 执行行为保持不变。
 
 ## 1. 当前基线与目标结构
 
@@ -16,19 +16,25 @@ MCP submit_goal
   -> GoalSubmissionService              # 组装 Goal plan
   -> GoalOrchestrationService           # Goal / Phase / Task
   -> ControlledActuationService         # authorization / reservation
-  -> CodexExecutionAdapter              # 当前仅支持 codex exec
-  -> codex exec --json -
+  -> ExecutionService                   # execution_mode 路由
+  -> ExecutionBackendRouter
+       -> CliExecutionBackend            # batch
+            -> CodexExecutionAdapter
+                 -> codex exec --json -
+       -> CodexAppServerBackend           # interactive
+            -> SessionStore
+            -> thread/start -> turn/start
 ```
 
-Phase 2 的新增路径是独立的 Session record：
+Session record 的持久化路径是：
 
 ```text
 SessionStore
   -> .task/sessions/<session_id>.json
 ```
 
-它不插入上面的 CLI 调用链。`submit_goal` 仍按原路径执行，Session Store
-只为后续 interactive backend 保存必要的长期 context 字段。
+batch 不创建 Session；interactive 在 Task 已创建并通过 ControlledActuation
+授权后创建 Session，并把 provider Thread ID 持久化到该 Session。
 
 CLI 入口直接调用 `GoalSubmissionService`，但仍经过同一套 Goal、Task、
 Actuation 和 Execution 持久化逻辑。`ExecutionContextService` 目前只是
@@ -106,7 +112,7 @@ provider thread                          ==  LRM interactive Session reference
 provider turn                            ==  one interactive Execution unit
 ```
 
-未来映射关系：
+当前 Phase 3 的映射关系：
 
 ```text
 LRM Session
@@ -119,7 +125,8 @@ LRM Session
 ```
 
 `Session` 是长期上下文，`Turn` 是一次 interactive 交互，`Execution Event`
-是该次交互的事件投影；本阶段只保存 Session 字段，不创建这些 provider 对象。
+是该次交互的事件投影；Phase 3 创建一个 Thread 和一个首 Turn，并同步基础
+Session/Execution 生命周期。
 
 provider 返回的 `sessionId`、transport connection id 或 UI/window reference
 都是 provider metadata；只有经明确绑定的 provider `thread.id` 才能作为
@@ -143,8 +150,8 @@ app-server 的 Thread 仍然保存上下文，后续可拥有多个 Turn/Executi
 
 ## 5. `submit_goal` 兼容性冻结
 
-以下仍是未来 interactive backend 的设计边界，不是 Phase 2 的新增 API。当前
-`submit_goal` contract、receipt 和 CLI execution 行为保持不变。
+以下是 Phase 3 interactive backend 的兼容边界。当前 `submit_goal` receipt
+和 CLI execution 行为保持不变。
 
 现有公开工具 contract 继续保持：
 
@@ -156,7 +163,10 @@ app-server 的 Thread 仍然保存上下文，后续可拥有多个 Turn/Executi
   "goal": "string",
   "requirements": ["string"],
   "acceptance_criteria": ["string"],
-  "max_iterations": 2
+  "max_iterations": 2,
+  "execution_mode": "batch" | "interactive",
+  "model": "optional provider model id",
+  "reasoning_effort": "optional provider effort id"
 }
 ```
 
@@ -175,7 +185,7 @@ app-server 的 Thread 仍然保存上下文，后续可拥有多个 Turn/Executi
 `execution_id` 或 provider Thread id；公开工具返回时 canonical conversation
 可能尚未建立。
 
-未来可能增加的 additive API 字段是：
+当前 additive API 字段是：
 
 ```json
 {
@@ -189,8 +199,8 @@ app-server 的 Thread 仍然保存上下文，后续可拥有多个 Turn/Executi
 2. 省略该字段的历史调用继续走 `CliBackend`，行为等价于当前
    `codex exec --json -`。
 3. `"interactive"` 才允许选择 `CodexAppServerBackend`。
-4. 字段必须从 MCP input 贯穿 pending submission、GoalSubmission、Goal/
-   Task checkpoint 到 ExecutionService；不能只改入口 schema。
+4. 字段从 MCP input 贯穿 pending submission、GoalSubmission、Goal checkpoint
+   和 ExecutionService；不能只改入口 schema。
 5. `execution_mode` 不是 `session_id`、model name 或 reasoning effort；这些
    provider/runtime 细节不加入本阶段的 `submit_goal` 必填输入。
 6. `correlation_key` 仍是一次调用的直接关联 key。不得使用 assistant 文本、
@@ -247,25 +257,36 @@ codex app-server generate-json-schema --out <temporary-directory>
 Schema、handshake 或必需方法不匹配时，Backend 必须 fail closed；不得通过
 字段猜测、未识别事件或 provider-specific fallback 继续执行。
 
-## 8. Phase 2 实现内容与非目标
+## 8. Phase 3 实现内容与非目标
 
 本阶段已经实现：
 
-- `Session`、`SessionStatus`、`SessionBackendType` 及其 create/update 输入类型；
-- Session 的严格 Zod schema；
-- `SessionStore.createSession()`、`getSession()`、`updateSession()` 和
-  `listSessions()`；
-- `.task/sessions/<session_id>.json` 的 application-local 持久化。
+- `submit_goal.execution_mode`，省略时默认 `batch`；
+- `ExecutionService`、`ExecutionBackendRouter`、`CliExecutionBackend` 和
+  `CodexAppServerBackend`；
+- interactive 的 `model/list` capability discovery、provider default/model
+  选择、`thread/start` 和 `turn/start`；
+- interactive Session 的 `created -> starting -> active -> completed|failed`
+  同步，以及 provider Thread ID 持久化；
+- `.task/sessions/<session_id>.json` 的 Session 绑定。
+
+人工真实 smoke 入口为 `npm run test:interactive-goal`。为避免测试新建
+Codex Thread 时使用其他模型，运行前必须设置：
+
+```powershell
+$env:CODEX_INTERACTIVE_MODEL = "gpt-5.6-luna"
+$env:CODEX_INTERACTIVE_EFFORT = "max"
+npm run test:interactive-goal
+```
+
+Backend 本身仍通过 `model/list` 校验实际 catalog，不硬编码模型选择。
 
 本阶段非目标：
 
-- 不增加 `ExecutionBackend` 调度层，不调用 app-server，不修改 App-server client
-  的现有协议代码，也不增加 MCP tool。
+- 不修改 App-server client 的现有协议代码，不把原始 JSON-RPC 事件传给 MCP caller。
 - 不迁移既有 `.task` record，不改 `ExecutionContextService` 的现有字段含义，
   不把 `thread_id` 直接塞入 Execution。
-- 不修改 `submit_goal`、Goal API、Task API、现有 Execution API、CLI backend 或
-  Extension delivery。
-- 不把 app-server 原始 JSON-RPC 事件传给 LRM caller。
+- 不实现 Launcher UI、approval、user input、pause/resume 或多 Agent。
 - 不增加自动重试、自动选模、隐式 Thread 复用或浏览器窗口推断。
 - 不把 `ReviewRequest`、`ConversationRouting` 或现有 Auto Iteration 逻辑搬进 Backend。
 

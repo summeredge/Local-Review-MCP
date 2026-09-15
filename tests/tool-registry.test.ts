@@ -122,6 +122,7 @@ describe("MCP tool registry", () => {
         requirements: expect.any(Object),
         acceptance_criteria: expect.any(Object),
         max_iterations: expect.any(Object),
+        execution_mode: expect.any(Object),
         correlation_key: expect.any(Object),
       },
     });

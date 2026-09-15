@@ -131,6 +131,25 @@ describe("submit_goal MCP tool", () => {
       .resolves.toContain(CORRELATION_A);
   });
 
+  it("preserves interactive execution mode through the pending identity gate", async () => {
+    const { client, correlations, pending, submitGoal, workspaceId } = await fixture();
+
+    await callFor(client, {
+      ...goalArguments(),
+      execution_mode: "interactive",
+    });
+    expect((await pending.get(CORRELATION_A))?.execution_mode).toBe("interactive");
+
+    await correlations.observe(evidence(CORRELATION_A, "conversation-interactive"));
+    pending.scheduleResolve(CORRELATION_A);
+    await waitFor(() => submitGoal.mock.calls.length === 1);
+    await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "started");
+
+    expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
+      execution_mode: "interactive",
+    }));
+  });
+
   it("consumes a pending submission after late canonical evidence", async () => {
     const { client, correlations, pending, submitGoal, workspaceId } = await fixture();
 

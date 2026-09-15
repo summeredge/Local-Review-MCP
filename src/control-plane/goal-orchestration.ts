@@ -26,6 +26,7 @@ import {
   type ActuationAuthorization,
   type ControlledActuation,
 } from "./controlled-actuation.js";
+import { executionModeSchema } from "./execution-service.js";
 
 const STATE_VERSION = 1;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
@@ -54,6 +55,9 @@ export const createGoalInputSchema = z.object({
   goal_id: goalIdSchema,
   workspace_id: workspaceIdSchema,
   conversation_id: conversationIdSchema,
+  execution_mode: executionModeSchema.default("batch"),
+  model: z.string().min(1).max(256).optional(),
+  reasoning_effort: z.string().min(1).max(64).optional(),
   phases: z.array(z.object({
     phase_id: phaseIdSchema,
     objective: instructionItemSchema,
@@ -111,6 +115,9 @@ export const goalOrchestrationSchema = z.object({
   goal_id: goalIdSchema,
   workspace_id: workspaceIdSchema,
   conversation_id: conversationIdSchema,
+  execution_mode: executionModeSchema.default("batch"),
+  model: z.string().min(1).max(256).optional(),
+  reasoning_effort: z.string().min(1).max(64).optional(),
   review_only: z.boolean().optional(),
   phases: z.array(phaseSchema).min(1).max(1_000),
   status: goalOrchestrationStatusSchema,
@@ -229,6 +236,9 @@ function planIdentity(goal: GoalOrchestration): z.infer<typeof createGoalInputSc
     goal_id: goal.goal_id,
     workspace_id: goal.workspace_id,
     conversation_id: goal.conversation_id,
+    execution_mode: goal.execution_mode,
+    ...(goal.model === undefined ? {} : { model: goal.model }),
+    ...(goal.reasoning_effort === undefined ? {} : { reasoning_effort: goal.reasoning_effort }),
     phases: goal.phases.map(({ status: _status, ...phase }) => phase),
   });
 }
@@ -683,10 +693,14 @@ export class GoalOrchestrationService {
       try {
         authorization = await this.controlled.authorize({
           actuation_id: actuationId,
+          goal_id: goal.goal_id,
           workspace_id: goal.workspace_id,
           task_id: task.task_id,
           execution_id: executionId,
           instruction,
+          execution_mode: goal.execution_mode,
+          ...(goal.model === undefined ? {} : { model: goal.model }),
+          ...(goal.reasoning_effort === undefined ? {} : { reasoning_effort: goal.reasoning_effort }),
         });
       } catch (error: unknown) {
         authorization = await this.authorizations.getAuthorizationByActuation(actuationId);
@@ -757,10 +771,15 @@ export class GoalOrchestrationService {
     authorization: ActuationAuthorization,
   ): void {
     if (authorization.actuation_id !== goal.actuation_id
+      || (authorization.goal_id !== undefined && authorization.goal_id !== goal.goal_id)
       || authorization.workspace_id !== goal.workspace_id
       || authorization.task_id !== task.task_id
       || authorization.execution_id !== goal.execution_id
-      || authorization.instruction !== instruction) {
+      || authorization.instruction !== instruction
+      || (authorization.execution_mode ?? "batch") !== goal.execution_mode
+      || authorization.model !== goal.model
+      || authorization.reasoning_effort !== goal.reasoning_effort
+      || (goal.execution_mode === "interactive" && authorization.goal_id !== goal.goal_id)) {
       throw new Error("Actuation authorization identity does not match the Goal task");
     }
   }

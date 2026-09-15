@@ -19,12 +19,18 @@ import {
   ExtensionReviewCompletionUnavailableError,
 } from "./control-plane/extension-review-completion.js";
 import { CodexExecutionCompletionService } from "./control-plane/codex-execution-completion.js";
+import { CodexAppServerBackend } from "./backends/codex_app_server/backend.js";
 import { AutoIterationService } from "./control-plane/auto-iteration.js";
 import { GoalPreflightService } from "./control-plane/goal-preflight.js";
 import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
 import { GoalSubmissionService } from "./control-plane/goal-submission.js";
 import { PendingGoalSubmissionService } from "./control-plane/pending-goal-submission.js";
 import { ExecutionRoutingService } from "./control-plane/execution-routing.js";
+import {
+  CliExecutionBackend,
+  ExecutionBackendRouter,
+  ExecutionService,
+} from "./control-plane/execution-service.js";
 import {
   LOCAL_CONTROL_BRIDGE_HOST,
   LOCAL_CONTROL_BRIDGE_PORTS,
@@ -58,6 +64,8 @@ export interface AppContext extends McpRuntimeContext {
   readonly codexExecutionCompletion?: CodexExecutionCompletionService;
   readonly actuationAuthorizationStore?: ActuationAuthorizationStore;
   readonly codexExecutionAdapter?: CodexExecutionAdapter;
+  readonly codexAppServerBackend?: CodexAppServerBackend;
+  readonly executionService?: ExecutionService;
   readonly controlledActuation?: ControlledActuationService;
   readonly autoIteration?: AutoIterationService;
   readonly goalPreflight?: GoalPreflightService;
@@ -106,11 +114,19 @@ export function createAppContext(
     completionService: codexExecutionCompletion,
     environment,
   });
+  const codexAppServerBackend = new CodexAppServerBackend(registry, {
+    storageRoot,
+    environment,
+  });
+  const executionService = new ExecutionService(new ExecutionBackendRouter({
+    batch: new CliExecutionBackend(codexExecutionAdapter),
+    interactive: codexAppServerBackend,
+  }));
   const actuationAuthorizationStore = new ActuationAuthorizationStore(storageRoot);
   const controlledActuation = new ControlledActuationService(registry, {
     storageRoot,
     authorizationStore: actuationAuthorizationStore,
-    adapter: codexExecutionAdapter,
+    adapter: executionService,
   });
   const completionRouter = new ReviewCompletionRouter(
     storageRoot,
@@ -152,6 +168,8 @@ export function createAppContext(
     codexExecutionCompletion,
     actuationAuthorizationStore,
     codexExecutionAdapter,
+    codexAppServerBackend,
+    executionService,
     controlledActuation,
     autoIteration,
     goalPreflight,
@@ -273,6 +291,7 @@ export async function startApp(
     }
     server.once("close", () => {
       context.goalPreflight?.setRuntimeReady(false);
+      void context.executionService?.close().catch(() => undefined);
       void stopBridge().catch(() => undefined);
       void context.tunnel.stop().catch(() => undefined);
     });
