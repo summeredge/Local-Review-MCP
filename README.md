@@ -7,7 +7,7 @@ V0.1 Release Candidate / Task 12
 ## Current capabilities
 
 - MCP Streamable HTTP runtime
-- twelve read-only tools, including the workspace registry, review context, and
+- nineteen read-only tools, including the workspace registry, review context, and
   interactive Session status tools
 - `submit_goal` Control Plane entry point with automatic current-conversation binding
 - fixed loopback host
@@ -153,10 +153,11 @@ $env:LOCAL_REVIEW_MCP_REMOTE_TOKEN = $env:LOCAL_REVIEW_MCP_TOKEN
 
 `verify-remote.ps1` checks that unauthenticated and wrong-token health requests
 return HTTP 401, the correct token returns `status=ok`, MCP `initialize` works,
-and `tools/list` contains the twelve read-only tools plus `submit_goal`:
+and `tools/list` contains the read-only tools plus `submit_goal`:
 `workspace_info`, `list_files`, `read_file`, `search_text`, `git_status`, and
 `git_diff`, plus `workspace_list`, `review_summary`, `execution_output`,
-`get_session_status`, `get_execution_status`, `list_session_events`, and
+`get_session_status`, `get_execution_status`, `list_session_events`,
+`get_identity_trace`, `get_evidence_transport_trace`, and
 `submit_goal`.
 
 ## Remote MCP Setup
@@ -209,7 +210,7 @@ hardcodes a tunnel hostname.
 3. Select the connector's OAuth authentication option. The server publishes
    MCP protected-resource metadata, authorization-server metadata, dynamic
    client registration, and PKCE endpoints under the same public origin.
-4. Scan the tools, confirm the twelve read-only actions plus `submit_goal`, save the draft app, and
+4. Scan the tools, confirm the read-only actions plus `submit_goal`, save the draft app, and
    select it from a new chat. Ask for a code review; ChatGPT should call
    `workspace_list` first, then `review_summary`, `execution_output`,
    `workspace_info`, `git_status`, `git_diff`, `read_file`, and `search_text`
@@ -226,8 +227,8 @@ registered path. Without `workspace_id`, tools use that active workspace.
 
 The current read-only tools are `workspace_info`, `list_files`, `read_file`,
 `search_text`, `git_status`, `git_diff`, `workspace_list`, `review_summary`,
-`execution_output`, `get_session_status`, `get_execution_status`, and
-`list_session_events`. The Control Plane tool `submit_goal` durably accepts a
+`execution_output`, `get_session_status`, `get_execution_status`,
+`list_session_events`, `get_identity_trace`, and `get_evidence_transport_trace`. The Control Plane tool `submit_goal` durably accepts a
 Goal and starts it after canonical Extension evidence proves the conversation.
 All workspace-scoped tools except `workspace_list` accept an optional
 `workspace_id`; an omitted ID preserves the active-workspace behavior.
@@ -290,7 +291,7 @@ the remote test. No token or public URL is stored in the repository.
 ## Security Notes
 
 Local Review MCP provides `read`, `search`, `review`, and interactive status
-capabilities through its twelve read-only tools, plus the reviewed `submit_goal` Control Plane entry
+capabilities through its nineteen read-only tools, plus the reviewed `submit_goal` Control Plane entry
 point. It does not provide:
 
 - `modify` or `write_file` operations;

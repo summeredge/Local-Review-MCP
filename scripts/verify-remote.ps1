@@ -170,13 +170,15 @@ try {
             "submit_goal",
             "get_session_status",
             "get_execution_status",
-            "list_session_events"
+            "list_session_events",
+            "get_identity_trace",
+            "get_evidence_transport_trace"
         )
         $actualTools = @($tools | ForEach-Object { Get-PropertyValue $_ "name" })
         if ($actualTools.Count -ne $expectedTools.Count -or (($actualTools | Sort-Object) -join ",") -ne (($expectedTools | Sort-Object) -join ",")) {
-            throw "tools/list returned an unexpected tool surface; expected thirteen tools."
+            throw "tools/list returned an unexpected tool surface; expected fifteen tools."
         }
-        Write-Host "tools/list: passed (thirteen tools)"
+        Write-Host "tools/list: passed (fifteen tools)"
         Write-Host "Remote verification passed."
         exit 0
     } finally {

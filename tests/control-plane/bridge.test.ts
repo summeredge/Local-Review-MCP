@@ -776,6 +776,8 @@ describe("Local Control Bridge app lifecycle", () => {
       ...runtime,
       correlations: new ConversationCorrelationRegistry(root),
     };
+    const trace = vi.spyOn(runtime.identityTrace!, "record");
+    const transportTrace = vi.spyOn(runtime.evidenceTransportTrace!, "record");
     const observer = vi.fn();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     let server: Server | null = null;
@@ -799,6 +801,21 @@ describe("Local Control Bridge app lifecycle", () => {
       expect(context.correlations.correlation(evidence.request_id)?.conversation_id).toBe(
         evidence.conversation_id,
       );
+      expect(trace).toHaveBeenCalledWith(expect.objectContaining({
+        event: "extension_evidence_received",
+        correlation_key: evidence.request_id,
+        conversation_id: evidence.conversation_id,
+      }));
+      expect(transportTrace).toHaveBeenCalledWith(expect.objectContaining({
+        event: "connector_evidence_received",
+        correlation_key: evidence.request_id,
+        conversation_id: evidence.conversation_id,
+      }));
+      expect(transportTrace).toHaveBeenCalledWith(expect.objectContaining({
+        event: "extension_evidence_received",
+        correlation_key: evidence.request_id,
+        conversation_id: evidence.conversation_id,
+      }));
       expect(observer).toHaveBeenCalledWith(evidence);
       expect(warning).toHaveBeenCalledWith(
         "Conversation correlation state could not be restored; starting without restored proof",

@@ -35,4 +35,5 @@
 {"ts":"2026-09-14T09:22:00+08:00","action":"add","type":"error","id":"ERR-20260914-001","summary":"PowerShell 下 node --check 通配符需逐文件展开"}
 {"ts":"2026-09-14T13:00:00+08:00","action":"add","type":"learning","id":"LRN-20260914-001","summary":"ChatGPT 新聊天需发送首条消息后才生成真实 conversation_id 路由"}
 {"ts":"2026-09-15T18:53:56+08:00","action":"add","type":"error","id":"ERR-20260915-001","summary":"PowerShell 中含管道符的 rg 正则应使用单引号或变量传参"}
+{"ts":"2026-09-15T19:00:00+08:00","action":"add","type":"error","id":"ERR-20260915-002","summary":"Identity Trace MCP 上下文初始遗漏内部 record 能力，typecheck 暴露后修正"}
 ```

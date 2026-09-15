@@ -522,6 +522,8 @@ describe("Extension background identity authority", () => {
     expect(storage.data.token).toBe("paired-token");
     expect(new URL(worker.calls.at(-1)!.input).pathname).toBe("/identity-evidence");
     expect(JSON.parse(String(worker.calls.at(-1)!.init.body))).toMatchObject({ request_id: UUID_REQUEST_ID });
+    expect((worker.calls.at(-1)!.init.headers as Record<string, string>)["x-lrm-evidence-transport-event"])
+      .toBe("extension_evidence_created");
     const hellos = worker.calls.filter((call) => new URL(call.input).pathname === "/hello").length;
     await worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1");
     expect(worker.calls.filter((call) => new URL(call.input).pathname === "/hello")).toHaveLength(hellos);

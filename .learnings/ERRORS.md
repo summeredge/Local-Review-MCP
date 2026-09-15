@@ -36,6 +36,38 @@ ReviewRequest to `completed` when recovery finds a valid completed ReviewResult.
 
 ---
 
+## [ERR-20260915-002] 新增 Identity Trace 后上下文类型遗漏写入能力
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+新增诊断 trace 时，`McpRuntimeContext` 初始只声明了查询方法，应用层写入节点因此未通过 typecheck。
+
+### 错误信息
+
+```text
+Property 'record' does not exist on type 'Pick<IdentityTraceService, "getIdentityTrace">'.
+```
+
+### 上下文
+
+- 为 Identity Trace 增加了 MCP 只读查询，同时在 App/服务节点旁路写入事件
+- 首次 `npm run typecheck` 暴露读写端口类型未统一
+
+### 建议修复
+
+内部上下文类型同时声明 `record` 与 `getIdentityTrace`；对外仍只注册只读查询工具。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---
+
 ## [ERR-20260914-001] PowerShell wildcard passed literally to node --check
 
 **Priority**: low

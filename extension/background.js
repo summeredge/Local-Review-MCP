@@ -5,6 +5,8 @@
   const SERVICE = 'local-review-control-bridge';
   const PROTOCOL = 3;
   const PROTOCOL_HEADER = 'x-lrm-bridge-protocol';
+  const EVIDENCE_TRANSPORT_EVENT_HEADER = 'x-lrm-evidence-transport-event';
+  const EXTENSION_EVIDENCE_CREATED_EVENT = 'extension_evidence_created';
   const REQUEST_ID = /^[A-Za-z0-9_-]{1,100}$/u;
   const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
   const DOCUMENT_ID = /^[A-Za-z0-9_-]{1,256}$/u;
@@ -460,7 +462,7 @@
     return tracked;
   }
 
-  async function postBridge(path, body, retried = false) {
+  async function postBridge(path, body, retried = false, extraHeaders = {}) {
     const credential = await ensureCredential();
     if (!credential.ok) return credential;
     const found = credential.found;
@@ -472,7 +474,8 @@
         headers: {
           'content-type': 'application/json',
           [PROTOCOL_HEADER]: String(PROTOCOL),
-          authorization: `Bearer ${requestToken}`
+          authorization: `Bearer ${requestToken}`,
+          ...extraHeaders
         },
         body: JSON.stringify(body)
       });
@@ -483,7 +486,7 @@
         }
         if (retried) return { ok: false, error: 'not_paired' };
         trustedUntil = 0;
-        return postBridge(path, body, true);
+        return postBridge(path, body, true, extraHeaders);
       }
       const data = await response.json().catch(() => null);
       if (response.ok) trustedUntil = Date.now() + PORT_TRUST_MS;
@@ -495,14 +498,16 @@
       if (!retried) {
         port = null;
         await persistBridge();
-        return postBridge(path, body, true);
+        return postBridge(path, body, true, extraHeaders);
       }
       return { ok: false, error: 'bridge_unavailable' };
     }
   }
 
   function postEvidence(evidence) {
-    return postBridge('/identity-evidence', evidence);
+    return postBridge('/identity-evidence', evidence, false, {
+      [EVIDENCE_TRANSPORT_EVENT_HEADER]: EXTENSION_EVIDENCE_CREATED_EVENT
+    });
   }
 
   async function receiveNavigation(message, sender) {

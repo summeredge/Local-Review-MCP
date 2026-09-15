@@ -5,6 +5,8 @@ export const LOCAL_CONTROL_BRIDGE_PORTS = [12081, 12082, 12083, 12084, 12085] as
 export const MAX_BRIDGE_REQUEST_BYTES = 64 * 1024;
 export const MAX_BRIDGE_COMPLETION_ACK_REQUEST_BYTES = 512 * 1024;
 export const BRIDGE_PROTOCOL_HEADER = "x-lrm-bridge-protocol" as const;
+export const EVIDENCE_TRANSPORT_EVENT_HEADER = "x-lrm-evidence-transport-event" as const;
+export const EXTENSION_EVIDENCE_CREATED_EVENT = "extension_evidence_created" as const;
 
 const CHROME_EXTENSION_ID = /^[a-p]{32}$/u;
 

@@ -30,7 +30,7 @@ describe("MCP tool registry", () => {
     const result = await client.listTools();
     const names = result.tools.map((tool) => tool.name).sort();
 
-    expect(names).toHaveLength(18);
+    expect(names).toHaveLength(20);
     expect(names).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
     expect(result.tools.find((tool) => tool.name === "workspace_info")?.outputSchema).toMatchObject({
       type: "object",

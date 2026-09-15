@@ -16,7 +16,16 @@ import {
   GoalPreflightError,
 } from "./goal-preflight.js";
 import type { ConversationCorrelationRegistry } from "./conversation-correlation.js";
+import type { ExtensionIdentityEvidence } from "./extension-identity.js";
 import { executionModeSchema } from "./execution-service.js";
+import type {
+  IdentityTraceRecordInput,
+  IdentityTraceService,
+} from "./identity-trace.js";
+import type {
+  EvidenceTransportTraceRecordInput,
+  EvidenceTransportTraceService,
+} from "./evidence-transport-trace.js";
 
 export const PENDING_GOAL_SUBMISSION_TTL_MS = 2 * 60 * 1000;
 
@@ -90,6 +99,8 @@ type TerminalPendingGoalSubmission = Extract<
 export interface PendingGoalSubmissionServiceOptions {
   readonly storageRoot?: string;
   readonly now?: () => number;
+  readonly identityTrace?: Pick<IdentityTraceService, "record">;
+  readonly evidenceTransportTrace?: Pick<EvidenceTransportTraceService, "record">;
 }
 
 export function pendingGoalSubmissionStateFile(storageRoot: string): string {
@@ -175,6 +186,8 @@ export class PendingGoalSubmissionService {
   private readonly correlations: Pick<ConversationCorrelationRegistry, "correlation">;
   private readonly goalSubmission: Pick<GoalSubmissionService, "submitGoal">;
   private readonly now: () => number;
+  private readonly identityTrace: Pick<IdentityTraceService, "record"> | undefined;
+  private readonly evidenceTransportTrace: Pick<EvidenceTransportTraceService, "record"> | undefined;
   private submissions = new Map<string, PendingGoalSubmission>();
   private restorePromise: Promise<void> | null = null;
   private readonly expiryTimers = new Map<string, NodeJS.Timeout>();
@@ -192,6 +205,8 @@ export class PendingGoalSubmissionService {
     this.correlations = correlations;
     this.goalSubmission = goalSubmission;
     this.now = options.now ?? Date.now;
+    this.identityTrace = options.identityTrace;
+    this.evidenceTransportTrace = options.evidenceTransportTrace;
   }
 
   public restore(): Promise<void> {
@@ -217,6 +232,7 @@ export class PendingGoalSubmissionService {
           next.set(parsed.correlation_key, expired);
           await this.persist(next);
           this.submissions = next;
+          this.tracePendingExpired(current);
           this.cancelExpiry(parsed.correlation_key);
           return this.receipt(expired);
         }
@@ -238,6 +254,15 @@ export class PendingGoalSubmissionService {
       next.set(record.correlation_key, record);
       await this.persist(next);
       this.submissions = next;
+      this.trace({
+        event: "pending_created",
+        correlation_key: record.correlation_key,
+        workspace_id: record.workspace_id,
+        created_at: record.accepted_at,
+        expires_at: record.expires_at,
+        timeout_ms: Date.parse(record.expires_at) - Date.parse(record.accepted_at),
+        execution_mode: record.execution_mode ?? "batch",
+      });
       return this.receipt(record);
     });
 
@@ -267,6 +292,7 @@ export class PendingGoalSubmissionService {
       next.set(key, this.failedRecord(current, now, "pending_identity_expired"));
       await this.persist(next);
       this.submissions = next;
+      this.tracePendingExpired(current);
       this.cancelExpiry(key);
     });
   }
@@ -274,6 +300,11 @@ export class PendingGoalSubmissionService {
   public scheduleResolve(correlationKey: string): void {
     const parsed = correlationKeySchema.safeParse(correlationKey);
     if (!parsed.success || this.scheduled.has(parsed.data)) return;
+    this.traceTransport({
+      event: "connector_resolve_called",
+      correlation_key: parsed.data,
+      conversation_id: this.correlations.correlation(parsed.data)?.conversation_id,
+    });
     const work = this.resolve(parsed.data)
       .catch((error: unknown) => {
         console.warn("Pending Goal submission resolution failed:", errorMessage(error));
@@ -287,20 +318,43 @@ export class PendingGoalSubmissionService {
   public async resolve(correlationKey: string): Promise<void> {
     const key = correlationKeySchema.parse(correlationKey);
     await this.restore();
+    this.traceTransport({
+      event: "evidence_resolve_attempted",
+      correlation_key: key,
+      conversation_id: this.correlations.correlation(key)?.conversation_id,
+    });
     const claimed = await this.exclusive(async () => {
       const current = this.submissions.get(key);
-      if (current === undefined || current.state !== "pending_identity") return null;
+      if (current === undefined || current.state !== "pending_identity") {
+        this.traceTransport({
+          event: "evidence_resolve_failed",
+          correlation_key: key,
+          conversation_id: this.correlations.correlation(key)?.conversation_id,
+        });
+        return null;
+      }
       const now = this.currentTime();
       if (isExpired(current, now)) {
         const next = new Map(this.submissions);
         next.set(key, this.failedRecord(current, now, "pending_identity_expired"));
         await this.persist(next);
         this.submissions = next;
+        this.tracePendingExpired(current);
+        this.traceMatchFailed(current, "expired");
+        this.traceTransport({
+          event: "evidence_resolve_failed",
+          correlation_key: key,
+          conversation_id: this.correlations.correlation(key)?.conversation_id,
+        });
         this.cancelExpiry(key);
         return null;
       }
       const correlation = this.correlations.correlation(key);
-      if (correlation === null) return null;
+      if (correlation === null) {
+        this.traceMatchFailed(current, "missing_evidence");
+        this.traceTransport({ event: "evidence_resolve_failed", correlation_key: key });
+        return null;
+      }
 
       const next = new Map(this.submissions);
       const starting = pendingGoalSubmissionSchema.parse({
@@ -310,6 +364,17 @@ export class PendingGoalSubmissionService {
       next.set(key, starting);
       await this.persist(next);
       this.submissions = next;
+      this.trace({
+        event: "evidence_match_success",
+        correlation_key: starting.correlation_key,
+        conversation_id: correlation.conversation_id,
+        workspace_id: starting.workspace_id,
+      });
+      this.traceTransport({
+        event: "evidence_resolve_success",
+        correlation_key: starting.correlation_key,
+        conversation_id: correlation.conversation_id,
+      });
       this.cancelExpiry(key);
       return {
         record: starting,
@@ -354,6 +419,7 @@ export class PendingGoalSubmissionService {
       for (const [key, record] of next) {
         if (!isExpired(record, now)) continue;
         next.set(key, this.failedRecord(record, now, "pending_identity_expired"));
+        this.tracePendingExpired(record);
         changed = true;
       }
       prune(next, now);
@@ -381,6 +447,49 @@ export class PendingGoalSubmissionService {
   public async list(): Promise<PendingGoalSubmission[]> {
     await this.restore();
     return this.exclusive(async () => [...this.submissions.values()].map(clone));
+  }
+
+  public async diagnoseEvidence(
+    evidence: ExtensionIdentityEvidence,
+    workspaceId: string,
+  ): Promise<void> {
+    if (this.identityTrace === undefined) return;
+    await this.restore();
+    const candidates = await this.exclusive(async () => [...this.submissions.values()]
+      .filter((record) => record.workspace_id === workspaceId)
+      .filter((record) => record.state === "pending_identity"
+        || (record.state === "failed" && record.error === "pending_identity_expired"))
+      .map((record) => ({
+        correlation_key: record.correlation_key,
+        conversation_id: evidence.conversation_id,
+        workspace_id: record.workspace_id,
+        state: record.state,
+        evidence_request_id: evidence.request_id,
+      })));
+    for (const candidate of candidates) {
+      if (candidate.correlation_key === candidate.evidence_request_id) {
+        if (candidate.state === "failed") {
+          this.trace({
+            event: "evidence_match_failed",
+            correlation_key: candidate.correlation_key,
+            conversation_id: candidate.conversation_id,
+            workspace_id: candidate.workspace_id,
+            reason: "expired",
+          });
+        }
+        continue;
+      }
+      if (candidate.state === "pending_identity") {
+        this.trace({
+          event: "evidence_match_failed",
+          correlation_key: candidate.correlation_key,
+          conversation_id: candidate.conversation_id,
+          workspace_id: candidate.workspace_id,
+          reason: "correlation_mismatch",
+          observed_correlation_key: candidate.evidence_request_id,
+        });
+      }
+    }
   }
 
   private async restoreOnce(): Promise<void> {
@@ -425,6 +534,7 @@ export class PendingGoalSubmissionService {
         changed = true;
       } else if (isExpired(record, now)) {
         restored.set(key, this.failedRecord(record, now, "pending_identity_expired"));
+        this.tracePendingExpired(record);
         changed = true;
       }
     }
@@ -496,6 +606,15 @@ export class PendingGoalSubmissionService {
       }));
       await this.persist(next);
       this.submissions = next;
+      this.trace({
+        event: "goal_started",
+        correlation_key: current.correlation_key,
+        workspace_id: current.workspace_id,
+        goal_id: result.goal_id,
+        phase_id: result.phase_id,
+        task_id: result.task_id,
+        execution_id: result.execution_id,
+      });
       this.cancelExpiry(key);
     });
   }
@@ -522,6 +641,45 @@ export class PendingGoalSubmissionService {
     const now = this.now();
     if (!Number.isFinite(now)) throw new Error("pending Goal submission clock is invalid");
     return now;
+  }
+
+  private trace(input: IdentityTraceRecordInput): void {
+    try {
+      this.identityTrace?.record(input);
+    } catch {
+      // Diagnostic tracing is observational and must not affect submission behavior.
+    }
+  }
+
+  private traceTransport(input: EvidenceTransportTraceRecordInput): void {
+    try {
+      this.evidenceTransportTrace?.record(input);
+    } catch {
+      // Diagnostic tracing is observational and must not affect submission behavior.
+    }
+  }
+
+  private tracePendingExpired(record: PendingGoalSubmission): void {
+    this.trace({
+      event: "pending_expired",
+      correlation_key: record.correlation_key,
+      workspace_id: record.workspace_id,
+      created_at: record.accepted_at,
+      expires_at: record.expires_at,
+      timeout_ms: Date.parse(record.expires_at) - Date.parse(record.accepted_at),
+    });
+  }
+
+  private traceMatchFailed(
+    record: PendingGoalSubmission,
+    reason: "missing_evidence" | "expired",
+  ): void {
+    this.trace({
+      event: "evidence_match_failed",
+      correlation_key: record.correlation_key,
+      workspace_id: record.workspace_id,
+      reason,
+    });
   }
 
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {

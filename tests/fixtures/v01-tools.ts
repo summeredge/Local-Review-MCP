@@ -21,4 +21,6 @@ export const EXPECTED_REGISTERED_TOOL_NAMES = [
   "get_session_status",
   "get_execution_status",
   "list_session_events",
+  "get_identity_trace",
+  "get_evidence_transport_trace",
 ] as const;

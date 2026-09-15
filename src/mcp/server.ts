@@ -24,6 +24,16 @@ import {
   type GoalSubmissionService,
 } from "../control-plane/goal-submission.js";
 import {
+  identityTraceQueryInputSchema,
+  identityTraceOutputSchema,
+  type IdentityTraceService,
+} from "../control-plane/identity-trace.js";
+import {
+  evidenceTransportTraceQueryInputSchema,
+  evidenceTransportTraceOutputSchema,
+  type EvidenceTransportTraceService,
+} from "../control-plane/evidence-transport-trace.js";
+import {
   PendingGoalSubmissionConflictError,
   type PendingGoalSubmissionService,
 } from "../control-plane/pending-goal-submission.js";
@@ -67,6 +77,11 @@ export interface McpRuntimeContext {
   readonly correlations?: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">;
   readonly goalSubmission?: Pick<GoalSubmissionService, "submitGoal">;
   readonly pendingGoalSubmission?: Pick<PendingGoalSubmissionService, "accept">;
+  readonly identityTrace?: Pick<IdentityTraceService, "getIdentityTrace" | "record">;
+  readonly evidenceTransportTrace?: Pick<
+    EvidenceTransportTraceService,
+    "getEvidenceTransportTrace" | "record"
+  >;
   readonly statusQuery?: Pick<
     StatusQueryService,
     "getSessionStatus" | "getExecutionStatus" | "listSessionEvents"
@@ -108,6 +123,7 @@ export const STATUS_QUERY_TOOL_NAMES = [
   "get_execution_status",
   "list_session_events",
 ] as const;
+export const DIAGNOSTIC_TOOL_NAMES = ["get_identity_trace", "get_evidence_transport_trace"] as const;
 export const REGISTERED_TOOL_NAMES = [
   ...V01_TOOL_NAMES,
   ...WORKSPACE_REGISTRY_TOOL_NAMES,
@@ -115,6 +131,7 @@ export const REGISTERED_TOOL_NAMES = [
   ...WORKSPACE_REVIEW_TOOL_NAMES,
   ...CONTROL_PLANE_TOOL_NAMES,
   ...STATUS_QUERY_TOOL_NAMES,
+  ...DIAGNOSTIC_TOOL_NAMES,
 ] as const;
 
 export type V01ToolName = typeof V01_TOOL_NAMES[number];
@@ -924,6 +941,49 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   );
 
   server.registerTool(
+    "get_identity_trace",
+    {
+      description: "Read hashed identity evidence trace events for one submit_goal correlation key.",
+      inputSchema: identityTraceQueryInputSchema,
+      outputSchema: identityTraceOutputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        if (context.identityTrace === undefined) {
+          return toToolError(new Error("Identity trace runtime is unavailable."));
+        }
+        return structuredResponse(identityTraceOutputSchema, await context.identityTrace.getIdentityTrace(input));
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_evidence_transport_trace",
+    {
+      description: "Read the hash-only Browser Extension evidence transport trace for one submit_goal correlation key.",
+      inputSchema: evidenceTransportTraceQueryInputSchema,
+      outputSchema: evidenceTransportTraceOutputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        if (context.evidenceTransportTrace === undefined) {
+          return toToolError(new Error("Evidence transport trace runtime is unavailable."));
+        }
+        return structuredResponse(
+          evidenceTransportTraceOutputSchema,
+          await context.evidenceTransportTrace.getEvidenceTransportTrace(input),
+        );
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "submit_goal",
     {
       description: "Control Plane: durably accept a Goal for the current ChatGPT conversation. The model must generate a new UUID v4 correlation_key for every invocation and never reuse one; users do not need to provide it manually. The Goal starts asynchronously after exact canonical Extension evidence proves the conversation.",
@@ -938,6 +998,16 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
 
       try {
         const selection = registry.resolve(input.workspace_id);
+        const correlation = context.correlations?.correlation(input.correlation_key);
+        context.identityTrace?.record({
+          event: "submit_goal_received",
+          correlation_key: input.correlation_key,
+          ...(correlation === null || correlation === undefined
+            ? {}
+            : { conversation_id: correlation.conversation_id }),
+          workspace_id: selection.id,
+          execution_mode: input.execution_mode ?? "batch",
+        });
         return structuredResponse(goalSubmissionAcceptedSchema, await pendingGoalSubmission.accept({
           correlation_key: input.correlation_key,
           workspace_id: selection.id,

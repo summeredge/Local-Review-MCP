@@ -28,8 +28,14 @@ import {
   extensionIdentityEvidenceSchema,
   type ExtensionIdentityEvidence,
 } from "./extension-identity.js";
+import type {
+  EvidenceTransportTraceRecordInput,
+  EvidenceTransportTraceService,
+} from "./evidence-transport-trace.js";
 import {
   BRIDGE_PROTOCOL_HEADER,
+  EVIDENCE_TRANSPORT_EVENT_HEADER,
+  EXTENSION_EVIDENCE_CREATED_EVENT,
   isCompatibleBridgeProtocol,
   LOCAL_CONTROL_BRIDGE_HOST,
   LOCAL_CONTROL_BRIDGE_PORTS,
@@ -43,6 +49,7 @@ import {
 export interface BridgeStartOptions {
   readonly ports?: readonly number[];
   readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => void | Promise<void>;
+  readonly evidenceTransportTrace?: Pick<EvidenceTransportTraceService, "record">;
   readonly claimExtensionDelivery?: (
     claim: ExtensionDeliveryClaim,
   ) => LeasedExtensionDelivery | null | Promise<LeasedExtensionDelivery | null>;
@@ -84,6 +91,7 @@ let pairedOrigin: string | null = null;
 let bearerToken: string | null = null;
 let lastExtensionSeenAt: number | null = null;
 let onIdentityEvidence: (evidence: ExtensionIdentityEvidence) => void | Promise<void> = () => undefined;
+let evidenceTransportTrace: Pick<EvidenceTransportTraceService, "record"> | undefined;
 let claimExtensionDelivery: NonNullable<BridgeStartOptions["claimExtensionDelivery"]> = () => null;
 let ackExtensionDelivery: NonNullable<BridgeStartOptions["ackExtensionDelivery"]> = () => {
   throw new ExtensionDeliveryNotFoundError("delivery not found");
@@ -116,7 +124,7 @@ function json(
   };
   if (origin !== null) {
     headers["access-control-allow-origin"] = origin;
-    headers["access-control-allow-headers"] = `authorization, content-type, ${BRIDGE_PROTOCOL_HEADER}`;
+    headers["access-control-allow-headers"] = `authorization, content-type, ${BRIDGE_PROTOCOL_HEADER}, ${EVIDENCE_TRANSPORT_EVENT_HEADER}`;
     headers["access-control-allow-methods"] = "GET, POST, OPTIONS";
   }
   response.writeHead(status, headers);
@@ -126,7 +134,7 @@ function json(
 function empty(response: ServerResponse, status: number, origin: string): void {
   response.writeHead(status, {
     "access-control-allow-origin": origin,
-    "access-control-allow-headers": `authorization, content-type, ${BRIDGE_PROTOCOL_HEADER}`,
+    "access-control-allow-headers": `authorization, content-type, ${BRIDGE_PROTOCOL_HEADER}, ${EVIDENCE_TRANSPORT_EVENT_HEADER}`,
     "access-control-allow-methods": "GET, POST, OPTIONS",
     "access-control-max-age": "600",
     "cache-control": "no-store",
@@ -179,6 +187,20 @@ function noteExtensionSeen(): void {
 
 function clearExtensionPresence(): void {
   lastExtensionSeenAt = null;
+}
+
+function traceEvidenceTransport(input: EvidenceTransportTraceRecordInput): void {
+  try {
+    evidenceTransportTrace?.record(input);
+  } catch {
+    // Diagnostic tracing is observational and must never affect Bridge behavior.
+  }
+}
+
+function stringField(value: unknown, key: string): string | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === "string" && field.length > 0 ? field : null;
 }
 
 function readJson(
@@ -261,10 +283,16 @@ async function receiveIdentityEvidence(
   response: ServerResponse,
   origin: string,
 ): Promise<void> {
+  const extensionEvidenceCreated = request.headers[EVIDENCE_TRANSPORT_EVENT_HEADER]
+    === EXTENSION_EVIDENCE_CREATED_EVENT;
   let body: unknown;
   try {
     body = await readJson(request);
   } catch (error: unknown) {
+    if (extensionEvidenceCreated) {
+      traceEvidenceTransport({ event: "extension_evidence_created" });
+    }
+    traceEvidenceTransport({ event: "bridge_evidence_rejected" });
     if (error instanceof RequestBodyTooLargeError) {
       json(response, 413, { error: "body_too_large" }, origin);
       return;
@@ -273,11 +301,35 @@ async function receiveIdentityEvidence(
     return;
   }
 
+  const correlationKey = stringField(body, "request_id");
+  const conversationId = stringField(body, "conversation_id");
+  if (extensionEvidenceCreated) {
+    traceEvidenceTransport({
+      event: "extension_evidence_created",
+      correlation_key: correlationKey,
+      conversation_id: conversationId,
+    });
+  }
   const parsed = extensionIdentityEvidenceSchema.safeParse(body);
   if (!parsed.success) {
+    traceEvidenceTransport({
+      event: "bridge_evidence_rejected",
+      correlation_key: correlationKey,
+      conversation_id: conversationId,
+    });
     json(response, 400, { error: "invalid_identity_evidence" }, origin);
     return;
   }
+  traceEvidenceTransport({
+    event: "bridge_evidence_received",
+    correlation_key: parsed.data.request_id,
+    conversation_id: parsed.data.conversation_id,
+  });
+  traceEvidenceTransport({
+    event: "bridge_evidence_forwarded",
+    correlation_key: parsed.data.request_id,
+    conversation_id: parsed.data.conversation_id,
+  });
   await onIdentityEvidence(parsed.data);
   json(response, 202, { accepted: true }, origin);
 }
@@ -614,6 +666,7 @@ async function startBridgeOnce(options: BridgeStartOptions): Promise<number | nu
 
 export function startBridge(options: BridgeStartOptions = {}): Promise<number | null> {
   onIdentityEvidence = options.onIdentityEvidence ?? (() => undefined);
+  evidenceTransportTrace = options.evidenceTransportTrace;
   claimExtensionDelivery = options.claimExtensionDelivery ?? (() => null);
   ackExtensionDelivery = options.ackExtensionDelivery ?? (() => {
     throw new ExtensionDeliveryNotFoundError("delivery not found");
@@ -636,6 +689,7 @@ export function stopBridge(): Promise<void> {
     bearerToken = null;
     clearExtensionPresence();
     onIdentityEvidence = () => undefined;
+    evidenceTransportTrace = undefined;
     claimExtensionDelivery = () => null;
     ackExtensionDelivery = () => {
       throw new ExtensionDeliveryNotFoundError("delivery not found");

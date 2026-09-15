@@ -1,6 +1,6 @@
 # MCP tool contract
 
-This document freezes the V0.1 Release Candidate tool surface. Twelve tools are
+This document freezes the V0.1 Release Candidate tool surface. Nineteen tools are
 read-only, and `submit_goal` is the reviewed Control Plane entry point. The
 names and input fields below are the current MCP contract; the runtime does
 not expose direct write, exec, shell, commit, or push operations.
@@ -19,6 +19,8 @@ not expose direct write, exec, shell, commit, or push operations.
 | `get_session_status` | workspace | read-only |
 | `get_execution_status` | workspace | read-only |
 | `list_session_events` | workspace | read-only |
+| `get_identity_trace` | correlation key | read-only |
+| `get_evidence_transport_trace` | correlation key | read-only |
 | `submit_goal` | current ChatGPT conversation | Control Plane |
 
 ## Common rules
@@ -208,6 +210,27 @@ not expose direct write, exec, shell, commit, or push operations.
 - Output: `{ "session_id": "string", "events": [], "returned": "integer", "has_more": "boolean" }`.
 - Permission: authenticated read-only. Only normalized LRM event fields are
   returned; app-server JSON-RPC payloads are never exposed.
+
+### `get_identity_trace`
+
+- Purpose: Read the ordered, hash-only Browser Extension identity trace for one
+  `submit_goal` correlation key.
+- Input: `{ "correlation_key": "strict UUID v4" }`.
+- Output: `{ "events": [] }`; correlation and conversation identities are
+  returned only as SHA-256 hashes. The raw key is used only for lookup.
+- Permission: authenticated read-only diagnostic access. It never accepts
+  message text, tokens, cookies, or Extension payloads.
+
+### `get_evidence_transport_trace`
+
+- Purpose: Read the ordered Browser Extension to LRM evidence transport
+  events for one `submit_goal` correlation key.
+- Input: `{ "correlation_key": "strict UUID v4" }`.
+- Output: `{ "events": [{ "event": "string", "timestamp": "ISO-8601" }] }`.
+  The persisted trace uses only correlation and conversation SHA-256 hashes;
+  the query returns no identity values or payloads.
+- Permission: authenticated read-only diagnostic access. It never changes
+  pending identity state or Goal execution.
 
 ### `submit_goal`
 

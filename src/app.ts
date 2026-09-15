@@ -55,6 +55,8 @@ import {
   writeRuntimeDiagnostic,
   type RuntimeDiagnosticLogger,
 } from "./control-plane/runtime-diagnostic-logger.js";
+import { IdentityTraceService } from "./control-plane/identity-trace.js";
+import { EvidenceTransportTraceService } from "./control-plane/evidence-transport-trace.js";
 
 export interface AppContext extends McpRuntimeContext {
   readonly storageRoot?: string;
@@ -76,6 +78,8 @@ export interface AppContext extends McpRuntimeContext {
   readonly goalOrchestration?: GoalOrchestrationService;
   readonly goalSubmission?: GoalSubmissionService;
   readonly pendingGoalSubmission?: PendingGoalSubmissionService;
+  readonly identityTrace?: IdentityTraceService;
+  readonly evidenceTransportTrace?: EvidenceTransportTraceService;
   readonly executionRouter?: ExecutionRoutingService;
 }
 
@@ -154,8 +158,12 @@ export function createAppContext(
   const goalPreflight = new GoalPreflightService({ settings, registry, storageRoot });
   const goalSubmission = new GoalSubmissionService(goalOrchestration, goalPreflight);
   const correlations = new ConversationCorrelationRegistry(storageRoot);
+  const identityTrace = new IdentityTraceService(storageRoot);
+  const evidenceTransportTrace = new EvidenceTransportTraceService(storageRoot);
   const pendingGoalSubmission = new PendingGoalSubmissionService(correlations, goalSubmission, {
     storageRoot,
+    identityTrace,
+    evidenceTransportTrace,
   });
   const executionRouter = new ExecutionRoutingService(registry, {
     storageRoot,
@@ -190,6 +198,8 @@ export function createAppContext(
     goalOrchestration,
     goalSubmission,
     pendingGoalSubmission,
+    identityTrace,
+    evidenceTransportTrace,
     executionRouter,
     tunnel: createTunnelManager(settings.remote, {
       localEndpoint: localOrigin(settings),
@@ -253,8 +263,40 @@ export async function startApp(
       }
       const bridgePort = await startBridge({
         ports: options.bridgePorts,
+        evidenceTransportTrace: context.evidenceTransportTrace,
         onIdentityEvidence: async (evidence) => {
+          context.evidenceTransportTrace?.record({
+            event: "connector_evidence_received",
+            correlation_key: evidence.request_id,
+            conversation_id: evidence.conversation_id,
+          });
+          context.evidenceTransportTrace?.record({
+            event: "extension_evidence_received",
+            correlation_key: evidence.request_id,
+            conversation_id: evidence.conversation_id,
+          });
+          context.identityTrace?.record({
+            event: "extension_evidence_received",
+            correlation_key: evidence.request_id,
+            conversation_id: evidence.conversation_id,
+            workspace_id: context.registry.active.id,
+          });
+          const previous = context.correlations.correlation(evidence.request_id);
           const result = await context.correlations.observe(evidence);
+          if (result === "refused") {
+            context.identityTrace?.record({
+              event: "evidence_match_failed",
+              correlation_key: evidence.request_id,
+              conversation_id: evidence.conversation_id,
+              workspace_id: context.registry.active.id,
+              reason: "conversation_mismatch",
+              ...(previous === null ? {} : { expected_conversation_id: previous.conversation_id }),
+            });
+          }
+          void context.pendingGoalSubmission?.diagnoseEvidence(
+            evidence,
+            context.registry.active.id,
+          ).catch(() => undefined);
           if (result !== "refused") context.pendingGoalSubmission?.scheduleResolve(evidence.request_id);
           await options.onIdentityEvidence?.(evidence);
         },
