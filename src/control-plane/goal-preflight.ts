@@ -314,9 +314,6 @@ export class GoalPreflightService {
 
     const extension = await readExtension(true);
     result = goalPreflightResultSchema.parse({ ...result, extension });
-    if (!extension.ready) {
-      return fail(result, "extension", extension.reason ?? "Extension is not ready");
-    }
     const { failure_stage: _failureStage, failure_reason: _failureReason, ...withoutFailure } = result;
     return goalPreflightResultSchema.parse({ ...withoutFailure, ready: true });
   }

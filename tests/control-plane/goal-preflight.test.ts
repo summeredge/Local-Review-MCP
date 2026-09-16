@@ -189,16 +189,32 @@ describe("GoalPreflightService", () => {
     expect(f.extension).toHaveBeenCalledTimes(1);
   });
 
-  it("fails at Extension when pairing is missing", async () => {
-    const f = service({ extension: vi.fn(async () => extensionReadiness(false, false)) });
+  it("keeps expired Extension presence as diagnostics without blocking preflight", async () => {
+    const f = service({
+      extension: vi.fn(async () => ({
+        ready: false,
+        bridge_available: true,
+        extension_paired: true,
+        last_seen_at: 100,
+        readiness_state: "extension_not_present" as const,
+        reason: "Extension is not connected.",
+      })),
+      extensionStatus: () => ({ available: true, paired: true, present: false, lastSeenAt: 100 }),
+    });
     await expect(f.service.checkGoalPreflight({
       workspace_id: "workspace-a",
       conversation_id: "conversation-1",
     })).resolves.toMatchObject({
-      ready: false,
-      failure_stage: "extension",
-      failure_reason: "Extension is not paired.",
-      extension: { ready: false, paired: false, present: false },
+      ready: true,
+      extension: {
+        ready: false,
+        paired: true,
+        present: false,
+        bridge_available: true,
+        last_seen_at: 100,
+        readiness_state: "extension_not_present",
+        reason: "Extension is not connected.",
+      },
     });
     expect(f.extension).toHaveBeenCalledTimes(1);
   });
