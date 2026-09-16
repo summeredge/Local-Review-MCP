@@ -1190,7 +1190,7 @@ describe("diagnose-chatgpt-connector", () => {
         ready: false,
         readiness: { attempts: 1, final_state: "mcp_endpoint_unreachable" },
       },
-      connector: { reason: "mcp_endpoint_unreachable" },
+      connector: { reason: "mcp_unexpected_http_status_404" },
     });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });

@@ -77,12 +77,19 @@ function preflightFailure(): GoalPreflightResult {
   return {
     ready: false,
     runtime: { ready: true },
-    connector: { ready: false, status: "unconfigured", action: "none" },
+    connector: { ready: false, status: "verified", action: "none", timeline: [{
+      attempt: 1, retry_count: 0, elapsed_ms: 25,
+      state: "mcp_endpoint_unreachable", http_status: 403,
+      current_mcp_url: "https://mcp.example.test/mcp",
+      resource_metadata_url: null, protected_resource_metadata_url: null,
+      authorization_server_url: null, failed_stage: "/mcp",
+      error_type: "mcp_unexpected_http_status_403",
+    }] },
     extension: { ready: false },
     workspace: { valid: true, workspace_id: "workspace-a" },
     conversation: { valid: true, conversation_id: "conversation-a" },
     failure_stage: "connector",
-    failure_reason: "remote_not_configured",
+    failure_reason: "mcp_unexpected_http_status_403",
   };
 }
 
@@ -224,6 +231,12 @@ describe("PendingGoalSubmissionService", () => {
     await correlations.observe(evidence());
     await knownFailure.resolve(CORRELATION_A);
     expect((await knownFailure.get(CORRELATION_A))?.state).toBe("failed");
+    const restored = new PendingGoalSubmissionService(correlations, {
+      submitGoal: vi.fn(async () => result()),
+    }, { storageRoot: root });
+    await expect(restored.get(CORRELATION_A)).resolves.toMatchObject({
+      state: "failed", preflight: preflightFailure(),
+    });
 
     const uncertainRoot = await makeRoot();
     const uncertainCorrelations = new ConversationCorrelationRegistry(uncertainRoot);

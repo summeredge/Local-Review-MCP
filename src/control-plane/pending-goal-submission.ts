@@ -14,6 +14,8 @@ import {
 } from "./goal-submission.js";
 import {
   GoalPreflightError,
+  goalPreflightResultSchema,
+  type GoalPreflightResult,
 } from "./goal-preflight.js";
 import type { ConversationCorrelationRegistry } from "./conversation-correlation.js";
 import type { ExtensionIdentityEvidence } from "./extension-identity.js";
@@ -70,6 +72,7 @@ export const pendingGoalSubmissionSchema = z.discriminatedUnion("state", [
     state: z.literal("failed"),
     resolved_at: timestampSchema,
     error: terminalErrorSchema,
+    preflight: goalPreflightResultSchema.optional(),
   }).strict(),
   pendingBaseSchema.extend({
     state: z.literal("indeterminate"),
@@ -419,6 +422,7 @@ export class PendingGoalSubmissionService {
         key,
         error instanceof GoalPreflightError ? "failed" : "indeterminate",
         errorMessage(error),
+        error instanceof GoalPreflightError ? error.result : undefined,
       );
     }
   }
@@ -572,12 +576,14 @@ export class PendingGoalSubmissionService {
     record: PendingGoalSubmission,
     now: number,
     error: string,
+    preflight?: GoalPreflightResult,
   ): Extract<PendingGoalSubmission, { state: "failed" }> {
     return pendingGoalSubmissionSchema.parse({
       ...record,
       state: "failed",
       resolved_at: nowIso(now),
       error,
+      ...(preflight === undefined ? {} : { preflight }),
     }) as Extract<PendingGoalSubmission, { state: "failed" }>;
   }
 
@@ -636,13 +642,14 @@ export class PendingGoalSubmissionService {
     key: string,
     state: "failed" | "indeterminate",
     error: string,
+    preflight?: GoalPreflightResult,
   ): Promise<void> {
     await this.exclusive(async () => {
       const current = this.submissions.get(key);
       if (current === undefined || current.state !== "starting") return;
       const next = new Map(this.submissions);
       next.set(key, state === "failed"
-        ? this.failedRecord(current, this.currentTime(), error)
+        ? this.failedRecord(current, this.currentTime(), error, preflight)
         : this.indeterminateRecord(current, this.currentTime(), error));
       await this.persist(next);
       this.submissions = next;

@@ -107,6 +107,30 @@ function service(options: {
 }
 
 describe("GoalPreflightService", () => {
+  it("preserves the failed HTTP probe timeline without allowing execution", async () => {
+    const diagnostic = connectorDiagnostic({
+      ok: false, remote_ready: false, oauth_ready: false,
+      reason: "mcp_unexpected_http_status_403",
+    });
+    const timeline = [{
+      attempt: 1, retry_count: 0, elapsed_ms: 25,
+      state: "mcp_endpoint_unreachable" as const, http_status: 403,
+      current_mcp_url: "https://mcp.example.test/mcp",
+      resource_metadata_url: null, protected_resource_metadata_url: null,
+      authorization_server_url: null, failed_stage: "/mcp" as const,
+      error_type: "mcp_unexpected_http_status_403",
+    }];
+    diagnostic.remote.readiness.timeline = timeline;
+    const f = service({ connector: async () => diagnostic });
+    await expect(f.service.checkGoalPreflight({
+      workspace_id: "workspace-a", conversation_id: "conversation-1",
+    })).resolves.toMatchObject({
+      ready: false, failure_stage: "connector",
+      failure_reason: "mcp_unexpected_http_status_403",
+      connector: { ready: false, timeline },
+    });
+  });
+
   it("passes Runtime, Workspace, Connector, OAuth, and Extension readiness", async () => {
     const f = service();
     await expect(f.service.checkGoalPreflight({

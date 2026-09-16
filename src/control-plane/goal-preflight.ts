@@ -13,6 +13,7 @@ import {
 } from "./bridge.js";
 import {
   diagnoseChatGPTConnector,
+  remoteProbeTimelineEntrySchema,
   type ChatGPTConnectorDiagnostic,
 } from "./chatgpt-connector.js";
 import type {
@@ -45,6 +46,7 @@ const goalPreflightResultSchemaBase = z.object({
     reason: z.string().min(1).optional(),
     remote_ready: z.boolean().optional(),
     oauth_ready: z.boolean().optional(),
+    timeline: z.array(remoteProbeTimelineEntrySchema).optional(),
   }).strict(),
   extension: z.object({
     ready: z.boolean(),
@@ -286,6 +288,8 @@ export class GoalPreflightService {
         action: connector.connector.action,
         reason: connector.connector.reason,
         ...(connector.remote === undefined ? {} : { remote_ready: connector.remote.ready }),
+        ...(connector.remote?.readiness?.timeline === undefined
+          ? {} : { timeline: connector.remote.readiness.timeline }),
         ...(connector.oauth === undefined ? {} : { oauth_ready: connector.oauth.ready }),
       },
     });

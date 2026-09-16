@@ -41,19 +41,22 @@ type RemoteProbeState =
 
 type RemoteProbeStage = "/mcp" | "oauth-protected-resource" | "oauth-authorization-server";
 
-interface RemoteProbeTimelineEntry {
-  readonly attempt: number;
-  readonly retry_count: number;
-  readonly elapsed_ms: number;
-  readonly state: RemoteProbeState;
-  readonly http_status: number | null;
-  readonly current_mcp_url: string;
-  readonly resource_metadata_url: string | null;
-  readonly protected_resource_metadata_url: string | null;
-  readonly authorization_server_url: string | null;
-  readonly failed_stage: RemoteProbeStage | null;
-  readonly error_type: string | null;
-}
+export const remoteProbeTimelineEntrySchema = z.object({
+  attempt: z.number().int().positive(),
+  retry_count: z.number().int().nonnegative(),
+  elapsed_ms: z.number().nonnegative(),
+  state: z.enum(["not_checked", "tunnel_not_ready", "connection_failed",
+    "oauth_resource_unavailable", "mcp_endpoint_unreachable", "ready"]),
+  http_status: z.number().int().min(100).max(599).nullable(),
+  current_mcp_url: z.string(),
+  resource_metadata_url: z.string().nullable(),
+  protected_resource_metadata_url: z.string().nullable(),
+  authorization_server_url: z.string().nullable(),
+  failed_stage: z.enum(["/mcp", "oauth-protected-resource", "oauth-authorization-server"]).nullable(),
+  error_type: z.string().nullable(),
+}).strict();
+
+type RemoteProbeTimelineEntry = z.infer<typeof remoteProbeTimelineEntrySchema>;
 
 interface RemoteProbeSummary {
   attempts: number;
@@ -884,7 +887,7 @@ async function probeRemoteReadiness(
       : {
           kind: "failure",
           state: "mcp_endpoint_unreachable",
-          reason: "mcp_endpoint_unreachable",
+          reason: `mcp_unexpected_http_status_${mcp.response.status}`,
           http_status: mcp.response.status,
         };
   }
