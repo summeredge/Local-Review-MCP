@@ -39,11 +39,20 @@ type RemoteProbeState =
   | "mcp_endpoint_unreachable"
   | "ready";
 
+type RemoteProbeStage = "/mcp" | "oauth-protected-resource" | "oauth-authorization-server";
+
 interface RemoteProbeTimelineEntry {
   readonly attempt: number;
+  readonly retry_count: number;
   readonly elapsed_ms: number;
   readonly state: RemoteProbeState;
   readonly http_status: number | null;
+  readonly current_mcp_url: string;
+  readonly resource_metadata_url: string | null;
+  readonly protected_resource_metadata_url: string | null;
+  readonly authorization_server_url: string | null;
+  readonly failed_stage: RemoteProbeStage | null;
+  readonly error_type: string | null;
 }
 
 interface RemoteProbeSummary {
@@ -817,6 +826,14 @@ interface RemoteProbeAttempt {
   readonly http_status: number | null;
 }
 
+interface RemoteProbeTrace {
+  readonly current_mcp_url: string;
+  resource_metadata_url: string | null;
+  protected_resource_metadata_url: string | null;
+  authorization_server_url: string | null;
+  stage: RemoteProbeStage;
+}
+
 async function probeRemoteReadiness(
   result: ChatGPTConnectorDiagnostic,
   currentMcpUrl: string,
@@ -824,6 +841,7 @@ async function probeRemoteReadiness(
   deadline: number,
   requestTimeoutMs: number,
   now: () => number,
+  trace: RemoteProbeTrace,
 ): Promise<RemoteProbeAttempt> {
   const mcp = await fetchForReadiness(
     fetchImpl,
@@ -873,6 +891,7 @@ async function probeRemoteReadiness(
 
   result.remote.ready = true;
   const protectedUrl = metadataUrl(mcp.response.headers.get("www-authenticate"), currentMcpUrl);
+  trace.resource_metadata_url = protectedUrl;
   if (protectedUrl === null) {
     return {
       kind: "failure",
@@ -881,6 +900,8 @@ async function probeRemoteReadiness(
       http_status: 401,
     };
   }
+  trace.protected_resource_metadata_url = protectedUrl;
+  trace.stage = "oauth-protected-resource";
   const protectedResponse = await fetchForReadiness(
     fetchImpl,
     protectedUrl,
@@ -948,6 +969,8 @@ async function probeRemoteReadiness(
     "/.well-known/oauth-authorization-server",
     authorizationServer,
   );
+  trace.authorization_server_url = authorizationMetadataUrl.href;
+  trace.stage = "oauth-authorization-server";
   const authorizationResponse = await fetchForReadiness(
     fetchImpl,
     authorizationMetadataUrl,
@@ -1097,6 +1120,13 @@ export async function diagnoseChatGPTConnector(
   const startedAt = now();
   const deadline = startedAt + readinessTimeoutMs;
   for (let attempt = 1; ; attempt += 1) {
+    const trace: RemoteProbeTrace = {
+      current_mcp_url: currentMcpUrl,
+      resource_metadata_url: null,
+      protected_resource_metadata_url: null,
+      authorization_server_url: null,
+      stage: "/mcp",
+    };
     const probe = await probeRemoteReadiness(
       result,
       currentMcpUrl,
@@ -1104,13 +1134,21 @@ export async function diagnoseChatGPTConnector(
       deadline,
       requestTimeoutMs,
       now,
+      trace,
     );
     result.remote.readiness.attempts = attempt;
     result.remote.readiness.timeline.push({
       attempt,
+      retry_count: Math.max(0, attempt - 1),
       elapsed_ms: Math.max(0, now() - startedAt),
       state: probe.state,
       http_status: probe.http_status,
+      current_mcp_url: trace.current_mcp_url,
+      resource_metadata_url: trace.resource_metadata_url,
+      protected_resource_metadata_url: trace.protected_resource_metadata_url,
+      authorization_server_url: trace.authorization_server_url,
+      failed_stage: probe.kind === "ready" ? null : trace.stage,
+      error_type: probe.reason === "" ? null : probe.reason,
     });
     result.remote.readiness.final_state = probe.state;
     if (probe.kind === "failure") {
