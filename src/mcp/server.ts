@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { appendFileSync, createReadStream } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -212,6 +212,89 @@ const gitDiffInputSchema = {
   stat: z.boolean().optional().default(false),
 };
 const EXECUTION_OUTPUT_PATH = ".review/execution_output.json";
+
+type ProbePresence = "present" | "absent";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function probePresence(value: unknown): ProbePresence {
+  return value === undefined ? "absent" : "present";
+}
+
+function probeIdentity(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (Array.isArray(value) && value.length === 1) return probeIdentity(value[0]);
+  return null;
+}
+
+function probeHash(value: string | null): string | undefined {
+  return value === null ? undefined : createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function logMcpContextProbe(extra: unknown): void {
+  if (process.env.LRM_MCP_CONTEXT_PROBE !== "1") return;
+  const context = isRecord(extra) ? extra : {};
+  const metadata = isRecord(context._meta) ? context._meta : undefined;
+  const requestInfo = isRecord(context.requestInfo) ? context.requestInfo : undefined;
+  const headers = isRecord(requestInfo?.headers) ? requestInfo.headers : undefined;
+  const header = (name: string) => probeIdentity(headers?.[name]);
+  const openaiSession = probeIdentity(metadata?.["openai/session"]);
+  const sessionId = probeIdentity(context.sessionId);
+  const requestId = probeIdentity(context.requestId);
+  const callId = probeIdentity(context.callId)
+    ?? probeIdentity(metadata?.["openai/call_id"])
+    ?? probeIdentity(metadata?.call_id)
+    ?? probeIdentity(metadata?.callId);
+  const headerSession = header("x-openai-session") ?? header("openai-session");
+  const headerConversation = header("x-openai-conversation-id") ?? header("openai-conversation-id");
+  const headerThread = header("x-openai-thread-id") ?? header("openai-thread-id");
+  const headerRequestId = header("x-request-id");
+  const entry = JSON.stringify({
+    probe: "runtime_identity_probe",
+    timestamp: new Date().toISOString(),
+    field_presence: {
+      handler_extra: probePresence(extra) === "present",
+      _meta: probePresence(context._meta) === "present",
+      "_meta.openai/session": openaiSession !== null,
+      sessionId: sessionId !== null,
+      requestId: requestId !== null,
+      callId: callId !== null,
+      requestInfo: requestInfo !== undefined,
+      "requestInfo.headers": headers !== undefined,
+      "headers.openai_session": headerSession !== null,
+      "headers.openai_conversation_id": headerConversation !== null,
+      "headers.openai_thread_id": headerThread !== null,
+      "headers.x_request_id": headerRequestId !== null,
+      authInfo: probePresence(context.authInfo) === "present",
+      "authInfo.extra": isRecord(context.authInfo) && probePresence(context.authInfo.extra) === "present",
+    },
+    identity_hashes: {
+      ...(probeHash(openaiSession) === undefined ? {} : { openai_session: probeHash(openaiSession) }),
+      ...(probeHash(sessionId) === undefined ? {} : { session_id: probeHash(sessionId) }),
+      ...(probeHash(requestId) === undefined ? {} : { request_id: probeHash(requestId) }),
+      ...(probeHash(callId) === undefined ? {} : { call_id: probeHash(callId) }),
+      ...(probeHash(headerSession) === undefined ? {} : { header_session: probeHash(headerSession) }),
+      ...(probeHash(headerConversation) === undefined
+        ? {}
+        : { header_conversation_id: probeHash(headerConversation) }),
+      ...(probeHash(headerThread) === undefined ? {} : { header_thread_id: probeHash(headerThread) }),
+      ...(probeHash(headerRequestId) === undefined ? {} : { header_request_id: probeHash(headerRequestId) }),
+    },
+  });
+  const outputPath = process.env.LRM_MCP_CONTEXT_PROBE_PATH?.trim();
+  if (outputPath === undefined || outputPath === "") {
+    console.warn("MCP runtime identity probe", entry);
+    return;
+  }
+  try {
+    appendFileSync(outputPath, `${entry}\n`, "utf8");
+  } catch {
+    console.warn("MCP runtime identity probe write failed");
+  }
+}
 
 interface ListedEntry {
   readonly path: string;
@@ -990,7 +1073,8 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
       inputSchema: goalSubmissionToolInputSchema,
       outputSchema: goalSubmissionAcceptedSchema,
     },
-    async (input) => {
+    async (input, extra) => {
+      logMcpContextProbe(extra);
       const pendingGoalSubmission = context.pendingGoalSubmission;
       if (pendingGoalSubmission === undefined) {
         return toToolError(new Error("Goal submission runtime is unavailable."));

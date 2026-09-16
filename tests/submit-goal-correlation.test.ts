@@ -4,8 +4,11 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 const ORIGIN = "https://chatgpt.com";
 const CONVERSATION = "11111111-2222-3333-4444-555555555555";
+const CONVERSATION_B = "66666666-7777-4888-8999-000000000000";
 const KEY_A = "00000000-0000-4000-8000-000000000001";
 const KEY_B = "00000000-0000-4000-8000-000000000002";
+const KEY_C = "00000000-0000-4000-8000-000000000003";
+const KEY_D = "00000000-0000-4000-8000-000000000004";
 const PLATFORM_REQUEST_ID = "platform-request-id";
 
 let fiberSource = "";
@@ -46,7 +49,7 @@ function pageWindow(): PageWindow {
   return window;
 }
 
-function request(id: string, tool: string, correlationKey?: string): Record<string, unknown> {
+function request(id: string, tool: string, correlationKey?: string, requestId = "request-trace-not-used"): Record<string, unknown> {
   return {
     id,
     author: { role: "assistant" },
@@ -58,11 +61,16 @@ function request(id: string, tool: string, correlationKey?: string): Record<stri
         args: correlationKey === undefined ? {} : { correlation_key: correlationKey },
       }),
     },
-    metadata: { request_id: "request-trace-not-used" },
+    metadata: { request_id: requestId },
   };
 }
 
-function currentConnectorRequest(id: string, tool: string, correlationKey?: string): Record<string, unknown> {
+function currentConnectorRequest(
+  id: string,
+  tool: string,
+  correlationKey?: string,
+  requestId = PLATFORM_REQUEST_ID,
+): Record<string, unknown> {
   return {
     id,
     author: { role: "assistant" },
@@ -74,26 +82,30 @@ function currentConnectorRequest(id: string, tool: string, correlationKey?: stri
         arguments: JSON.stringify(correlationKey === undefined ? {} : { correlation_key: correlationKey }),
       }),
     },
-    metadata: { request_id: PLATFORM_REQUEST_ID },
+    metadata: { request_id: requestId },
   };
 }
 
-function fiberSection(messages: unknown[]): Record<string, unknown> {
+function fiberSection(
+  messages: unknown[],
+  turnId = "turn-1",
+  conversationId = CONVERSATION,
+): Record<string, unknown> {
   let model: Record<string, unknown> = {
-    memoizedProps: { conversation: { id: CONVERSATION }, turn: { id: "turn-1", messages } },
+    memoizedProps: { conversation: { id: conversationId }, turn: { id: turnId, messages } },
     return: null,
   };
   for (let depth = 0; depth < 30; depth += 1) {
     model = { memoizedProps: { children: null }, return: model };
   }
-  return { __reactFiber$test: model, getAttribute: () => "turn-1" };
+  return { __reactFiber$test: model, getAttribute: () => turnId };
 }
 
-function scanFiber(messages: unknown[]): Record<string, any> {
+function scanFiberSections(sections: Record<string, unknown>[]): Record<string, any> {
   const window = pageWindow();
   vm.runInNewContext(fiberSource, {
     window,
-    document: { querySelectorAll: () => [fiberSection(messages)] },
+    document: { querySelectorAll: () => sections },
     location: { origin: ORIGIN },
   }, { filename: "fiber.js" });
   let reply: Record<string, any> | undefined;
@@ -107,10 +119,26 @@ function scanFiber(messages: unknown[]): Record<string, any> {
   return reply;
 }
 
-async function contentMessages(reply: Record<string, unknown>): Promise<Record<string, unknown>[]> {
+function scanFiber(messages: unknown[]): Record<string, any> {
+  return scanFiberSections([fiberSection(messages)]);
+}
+
+async function contentMessages(
+  reply: Record<string, unknown>,
+  options: { fiberReplyDelayMs?: number; navigateBeforeFiberReply?: string } = {},
+): Promise<Record<string, unknown>[]> {
   const listeners = new Map<string, Set<(event: Record<string, unknown>) => void>>();
   const messages: Record<string, unknown>[] = [];
   const location = { origin: ORIGIN, href: `${ORIGIN}/c/${CONVERSATION}` };
+  let navigated = false;
+  const history = {
+    pushState(_state: unknown, _title: string, url: string) {
+      location.href = new URL(url, location.href).href;
+    },
+    replaceState(_state: unknown, _title: string, url: string) {
+      location.href = new URL(url, location.href).href;
+    },
+  };
   const window: PageWindow = {
     addEventListener(type, listener) {
       const held = listeners.get(type) ?? new Set();
@@ -122,19 +150,27 @@ async function contentMessages(reply: Record<string, unknown>): Promise<Record<s
     },
     postMessage(data, targetOrigin) {
       if (targetOrigin !== ORIGIN || (data as Record<string, unknown>)?.source !== "lrm-extension-identity-ask") return;
-      for (const listener of listeners.get("message") ?? []) {
-        listener({
-          source: window,
-          origin: ORIGIN,
-          data: { ...reply, source: "lrm-extension-identity-reply", nonce: (data as Record<string, unknown>).nonce },
-        });
+      if (options.navigateBeforeFiberReply && !navigated) {
+        navigated = true;
+        history.pushState({}, "", options.navigateBeforeFiberReply);
       }
+      const deliver = () => {
+        for (const listener of listeners.get("message") ?? []) {
+          listener({
+            source: window,
+            origin: ORIGIN,
+            data: { ...reply, source: "lrm-extension-identity-reply", nonce: (data as Record<string, unknown>).nonce },
+          });
+        }
+      };
+      if (options.fiberReplyDelayMs && options.fiberReplyDelayMs > 0) setTimeout(deliver, options.fiberReplyDelayMs);
+      else deliver();
     },
   };
   vm.runInNewContext(contentSource, {
     window,
     location,
-    history: { pushState() {}, replaceState() {} },
+    history,
     document: { documentElement: {} },
     chrome: { runtime: { sendMessage(message: Record<string, unknown>, callback: (value: object) => void) {
       messages.push(structuredClone(message));
@@ -148,20 +184,34 @@ async function contentMessages(reply: Record<string, unknown>): Promise<Record<s
     clearTimeout,
     setInterval: () => 1,
   }, { filename: "content.js" });
-  await new Promise((resolve) => setTimeout(resolve, 220));
+  const settleMs = options.fiberReplyDelayMs && options.fiberReplyDelayMs > 0
+    ? 440 + options.fiberReplyDelayMs : 220;
+  await new Promise((resolve) => setTimeout(resolve, settleMs));
   return messages;
 }
 
 describe("Extension submit_goal correlation evidence", () => {
-  it("extracts each strict submit_goal key independently", () => {
-    const reply = scanFiber([
-      request("submit-a", "submit_goal", KEY_A),
-      request("submit-b", "submit_goal", KEY_B),
+  it("sends only the current submit_goal key when history has older keys", () => {
+    const reply = scanFiberSections([
+      fiberSection([currentConnectorRequest("old-a", "submit_goal", KEY_A)], "turn-a"),
+      fiberSection([currentConnectorRequest("old-b", "submit_goal", KEY_B)], "turn-b"),
+      fiberSection([currentConnectorRequest("old-c", "submit_goal", KEY_C)], "turn-c"),
+      fiberSection([currentConnectorRequest("current", "submit_goal", KEY_D)], "turn-d"),
     ]);
-    const keys = reply.evidence.map((entry: Record<string, unknown>) => entry.request_id);
-    expect(keys).toEqual(expect.arrayContaining([KEY_A, KEY_B]));
-    expect(keys.filter((key: string) => key === KEY_A)).toHaveLength(1);
-    expect(keys.filter((key: string) => key === KEY_B)).toHaveLength(1);
+    expect(reply.evidence).toEqual([{
+      request_id: KEY_D,
+      fiber_conversation_id: CONVERSATION,
+    }]);
+    expect(reply.diagnostic).toEqual({ source: "assistant_tool_arguments", matched: true });
+  });
+
+  it("does not emit an old submit_goal key when the current turn has no submit_goal", () => {
+    const reply = scanFiberSections([
+      fiberSection([currentConnectorRequest("old", "submit_goal", KEY_A)], "turn-a"),
+      fiberSection([{ author: { role: "user" }, content: { content_type: "text", text: "current" } }], "turn-b"),
+    ]);
+    expect(reply.evidence).toEqual([]);
+    expect(reply.diagnostic).toEqual({ source: "none", matched: false });
   });
 
   it("extracts a valid key from the current direct Connector request shape", () => {
@@ -195,26 +245,34 @@ describe("Extension submit_goal correlation evidence", () => {
       } },
     ]);
     const keys = reply.evidence.map((entry: Record<string, unknown>) => entry.request_id);
-    expect(keys).toContain("request-trace-not-used");
-    expect(keys).not.toContain(KEY_A);
+    expect(keys).toEqual([]);
   });
 
-  it("keeps metadata.request_id separate from the submit_goal key", async () => {
+  it("does not let an old Fiber request id pollute the current key", async () => {
+    const reply = scanFiber([request("old", "workspace_info", undefined, "A"), currentConnectorRequest("current", "submit_goal", KEY_B)]);
+    const messages = await contentMessages(reply);
+    expect(messages.filter((message) => message.type === "identity_evidence").map((message) => message.request_id))
+      .toEqual([KEY_B]);
+  });
+
+  it("fails closed when the current submit_goal has no correlation_key", () => {
+    const reply = scanFiber([
+      currentConnectorRequest("old", "submit_goal", KEY_A),
+      currentConnectorRequest("current", "submit_goal"),
+    ]);
+    expect(reply.evidence).toEqual([]);
+  });
+
+  it("uses the submit_goal key instead of metadata.request_id", async () => {
     const messages = await contentMessages(scanFiber([
-      currentConnectorRequest("submit-current", "submit_goal", KEY_A),
+      currentConnectorRequest("submit-current", "submit_goal", KEY_B, KEY_A),
     ]));
-    expect(messages).toContainEqual({
+    expect(messages.filter((message) => message.type === "identity_evidence")).toEqual([{
       type: "identity_evidence",
-      request_id: PLATFORM_REQUEST_ID,
+      request_id: KEY_B,
       conversation_id: CONVERSATION,
       navigation_epoch: 0,
-    });
-    expect(messages).toContainEqual({
-      type: "identity_evidence",
-      request_id: KEY_A,
-      conversation_id: CONVERSATION,
-      navigation_epoch: 0,
-    });
+    }]);
   });
 
   it("passes the legacy submit_goal key through identity evidence", async () => {
@@ -225,5 +283,30 @@ describe("Extension submit_goal correlation evidence", () => {
       conversation_id: CONVERSATION,
       navigation_epoch: 0,
     });
+  });
+
+  it("keeps each conversation's current submit_goal key isolated", () => {
+    const replyA = scanFiberSections([
+      fiberSection([currentConnectorRequest("conversation-a", "submit_goal", KEY_A)], "turn-a", CONVERSATION),
+    ]);
+    const replyB = scanFiberSections([
+      fiberSection([currentConnectorRequest("conversation-b", "submit_goal", KEY_B)], "turn-b", CONVERSATION_B),
+    ]);
+    expect(replyA.evidence).toEqual([{
+      request_id: KEY_A,
+      fiber_conversation_id: CONVERSATION,
+    }]);
+    expect(replyB.evidence).toEqual([{
+      request_id: KEY_B,
+      fiber_conversation_id: CONVERSATION_B,
+    }]);
+  });
+
+  it("does not submit evidence after navigation changes during the Fiber scan", async () => {
+    const messages = await contentMessages(
+      scanFiber([currentConnectorRequest("current", "submit_goal", KEY_B)]),
+      { fiberReplyDelayMs: 100, navigateBeforeFiberReply: `/c/${CONVERSATION_B}` },
+    );
+    expect(messages.filter((message) => message.type === "identity_evidence")).toEqual([]);
   });
 });

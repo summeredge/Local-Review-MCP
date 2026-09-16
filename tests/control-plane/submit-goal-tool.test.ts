@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -118,6 +119,50 @@ function toolJson(result: unknown): Record<string, unknown> {
 }
 
 describe("submit_goal MCP tool", () => {
+  it("logs only hashes and presence for the opt-in runtime identity probe", async () => {
+    const { client } = await fixture();
+    const openaiSession = "conversation-secret";
+    const callId = "call-secret";
+    const probeDirectory = await mkdtemp(join(tmpdir(), "lrm-mcp-context-probe-"));
+    temporaryDirectories.push(probeDirectory);
+    const probePath = join(probeDirectory, "probe.jsonl");
+    const previousProbe = process.env.LRM_MCP_CONTEXT_PROBE;
+    const previousProbePath = process.env.LRM_MCP_CONTEXT_PROBE_PATH;
+    process.env.LRM_MCP_CONTEXT_PROBE = "1";
+    process.env.LRM_MCP_CONTEXT_PROBE_PATH = probePath;
+    try {
+      await client.callTool({
+        name: "submit_goal",
+        arguments: goalArguments(),
+        _meta: { "openai/session": openaiSession, call_id: callId },
+      });
+    } finally {
+      if (previousProbe === undefined) delete process.env.LRM_MCP_CONTEXT_PROBE;
+      else process.env.LRM_MCP_CONTEXT_PROBE = previousProbe;
+      if (previousProbePath === undefined) delete process.env.LRM_MCP_CONTEXT_PROBE_PATH;
+      else process.env.LRM_MCP_CONTEXT_PROBE_PATH = previousProbePath;
+    }
+
+    const output = await readFile(probePath, "utf8");
+    const record = JSON.parse(output.trim()) as Record<string, any>;
+    expect(record).toMatchObject({
+      probe: "runtime_identity_probe",
+      field_presence: {
+        handler_extra: true,
+        _meta: true,
+        "_meta.openai/session": true,
+        requestId: true,
+        callId: true,
+      },
+      identity_hashes: {
+        openai_session: createHash("sha256").update(openaiSession).digest("hex"),
+        call_id: createHash("sha256").update(callId).digest("hex"),
+      },
+    });
+    expect(output).not.toContain(openaiSession);
+    expect(output).not.toContain(callId);
+  });
+
   it("durably accepts without correlation and does not start a Goal", async () => {
     const { client, pending, submitGoal, storageRoot } = await fixture();
 

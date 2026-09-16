@@ -28,6 +28,7 @@ import type {
 } from "./evidence-transport-trace.js";
 
 export const PENDING_GOAL_SUBMISSION_TTL_MS = 2 * 60 * 1000;
+const PENDING_IDENTITY_TIMEOUT_ENV = "LRM_PENDING_IDENTITY_TIMEOUT_MS";
 
 const STATE_SCHEMA_VERSION = 1;
 const MAX_PENDING_GOAL_SUBMISSIONS = 10_000;
@@ -99,6 +100,7 @@ type TerminalPendingGoalSubmission = Extract<
 export interface PendingGoalSubmissionServiceOptions {
   readonly storageRoot?: string;
   readonly now?: () => number;
+  readonly environment?: NodeJS.ProcessEnv;
   readonly identityTrace?: Pick<IdentityTraceService, "record">;
   readonly evidenceTransportTrace?: Pick<EvidenceTransportTraceService, "record">;
 }
@@ -116,6 +118,15 @@ function errorCode(error: unknown): string | undefined {
 function errorMessage(error: unknown): string {
   const message = error instanceof Error && error.message !== "" ? error.message : String(error);
   return message.slice(0, 4_000) || "pending Goal submission failed";
+}
+
+function pendingIdentityTimeoutMs(environment: NodeJS.ProcessEnv): number {
+  const raw = environment[PENDING_IDENTITY_TIMEOUT_ENV]?.trim();
+  if (raw === undefined || raw === "" || !/^\d+$/u.test(raw)) return PENDING_GOAL_SUBMISSION_TTL_MS;
+  const timeoutMs = Number(raw);
+  return Number.isSafeInteger(timeoutMs) && timeoutMs > 0
+    ? timeoutMs
+    : PENDING_GOAL_SUBMISSION_TTL_MS;
 }
 
 function clone<T>(value: T): T {
@@ -186,6 +197,7 @@ export class PendingGoalSubmissionService {
   private readonly correlations: Pick<ConversationCorrelationRegistry, "correlation">;
   private readonly goalSubmission: Pick<GoalSubmissionService, "submitGoal">;
   private readonly now: () => number;
+  private readonly identityTimeoutMs: number;
   private readonly identityTrace: Pick<IdentityTraceService, "record"> | undefined;
   private readonly evidenceTransportTrace: Pick<EvidenceTransportTraceService, "record"> | undefined;
   private submissions = new Map<string, PendingGoalSubmission>();
@@ -205,6 +217,7 @@ export class PendingGoalSubmissionService {
     this.correlations = correlations;
     this.goalSubmission = goalSubmission;
     this.now = options.now ?? Date.now;
+    this.identityTimeoutMs = pendingIdentityTimeoutMs(options.environment ?? process.env);
     this.identityTrace = options.identityTrace;
     this.evidenceTransportTrace = options.evidenceTransportTrace;
   }
@@ -248,7 +261,7 @@ export class PendingGoalSubmissionService {
       const record = pendingGoalSubmissionSchema.parse({
         ...parsed,
         accepted_at: acceptedAt,
-        expires_at: nowIso(now + PENDING_GOAL_SUBMISSION_TTL_MS),
+        expires_at: nowIso(now + this.identityTimeoutMs),
         state: "pending_identity",
       });
       next.set(record.correlation_key, record);

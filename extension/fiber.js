@@ -10,7 +10,6 @@
   const TURN_SELECTOR = 'section[data-testid^="conversation-turn"]';
   const MAX_CLIMB = 80;
   const MAX_TURNS = 100;
-  const MAX_REQUESTS = 200;
   const MAX_COMPLETION_MESSAGE_CANDIDATES = 20;
   const MAX_COMPLETION_CONTENT = 256 * 1024;
   const REQUEST_ID = /^[A-Za-z0-9_-]{1,100}$/u;
@@ -380,22 +379,6 @@
     return null;
   }
 
-  function requestIdsOf(messages) {
-    if (!Array.isArray(messages)) return [];
-    const ids = [];
-    const seen = new Set();
-    for (let index = 0; index < messages.length && ids.length < MAX_REQUESTS; index += 1) {
-      const message = messages[index];
-      if (!message || typeof message !== 'object') continue;
-      const metadata = message.metadata;
-      const requestId = metadata && typeof metadata === 'object' ? metadata.request_id : null;
-      if (typeof requestId !== 'string' || !REQUEST_ID.test(requestId) || seen.has(requestId)) continue;
-      seen.add(requestId);
-      ids.push(requestId);
-    }
-    return ids;
-  }
-
   function own(value, key) {
     return Boolean(value && typeof value === 'object'
       && Object.prototype.hasOwnProperty.call(value, key));
@@ -409,7 +392,7 @@
     return parts[parts.length - 1];
   }
 
-  function submitGoalCorrelationKeyOf(message) {
+  function submitGoalCandidateOf(message) {
     if (!message || typeof message !== 'object' || message.author?.role !== 'assistant') return null;
     const recipient = message.recipient;
     const legacy = recipient === 'api_tool.call_tool';
@@ -427,8 +410,7 @@
     }
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
     const pathName = own(payload, 'path') ? toolNameFromPath(payload.path) : null;
-    if (legacy && pathName !== 'submit_goal') return null;
-    if (own(payload, 'path') && pathName !== 'submit_goal') return null;
+    if ((legacy && pathName !== 'submit_goal') || (own(payload, 'path') && pathName !== 'submit_goal')) return null;
     for (const key of ['name', 'tool', 'tool_name']) {
       if (own(payload, key) && payload[key] !== 'submit_goal') return null;
     }
@@ -448,18 +430,14 @@
     return typeof key === 'string' && CORRELATION_KEY.test(key) ? key : null;
   }
 
-  function submitGoalCorrelationKeysOf(messages) {
-    if (!Array.isArray(messages)) return [];
-    const keys = [];
-    const seen = new Set();
-    for (const message of messages) {
-      const key = submitGoalCorrelationKeyOf(message);
-      if (!key || seen.has(key)) continue;
-      seen.add(key);
-      keys.push(key);
-      if (keys.length >= MAX_REQUESTS) break;
+  function currentToolCorrelationOf(messages) {
+    if (!Array.isArray(messages)) return { found: false, key: null };
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (!requestOf(message)) continue;
+      return { found: true, key: submitGoalCandidateOf(message) };
     }
-    return keys;
+    return { found: false, key: null };
   }
 
   function turnsOf(sections) {
@@ -483,8 +461,6 @@
   }
 
   function scan(nonce) {
-    const byRequest = new Map();
-    const conflicts = new Set();
     let sections;
     try {
       sections = document.querySelectorAll(TURN_SELECTOR);
@@ -493,32 +469,55 @@
     }
 
     const turns = turnsOf(sections);
-    const first = Math.max(0, turns.length - MAX_TURNS);
-    for (let turnIndex = first; turnIndex < turns.length; turnIndex += 1) {
-      const turn = turns[turnIndex];
+    let currentTool = { found: false, key: null };
+    let currentTurnConversationId = null;
+    let fiberRootDetected = false;
+    let messages = null;
+    const currentTurn = turns[turns.length - 1];
+    if (currentTurn) {
       try {
-        const fiber = fiberOf(turn.sections[0]);
+        const fiber = fiberOf(currentTurn.sections[0]);
+        fiberRootDetected = Boolean(fiber);
         const conversation = fiber ? conversationEvidenceDetailsOf(fiber) : null;
-        const conversationId = conversation && !conversation.conflict && !conversation.unreadable
+        currentTurnConversationId = conversation && !conversation.conflict && !conversation.unreadable
           ? conversation.conversationId : null;
-        const messages = fiber ? turnMessagesOf(fiber) : null;
-        if (!conversationId || !messages) continue;
-        for (const requestId of submitGoalCorrelationKeysOf(messages).concat(requestIdsOf(messages))) {
-          const previous = byRequest.get(requestId);
-          if (previous !== undefined && previous !== conversationId) conflicts.add(requestId);
-          else if (previous === undefined) byRequest.set(requestId, conversationId);
-        }
+        messages = fiber ? turnMessagesOf(fiber) : null;
+        currentTool = currentToolCorrelationOf(messages);
       } catch {
-        // One unreadable turn must not turn into guessed identity evidence.
+        // An unreadable current turn must not turn into guessed identity evidence.
       }
     }
 
-    const evidence = [];
-    for (const [requestId, conversationId] of byRequest) {
-      if (conflicts.has(requestId)) continue;
-      evidence.push({ request_id: requestId, fiber_conversation_id: conversationId });
+    const assistantToolCalls = Array.isArray(messages) ? messages.filter(requestOf) : [];
+    const submitGoalFound = assistantToolCalls.some((message) =>
+      message.recipient === 'Local_MCP_Connector.submit_goal'
+      || submitGoalCandidateOf(message) !== null);
+    const correlationKeyFound = assistantToolCalls.some((message) => submitGoalCandidateOf(message) !== null);
+    try {
+      console.debug(JSON.stringify({
+        timestamp: new Date().toISOString(),
+        fiber_root_detected: fiberRootDetected,
+        assistant_tool_calls_found: assistantToolCalls.length,
+        submit_goal_found: submitGoalFound,
+        correlation_key_found: correlationKeyFound,
+      }));
+    } catch {
+      // Debug tracing must not affect identity evidence.
     }
-    post({ source: REPLY, nonce, version: VERSION, evidence }, location.origin);
+
+    const evidence = currentTool.key && currentTurnConversationId
+      ? [{ request_id: currentTool.key, fiber_conversation_id: currentTurnConversationId }]
+      : [];
+    post({
+      source: REPLY,
+      nonce,
+      version: VERSION,
+      evidence,
+      diagnostic: {
+        source: currentTool.key ? 'assistant_tool_arguments' : 'none',
+        matched: evidence.length === 1,
+      },
+    }, location.origin);
   }
 
   function conversationIdFromLocation() {

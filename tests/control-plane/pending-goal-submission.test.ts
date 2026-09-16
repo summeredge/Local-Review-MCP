@@ -11,6 +11,7 @@ import {
 } from "../../src/control-plane/goal-preflight.js";
 import {
   PendingGoalSubmissionService,
+  PENDING_GOAL_SUBMISSION_TTL_MS,
   pendingGoalSubmissionStateFile,
   type PendingGoalSubmissionInput,
 } from "../../src/control-plane/pending-goal-submission.js";
@@ -86,6 +87,63 @@ function preflightFailure(): GoalPreflightResult {
 }
 
 describe("PendingGoalSubmissionService", () => {
+  it("uses the configured identity timeout in expiry and trace", async () => {
+    const root = await makeRoot();
+    let now = Date.now();
+    const identityTrace = { record: vi.fn() };
+    const pending = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), {
+      submitGoal: vi.fn(async () => result()),
+    }, {
+      storageRoot: root,
+      now: () => now,
+      environment: { LRM_PENDING_IDENTITY_TIMEOUT_MS: "600000" },
+      identityTrace,
+    });
+
+    await pending.accept(input());
+    expect(identityTrace.record).toHaveBeenCalledWith(expect.objectContaining({
+      event: "pending_created",
+      timeout_ms: 600000,
+    }));
+
+    now += 600000;
+    await pending.expire(CORRELATION_A);
+    expect(identityTrace.record).toHaveBeenLastCalledWith(expect.objectContaining({
+      event: "pending_expired",
+      timeout_ms: 600000,
+    }));
+  });
+
+  it.each([
+    ["unset", undefined],
+    ["empty", ""],
+    ["invalid", "not-a-number"],
+    ["zero", "0"],
+    ["negative", "-1"],
+    ["fractional", "1.5"],
+  ] as const)("falls back to the default identity timeout for %s values", async (_label, value) => {
+    const root = await makeRoot();
+    let now = Date.now();
+    const identityTrace = { record: vi.fn() };
+    const pending = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), {
+      submitGoal: vi.fn(async () => result()),
+    }, {
+      storageRoot: root,
+      now: () => now,
+      environment: value === undefined ? {} : { LRM_PENDING_IDENTITY_TIMEOUT_MS: value },
+      identityTrace,
+    });
+
+    await pending.accept(input());
+    expect(identityTrace.record).toHaveBeenCalledWith(expect.objectContaining({
+      event: "pending_created",
+      timeout_ms: PENDING_GOAL_SUBMISSION_TTL_MS,
+    }));
+
+    now += PENDING_GOAL_SUBMISSION_TTL_MS;
+    await pending.expire(CORRELATION_A);
+  });
+
   it("recovers a pending submission when canonical correlation was restored", async () => {
     const root = await makeRoot();
     const correlations = new ConversationCorrelationRegistry(root);
