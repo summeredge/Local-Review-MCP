@@ -705,3 +705,38 @@ PowerShell 中含 `|` 的正则使用单引号包裹，或将参数通过变量�
 - See Also: ERR-20260912-001
 
 ---
+
+## [ERR-20260917-001] MAIN-world Fiber identity tests return no evidence
+
+**Priority**: low
+**Status**: pending
+**Area**: tools
+
+### 摘要
+
+完整 TypeScript 测试中 `tests/extension-identity.test.ts` 的三个 MAIN-world
+Fiber identity evidence 测试稳定返回空 evidence；该路径不属于 Launcher 任务清理改动。
+
+### 错误信息
+
+```text
+expected [{ fiber_conversation_id, request_id }] to deeply equal []
+```
+
+### 上下文
+
+- `npm run build` 通过
+- `npm test`：87 个测试文件中 86 个通过，748 项中 744 通过、1 跳过、3 失败
+- 单独运行 `npm test -- tests/extension-identity.test.ts` 仍为 3 失败、33 通过
+
+### 建议修复
+
+独立检查 Extension MAIN-world Fiber fixture 与实现的结构契约；不要将该无关失败并入
+Launcher 任务信息清理改动。
+
+### 元数据
+
+- Reproducible: yes
+- See Also: none
+
+---

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from time import monotonic
 
-from PySide6.QtCore import QThreadPool, QTimer, Slot
+from PySide6.QtCore import QThreadPool, QTimer, Qt, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -134,6 +136,9 @@ class LauncherWindow(QMainWindow):
         self.reset_oauth_button = QPushButton("Reset OAuth Clients")
         self.delete_oauth_button = QPushButton("删除 OAuth Client")
         self.delete_oauth_button.setEnabled(False)
+        self.clear_task_cache_button = QPushButton("清理界面缓存")
+        self.clear_persisted_task_button = QPushButton("清理持久化任务记录")
+        self.clear_persisted_task_button.setEnabled(False)
         self.workspace_button = QPushButton("添加 Workspace")
         self.delete_workspace_button = QPushButton("删除 Workspace")
         self.rename_workspace_button = QPushButton("编辑名称")
@@ -152,6 +157,8 @@ class LauncherWindow(QMainWindow):
         self.refresh_oauth_button.clicked.connect(self.refresh_oauth_status)
         self.reset_oauth_button.clicked.connect(self.reset_oauth_clients)
         self.delete_oauth_button.clicked.connect(self.delete_oauth_client)
+        self.clear_task_cache_button.clicked.connect(self.clear_task_cache)
+        self.clear_persisted_task_button.clicked.connect(self.clear_persisted_task_records)
         self.workspace_button.clicked.connect(self.choose_workspace)
         self.delete_workspace_button.clicked.connect(self.delete_workspace)
         self.rename_workspace_button.clicked.connect(self.rename_workspace)
@@ -165,74 +172,98 @@ class LauncherWindow(QMainWindow):
         self.clear_log_button.clicked.connect(self.clear_log)
         self.save_log_button.clicked.connect(self.save_log)
 
-        layout = QVBoxLayout()
+        startup_layout = QVBoxLayout()
+        overview_layout = QVBoxLayout()
         title = QLabel("Local Review MCP")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
-        layout.addWidget(title)
-        layout.addWidget(self._row("Launcher State:", self.launcher_state))
-        layout.addWidget(self._row("MCP Runtime:", self.mcp_status))
-        layout.addWidget(self._row("Cloudflare Tunnel:", self.tunnel_status))
-        layout.addWidget(self._row("Remote Endpoint:", self.remote_status))
-        layout.addWidget(self._row("OAuth Status:", self.oauth_status_label))
-        layout.addWidget(self._row("Workspace:", self.workspace_label))
-        layout.addSpacing(8)
-        layout.addWidget(QLabel("Workspace Registry"))
-        layout.addWidget(self.workspace_table)
+        overview_layout.addWidget(title)
+        overview_layout.addWidget(self._row("Launcher State:", self.launcher_state))
+        overview_layout.addWidget(self._row("MCP Runtime:", self.mcp_status))
+        overview_layout.addWidget(self._row("Cloudflare Tunnel:", self.tunnel_status))
+        overview_layout.addWidget(self._row("Remote Endpoint:", self.remote_status))
+        overview_layout.addWidget(self._row("OAuth Status:", self.oauth_status_label))
+        overview_layout.addWidget(self._row("Workspace:", self.workspace_label))
+        top_actions = QWidget()
+        top_actions.setFixedWidth(510)
+        top_actions_layout = QVBoxLayout(top_actions)
+        top_actions_layout.setContentsMargins(0, 0, 0, 0)
+        top_actions_layout.setSpacing(6)
+        control_buttons = QHBoxLayout()
+        control_buttons.addWidget(self.start_button)
+        control_buttons.addWidget(self.stop_button)
+        control_buttons.addWidget(self.refresh_button)
+        top_actions_layout.addLayout(control_buttons)
+        oauth_buttons = QHBoxLayout()
+        oauth_buttons.addWidget(self.refresh_oauth_button)
+        oauth_buttons.addWidget(self.reset_oauth_button)
+        oauth_buttons.addWidget(self.delete_oauth_button)
+        top_actions_layout.addLayout(oauth_buttons)
+        overview_layout.insertWidget(1, top_actions, 0, Qt.AlignmentFlag.AlignLeft)
+        startup_layout.addLayout(overview_layout)
+        startup_layout.addSpacing(8)
+        startup_layout.addWidget(QLabel("Workspace Registry"))
+        startup_layout.addWidget(self.workspace_table)
         workspace_buttons = QHBoxLayout()
         workspace_buttons.addWidget(self.workspace_button)
         workspace_buttons.addWidget(self.delete_workspace_button)
         workspace_buttons.addWidget(self.rename_workspace_button)
         workspace_buttons.addWidget(self.set_current_workspace_button)
-        layout.addLayout(workspace_buttons)
-        layout.addSpacing(8)
-        layout.addWidget(QLabel("Task Dashboard"))
-        layout.addWidget(self.session_table)
-        layout.addWidget(self.session_empty_label)
-        layout.addWidget(self.open_codex_task_button)
-        layout.addWidget(QLabel("Session Viewer"))
-        layout.addWidget(self.session_details_label)
-        layout.addWidget(self.execution_details_label)
-        layout.addWidget(QLabel("Event Stream"))
-        layout.addWidget(self.event_table)
-        layout.addSpacing(8)
-        layout.addWidget(QLabel("运行信息"))
-        layout.addWidget(self._row("Workspace:", self.runtime_workspace_label))
-        layout.addWidget(self._row("Production Config:", self.production_config_label))
-        layout.addWidget(self._row("Tunnel Mode:", self.tunnel_mode_label))
-        layout.addWidget(self._row("Remote Endpoint:", self.remote_endpoint_label))
-        layout.addWidget(self._row("cloudflared Version:", self.cloudflared_version_label))
-        layout.addSpacing(8)
-        control_buttons = QHBoxLayout()
-        control_buttons.addWidget(self.start_button)
-        control_buttons.addWidget(self.stop_button)
-        control_buttons.addWidget(self.refresh_button)
-        layout.addLayout(control_buttons)
-        oauth_buttons = QHBoxLayout()
-        oauth_buttons.addWidget(self.refresh_oauth_button)
-        oauth_buttons.addWidget(self.reset_oauth_button)
-        oauth_buttons.addWidget(self.delete_oauth_button)
-        layout.addLayout(oauth_buttons)
-        layout.addSpacing(8)
-        layout.addWidget(QLabel("配置"))
+        startup_layout.addLayout(workspace_buttons)
+        startup_layout.addSpacing(8)
+        startup_layout.addWidget(QLabel("运行信息"))
+        startup_layout.addWidget(self._row("Workspace:", self.runtime_workspace_label))
+        startup_layout.addWidget(self._row("Production Config:", self.production_config_label))
+        startup_layout.addWidget(self._row("Tunnel Mode:", self.tunnel_mode_label))
+        startup_layout.addWidget(self._row("Remote Endpoint:", self.remote_endpoint_label))
+        startup_layout.addWidget(self._row("cloudflared Version:", self.cloudflared_version_label))
+        startup_layout.addSpacing(8)
+        startup_layout.addWidget(QLabel("配置"))
         config_buttons = QHBoxLayout()
         config_buttons.addWidget(self.open_config_button)
         config_buttons.addWidget(self.backup_config_button)
         config_buttons.addWidget(self.validate_config_button)
-        layout.addLayout(config_buttons)
-        layout.addWidget(self.message_label)
-        layout.addWidget(QLabel("Startup log:"))
-        layout.addWidget(self.log_output)
+        startup_layout.addLayout(config_buttons)
+        startup_layout.addWidget(self.message_label)
+        startup_layout.addWidget(QLabel("Startup log:"))
+        startup_layout.addWidget(self.log_output)
         log_buttons = QHBoxLayout()
         log_buttons.addWidget(self.copy_log_button)
         log_buttons.addWidget(self.clear_log_button)
         log_buttons.addWidget(self.save_log_button)
-        layout.addLayout(log_buttons)
-        container = QWidget()
-        container.setLayout(layout)
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setWidget(container)
-        self.setCentralWidget(scroll_area)
+        startup_layout.addLayout(log_buttons)
+
+        task_layout = QVBoxLayout()
+        task_toolbar = QHBoxLayout()
+        task_toolbar.addWidget(QLabel("Task Dashboard"))
+        task_toolbar.addStretch()
+        task_toolbar.addWidget(self.clear_task_cache_button)
+        task_toolbar.addWidget(self.clear_persisted_task_button)
+        task_layout.addLayout(task_toolbar)
+        task_layout.addWidget(self.session_table)
+        task_layout.addWidget(self.session_empty_label)
+        task_layout.addWidget(self.open_codex_task_button)
+        task_layout.addWidget(QLabel("Session Viewer"))
+        task_layout.addWidget(self.session_details_label)
+        task_layout.addWidget(self.execution_details_label)
+        task_layout.addWidget(QLabel("Event Stream"))
+        task_layout.addWidget(self.event_table)
+
+        startup_container = QWidget()
+        startup_container.setLayout(startup_layout)
+        startup_scroll_area = QScrollArea()
+        startup_scroll_area.setWidgetResizable(True)
+        startup_scroll_area.setWidget(startup_container)
+
+        task_container = QWidget()
+        task_container.setLayout(task_layout)
+        task_scroll_area = QScrollArea()
+        task_scroll_area.setWidgetResizable(True)
+        task_scroll_area.setWidget(task_container)
+
+        tabs = QTabWidget()
+        tabs.addTab(startup_scroll_area, "启动信息")
+        tabs.addTab(task_scroll_area, "任务信息")
+        self.setCentralWidget(tabs)
         self.resize(820, 680)
 
         self.timer = QTimer(self)
@@ -440,6 +471,40 @@ class LauncherWindow(QMainWindow):
         self.execution_details_label.setText("Execution: —")
         self.event_table.setRowCount(0)
 
+    def clear_task_cache(self) -> None:
+        self._status_check_generation += 1
+        self._session_view_models = ()
+        self._last_status = replace(self._last_status, sessions=())
+        self.session_table.setRowCount(0)
+        self.session_empty_label.setText("No active sessions")
+        self.session_empty_label.setVisible(True)
+        self._clear_session_view()
+        self.message_label.setText("Task dashboard interface cache cleared.")
+
+    def clear_persisted_task_records(self) -> None:
+        if (
+            not self._last_status.mcp_running
+            or self.state in (LauncherState.STARTING, LauncherState.STOPPING)
+        ):
+            return
+        answer = QMessageBox.question(
+            self,
+            "清理持久化任务记录",
+            "删除当前 Workspace 中已结束的 Session、Event、Execution 和 Task 记录？\n"
+            "运行中的任务不会删除。\n\n继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        deleted = self.status_checker.clear_persisted_task_records()
+        if deleted is None:
+            self._show_error("无法清理持久化任务记录。")
+            return
+        self.clear_task_cache()
+        self.message_label.setText(f"已清理 {deleted} 条持久化任务记录。")
+        self.refresh_status()
+
     @staticmethod
     def _format_timestamp(timestamp: str | None) -> str:
         if timestamp is None:
@@ -510,6 +575,10 @@ class LauncherWindow(QMainWindow):
         )
         self.refresh_oauth_button.setEnabled(oauth_available)
         self.reset_oauth_button.setEnabled(oauth_available)
+        self.clear_persisted_task_button.setEnabled(
+            status.mcp_running
+            and self.state not in (LauncherState.STARTING, LauncherState.STOPPING)
+        )
         self.delete_oauth_button.setEnabled(
             oauth_available
             and status.oauth_registry is not None
@@ -589,6 +658,7 @@ class LauncherWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.workspace_button.setEnabled(False)
+        self.clear_persisted_task_button.setEnabled(False)
         self.delete_oauth_button.setEnabled(False)
         try:
             self.process_manager.start(self.configuration)
@@ -611,6 +681,7 @@ class LauncherWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self.workspace_button.setEnabled(False)
+        self.clear_persisted_task_button.setEnabled(False)
         self.delete_oauth_button.setEnabled(False)
         try:
             message = self.process_manager.stop()

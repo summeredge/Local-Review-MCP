@@ -1,4 +1,4 @@
-"""Read-only launcher health checks."""
+"""Launcher health checks and task dashboard maintenance."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class StatusQueryError(RuntimeError):
-    """The read-only Status Query API returned an unusable result."""
+    """The local Status Query API returned an unusable result."""
 
 
 def _display_event_time(timestamp: str) -> str:
@@ -386,6 +386,16 @@ class StatusChecker:
                 return 200 <= response.status < 300
         except (HTTPError, URLError, OSError, TimeoutError):
             return False
+
+    def clear_persisted_task_records(self) -> int | None:
+        try:
+            payload = self._request_json(self.session_catalog_url, method="DELETE")
+        except StatusQueryError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        deleted = payload.get("deleted_sessions")
+        return deleted if isinstance(deleted, int) and not isinstance(deleted, bool) and deleted >= 0 else None
 
     def dashboard_sessions(self) -> tuple[SessionViewModel, ...]:
         catalog = self._session_catalog()

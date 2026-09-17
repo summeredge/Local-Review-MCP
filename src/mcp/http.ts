@@ -33,6 +33,11 @@ const SAFE_OAUTH_STORAGE_PATH = "oauth/clients.json";
 
 type HttpStatusQuery = NonNullable<McpRuntimeContext["statusQuery"]> & {
   readonly listSessionSummaries: (workspaceId?: string) => Promise<readonly unknown[]>;
+  readonly clearSessionRecords?: (workspaceId?: string) => Promise<{
+    readonly deleted_sessions: number;
+    readonly deleted_events: number;
+    readonly deleted_tasks: number;
+  }>;
 };
 
 type HttpRuntimeContext = Omit<McpRuntimeContext, "statusQuery"> & {
@@ -159,7 +164,7 @@ async function handleLauncherSessionCatalogRequest(
     sendUnauthorized(response);
     return;
   }
-  if (request.method !== "GET") {
+  if (request.method !== "GET" && request.method !== "DELETE") {
     request.resume();
     sendJson(response, 405, { error: "method_not_allowed" });
     return;
@@ -168,11 +173,26 @@ async function handleLauncherSessionCatalogRequest(
     sendJson(response, 503, { error: "status_query_unavailable" });
     return;
   }
+  if (request.method === "GET") {
+    try {
+      const sessions = await context.statusQuery.listSessionSummaries(context.registry.active.id);
+      sendJson(response, 200, { sessions });
+    } catch {
+      sendJson(response, 500, { error: "session_catalog_unavailable" });
+    }
+    return;
+  }
+
+  if (context.statusQuery.clearSessionRecords === undefined) {
+    request.resume();
+    sendJson(response, 503, { error: "task_record_cleanup_unavailable" });
+    return;
+  }
   try {
-    const sessions = await context.statusQuery.listSessionSummaries(context.registry.active.id);
-    sendJson(response, 200, { sessions });
+    const result = await context.statusQuery.clearSessionRecords(context.registry.active.id);
+    sendJson(response, 200, { deleted: true, ...result });
   } catch {
-    sendJson(response, 500, { error: "session_catalog_unavailable" });
+    sendJson(response, 500, { error: "task_record_cleanup_failed" });
   }
 }
 

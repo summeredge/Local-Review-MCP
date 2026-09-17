@@ -1,4 +1,4 @@
-"""Minimal checks for asynchronous, read-only launcher status checks."""
+"""Minimal checks for asynchronous launcher status checks and task maintenance."""
 
 from __future__ import annotations
 
@@ -240,6 +240,25 @@ class StatusCheckerTests(unittest.TestCase):
             self.assertTrue(StatusChecker(auth_token="secret").reset_oauth_clients())
 
         request = open_url.call_args.args[0]
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+
+    def test_clear_persisted_task_records_uses_authenticated_delete(self) -> None:
+        response = MagicMock()
+        response.read.return_value = json.dumps({
+            "deleted": True,
+            "deleted_sessions": 2,
+            "deleted_events": 2,
+            "deleted_tasks": 1,
+        }).encode("utf-8")
+        response.headers.get.return_value = "application/json"
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+        with patch("status_checker.urlopen", return_value=response) as open_url:
+            self.assertEqual(StatusChecker(auth_token="secret").clear_persisted_task_records(), 2)
+
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:12080/launcher/sessions")
         self.assertEqual(request.get_method(), "DELETE")
         self.assertEqual(request.get_header("Authorization"), "Bearer secret")
 

@@ -24,7 +24,7 @@ import type { CodexAppServerEvent } from "../../src/backends/codex_app_server/ev
 import { ExecutionContextService } from "../../src/context/execution-service.js";
 import { SessionStore } from "../../src/context/session-store.js";
 import { TaskContextService } from "../../src/context/service.js";
-import { goalOrchestrationSchema } from "../../src/control-plane/goal-orchestration.js";
+import { goalOrchestrationSchema, type GoalOrchestration } from "../../src/control-plane/goal-orchestration.js";
 import { StatusQueryService } from "../../src/control-plane/status-query.js";
 import { createMcpServer } from "../../src/mcp/server.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
@@ -394,5 +394,69 @@ describe("Codex Event Adapter and LRM event stream", () => {
     });
     expect(eventsResult.isError).not.toBe(true);
     expect(eventsResult.structuredContent).toMatchObject({ returned: 2, has_more: true });
+  });
+
+  it("clears terminal interactive records while retaining active Sessions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-status-cleanup-"));
+    temporaryDirectories.push(root);
+    const sessions = new SessionStore(root);
+    const terminal = await sessions.createSession({
+      session_id: "session-terminal",
+      goal_id: "goal-terminal",
+      task_id: "task-terminal",
+      backend_type: "codex_app_server",
+      status: "completed",
+      workspace: "C:\\workspace",
+      thread_id: "thread-terminal",
+    });
+    const active = await sessions.createSession({
+      session_id: "session-active",
+      goal_id: "goal-active",
+      task_id: "task-active",
+      backend_type: "codex_app_server",
+      status: "active",
+      workspace: "C:\\workspace",
+      thread_id: "thread-active",
+    });
+    const tasks = new TaskContextService(root);
+    await tasks.createTaskContext({ task_id: terminal.task_id, workspace_id: "workspace-1" });
+    const executions = new ExecutionContextService(root);
+    await executions.createExecutionContext({
+      execution_id: "execution-terminal",
+      workspace_id: "workspace-1",
+      task_id: terminal.task_id,
+      process_id: 9_001,
+    });
+    const events = new EventStore(root);
+    await events.appendEvent({
+      session_id: terminal.session_id,
+      execution_id: "execution-terminal",
+      thread_id: "thread-terminal",
+      timestamp: "2026-09-15T00:00:00.000Z",
+      event_type: "session_started",
+      payload: {},
+    });
+    const query = new StatusQueryService({
+      storageRoot: root,
+      sessions,
+      goals: {
+        getGoal: async (goalId) => ({ goal_id: goalId, workspace_id: "workspace-1" } as GoalOrchestration),
+      },
+    });
+
+    await expect(query.clearSessionRecords("workspace-1")).resolves.toEqual({
+      deleted_sessions: 1,
+      deleted_events: 1,
+      deleted_tasks: 1,
+    });
+    await expect(sessions.getSession(terminal.session_id)).resolves.toBeNull();
+    await expect(sessions.getSession(active.session_id)).resolves.toMatchObject({ status: "active" });
+    await expect(tasks.getTaskContext(terminal.task_id)).resolves.toBeNull();
+    await expect(executions.getExecutionContext(
+      "workspace-1",
+      terminal.task_id,
+      "execution-terminal",
+    )).resolves.toBeNull();
+    await expect(events.listEvents(terminal.session_id)).resolves.toEqual([]);
   });
 });

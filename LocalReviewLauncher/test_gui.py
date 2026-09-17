@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QTableWidget
 
+from config_manager import LauncherConfig
 from gui import LauncherState, LauncherWindow
 from status_checker import (
     LauncherStatus,
@@ -31,6 +32,36 @@ class LauncherLogTests(unittest.TestCase):
     @staticmethod
     def _window() -> SimpleNamespace:
         return SimpleNamespace(log_output=QPlainTextEdit(), message_label=QLabel())
+
+    def test_startup_actions_below_title_at_three_quarter_width(self) -> None:
+        manager = Mock()
+        manager.load.return_value = LauncherConfig("", "config.production.json", False)
+        with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
+            LauncherWindow, "refresh_status"
+        ), patch.object(LauncherWindow, "_render_runtime_info"):
+            process.return_value.has_started = False
+            window = LauncherWindow(Path.cwd(), manager)
+            self.addCleanup(window.close)
+            window.timer.stop()
+            window.show()
+            self.application.processEvents()
+            title = next(label for label in window.findChildren(QLabel) if label.text() == "Local Review MCP")
+            actions = window.start_button.parentWidget()
+            overview = actions.parentWidget().layout().itemAt(0).layout()
+            self.assertIs(overview.itemAt(0).widget(), title)
+            self.assertIs(overview.itemAt(1).widget(), actions)
+            self.assertEqual(actions.width(), 680 * 3 // 4)
+            self.assertEqual(actions.x(), title.x())
+            self.assertGreater(actions.y(), title.geometry().bottom())
+            self.assertLess(actions.geometry().bottom(), window.launcher_state.parentWidget().y())
+            first_row = (window.start_button, window.stop_button, window.refresh_button)
+            second_row = (window.refresh_oauth_button, window.reset_oauth_button, window.delete_oauth_button)
+            for column, (upper, lower) in enumerate(zip(first_row, second_row)):
+                self.assertIs(actions.layout().itemAt(0).layout().itemAt(column).widget(), upper)
+                self.assertIs(actions.layout().itemAt(1).layout().itemAt(column).widget(), lower)
+                self.assertEqual(upper.x(), lower.x())
+                self.assertEqual(upper.width(), lower.width())
+                self.assertGreater(lower.y(), upper.geometry().bottom())
 
     def test_save_log_writes_utf8(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

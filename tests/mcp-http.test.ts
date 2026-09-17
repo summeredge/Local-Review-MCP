@@ -85,6 +85,18 @@ describe("MCP HTTP runtime", () => {
     });
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ sessions: [] });
+
+    const cleanup = await fetch(`http://127.0.0.1:${port}/launcher/sessions`, {
+      method: "DELETE",
+      headers: { authorization: "Bearer test-token" },
+    });
+    expect(cleanup.status).toBe(200);
+    await expect(cleanup.json()).resolves.toEqual({
+      deleted: true,
+      deleted_sessions: 0,
+      deleted_events: 0,
+      deleted_tasks: 0,
+    });
   });
 
   it("propagates the normalized request id into an MCP tool call", async () => {

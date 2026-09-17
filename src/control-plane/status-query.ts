@@ -1,3 +1,4 @@
+import { rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { z } from "zod";
 import {
@@ -10,8 +11,10 @@ import {
   workspaceIdSchema,
 } from "../context/schema.js";
 import { ExecutionContextService } from "../context/execution-service.js";
+import { taskExecutionsDirectory } from "../context/execution.js";
 import { SessionStore } from "../context/session-store.js";
-import { defaultTaskContextStorageRoot } from "../context/task.js";
+import { sessionFile } from "../context/session.js";
+import { defaultTaskContextStorageRoot, taskContextFile } from "../context/task.js";
 import { TaskContextService } from "../context/service.js";
 import type { ExecutionContext, Session } from "../context/types.js";
 import type { GoalOrchestrationService, GoalOrchestration } from "./goal-orchestration.js";
@@ -19,7 +22,7 @@ import {
   lrmEventSchema,
   type StoredLrmEvent,
 } from "./events/model.js";
-import { EventStore } from "./events/store.js";
+import { EventStore, eventsFile } from "./events/store.js";
 
 const providerIdSchema = z.string().min(1).max(256);
 const optionalModelSchema = z.string().min(1).max(256).optional();
@@ -362,6 +365,46 @@ export class StatusQueryService {
       });
     }
     return summaries.sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+  }
+
+  public async clearSessionRecords(workspaceId?: string): Promise<{
+    readonly deleted_sessions: number;
+    readonly deleted_events: number;
+    readonly deleted_tasks: number;
+  }> {
+    const sessions = await this.sessions.listSessions();
+    const terminal = new Set(["completed", "failed", "terminated"]);
+    const candidates: Array<{ readonly session: Session; readonly workspace_id: string }> = [];
+    for (const session of sessions) {
+      if (session.backend_type !== "codex_app_server" || !terminal.has(session.status)) continue;
+      const goal = await this.optionalGoal(session.goal_id);
+      if (goal === undefined || (workspaceId !== undefined && goal.workspace_id !== workspaceId)) continue;
+      candidates.push({ session, workspace_id: goal.workspace_id });
+    }
+
+    const candidateIds = new Set(candidates.map(({ session }) => session.session_id));
+    const retainedTasks = new Set(sessions
+      .filter((session) => !candidateIds.has(session.session_id))
+      .map((session) => session.task_id));
+    const deletedTasks = new Set<string>();
+    for (const { session, workspace_id } of candidates) {
+      await rm(sessionFile(this.storageRoot, session.session_id), { force: true });
+      await rm(eventsFile(this.storageRoot, session.session_id), { force: true });
+      const taskKey = `${workspace_id}\0${session.task_id}`;
+      if (!retainedTasks.has(session.task_id) && !deletedTasks.has(taskKey)) {
+        await rm(taskContextFile(this.storageRoot, session.task_id), { force: true });
+        await rm(taskExecutionsDirectory(this.storageRoot, workspace_id, session.task_id), {
+          recursive: true,
+          force: true,
+        });
+        deletedTasks.add(taskKey);
+      }
+    }
+    return {
+      deleted_sessions: candidates.length,
+      deleted_events: candidates.length,
+      deleted_tasks: deletedTasks.size,
+    };
   }
 
   private async resolveExecution(input: z.output<typeof executionStatusQueryInputSchema>): Promise<ExecutionMatch> {

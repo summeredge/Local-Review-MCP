@@ -1,8 +1,9 @@
 # LocalReviewLauncher Task Dashboard
 
 Phase 5 exposes the existing interactive Session state in the PySide6 launcher.
-It is a read-only view: it does not submit, stop, resume, approve, or otherwise
-control a Goal, Execution, Codex Thread, or Turn.
+It does not submit, stop, resume, approve, or otherwise control a Goal,
+Execution, Codex Thread, or Turn. Task records can be cleared from the
+dedicated task tab; running Sessions are retained.
 
 ## Data source
 
@@ -64,6 +65,17 @@ The dashboard refreshes every five seconds using the launcher's existing
 background status worker. A manual **刷新状态** performs the same read-only
 refresh.
 
+## Task record cleanup
+
+The task tab provides two separate cleanup actions:
+
+- **清理界面缓存** clears the current launcher display without touching
+  persisted records. A later refresh can load them again.
+- **清理持久化任务记录** removes completed, failed, or terminated Session,
+  Event, Execution, and corresponding Task records for the active Workspace.
+  Running Sessions and their records are retained. The action uses the
+  existing authenticated loopback launcher endpoint and asks for confirmation.
+
 ## Opening a Codex Task
 
 **Open Codex Task** is a locator entry point. This launcher does not automate
@@ -94,4 +106,5 @@ normalized Event Store
 
 Session is the long-lived interactive context. Execution is one run within
 that context, and a Turn is the provider-level unit for that run. The launcher
-only observes these records; it does not alter their lifecycle.
+only observes their lifecycle. Cleanup removes terminal dashboard records but
+does not change the lifecycle of a running Session.
