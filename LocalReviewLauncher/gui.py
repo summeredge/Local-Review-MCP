@@ -494,13 +494,28 @@ class LauncherWindow(QMainWindow):
 
         # Aggregate before limiting rows so a retained stream keeps all its text.
         rows = deque(maxlen=MAX_EVENT_STREAM_ROWS)
-        for is_delta, group in groupby(session.events, key=lambda event: event.event_type == "agent_message_delta"):
-            if is_delta:
-                first = next(group)
-                content = first.content + "".join(event.content for event in group)
-                rows.append((first.display_time, "agent_message_stream", content or "—"))
-            else:
+        # Session identity is already validated when building session.events.
+        for identity, group in groupby(session.events, key=lambda event: (
+            (event.execution_id, event.turn_id, event.item_id)
+            if event.event_type in {"agent_message_delta", "agent_message_completed"} else None
+        )):
+            if identity is None:
                 rows.extend((event.display_time, event.event_type, event.content or "—") for event in group)
+                continue
+            first = None
+            chunks = []
+            for event in group:
+                if first is None:
+                    first = event
+                if event.event_type == "agent_message_completed":
+                    # Core emits completed.content as the suffix not yet sent by deltas.
+                    rows.append((first.display_time, "agent_message_stream", "".join(chunks) + event.content))
+                    first = None
+                    chunks.clear()
+                else:
+                    chunks.append(event.content)
+            if first is not None:
+                rows.append((first.display_time, "agent_message_stream", "".join(chunks)))
         scroll_position = self.event_table.verticalScrollBar().value()
         self.event_table.setRowCount(len(rows))
         for row, values in enumerate(rows):

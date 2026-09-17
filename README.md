@@ -12,6 +12,8 @@ V0.1 Release Candidate / Phase 5.6.1
 - `submit_goal` Control Plane entry point with asynchronous exact-current-conversation binding
 - batch CLI and interactive Codex app-server Execution backends
 - normalized interactive Session events with read-only Session/Execution status queries
+- schema-validated MCP structured outputs and schema-v1 ReviewVerdict parsing
+- durable Extension delivery and review-completion channels with identity-bound receipts
 - MV3 Browser Extension/Fiber identity evidence and loopback Local Control Bridge
 - fixed loopback host
 - configurable fixed port
@@ -30,7 +32,7 @@ V0.1 Release Candidate / Phase 5.6.1
 
 ## Architecture
 
-LRM keeps the MCP Data Plane and the Control Plane separate:
+The Local MCP Server keeps the MCP Data Plane and the Control Plane separate:
 
 ```text
 MCP Read-only Data Plane
@@ -57,9 +59,9 @@ Execution and review use these current paths:
 batch:        Task -> Execution                 (Codex CLI)
 interactive: Task -> Session -> provider Thread -> Turn -> Execution -> normalized Events
 
-terminal Execution -> Review Request -> Conversation Routing -> Review Delivery
-                   -> Extension Review Completion -> ReviewResult -> ReviewVerdict
-                   -> LoopDecision -> complete | next Execution | human required
+passed Execution -> Review Request -> Conversation Routing -> Review Delivery
+                 -> Extension Delivery -> Extension Review Completion -> ReviewResult
+                 -> ReviewVerdict -> AutoIteration -> complete | next Execution | human required
 ```
 
 Request correlation (`correlation_key -> conversation_id`) is identity evidence
@@ -69,8 +71,14 @@ Delivery target.
 `Session` is the long-lived interactive context and stores the provider Thread
 ID. `Turn` is the provider-level unit for one interactive Execution. Batch
 execution continues through `codex exec --json -` and does not automatically
-create a Session. The Playwright Browser Worker remains an independent path for
-explicit diagnostics and compatibility; it is not an MCP Data Plane capability.
+create a Session. The Playwright Browser Worker remains an independent automation
+path for explicit diagnostics and compatibility; current integrated delivery and
+completion use the Extension/Bridge path, and the Worker is not an MCP Data Plane
+capability.
+
+Completed ReviewResults are parsed as schema-v1 `ReviewVerdict` values; the
+integrated `AutoIteration` path handles `APPROVE`, `ITERATE`, and
+`HUMAN_REQUIRED` outcomes.
 
 ### Interactive Execution and status
 
@@ -335,11 +343,11 @@ same-model `serverId$()` result can resolve it to a canonical conversation ID.
 
 The Local Control Bridge is a separate loopback Control Plane server on
 `127.0.0.1`, discovered on ports `12081` through `12085`, using protocol `3`.
-It pairs one validated Extension Origin and authenticates protected evidence
-transport with a process-local bearer token. `GET /hello` is discovery;
-protected identity evidence is posted to `/identity-evidence`. If the Bridge is
-unavailable, the MCP Data Plane can still start, but `submit_goal` cannot pass
-its Browser identity-channel readiness gate.
+It pairs one validated Extension Origin and authenticates protected identity,
+delivery, and completion transport with a process-local bearer token.
+`GET /hello` is discovery; protected identity evidence is posted to
+`/identity-evidence`. If the Bridge is unavailable, the MCP Data Plane can still
+start, but `submit_goal` cannot pass its Browser identity-channel readiness gate.
 
 `GET http://127.0.0.1:<port>/launcher/readiness` is a loopback,
 static-token-protected status endpoint also shown by the Launcher. `ready` means
@@ -442,6 +450,19 @@ Review Delivery chain with a mock Page and does not require a ChatGPT login:
 npm run diagnose:review-submission
 ```
 
+The live Goal E2E diagnostic exercises the Extension-based Goal, delivery,
+review-completion, verdict, and terminal-state path for one concrete ChatGPT
+conversation:
+
+```powershell
+npm run diagnose:goal-e2e -- --config config.production.json --conversation-id <conversation_id>
+```
+
+It requires the exact connector, an open target conversation, and a paired and
+present Extension. The automated Phase 5.6 review-loop test uses an in-process
+app-server test double; it verifies LRM lifecycle and verdict parsing, not live
+ChatGPT/browser delivery.
+
 The interactive app-server smoke uses a temporary state root and requires the
 requested provider selection:
 
@@ -468,9 +489,10 @@ local HTTP checks.
 
 The read-only Task Dashboard lists only interactive `codex_app_server` Sessions
 and shows Goal/Task, Session/Thread, model/effort, status, current Execution,
-and last update. The Session Viewer shows the current Execution and the
-normalized Event Stream; it refreshes every five seconds and provides an
-Open Codex Task locator using the proven Thread/Session IDs. The Launcher only
+and last update. The Session Viewer shows the current Execution and the paginated
+normalized Event Stream; adjacent agent-message deltas are aggregated for display
+and the rendered stream is capped at 500 rows. It refreshes every five seconds
+and provides an Open Codex Task locator using the proven Thread/Session IDs. The Launcher only
 observes lifecycle state and does not submit, stop, resume, approve, or control
 a Goal, Execution, Thread, or Turn. Separate cleanup actions can clear the
 display or remove completed/failed/terminated persisted task records; running

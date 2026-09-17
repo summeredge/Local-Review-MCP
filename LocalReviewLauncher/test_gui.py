@@ -23,7 +23,6 @@ from status_checker import (
     OAuthClientStatus,
     OAuthRegistryStatus,
     SessionViewModel,
-    SessionEventViewModel,
     StatusChecker,
     StatusQueryError,
     build_session_view_model,
@@ -362,6 +361,8 @@ class LauncherDashboardTests(unittest.TestCase):
             "turn_completed",
         ])
         self.assertEqual(view.events[2].content, "Hello")
+        self.assertEqual((view.events[2].execution_id, view.events[2].turn_id, view.events[2].item_id),
+                         ("execution-1", "turn-1", "item-1"))
         self.assertEqual(view.events[2].display_time,
                          datetime.fromisoformat(view.events[2].timestamp).astimezone().strftime("%H:%M:%S"))
 
@@ -420,33 +421,59 @@ class LauncherDashboardTests(unittest.TestCase):
         self.assertEqual(window.event_table.item(3, 1).text(), "execution_failed")
         self.assertEqual(window.event_table.item(3, 2).text(), "provider failed")
 
-    def test_event_stream_aggregates_only_adjacent_deltas_and_keeps_latest_500(self) -> None:
+    def test_event_stream_identity_completion_boundaries_and_latest_500(self) -> None:
         session, execution, events, summary = self._payloads()
         view = build_session_view_model(session, execution, events, summary=summary)
         window = self._window()
-        raw = tuple(SessionEventViewModel(i + 1, view.events[0].timestamp, kind, content)
+        raw = tuple(replace(view.events[2], sequence=i + 1, event_type=kind, content=content)
                     for i, (kind, content) in enumerate([
                         ("session_started", ""), ("turn_started", ""),
                         *[("agent_message_delta", text) for text in ("L", "RM_", "ID", "ENTITY_PASS")],
-                        ("agent_message_completed", "LRM_IDENTITY_PASS"),
+                        ("agent_message_completed", " complete"),
                         ("agent_message_delta", "next\nmessage"),
-                        ("turn_completed", ""), ("execution_completed", ""),
+                        ("turn_completed", ""),
                         ("execution_failed", "reason"),
                     ]))
-        for source, expected in (
-            (raw, [("session_started", "—"), ("turn_started", "—"),
-                   ("agent_message_stream", "LRM_IDENTITY_PASS"),
-                   ("agent_message_completed", "LRM_IDENTITY_PASS"),
+        delta = view.events[2]
+        completed = replace(delta, event_type="agent_message_completed", content="EVENT_PASS")
+        cases = [
+            ("completion closes message", raw, [("session_started", "—"), ("turn_started", "—"),
+                   ("agent_message_stream", "LRM_IDENTITY_PASS complete"),
                    ("agent_message_stream", "next\nmessage"),
-                   ("turn_completed", "—"), ("execution_completed", "—"),
+                   ("turn_completed", "—"),
                    ("execution_failed", "reason")]),
-            (tuple(replace(raw[2], sequence=i + 1, content="x") for i in range(10_000)),
+            ("10000 deltas", tuple(replace(delta, sequence=i + 1, content="x") for i in range(10_000)),
              [("agent_message_stream", "x" * 10_000)]),
-            (tuple(replace(raw[-1], sequence=i + 1, content=str(i)) for i in range(600)),
+            ("500 lifecycle rows", tuple(replace(raw[-1], sequence=i + 1, content=str(i)) for i in range(600)),
              [("execution_failed", str(i)) for i in range(100, 600)]),
-            ((), []),
-        ):
-            with self.subTest(raw_events=len(source)):
+            ("500 text rows", tuple(replace(delta, sequence=i + 1, item_id=f"item-{i}", content=str(i))
+                                    for i in range(600)),
+             [("agent_message_stream", str(i)) for i in range(100, 600)]),
+            ("same identity", tuple(replace(delta, content=text) for text in ("我", "会", "先")),
+             [("agent_message_stream", "我会先")]),
+            ("delta plus completed suffix", (delta, completed), [("agent_message_stream", delta.content + "EVENT_PASS")]),
+            ("completed alone", (replace(completed, content="完整消息"),), [("agent_message_stream", "完整消息")]),
+            ("full deltas plus empty completion", (delta, replace(completed, content="")),
+             [("agent_message_stream", delta.content)]),
+            ("whitespace", tuple(replace(delta, content=text) for text in ("", " ", "\n", "x", " ")),
+             [("agent_message_stream", " \nx ")]),
+            ("empty delta", (replace(delta, content=""),), [("agent_message_stream", "")]),
+            ("empty events", (), []),
+        ]
+        for field in ("execution_id", "turn_id", "item_id"):
+            for event in (delta, completed):
+                cases.append((f"{field} {event.event_type}", (delta, replace(event, **{field: "other"})),
+                              [("agent_message_stream", delta.content), ("agent_message_stream", event.content)]))
+        for lifecycle in (view.events[0], view.events[1], view.events[-1], raw[-1]):
+            for event in (delta, completed):
+                cases.append((f"{lifecycle.event_type} {event.event_type}", (delta, lifecycle, event),
+                              [("agent_message_stream", delta.content),
+                               (lifecycle.event_type, lifecycle.content or "—"),
+                               ("agent_message_stream", event.content)]))
+        for name, source, expected in cases:
+            with self.subTest(case=name):
+                source = tuple(replace(event, sequence=i + 1) for i, event in enumerate(source))
+                snapshot = tuple(replace(event) for event in source)
                 current = replace(view, events=source)
                 window._render_session_dashboard((current,))
                 window.session_table.selectRow(0)
@@ -458,7 +485,20 @@ class LauncherDashboardTests(unittest.TestCase):
                 window._render_session_dashboard((current,))
                 self.assertEqual(window.event_table.rowCount(), len(expected))
                 self.assertIs(current.events, source)
+                self.assertEqual(current.events, snapshot)
                 self.assertEqual(current.execution, view.execution)
+
+    def test_event_identity_is_required_and_foreign_or_unknown_events_are_rejected(self) -> None:
+        session, execution, payload, summary = self._payloads()
+        delta = payload["events"][2]
+        invalid = [{**delta, "event_type": kind} for kind in ("execution_completed", "agent_message_stream", "unknown")]
+        invalid.append({**delta, "session_id": "other-session"})
+        for kind in ("agent_message_delta", "agent_message_completed"):
+            for field in ("execution_id", "turn_id", "item_id"):
+                invalid.append({key: value for key, value in {**delta, "event_type": kind}.items() if key != field})
+        for event in invalid:
+            with self.subTest(event=event), self.assertRaises(StatusQueryError):
+                build_session_view_model(session, execution, {**payload, "events": [event]}, summary=summary)
 
     def test_paginated_text_preserves_whitespace_and_rejects_stalled_or_foreign_pages(self) -> None:
         session, execution, payload, summary = self._payloads()
@@ -470,7 +510,7 @@ class LauncherDashboardTests(unittest.TestCase):
             ]},
             {"session_id": "session-1", "has_more": False, "events": [
                 {**delta, "sequence": 3, "payload": {"content": "world\n"}},
-                {**delta, "sequence": 4, "event_type": "execution_completed", "payload": {}},
+                {**payload["events"][-1], "sequence": 4},
             ]},
         ]
         checker = StatusChecker(workspace_id="workspace-1")
@@ -484,7 +524,7 @@ class LauncherDashboardTests(unittest.TestCase):
         window.session_table.selectRow(0)
         window._render_selected_session()
         self.assertEqual(window.event_table.item(0, 2).text(), "Hello world\n")
-        self.assertEqual(window.event_table.item(1, 1).text(), "execution_completed")
+        self.assertEqual(window.event_table.item(1, 1).text(), "turn_completed")
         self.assertEqual(len(view.events), 4)
         for invalid in (pages[0], {**pages[1], "session_id": "other-session"},
                         {**pages[0], "events": []}):

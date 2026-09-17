@@ -40,7 +40,6 @@ EVENT_TYPES = frozenset({
     "agent_message_completed",
     "turn_completed",
     "execution_failed",
-    "execution_completed",
 })
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -62,6 +61,9 @@ class SessionEventViewModel:
     timestamp: str
     event_type: str
     content: str
+    execution_id: str
+    turn_id: str | None = None
+    item_id: str | None = None
 
     @property
     def display_time(self) -> str:
@@ -250,13 +252,16 @@ def _parse_events(payload: object, session: Mapping[str, object]) -> tuple[Sessi
         event_thread_id = _text(event.get("thread_id"), "event.thread_id")
         if session.get("thread_id") is not None and event_thread_id != session["thread_id"]:
             raise StatusQueryError("event Thread does not match the Session")
-        _identifier(event.get("execution_id"), "event.execution_id")
+        execution_id = _identifier(event.get("execution_id"), "event.execution_id")
         event_type = _text(event.get("event_type"), "event.event_type", 64)
         if event_type not in EVENT_TYPES:
             raise StatusQueryError("event.event_type is not recognized")
+        turn_id = None if event_type == "session_started" else _text(event.get("turn_id"), "event.turn_id")
+        item_id = None
         event_payload = _object(event.get("payload"), "event.payload")
         content = ""
         if event_type in {"agent_message_delta", "agent_message_completed"}:
+            item_id = _text(event.get("item_id"), "event.item_id")
             content = event_payload.get("content", "")
             if not isinstance(content, str) or len(content) > 4_000:
                 raise StatusQueryError("event.payload.content must be a string of at most 4000 characters")
@@ -268,6 +273,9 @@ def _parse_events(payload: object, session: Mapping[str, object]) -> tuple[Sessi
             timestamp=_timestamp(event.get("timestamp"), "event.timestamp"),
             event_type=event_type,
             content=content,
+            execution_id=execution_id,
+            turn_id=turn_id,
+            item_id=item_id,
         ))
     return tuple(sorted(events, key=lambda event: event.sequence))
 
