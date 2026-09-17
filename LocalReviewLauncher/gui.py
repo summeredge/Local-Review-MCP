@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from dataclasses import replace
 from datetime import datetime
 from enum import Enum
+from itertools import groupby
 from pathlib import Path
 from time import monotonic
 
@@ -43,6 +45,7 @@ from status_worker import StatusCheckScheduler, StatusCheckWorker
 STARTUP_TIMEOUT_SECONDS = 60
 STARTUP_POLL_INTERVAL_MS = 2_000
 BROWSER_PRESENCE_GRACE_SECONDS = 15
+MAX_EVENT_STREAM_ROWS = 500
 
 
 class LauncherState(str, Enum):
@@ -127,6 +130,7 @@ class LauncherWindow(QMainWindow):
         self.event_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.event_table.horizontalHeader().setStretchLastSection(True)
         self.event_table.setMinimumHeight(180)
+        self.event_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._session_view_models: tuple[SessionViewModel, ...] = ()
         self.message_label = QLabel()
         self.message_label.setWordWrap(True)
@@ -488,13 +492,24 @@ class LauncherWindow(QMainWindow):
                 f"finished_at: {self._format_timestamp(execution.finished_at)}",
             ]))
 
-        self.event_table.setRowCount(0)
-        for row, event in enumerate(session.events):
-            self.event_table.insertRow(row)
-            values = (event.display_time, event.event_type, event.content or "—")
+        # Aggregate before limiting rows so a retained stream keeps all its text.
+        rows = deque(maxlen=MAX_EVENT_STREAM_ROWS)
+        for is_delta, group in groupby(session.events, key=lambda event: event.event_type == "agent_message_delta"):
+            if is_delta:
+                first = next(group)
+                content = first.content + "".join(event.content for event in group)
+                rows.append((first.display_time, "agent_message_stream", content or "—"))
+            else:
+                rows.extend((event.display_time, event.event_type, event.content or "—") for event in group)
+        scroll_position = self.event_table.verticalScrollBar().value()
+        self.event_table.setRowCount(len(rows))
+        for row, values in enumerate(rows):
             for column, value in enumerate(values):
                 self.event_table.setItem(row, column, QTableWidgetItem(value))
+        self.event_table.resizeColumnToContents(0)
+        self.event_table.resizeColumnToContents(1)
         self.event_table.resizeRowsToContents()
+        self.event_table.verticalScrollBar().setValue(scroll_position)
 
     def _clear_session_view(self) -> None:
         self.open_codex_task_button.setEnabled(False)

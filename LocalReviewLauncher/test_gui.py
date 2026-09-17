@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,9 @@ from status_checker import (
     OAuthClientStatus,
     OAuthRegistryStatus,
     SessionViewModel,
+    SessionEventViewModel,
+    StatusChecker,
+    StatusQueryError,
     build_session_view_model,
 )
 
@@ -44,6 +48,7 @@ class LauncherLogTests(unittest.TestCase):
             process.return_value.has_started = False
             window = LauncherWindow(Path.cwd(), manager)
             self.addCleanup(window.close)
+            self.assertEqual(window.timer.interval(), 5_000)
             window.timer.stop()
             window.show()
             self.application.processEvents()
@@ -414,6 +419,78 @@ class LauncherDashboardTests(unittest.TestCase):
         self.assertEqual(window.session_table.item(0, 1).text(), "failed")
         self.assertEqual(window.event_table.item(3, 1).text(), "execution_failed")
         self.assertEqual(window.event_table.item(3, 2).text(), "provider failed")
+
+    def test_event_stream_aggregates_only_adjacent_deltas_and_keeps_latest_500(self) -> None:
+        session, execution, events, summary = self._payloads()
+        view = build_session_view_model(session, execution, events, summary=summary)
+        window = self._window()
+        raw = tuple(SessionEventViewModel(i + 1, view.events[0].timestamp, kind, content)
+                    for i, (kind, content) in enumerate([
+                        ("session_started", ""), ("turn_started", ""),
+                        *[("agent_message_delta", text) for text in ("L", "RM_", "ID", "ENTITY_PASS")],
+                        ("agent_message_completed", "LRM_IDENTITY_PASS"),
+                        ("agent_message_delta", "next\nmessage"),
+                        ("turn_completed", ""), ("execution_completed", ""),
+                        ("execution_failed", "reason"),
+                    ]))
+        for source, expected in (
+            (raw, [("session_started", "—"), ("turn_started", "—"),
+                   ("agent_message_stream", "LRM_IDENTITY_PASS"),
+                   ("agent_message_completed", "LRM_IDENTITY_PASS"),
+                   ("agent_message_stream", "next\nmessage"),
+                   ("turn_completed", "—"), ("execution_completed", "—"),
+                   ("execution_failed", "reason")]),
+            (tuple(replace(raw[2], sequence=i + 1, content="x") for i in range(10_000)),
+             [("agent_message_stream", "x" * 10_000)]),
+            (tuple(replace(raw[-1], sequence=i + 1, content=str(i)) for i in range(600)),
+             [("execution_failed", str(i)) for i in range(100, 600)]),
+            ((), []),
+        ):
+            with self.subTest(raw_events=len(source)):
+                current = replace(view, events=source)
+                window._render_session_dashboard((current,))
+                window.session_table.selectRow(0)
+                window._render_selected_session()
+                self.assertEqual(window.event_table.rowCount(), len(expected))
+                self.assertEqual([(window.event_table.item(i, 1).text(),
+                                   window.event_table.item(i, 2).text())
+                                  for i in range(len(expected))], expected)
+                window._render_session_dashboard((current,))
+                self.assertEqual(window.event_table.rowCount(), len(expected))
+                self.assertIs(current.events, source)
+                self.assertEqual(current.execution, view.execution)
+
+    def test_paginated_text_preserves_whitespace_and_rejects_stalled_or_foreign_pages(self) -> None:
+        session, execution, payload, summary = self._payloads()
+        delta = payload["events"][2]
+        pages = [
+            {"session_id": "session-1", "has_more": True, "events": [
+                {**delta, "sequence": 1, "payload": {"content": "Hello"}},
+                {**delta, "sequence": 2, "payload": {"content": " "}},
+            ]},
+            {"session_id": "session-1", "has_more": False, "events": [
+                {**delta, "sequence": 3, "payload": {"content": "world\n"}},
+                {**delta, "sequence": 4, "event_type": "execution_completed", "payload": {}},
+            ]},
+        ]
+        checker = StatusChecker(workspace_id="workspace-1")
+        with patch.object(checker, "_call_tool", side_effect=pages) as query:
+            events = checker._session_events(session)
+        self.assertEqual([call.args[1]["after_sequence"] for call in query.call_args_list], [0, 2])
+        self.assertTrue(all(call.args[1]["workspace_id"] == "workspace-1" for call in query.call_args_list))
+        view = build_session_view_model(session, execution, events, summary=summary)
+        window = self._window()
+        window._render_session_dashboard((view,))
+        window.session_table.selectRow(0)
+        window._render_selected_session()
+        self.assertEqual(window.event_table.item(0, 2).text(), "Hello world\n")
+        self.assertEqual(window.event_table.item(1, 1).text(), "execution_completed")
+        self.assertEqual(len(view.events), 4)
+        for invalid in (pages[0], {**pages[1], "session_id": "other-session"},
+                        {**pages[0], "events": []}):
+            with self.subTest(page=invalid), patch.object(checker, "_call_tool", side_effect=[pages[0], invalid]):
+                with self.assertRaises(StatusQueryError):
+                    checker._session_events(session)
 
 
 if __name__ == "__main__":

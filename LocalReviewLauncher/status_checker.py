@@ -40,6 +40,7 @@ EVENT_TYPES = frozenset({
     "agent_message_completed",
     "turn_completed",
     "execution_failed",
+    "execution_completed",
 })
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -256,7 +257,9 @@ def _parse_events(payload: object, session: Mapping[str, object]) -> tuple[Sessi
         event_payload = _object(event.get("payload"), "event.payload")
         content = ""
         if event_type in {"agent_message_delta", "agent_message_completed"}:
-            content = _text(event_payload.get("content", ""), "event.payload.content", 4_000) if event_payload.get("content", "") != "" else ""
+            content = event_payload.get("content", "")
+            if not isinstance(content, str) or len(content) > 4_000:
+                raise StatusQueryError("event.payload.content must be a string of at most 4000 characters")
         elif event_type == "execution_failed":
             reason = event_payload.get("reason")
             content = "" if reason is None else _text(reason, "event.payload.reason", 4_000)
@@ -469,10 +472,7 @@ class StatusChecker:
                     execution_status = None
 
             try:
-                session_events = self._call_tool("list_session_events", {
-                    "session_id": summary["session_id"],
-                    **({"workspace_id": self.workspace_id} if self.workspace_id else {}),
-                })
+                session_events = self._session_events(session_status)
             except StatusQueryError:
                 session_events = None
 
@@ -486,6 +486,28 @@ class StatusChecker:
             except StatusQueryError:
                 continue
         return tuple(sessions)
+
+    def _session_events(self, session: Mapping[str, object]) -> dict[str, object]:
+        events: list[object] = []
+        after_sequence = 0
+        while True:
+            page = self._call_tool("list_session_events", {
+                "session_id": session["session_id"],
+                "after_sequence": after_sequence,
+                **({"workspace_id": self.workspace_id} if self.workspace_id else {}),
+            })
+            parsed = _parse_events(page, session)
+            if any(event.sequence <= after_sequence for event in parsed):
+                raise StatusQueryError("Event pagination did not advance")
+            events.extend(page["events"])
+            has_more = page.get("has_more", False)
+            if not isinstance(has_more, bool):
+                raise StatusQueryError("has_more must be a boolean")
+            if not has_more:
+                return {"session_id": session["session_id"], "events": events}
+            if not parsed:
+                raise StatusQueryError("Event pagination returned an empty continuation")
+            after_sequence = parsed[-1].sequence
 
     def _session_catalog(self) -> tuple[dict[str, object], ...]:
         payload = self._request_json(self.session_catalog_url)
