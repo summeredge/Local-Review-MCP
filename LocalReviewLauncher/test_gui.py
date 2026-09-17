@@ -66,6 +66,32 @@ class LauncherLogTests(unittest.TestCase):
             ready = BrowserReadiness(True, "ready", True, True, True, 123, "", "")
             window._render_status(LauncherStatus(True, True, True, browser=ready))
             self.assertEqual(window.browser_status.text(), "READY")
+            missing = BrowserReadiness(False, "extension_not_present", True, True, False,
+                                       123, "Extension is not connected.", "Refresh ChatGPT page")
+            with patch("gui.monotonic", return_value=100) as clock:
+                window._render_status(LauncherStatus(True, True, True, browser=missing))
+                self.assertEqual(window.browser_status.text(), "READY")
+                self.assertFalse(window._last_status.browser.ready)  # Raw readiness stays authoritative.
+                clock.return_value = 114.9
+                window._render_status(LauncherStatus(True, True, True, browser=missing))
+                self.assertEqual(window.browser_status.text(), "READY")
+                clock.return_value = 115
+                window._render_status(LauncherStatus(True, True, True, browser=missing))
+                self.assertTrue(window.browser_status.text().startswith("DEGRADED\nReason:"))
+                self.assertIn(missing.action, window.browser_status.text())
+                window._render_status(LauncherStatus(True, True, True, browser=ready))
+                self.assertEqual(window.browser_status.text(), "READY")
+                clock.return_value = 200
+                window._render_status(LauncherStatus(True, True, True, browser=missing))
+                self.assertEqual(window.browser_status.text(), "READY")
+                for hard_failure in (BrowserReadiness(), BrowserReadiness(
+                    False, "extension_not_paired", True, False, False, None, "Not paired", "Refresh ChatGPT page"
+                )):
+                    window._render_status(LauncherStatus(True, True, True, browser=ready))
+                    window._render_status(LauncherStatus(True, True, True, browser=hard_failure))
+                    self.assertTrue(window.browser_status.text().startswith("NOT READY"))
+                    window._render_status(LauncherStatus(True, True, True, browser=missing))
+                    self.assertTrue(window.browser_status.text().startswith("NOT READY"))
             first_row = (window.start_button, window.stop_button, window.refresh_button)
             second_row = (window.refresh_oauth_button, window.reset_oauth_button, window.delete_oauth_button)
             for column, (upper, lower) in enumerate(zip(first_row, second_row)):

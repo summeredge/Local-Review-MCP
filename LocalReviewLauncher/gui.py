@@ -42,6 +42,7 @@ from status_worker import StatusCheckScheduler, StatusCheckWorker
 
 STARTUP_TIMEOUT_SECONDS = 60
 STARTUP_POLL_INTERVAL_MS = 2_000
+BROWSER_PRESENCE_GRACE_SECONDS = 15
 
 
 class LauncherState(str, Enum):
@@ -64,6 +65,8 @@ class LauncherWindow(QMainWindow):
         )
         self.state = LauncherState.STOPPED
         self._last_status = LauncherStatus(False, False, False)
+        self._browser_was_ready = False
+        self._browser_missing_since: float | None = None
         self._status_check_scheduler = StatusCheckScheduler()
         self._status_check_generation = 0
         self._status_thread_pool = QThreadPool(self)
@@ -329,9 +332,29 @@ class LauncherWindow(QMainWindow):
         self._set_status(self.tunnel_status, "Connected" if status.tunnel_connected else "Offline", status.tunnel_connected)
         self._set_status(self.remote_status, "Online" if status.remote_online else "Offline", status.remote_online)
         browser = status.browser
-        browser_text = "READY" if browser.ready else f"NOT READY\nReason: {browser.reason}\nAction: {browser.action}"
+        display_state = "READY" if browser.ready else "NOT READY"
+        if browser.ready:
+            self._browser_was_ready = True
+            self._browser_missing_since = None
+        elif (status.mcp_running and browser.bridge_available and browser.extension_paired
+              and browser.readiness_state == "extension_not_present" and self._browser_was_ready):
+            now = monotonic()
+            if self._browser_missing_since is None:
+                self._browser_missing_since = now
+            display_state = ("READY" if now - self._browser_missing_since < BROWSER_PRESENCE_GRACE_SECONDS
+                             else "DEGRADED")
+        else:
+            self._browser_was_ready = False
+            self._browser_missing_since = None
+        browser_text = display_state if display_state == "READY" else f"{display_state}\nReason: {browser.reason}\nAction: {browser.action}"
         self.browser_status.setText(browser_text)
-        self.browser_status.setStyleSheet("color: #16803c" if browser.ready else "color: #9b1c1c")
+        self.browser_status.setStyleSheet("color: " + {
+            "READY": "#16803c", "DEGRADED": "#946200", "NOT READY": "#9b1c1c",
+        }[display_state])
+        self.browser_status.setToolTip(
+            "Display grace period: recent presence is missing; submit_goal still checks live readiness."
+            if display_state == "READY" and not browser.ready else ""
+        )
         self._render_oauth_status(status.oauth_registry)
         self._render_session_dashboard(getattr(status, "sessions", ()))
         self.workspace_label.setText(self._current_workspace_text())
