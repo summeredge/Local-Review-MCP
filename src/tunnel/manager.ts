@@ -40,7 +40,7 @@ export interface TunnelManagerOptions {
   readonly localEndpoint?: string;
   readonly authToken?: string;
   readonly environment?: NodeJS.ProcessEnv;
-  readonly cloudflare?: Pick<CloudflareTunnelOptions, "command" | "platform" | "spawn" | "readyTimeoutMs" | "token">;
+  readonly cloudflare?: Pick<CloudflareTunnelOptions, "command" | "platform" | "spawn" | "readyTimeoutMs" | "token" | "protocol">;
 }
 
 export class TunnelManager {
