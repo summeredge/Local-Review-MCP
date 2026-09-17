@@ -49,7 +49,7 @@ class StatusQueryError(RuntimeError):
 
 def _display_event_time(timestamp: str) -> str:
     try:
-        return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).strftime("%H:%M:%S")
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
     except ValueError:
         return "--:--:--"
 

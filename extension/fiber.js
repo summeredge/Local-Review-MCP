@@ -35,12 +35,27 @@
       // Current ChatGPT turn fibers carry the conversation model beside `turn`; older
       // shapes expose one of the flat/thread fields below. All readable identities must agree.
       const conversation = props.conversation && typeof props.conversation === 'object' ? props.conversation : null;
+      let modelConversationId = conversation?.id;
+      // Fresh chats retain a local WEB id after the route is assigned. Resolve it
+      // only through this same model's server-id getter, never through the URL.
+      if (typeof modelConversationId === 'string'
+        && /^WEB:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(modelConversationId)) {
+        try {
+          modelConversationId = typeof conversation.serverId$ === 'function'
+            ? conversation.serverId$() : null;
+        } catch {
+          return { conversationId: null, conflict: false, unreadable: true };
+        }
+        if (typeof modelConversationId !== 'string' || !CONVERSATION_ID.test(modelConversationId)) {
+          return { conversationId: null, conflict: false, unreadable: true };
+        }
+      }
       const values = [
         props.clientThreadId,
         props.conversationId,
         turn?.clientThreadId,
         turn?.conversationId,
-        conversation?.id,
+        modelConversationId,
       ];
       for (const value of values) {
         if (value === null || value === undefined) continue;
@@ -472,13 +487,14 @@
     let currentTool = { found: false, key: null };
     let currentTurnConversationId = null;
     let fiberRootDetected = false;
+    let conversation = null;
     let messages = null;
     const currentTurn = turns[turns.length - 1];
     if (currentTurn) {
       try {
         const fiber = fiberOf(currentTurn.sections[0]);
         fiberRootDetected = Boolean(fiber);
-        const conversation = fiber ? conversationEvidenceDetailsOf(fiber) : null;
+        conversation = fiber ? conversationEvidenceDetailsOf(fiber) : null;
         currentTurnConversationId = conversation && !conversation.conflict && !conversation.unreadable
           ? conversation.conversationId : null;
         messages = fiber ? turnMessagesOf(fiber) : null;
@@ -500,6 +516,11 @@
         assistant_tool_calls_found: assistantToolCalls.length,
         submit_goal_found: submitGoalFound,
         correlation_key_found: correlationKeyFound,
+        conversation_id_found: Boolean(currentTurnConversationId),
+        conversation_conflict: conversation?.conflict === true,
+        conversation_unreadable: conversation?.unreadable === true,
+        fiber_route_match: Boolean(currentTurnConversationId)
+          && currentTurnConversationId === conversationIdFromLocation(),
       }));
     } catch {
       // Debug tracing must not affect identity evidence.

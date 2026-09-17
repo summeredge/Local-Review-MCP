@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -319,7 +320,31 @@ class LauncherDashboardTests(unittest.TestCase):
             "turn_completed",
         ])
         self.assertEqual(view.events[2].content, "Hello")
-        self.assertEqual(view.events[2].display_time, "12:34:56")
+        self.assertEqual(view.events[2].display_time,
+                         datetime.fromisoformat(view.events[2].timestamp).astimezone().strftime("%H:%M:%S"))
+
+    def test_dashboard_converts_utc_timestamps_to_local_time(self) -> None:
+        session, execution, events, summary = self._payloads()
+        for timestamp in ("2026-09-17T04:34:19Z", "2026-09-17T20:34:19+00:00",
+                          "2026-09-17T12:34:19+08:00"):
+            with self.subTest(timestamp=timestamp):
+                expected = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone()
+                full_time = expected.strftime("%Y-%m-%d %H:%M:%S")
+                summary["updated_at"] = timestamp
+                execution["started_at"] = execution["finished_at"] = timestamp
+                for event in events["events"]:
+                    event["timestamp"] = timestamp
+                view = build_session_view_model(session, execution, events, summary=summary)
+                window = self._window()
+                LauncherWindow._render_session_dashboard(window, (view,))
+                window.session_table.selectRow(0)
+                LauncherWindow._render_selected_session(window)
+                self.assertEqual(window.session_table.item(0, 7).text(), full_time)
+                self.assertIn(f"updated_at: {full_time}", window.session_details_label.text())
+                self.assertIn(f"started_at: {full_time}", window.execution_details_label.text())
+                self.assertIn(f"finished_at: {full_time}", window.execution_details_label.text())
+                self.assertEqual(window.event_table.item(0, 0).text(), expected.strftime("%H:%M:%S"))
+                self.assertEqual(view.updated_at, timestamp)
 
     def test_empty_dashboard_shows_no_active_sessions(self) -> None:
         window = self._window()

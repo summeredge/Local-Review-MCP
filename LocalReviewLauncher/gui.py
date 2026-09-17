@@ -510,7 +510,7 @@ class LauncherWindow(QMainWindow):
         if timestamp is None:
             return "—"
         try:
-            return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+            return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
             return timestamp
 

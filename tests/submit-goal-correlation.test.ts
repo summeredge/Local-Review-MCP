@@ -103,10 +103,13 @@ function fiberSection(
 
 function scanFiberSections(sections: Record<string, unknown>[]): Record<string, any> {
   const window = pageWindow();
+  const debugMessages: string[] = [];
   vm.runInNewContext(fiberSource, {
     window,
     document: { querySelectorAll: () => sections },
-    location: { origin: ORIGIN },
+    location: { origin: ORIGIN, href: `${ORIGIN}/c/${CONVERSATION}` },
+    URL,
+    console: { debug: (message: string) => debugMessages.push(message) },
   }, { filename: "fiber.js" });
   let reply: Record<string, any> | undefined;
   window.addEventListener("message", (event) => {
@@ -116,7 +119,8 @@ function scanFiberSections(sections: Record<string, unknown>[]): Record<string, 
   });
   window.postMessage({ source: "lrm-extension-identity-ask", nonce: "test" }, ORIGIN);
   if (reply === undefined) throw new Error("Fiber helper did not answer");
-  return reply;
+  const lastDebug = debugMessages.at(-1);
+  return { ...reply, debug: lastDebug ? JSON.parse(lastDebug) : undefined };
 }
 
 function scanFiber(messages: unknown[]): Record<string, any> {
@@ -191,6 +195,50 @@ async function contentMessages(
 }
 
 describe("Extension submit_goal correlation evidence", () => {
+  it("reports the reloaded conversation identity as matched for the fresh correlation key", () => {
+    const FRESH_KEY = "dd3bf476-5a9e-4a5d-b445-a09e5dfe9dec";
+    const reply = scanFiberSections([{
+      __reactFiber$test: {
+        memoizedProps: {
+          conversation: { id: `WEB:${KEY_A}`, serverId$: () => CONVERSATION },
+          turn: { messages: [currentConnectorRequest("fresh", "submit_goal", FRESH_KEY)] },
+        },
+        return: null,
+      },
+      getAttribute: () => "fresh-turn",
+    }]);
+    expect(reply.debug).toMatchObject({
+      conversation_id_found: true,
+      conversation_conflict: false,
+      conversation_unreadable: false,
+      fiber_route_match: true,
+    });
+    expect(reply.evidence).toEqual([{ request_id: FRESH_KEY, fiber_conversation_id: CONVERSATION }]);
+  });
+
+  it("resolves a fresh chat only through its own server identity and preserves conflicts", async () => {
+    const section = (serverId: unknown, extra: Record<string, unknown> = {}) => ({
+      __reactFiber$test: {
+        memoizedProps: {
+          conversation: { id: `WEB:${KEY_A}`, serverId$: serverId },
+          turn: { messages: [currentConnectorRequest("fresh", "submit_goal", KEY_B)] },
+          ...extra,
+        },
+        return: null,
+      },
+    });
+    const valid = scanFiberSections([section(() => CONVERSATION)]);
+    expect(valid.evidence).toEqual([{ request_id: KEY_B, fiber_conversation_id: CONVERSATION }]);
+    expect((await contentMessages(valid)).filter((m) => m.type === "identity_evidence")).toHaveLength(1);
+    for (const serverId of [undefined, () => null, () => "", () => `WEB:${KEY_A}`,
+      () => ({}), () => { throw new Error("unavailable"); }]) {
+      expect(scanFiberSections([section(serverId)]).evidence).toEqual([]);
+    }
+    expect(scanFiberSections([section(() => CONVERSATION, { conversationId: CONVERSATION_B })]).evidence).toEqual([]);
+    const mismatch = scanFiberSections([section(() => CONVERSATION_B)]);
+    expect((await contentMessages(mismatch)).filter((m) => m.type === "identity_evidence")).toEqual([]);
+  });
+
   it("sends only the current submit_goal key when history has older keys", () => {
     const reply = scanFiberSections([
       fiberSection([currentConnectorRequest("old-a", "submit_goal", KEY_A)], "turn-a"),
