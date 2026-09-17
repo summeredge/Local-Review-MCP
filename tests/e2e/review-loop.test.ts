@@ -314,7 +314,9 @@ async function fixture(): Promise<{
     }),
   });
   const correlations = new ConversationCorrelationRegistry(storageRoot);
-  const pending = new PendingGoalSubmissionService(correlations, goalSubmission, { storageRoot });
+  const pending = new PendingGoalSubmissionService(correlations, goalSubmission, {
+    storageRoot, browserReadiness: () => ({ ready: true }),
+  });
   const statusQuery = new StatusQueryService({
     storageRoot,
     goals: orchestration,

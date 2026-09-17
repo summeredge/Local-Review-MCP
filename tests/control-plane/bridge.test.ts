@@ -302,7 +302,9 @@ describe("Local Control Bridge protocol", () => {
       });
     });
     const submitGoal = vi.fn(async (_request: GoalSubmissionRequest) => blocked);
-    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {
+      storageRoot: root, browserReadiness: () => ({ ready: true }),
+    });
     const correlationKey = "00000000-0000-4000-8000-000000000003";
     await pending.accept({
       correlation_key: correlationKey,

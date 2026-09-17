@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPlainTextEdit,
 from config_manager import LauncherConfig
 from gui import LauncherState, LauncherWindow
 from status_checker import (
+    BrowserReadiness,
     LauncherStatus,
     OAuthClientStatus,
     OAuthRegistryStatus,
@@ -55,6 +56,16 @@ class LauncherLogTests(unittest.TestCase):
             self.assertEqual(actions.x(), title.x())
             self.assertGreater(actions.y(), title.geometry().bottom())
             self.assertLess(actions.geometry().bottom(), window.launcher_state.parentWidget().y())
+            self.assertTrue(any(label.text() == "Browser:" for label in window.findChildren(QLabel)))
+            for state, reason in (("extension_not_paired", "Extension is not paired."),
+                                  ("extension_not_present", "Extension is not connected.")):
+                browser = BrowserReadiness(False, state, True, state == "extension_not_present", False,
+                                           123, reason, "Refresh ChatGPT page / 刷新 ChatGPT 页面")
+                window._render_status(LauncherStatus(True, True, True, browser=browser))
+                self.assertEqual(window.browser_status.text(), f"NOT READY\nReason: {reason}\nAction: {browser.action}")
+            ready = BrowserReadiness(True, "ready", True, True, True, 123, "", "")
+            window._render_status(LauncherStatus(True, True, True, browser=ready))
+            self.assertEqual(window.browser_status.text(), "READY")
             first_row = (window.start_button, window.stop_button, window.refresh_button)
             second_row = (window.refresh_oauth_button, window.reset_oauth_button, window.delete_oauth_button)
             for column, (upper, lower) in enumerate(zip(first_row, second_row)):

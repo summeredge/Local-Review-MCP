@@ -3,7 +3,13 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as bridge from "../../src/control-plane/bridge.js";
+
+beforeEach(() => {
+  vi.spyOn(bridge, "extensionDeliveryReadiness").mockReturnValue({ ready: true, readiness_state: "ready" });
+});
+afterEach(() => vi.restoreAllMocks());
 import { ConversationCorrelationRegistry } from "../../src/control-plane/conversation-correlation.js";
 import {
   IdentityTraceService,

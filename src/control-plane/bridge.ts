@@ -32,6 +32,7 @@ import type {
   EvidenceTransportTraceRecordInput,
   EvidenceTransportTraceService,
 } from "./evidence-transport-trace.js";
+import { browserIdentityDiagnosticSchema } from "./evidence-transport-trace.js";
 import {
   BRIDGE_PROTOCOL_HEADER,
   EVIDENCE_TRANSPORT_EVENT_HEADER,
@@ -497,7 +498,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     return;
   }
 
-  if (route !== "/pair" && route !== "/status" && route !== "/identity-evidence"
+  if (route !== "/pair" && route !== "/status" && route !== "/identity-evidence" && route !== "/identity-diagnostic"
     && route !== "/delivery/claim" && route !== "/delivery/ack"
     && route !== "/completion/claim" && route !== "/completion/ack") {
     request.resume();
@@ -523,7 +524,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     methodNotAllowed(request, response);
     return;
   }
-  if (route === "/identity-evidence" && request.method !== "POST") {
+  if ((route === "/identity-evidence" || route === "/identity-diagnostic") && request.method !== "POST") {
     methodNotAllowed(request, response);
     return;
   }
@@ -557,6 +558,15 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   if (!authorized(request, origin)) {
     request.resume();
     json(response, 401, { error: "unauthorized" }, origin);
+    return;
+  }
+  if (route === "/identity-diagnostic") {
+    try {
+      const parsed = browserIdentityDiagnosticSchema.safeParse(await readJson(request));
+      if (!parsed.success) { json(response, 400, { error: 'invalid_diagnostic' }, origin); return; }
+      traceEvidenceTransport({ event: 'browser_identity_diagnostic', diagnostic: parsed.data });
+      json(response, 202, { accepted: true }, origin);
+    } catch { json(response, 400, { error: 'invalid_diagnostic' }, origin); }
     return;
   }
   noteExtensionSeen();
@@ -724,16 +734,20 @@ export function extensionDeliveryReadiness(): ExtensionDeliveryReadiness {
   const details = {
     bridge_available: status.available,
     extension_paired: status.paired,
+    extension_present: status.present,
     last_seen_at: status.lastSeenAt,
   };
   if (!status.available) {
-    return { ready: false, reason: "Bridge is not ready.", readiness_state: "bridge_unavailable", ...details };
+    return { ready: false, reason: "Bridge is not ready.", readiness_state: "bridge_unavailable",
+      action: "Start or restart the local MCP runtime and wait for the Browser Bridge to connect.", ...details };
   }
   if (!status.paired) {
-    return { ready: false, reason: "Extension is not paired.", readiness_state: "extension_not_paired", ...details };
+    return { ready: false, reason: "Extension is not paired.", readiness_state: "extension_not_paired",
+      action: "Refresh the ChatGPT page and wait for the extension to reconnect. Reload/更新扩展后，请刷新 ChatGPT 页面并等待扩展重新连接。", ...details };
   }
   if (!status.present) {
-    return { ready: false, reason: "Extension is not connected.", readiness_state: "extension_not_present", ...details };
+    return { ready: false, reason: "Extension is not connected.", readiness_state: "extension_not_present",
+      action: "Refresh the ChatGPT page and wait for the extension to reconnect. Reload/更新扩展后，请刷新 ChatGPT 页面并等待扩展重新连接。", ...details };
   }
   return { ready: true, readiness_state: "ready", ...details };
 }

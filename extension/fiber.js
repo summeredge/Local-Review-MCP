@@ -534,6 +534,20 @@
       nonce,
       version: VERSION,
       evidence,
+      // Observation only: never used as identity evidence by the isolated world.
+      scan_diagnostic: {
+        current_turn_present: Boolean(currentTurn),
+        fiber_root_detected: fiberRootDetected,
+        messages_found: Array.isArray(messages),
+        assistant_tool_calls_found: assistantToolCalls.length,
+        submit_goal_found: submitGoalFound,
+        correlation_key_found: correlationKeyFound,
+        current_key_found: Boolean(currentTool.key),
+        correlation_key: currentTool.key,
+        conversation_id_found: Boolean(currentTurnConversationId),
+        conversation_conflict: conversation?.conflict === true,
+        conversation_unreadable: conversation?.unreadable === true,
+      },
       diagnostic: {
         source: currentTool.key ? 'assistant_tool_arguments' : 'none',
         matched: evidence.length === 1,

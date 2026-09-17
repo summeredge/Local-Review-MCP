@@ -18,6 +18,7 @@ LOCAL_HEALTH_URL = "http://127.0.0.1:12080/health"
 LOCAL_OAUTH_CLIENTS_URL = "http://127.0.0.1:12080/oauth/clients"
 LOCAL_MCP_URL = "http://127.0.0.1:12080/mcp"
 LOCAL_SESSION_CATALOG_URL = "http://127.0.0.1:12080/launcher/sessions"
+LOCAL_BROWSER_READINESS_URL = "http://127.0.0.1:12080/launcher/readiness"
 REMOTE_STATUS_URL = "https://review.syqiu.kdns.fr/.well-known/oauth-protected-resource"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 MAX_STATUS_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -117,6 +118,18 @@ class OAuthRegistryStatus:
 
 
 @dataclass(frozen=True)
+class BrowserReadiness:
+    ready: bool = False
+    readiness_state: str = "bridge_unavailable"
+    bridge_available: bool = False
+    extension_paired: bool = False
+    extension_present: bool = False
+    last_seen_at: int | None = None
+    reason: str = "Browser readiness could not be read."
+    action: str = "Start or restart the local MCP runtime and refresh status."
+
+
+@dataclass(frozen=True)
 class LauncherStatus:
     mcp_running: bool
     tunnel_connected: bool
@@ -124,6 +137,7 @@ class LauncherStatus:
     cloudflared_version: str = "unavailable"
     oauth_registry: OAuthRegistryStatus | None = None
     sessions: tuple[SessionViewModel, ...] = ()
+    browser: BrowserReadiness = BrowserReadiness()
 
 
 def _object(value: object, label: str) -> dict[str, object]:
@@ -336,12 +350,43 @@ class StatusChecker:
         mcp_url: str = LOCAL_MCP_URL,
         session_catalog_url: str = LOCAL_SESSION_CATALOG_URL,
         workspace_id: str | None = None,
+        browser_readiness_url: str = LOCAL_BROWSER_READINESS_URL,
     ) -> None:
         self.auth_token = auth_token
         self.oauth_clients_url = oauth_clients_url
         self.mcp_url = mcp_url
         self.session_catalog_url = session_catalog_url
         self.workspace_id = workspace_id
+        self.browser_readiness_url = browser_readiness_url
+
+    def browser_readiness(self) -> BrowserReadiness:
+        try:
+            document = _object(self._request_json(self.browser_readiness_url), "Browser readiness")
+            state = _status(document.get("readiness_state"), "readiness_state", frozenset({
+                "bridge_unavailable", "extension_not_paired", "extension_not_present", "ready",
+            }))
+            flags = [document.get(key) for key in (
+                "ready", "bridge_available", "extension_paired", "extension_present",
+            )]
+            if not all(isinstance(flag, bool) for flag in flags):
+                raise StatusQueryError("Browser readiness flags must be booleans")
+            ready, available, paired, present = flags
+            expected_state = (
+                "bridge_unavailable" if not available else "extension_not_paired" if not paired
+                else "extension_not_present" if not present else "ready"
+            )
+            if state != expected_state or ready != (state == "ready"):
+                raise StatusQueryError("Browser readiness is inconsistent")
+            seen = document.get("last_seen_at")
+            if seen is not None and (type(seen) is not int or seen < 0):
+                raise StatusQueryError("last_seen_at must be a non-negative timestamp")
+            reason = _optional_text(document.get("reason"), "reason", 4000) or ""
+            action = _optional_text(document.get("action"), "action", 4000) or ""
+            if not ready and (not reason or not action):
+                raise StatusQueryError("NOT READY must include a reason and action")
+            return BrowserReadiness(ready, state, available, paired, present, seen, reason, action)
+        except StatusQueryError:
+            return BrowserReadiness()
 
     def check(self) -> LauncherStatus:
         mcp_running = self._reachable(LOCAL_HEALTH_URL)

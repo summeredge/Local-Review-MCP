@@ -77,6 +77,9 @@ class LauncherWindow(QMainWindow):
         self.mcp_status = QLabel()
         self.tunnel_status = QLabel()
         self.remote_status = QLabel()
+        self.browser_status = QLabel("NOT READY")
+        self.browser_status.setWordWrap(True)
+        self.browser_status.setTextFormat(Qt.TextFormat.PlainText)
         self.oauth_status_label = QLabel("Unavailable")
         self.oauth_status_label.setWordWrap(True)
         self.workspace_label = QLabel()
@@ -181,6 +184,7 @@ class LauncherWindow(QMainWindow):
         overview_layout.addWidget(self._row("MCP Runtime:", self.mcp_status))
         overview_layout.addWidget(self._row("Cloudflare Tunnel:", self.tunnel_status))
         overview_layout.addWidget(self._row("Remote Endpoint:", self.remote_status))
+        overview_layout.addWidget(self._row("Browser:", self.browser_status))
         overview_layout.addWidget(self._row("OAuth Status:", self.oauth_status_label))
         overview_layout.addWidget(self._row("Workspace:", self.workspace_label))
         top_actions = QWidget()
@@ -324,6 +328,10 @@ class LauncherWindow(QMainWindow):
         self._set_status(self.mcp_status, "Running" if status.mcp_running else "Stopped", status.mcp_running)
         self._set_status(self.tunnel_status, "Connected" if status.tunnel_connected else "Offline", status.tunnel_connected)
         self._set_status(self.remote_status, "Online" if status.remote_online else "Offline", status.remote_online)
+        browser = status.browser
+        browser_text = "READY" if browser.ready else f"NOT READY\nReason: {browser.reason}\nAction: {browser.action}"
+        self.browser_status.setText(browser_text)
+        self.browser_status.setStyleSheet("color: #16803c" if browser.ready else "color: #9b1c1c")
         self._render_oauth_status(status.oauth_registry)
         self._render_session_dashboard(getattr(status, "sessions", ()))
         self.workspace_label.setText(self._current_workspace_text())

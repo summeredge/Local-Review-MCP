@@ -3,7 +3,8 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { bridgePort, extensionDeliveryReadiness, EXTENSION_PRESENCE_TIMEOUT_MS, startBridge, stopBridge } from "../src/control-plane/bridge.js";
 import { startApp } from "../src/app.js";
 import { createHttpServer } from "../src/mcp/http.js";
 import { inboundRequestId } from "../src/mcp/inbound.js";
@@ -74,6 +75,7 @@ describe("MCP HTTP runtime", () => {
     }, {
       registry,
       statusQuery: new StatusQueryService({ storageRoot: workspace }),
+      browserReadiness: extensionDeliveryReadiness,
     });
     runningServers.push(server);
     const port = await listen(server);
@@ -85,6 +87,41 @@ describe("MCP HTTP runtime", () => {
     });
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ sessions: [] });
+
+    const readinessUrl = `http://127.0.0.1:${port}/launcher/readiness`;
+    const headers = { authorization: "Bearer test-token" };
+    expect((await fetch(readinessUrl)).status).toBe(401);
+    expect((await fetch(readinessUrl, { method: "POST", headers })).status).toBe(405);
+    expect((await fetch(readinessUrl, { headers: { ...headers, "x-forwarded-for": "127.0.0.1" } })).status).toBe(404);
+    expect((await fetch(readinessUrl, { headers: { ...headers, "cf-connecting-ip": "127.0.0.1" } })).status).toBe(404);
+    const readiness = async () => {
+      const response = await fetch(readinessUrl, { headers });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      return response.json();
+    };
+    try {
+      await stopBridge();
+      expect(await readiness()).toMatchObject({ ready: false, readiness_state: "bridge_unavailable",
+        bridge_available: false, extension_paired: false, extension_present: false, last_seen_at: null });
+      await startBridge({ ports: [0] });
+      expect(await readiness()).toMatchObject({ ready: false, readiness_state: "extension_not_paired",
+        reason: "Extension is not paired.", action: expect.stringContaining("刷新 ChatGPT 页面") });
+      const pair = await fetch(`http://127.0.0.1:${bridgePort()}/pair`, {
+        method: "POST", headers: { origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+          "x-lrm-bridge-protocol": "3" }, body: "{}",
+      });
+      expect(pair.status).toBe(200);
+      const ready = await readiness();
+      expect(ready).toEqual({ ready: true, readiness_state: "ready", bridge_available: true,
+        extension_paired: true, extension_present: true, last_seen_at: expect.any(Number), reason: null, action: null });
+      vi.spyOn(Date, "now").mockReturnValue(ready.last_seen_at + EXTENSION_PRESENCE_TIMEOUT_MS);
+      expect(await readiness()).toMatchObject({ ready: false, readiness_state: "extension_not_present",
+        extension_paired: true, extension_present: false, reason: "Extension is not connected." });
+    } finally {
+      vi.restoreAllMocks();
+      await stopBridge();
+    }
 
     const cleanup = await fetch(`http://127.0.0.1:${port}/launcher/sessions`, {
       method: "DELETE",

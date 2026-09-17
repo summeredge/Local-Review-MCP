@@ -26,6 +26,7 @@ import type {
 } from "../../src/control-plane/goal-submission.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
+import { bridgePort, EXTENSION_PRESENCE_TIMEOUT_MS, startBridge, stopBridge } from "../../src/control-plane/bridge.js";
 
 const clients: Client[] = [];
 const temporaryDirectories: string[] = [];
@@ -33,6 +34,8 @@ const CORRELATION_A = "00000000-0000-4000-8000-000000000001";
 const CORRELATION_B = "00000000-0000-4000-8000-000000000002";
 
 afterEach(async () => {
+  vi.restoreAllMocks();
+  await stopBridge();
   await Promise.all(clients.splice(0).map((client) => client.close()));
   await Promise.all(temporaryDirectories.splice(0).map((directory) =>
     rm(directory, { recursive: true, force: true })));
@@ -66,7 +69,11 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
   }
 }
 
-async function fixture(options: { readonly now?: () => number } = {}) {
+async function fixture(options: { readonly now?: () => number; readonly browserReady?: boolean } = {}) {
+  if (options.browserReady !== false) {
+    await startBridge({ ports: [0] });
+    await pairBrowser();
+  }
   const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-submit-goal-workspace-"));
   const storageRoot = await mkdtemp(join(tmpdir(), "local-review-mcp-submit-goal-state-"));
   temporaryDirectories.push(workspace, storageRoot);
@@ -79,9 +86,11 @@ async function fixture(options: { readonly now?: () => number } = {}) {
     execution_id: "execution-1",
     status: "running",
   }));
+  const record = vi.fn();
   const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {
     storageRoot,
     now: options.now,
+    identityTrace: { record },
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const server = createMcpServer({
@@ -99,7 +108,17 @@ async function fixture(options: { readonly now?: () => number } = {}) {
     submitGoal,
     storageRoot,
     workspaceId: registry.active.id,
+    record,
   };
+}
+
+async function pairBrowser() {
+  const response = await fetch(`http://127.0.0.1:${bridgePort()}/pair`, {
+    method: "POST",
+    headers: { origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop", "x-lrm-bridge-protocol": "3" },
+    body: "{}",
+  });
+  expect(response.status).toBe(200);
 }
 
 function callFor(
@@ -119,6 +138,43 @@ function toolJson(result: unknown): Record<string, unknown> {
 }
 
 describe("submit_goal MCP tool", () => {
+  it.each(["bridge_unavailable", "extension_not_paired", "extension_not_present"] as const)(
+    "fails immediately for %s without a receipt, pending write, event or timer", async (state) => {
+      const { client, pending, storageRoot, record, submitGoal } = await fixture({ browserReady: false });
+      if (state !== "bridge_unavailable") await startBridge({ ports: [0] });
+      if (state === "extension_not_present") {
+        await pairBrowser();
+        vi.spyOn(Date, "now").mockReturnValue(Date.now() + EXTENSION_PRESENCE_TIMEOUT_MS + 1);
+      }
+      const timer = vi.spyOn(globalThis, "setTimeout");
+      const result = await callFor(client);
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toBeUndefined();
+      expect(toolJson(result)).toMatchObject({ error: "BROWSER_IDENTITY_CHANNEL_NOT_READY", readiness_state: state });
+      expect(toolJson(result)).not.toHaveProperty("accepted");
+      expect(toolJson(result).message).toContain("Browser identity channel is not ready");
+      expect(toolJson(result).action).toContain(state === "bridge_unavailable" ? "Start or restart" : "刷新 ChatGPT 页面");
+      expect(await pending.list()).toEqual([]);
+      await expect(readFile(pendingGoalSubmissionStateFile(storageRoot))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(record).not.toHaveBeenCalled();
+      expect(submitGoal).not.toHaveBeenCalled();
+      expect(timer.mock.calls.some((call) => call[1] === PENDING_GOAL_SUBMISSION_TTL_MS)).toBe(false);
+    },
+  );
+
+  it("accepts after reconnect and preserves an existing receipt if presence later disappears", async () => {
+    const { client, pending } = await fixture({ browserReady: false });
+    expect((await callFor(client)).isError).toBe(true);
+    await startBridge({ ports: [0] });
+    await pairBrowser();
+    const accepted = toolJson(await callFor(client));
+    expect(Object.keys(accepted).sort()).toEqual(["accepted", "accepted_at", "correlation_key", "expires_at"]);
+    expect(accepted).toMatchObject({ accepted: true, correlation_key: CORRELATION_A });
+    expect((await pending.get(CORRELATION_A))?.state).toBe("pending_identity");
+    await stopBridge();
+    expect(toolJson(await callFor(client))).toEqual(accepted);
+    expect((await callFor(client, goalArguments(CORRELATION_B))).isError).toBe(true);
+  });
   it("logs only hashes and presence for the opt-in runtime identity probe", async () => {
     const { client } = await fixture();
     const openaiSession = "conversation-secret";

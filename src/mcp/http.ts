@@ -14,6 +14,7 @@ import {
   validateRedirectUri,
 } from "../auth/oauth.js";
 import { authenticationSource, isAuthenticated } from "../auth/middleware.js";
+import type { ExtensionDeliveryReadiness } from "../control-plane/extension-delivery.js";
 import {
   APP_VERSION,
   DEFAULT_HOST,
@@ -41,6 +42,7 @@ type HttpStatusQuery = NonNullable<McpRuntimeContext["statusQuery"]> & {
 };
 
 type HttpRuntimeContext = Omit<McpRuntimeContext, "statusQuery"> & {
+  readonly browserReadiness?: () => ExtensionDeliveryReadiness;
   readonly statusQuery?: HttpStatusQuery;
   readonly tunnel?: Pick<TunnelProvider, "status">;
 };
@@ -714,6 +716,26 @@ export function createHttpServer(
           return;
         }
         await handleHealthRequest(request, response, context, oauth);
+        return;
+      }
+
+      if (path === "/launcher/readiness") {
+        request.resume();
+        if (!isDirectLoopbackRequest(request)) {
+          sendJson(response, 404, { error: "not_found" });
+        } else if (!isAuthenticated(request, settings.auth.token)) {
+          sendUnauthorized(response);
+        } else if (request.method !== "GET") {
+          sendJson(response, 405, { error: "method_not_allowed" });
+        } else {
+          const readiness = context.browserReadiness?.();
+          if (readiness === undefined) {
+            sendJson(response, 503, { error: "browser_readiness_unavailable" });
+            return;
+          }
+          sendJson(response, 200, { ...readiness, reason: readiness.reason ?? null, action: readiness.action ?? null },
+            { "cache-control": "no-store" });
+        }
         return;
       }
 

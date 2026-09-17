@@ -17,17 +17,39 @@ export const EVIDENCE_TRANSPORT_TRACE_EVENTS = [
   "evidence_resolve_attempted",
   "evidence_resolve_success",
   "evidence_resolve_failed",
+  "browser_identity_diagnostic",
 ] as const;
 
 export const evidenceTransportTraceEventNameSchema = z.enum(EVIDENCE_TRANSPORT_TRACE_EVENTS);
 const timestampSchema = z.string().datetime({ offset: true });
 const hashSchema = z.string().regex(/^(?:[a-f0-9]{64})?$/u);
+export const browserIdentityDiagnosticSchema = z.object({
+  stage: z.enum(['scan_started', 'scan_busy', 'document_registered', 'fiber_scanned',
+    'route_checked', 'deduplicated', 'worker_send_attempted', 'worker_send_finished',
+    'background_received', 'document_authorized', 'bridge_send_attempted', 'bridge_send_finished']),
+  scan_id: z.number().int().nonnegative().safe(),
+  navigation_epoch: z.number().int().nonnegative().safe(),
+  observed_at: timestampSchema,
+  correlation_key_hash: hashSchema,
+  conversation_id_hash: hashSchema,
+  document_id_hash: hashSchema,
+  flags: z.object(Object.fromEntries([
+    'current_turn_present', 'fiber_root_detected', 'messages_found', 'submit_goal_found',
+    'correlation_key_found', 'current_key_found', 'conversation_id_found', 'conversation_conflict',
+    'conversation_unreadable', 'fiber_reply_received', 'navigation_epoch_unchanged',
+    'fiber_route_match', 'register_document_ok', 'worker_reply_ok', 'bridge_reply_ok',
+    'scan_in_flight', 'route_conversation_present', 'document_authorized', 'sender_source_valid',
+  ].map(key => [key, z.boolean().optional()]))).strict(),
+  assistant_tool_calls_found: z.number().int().min(0).max(100000).optional(),
+  fiber_evidence_count: z.number().int().min(0).max(200).optional(),
+}).strict();
 
 const evidenceTransportTraceEventSchema = z.object({
   correlation_key_hash: hashSchema,
   conversation_id_hash: hashSchema,
   timestamp: timestampSchema,
   event: evidenceTransportTraceEventNameSchema,
+  diagnostic: browserIdentityDiagnosticSchema.optional(),
 }).strict();
 
 const evidenceTransportTraceQueryEventSchema = z.object({
@@ -39,6 +61,7 @@ export type EvidenceTransportTraceEvent = z.infer<typeof evidenceTransportTraceE
 export type EvidenceTransportTraceEventName = typeof EVIDENCE_TRANSPORT_TRACE_EVENTS[number];
 
 export interface EvidenceTransportTraceRecordInput {
+  readonly diagnostic?: z.infer<typeof browserIdentityDiagnosticSchema>;
   readonly event: EvidenceTransportTraceEventName;
   readonly correlation_key?: string | null;
   readonly conversation_id?: string | null;
@@ -88,8 +111,9 @@ export class EvidenceTransportTraceService {
   public record(input: EvidenceTransportTraceRecordInput): void {
     try {
       const event = evidenceTransportTraceEventSchema.parse({
-        correlation_key_hash: optionalHash(input.correlation_key),
-        conversation_id_hash: optionalHash(input.conversation_id),
+        correlation_key_hash: input.diagnostic?.correlation_key_hash ?? optionalHash(input.correlation_key),
+        conversation_id_hash: input.diagnostic?.conversation_id_hash ?? optionalHash(input.conversation_id),
+        ...(input.diagnostic ? { diagnostic: input.diagnostic } : {}),
         timestamp: timestamp(this.now()),
         event: input.event,
       });

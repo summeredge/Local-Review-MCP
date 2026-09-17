@@ -93,6 +93,8 @@ export interface ExtensionDeliveryReadiness {
   readonly reason?: string;
   readonly bridge_available?: boolean;
   readonly extension_paired?: boolean;
+  readonly extension_present?: boolean;
+  readonly action?: string;
   readonly last_seen_at?: number | null;
   readonly readiness_state?: "bridge_unavailable" | "extension_not_paired" | "extension_not_present" | "ready";
 }

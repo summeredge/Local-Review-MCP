@@ -1,7 +1,8 @@
 import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as bridge from "../../src/control-plane/bridge.js";
 import {
   ConversationCorrelationRegistry,
 } from "../../src/control-plane/conversation-correlation.js";
@@ -23,7 +24,12 @@ import type {
 const temporaryDirectories: string[] = [];
 const CORRELATION_A = "00000000-0000-4000-8000-000000000001";
 
+beforeEach(() => {
+  vi.spyOn(bridge, "extensionDeliveryReadiness").mockReturnValue({ ready: true, readiness_state: "ready" });
+});
+
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(temporaryDirectories.splice(0).map((directory) =>
     rm(directory, { recursive: true, force: true })));
 });
@@ -94,6 +100,37 @@ function preflightFailure(): GoalPreflightResult {
 }
 
 describe("PendingGoalSubmissionService", () => {
+  it("rejects an unavailable Browser channel before any pending side effect", async () => {
+    vi.mocked(bridge.extensionDeliveryReadiness).mockRestore();
+    const root = await makeRoot();
+    const record = vi.fn();
+    const submitGoal = vi.fn(async () => result());
+    const pending = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal },
+      { storageRoot: root, identityTrace: { record } });
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    try {
+      await expect(pending.accept(input())).rejects.toThrow("bridge_unavailable");
+      expect(await pending.list()).toEqual([]);
+      await expect(readFile(pendingGoalSubmissionStateFile(root))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(record).not.toHaveBeenCalled();
+      expect(timer).not.toHaveBeenCalled();
+      expect(submitGoal).not.toHaveBeenCalled();
+    } finally {
+      timer.mockRestore();
+    }
+  });
+  it("reproduces expiry when no evidence is delivered, without attributing the upstream loss", async () => {
+    const root = await makeRoot();
+    let now = Date.parse('2026-09-17T05:10:39.248Z');
+    const submitGoal = vi.fn(async () => result());
+    const pending = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal },
+      { storageRoot: root, now: () => now, environment: {} });
+    await pending.accept(input());
+    now += 120000;
+    await pending.expire(CORRELATION_A);
+    expect(await pending.get(CORRELATION_A)).toMatchObject({ state: 'failed', error: 'pending_identity_expired' });
+    expect(submitGoal).not.toHaveBeenCalled();
+  });
   it("uses the configured identity timeout in expiry and trace", async () => {
     const root = await makeRoot();
     let now = Date.now();

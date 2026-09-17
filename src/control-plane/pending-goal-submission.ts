@@ -5,6 +5,7 @@ import { z } from "zod";
 import { defaultTaskContextStorageRoot } from "../context/task.js";
 import { workspaceIdSchema } from "../context/schema.js";
 import { correlationKeySchema } from "../mcp/schema/common.js";
+import { extensionDeliveryReadiness } from "./bridge.js";
 import {
   goalSubmissionAcceptedSchema,
   goalSubmissionRequestSchema,
@@ -101,6 +102,7 @@ type TerminalPendingGoalSubmission = Extract<
 >;
 
 export interface PendingGoalSubmissionServiceOptions {
+  readonly browserReadiness?: typeof extensionDeliveryReadiness;
   readonly storageRoot?: string;
   readonly now?: () => number;
   readonly environment?: NodeJS.ProcessEnv;
@@ -113,6 +115,13 @@ export function pendingGoalSubmissionStateFile(storageRoot: string): string {
 }
 
 export class PendingGoalSubmissionConflictError extends Error {}
+
+export class BrowserReadinessError extends Error {
+  public constructor(public readonly readiness: ReturnType<typeof extensionDeliveryReadiness>) {
+    super(`Browser identity channel is not ready (${readiness.readiness_state}). ${readiness.reason} ${readiness.action}`);
+    this.name = "BrowserReadinessError";
+  }
+}
 
 function errorCode(error: unknown): string | undefined {
   return error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
@@ -201,6 +210,7 @@ export class PendingGoalSubmissionService {
   private readonly goalSubmission: Pick<GoalSubmissionService, "submitGoal">;
   private readonly now: () => number;
   private readonly identityTimeoutMs: number;
+  private readonly browserReadiness: typeof extensionDeliveryReadiness;
   private readonly identityTrace: Pick<IdentityTraceService, "record"> | undefined;
   private readonly evidenceTransportTrace: Pick<EvidenceTransportTraceService, "record"> | undefined;
   private submissions = new Map<string, PendingGoalSubmission>();
@@ -220,6 +230,7 @@ export class PendingGoalSubmissionService {
     this.correlations = correlations;
     this.goalSubmission = goalSubmission;
     this.now = options.now ?? Date.now;
+    this.browserReadiness = options.browserReadiness ?? extensionDeliveryReadiness;
     this.identityTimeoutMs = pendingIdentityTimeoutMs(options.environment ?? process.env);
     this.identityTrace = options.identityTrace;
     this.evidenceTransportTrace = options.evidenceTransportTrace;
@@ -255,6 +266,9 @@ export class PendingGoalSubmissionService {
         return this.receipt(current);
       }
 
+      // Global channel readiness only; exact conversation identity is still required below.
+      const readiness = this.browserReadiness();
+      if (!readiness.ready) throw new BrowserReadinessError(readiness);
       const next = new Map(this.submissions);
       prune(next, now);
       if (next.size >= MAX_PENDING_GOAL_SUBMISSIONS) {

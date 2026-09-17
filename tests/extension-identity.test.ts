@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import * as vm from "node:vm";
+import { webcrypto, createHash } from "node:crypto";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
 const ORIGIN = "https://chatgpt.com";
@@ -480,6 +481,8 @@ function loadBackground(
     clearTimeout,
     URL,
     console,
+    crypto: webcrypto,
+    TextEncoder,
   }, { filename: "background.js" });
   if (!listener) throw new Error("background listener was not registered");
   return {
@@ -505,6 +508,72 @@ const evidenceMessage = (conversationId: string, navigation_epoch: number, extra
 });
 
 describe("Extension background identity authority", () => {
+  it("retains diagnostics without credentials and flushes after normal delivery pairing", async () => {
+    const storage = new Storage({ port: null, token: null });
+    const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+    const sample = { type: 'identity_diagnostic', stage: 'scan_started', scan_id: 1, navigation_epoch: 0 };
+    const worker = loadBackground(storage, async (endpoint) => {
+      if (endpoint.pathname === '/hello') return response(200, { ...bridgeHello, paired: false });
+      if (endpoint.pathname === '/pair') return response(200, { token: 'paired-token' });
+      if (endpoint.pathname === '/delivery/claim') return response(200, { command: null });
+      if (endpoint.pathname === '/identity-diagnostic') return response(202, { accepted: true });
+      throw new Error(`unexpected request: ${endpoint.pathname}`);
+    });
+    expect(await worker.send(sample, 'document-1', 7, url)).toMatchObject({ ok: true });
+    await new Promise(resolve => setTimeout(resolve, 40));
+    expect(storage.data.identityDiagnosticOutbox).toHaveLength(1);
+    expect(worker.calls).toEqual([]);
+    await worker.send({ type: 'register_document', navigation_epoch: 0 }, 'document-1', 7, url);
+    expect(await worker.send({ type: 'delivery_claim', conversation_id: CONVERSATION_A, navigation_epoch: 0 },
+      'document-1', 7, url)).toMatchObject({ ok: true });
+    expect(storage.data.token).toBe('paired-token');
+    await worker.send({ ...sample, scan_id: 2 }, 'document-1', 7, url);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(storage.data.identityDiagnosticOutbox).toEqual([]);
+    expect(worker.calls.filter(call => new URL(call.input).pathname === '/identity-diagnostic')).toHaveLength(2);
+    expect(worker.calls.some(call => new URL(call.input).pathname === '/identity-evidence')).toBe(false);
+  });
+
+  it("persists hash-only diagnostics across a worker restart and keeps telemetry out of identity authority", async () => {
+    const storage = new Storage({ port: 12081, token: 'paired-token' });
+    const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+    const sample = { type: 'identity_diagnostic', stage: 'fiber_scanned', scan_id: 7, navigation_epoch: 0,
+      correlation_key: UUID_REQUEST_ID, fiber_root_detected: true, fiber_evidence_count: 0,
+      prompt: 'SECRET-PROMPT', token: 'SECRET-TOKEN', document_id: 'spoofed-document' };
+    const first = loadBackground(storage, async () => response(503, {}));
+    expect(await first.send(sample, 'document-1', 7, url)).toMatchObject({ ok: true });
+    await new Promise(resolve => setTimeout(resolve, 40));
+    const queued = storage.data.identityDiagnosticOutbox as Record<string, unknown>[];
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ scan_id: 7,
+      correlation_key_hash: createHash('sha256').update(UUID_REQUEST_ID).digest('hex'),
+      document_id_hash: createHash('sha256').update('document-1').digest('hex') });
+    expect(JSON.stringify(queued)).not.toMatch(/SECRET|spoofed|32ca0d45|document-1/);
+    expect(first.calls.every(call => new URL(call.input).pathname === '/identity-diagnostic')).toBe(true);
+    const restarted = loadBackground(storage, async (_url, init) => {
+      expect((storage.data.identityDiagnosticOutbox as unknown[]).length).toBeGreaterThan(0);
+      expect(JSON.parse(String(init.body))).toHaveProperty('document_id_hash');
+      return response(202, { accepted: true });
+    });
+    await restarted.send({ ...sample, scan_id: 8 }, 'document-1', 7, url);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(storage.data.identityDiagnosticOutbox).toEqual([]);
+    expect(restarted.calls).toHaveLength(2);
+    expect(storage.data.tabDocuments).toBeUndefined();
+    expect(await restarted.send(sample, 'document-1', 7, 'https://evil.example/c/a')).toMatchObject({ ok: false });
+  });
+
+  it("observes a valid-sender evidence rejection before Bridge without claiming document authority", async () => {
+    const storage = new Storage({ port: 12081, token: 'paired-token' });
+    const worker = loadBackground(storage, async () => response(503, {}));
+    expect(await worker.send(evidenceMessage(CONVERSATION_A, 0), 'document-1', 7, `${ORIGIN}/c/${CONVERSATION_A}`))
+      .toMatchObject({ ok: false, error: 'document_unregistered' });
+    await new Promise(resolve => setTimeout(resolve, 60));
+    const entries = storage.data.identityDiagnosticOutbox as Record<string, unknown>[];
+    expect(entries.map(entry => entry.stage)).toEqual(['background_received', 'document_authorized']);
+    expect(entries[1]).toMatchObject({ flags: { document_authorized: false } });
+    expect(worker.calls.some(call => new URL(call.input).pathname === '/identity-evidence')).toBe(false);
+  });
   it("discovers only the fixed Bridge ports, pairs, and stores the token", async () => {
     const storage = new Storage();
     const calls: string[] = [];

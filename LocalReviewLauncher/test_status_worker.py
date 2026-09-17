@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, Mock, patch
 
 from PySide6.QtCore import QCoreApplication, QThreadPool
 from status_checker import (
+    BrowserReadiness,
+    StatusQueryError,
     OAuthClientStatus,
     OAuthRegistryStatus,
     LauncherStatus,
@@ -32,6 +34,19 @@ class StatusCheckSchedulerTests(unittest.TestCase):
 
 
 class StatusCheckWorkerTests(unittest.TestCase):
+    def test_worker_includes_browser_readiness_and_fails_closed_on_probe_error(self) -> None:
+        browser = BrowserReadiness(True, "ready", True, True, True, 123, "", "")
+        probe = Mock(return_value=browser)
+        checker = SimpleNamespace(check=lambda: LauncherStatus(True, True, True), browser_readiness=probe)
+        results = []
+        worker = StatusCheckWorker(checker)
+        worker.signals.finished.connect(lambda _generation, status: results.append(status))
+        worker.run()
+        self.assertEqual(results[-1].browser, browser)
+        probe.side_effect = TimeoutError()
+        worker.run()
+        self.assertEqual(results[-1].browser, BrowserReadiness())
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.application = QCoreApplication.instance() or QCoreApplication([])
@@ -136,6 +151,40 @@ class StatusCheckWorkerTests(unittest.TestCase):
 
 
 class StatusCheckerTests(unittest.TestCase):
+    def test_browser_readiness_uses_authenticated_endpoint_for_all_states(self) -> None:
+        for state, available, paired, present, reason, action in (
+            ("bridge_unavailable", False, False, False, "Bridge is not ready.", "Start the runtime."),
+            ("extension_not_paired", True, False, False, "Extension is not paired.", "Refresh ChatGPT 页面"),
+            ("extension_not_present", True, True, False, "Extension is not connected.", "Refresh ChatGPT 页面"),
+            ("ready", True, True, True, None, None),
+        ):
+            payload = dict(ready=state == "ready", readiness_state=state, bridge_available=available,
+                           extension_paired=paired, extension_present=present, last_seen_at=123,
+                           reason=reason, action=action)
+            response = MagicMock()
+            response.read.return_value = json.dumps(payload).encode()
+            response.headers.get.return_value = "application/json"
+            response.__enter__.return_value = response
+            with self.subTest(state=state), patch("status_checker.urlopen", return_value=response) as open_url:
+                browser = StatusChecker(auth_token="secret").browser_readiness()
+                self.assertEqual(browser, BrowserReadiness(state == "ready", state, available, paired, present,
+                                                           123, reason or "", action or ""))
+                request = open_url.call_args.args[0]
+                self.assertEqual(request.full_url, "http://127.0.0.1:12080/launcher/readiness")
+                self.assertEqual(request.get_method(), "GET")
+                self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+
+    def test_browser_readiness_fails_closed_on_missing_or_inconsistent_status(self) -> None:
+        checker = StatusChecker()
+        valid = dict(ready=True, readiness_state="ready", bridge_available=True, extension_paired=True,
+                     extension_present=True, last_seen_at=123, reason=None, action=None)
+        for payload in (None, {}, {**valid, "ready": "true"}, {**valid, "extension_present": False},
+                        {**valid, "last_seen_at": True}, {**valid, "readiness_state": "unknown"}):
+            with self.subTest(payload=payload), patch.object(checker, "_request_json", return_value=payload):
+                self.assertEqual(checker.browser_readiness(), BrowserReadiness())
+        with patch.object(checker, "_request_json", side_effect=StatusQueryError("unreachable")):
+            self.assertEqual(checker.browser_readiness(), BrowserReadiness())
+
     def test_mcp_sse_tool_response_is_decoded(self) -> None:
         response = MagicMock()
         response.read.return_value = (

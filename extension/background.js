@@ -510,6 +510,88 @@
     });
   }
 
+  // Observation-only outbox, independent of identity/delivery state and pairing.
+  // ponytail: newest 1000 observations survive an outage; export before a long offline run.
+  const DIAGNOSTIC_STAGES = ['scan_started', 'scan_busy', 'document_registered', 'fiber_scanned',
+    'route_checked', 'deduplicated', 'worker_send_attempted', 'worker_send_finished',
+    'background_received', 'document_authorized', 'bridge_send_attempted', 'bridge_send_finished'];
+  const DIAGNOSTIC_FLAGS = ['current_turn_present', 'fiber_root_detected', 'messages_found',
+    'submit_goal_found', 'correlation_key_found', 'current_key_found', 'conversation_id_found',
+    'conversation_conflict', 'conversation_unreadable', 'fiber_reply_received',
+    'navigation_epoch_unchanged', 'fiber_route_match', 'register_document_ok', 'worker_reply_ok',
+    'bridge_reply_ok', 'scan_in_flight', 'route_conversation_present', 'document_authorized', 'sender_source_valid'];
+  let diagnosticQueue = Promise.resolve();
+  let diagnosticFlush = null;
+  async function diagnosticHash(value) {
+    if (!value) return '';
+    const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+    return Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+  function diagnosticState(task) {
+    const result = diagnosticQueue.then(task, task);
+    diagnosticQueue = result.catch(() => undefined);
+    return result;
+  }
+  function flushDiagnostics() {
+    if (diagnosticFlush) return;
+    diagnosticFlush = (async () => {
+      await load();
+      // Do not discover, pair, retry credentials, or refresh Bridge presence for telemetry.
+      if (!port || !token) return;
+      const stored = await chrome.storage.local.get(['identityDiagnosticOutbox']);
+      const batch = (stored.identityDiagnosticOutbox || []).slice(0, 1000);
+      for (const entry of batch) {
+        const response = await fetchBounded(`http://127.0.0.1:${port}/identity-diagnostic`, {
+          method: 'POST', cache: 'no-store', headers: { 'content-type': 'application/json',
+            [PROTOCOL_HEADER]: String(PROTOCOL), authorization: `Bearer ${token}` },
+          body: JSON.stringify(entry)
+        });
+        if (!response.ok) return;
+        await diagnosticState(async () => {
+          const current = await chrome.storage.local.get(['identityDiagnosticOutbox']);
+          const remaining = (current.identityDiagnosticOutbox || [])
+            .filter(item => JSON.stringify(item) !== JSON.stringify(entry));
+          await chrome.storage.local.set({ identityDiagnosticOutbox: remaining });
+        });
+      }
+    })().catch(() => undefined).finally(() => { diagnosticFlush = null; });
+  }
+  async function receiveDiagnostic(message, sender) {
+    const source = senderSource(sender);
+    let origin;
+    try { origin = new URL(sender?.url).origin; } catch { return { ok: false }; }
+    if (!['https://chatgpt.com', 'https://chat.openai.com'].includes(origin)
+      || (sender.frameId !== undefined && sender.frameId !== 0)
+      || !DIAGNOSTIC_STAGES.includes(message.stage) || requestedEpoch(message) === null
+      || !Number.isSafeInteger(message.scan_id) || message.scan_id < 0) return { ok: false };
+    try {
+      const flags = {};
+      for (const key of DIAGNOSTIC_FLAGS) if (typeof message[key] === 'boolean') flags[key] = message[key];
+      flags.sender_source_valid = Boolean(source);
+      const entry = { stage: message.stage, scan_id: message.scan_id,
+        navigation_epoch: message.navigation_epoch, observed_at: new Date().toISOString(),
+        correlation_key_hash: await diagnosticHash(typeof message.correlation_key === 'string'
+          && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(message.correlation_key)
+          ? message.correlation_key : ''),
+        conversation_id_hash: await diagnosticHash(senderConversation(sender)),
+        document_id_hash: await diagnosticHash(source?.documentId), flags };
+      for (const [key, limit] of [['assistant_tool_calls_found', 100000], ['fiber_evidence_count', 200]]) {
+        if (Number.isSafeInteger(message[key]) && message[key] >= 0 && message[key] <= limit) entry[key] = message[key];
+      }
+      await diagnosticState(async () => {
+        const stored = await chrome.storage.local.get(['identityDiagnosticOutbox']);
+        const prior = Array.isArray(stored.identityDiagnosticOutbox) ? stored.identityDiagnosticOutbox : [];
+        await chrome.storage.local.set({ identityDiagnosticOutbox: [...prior, entry].slice(-1000) });
+      });
+      flushDiagnostics();
+      return { ok: true };
+    } catch { return { ok: false }; }
+  }
+  function evidenceDiagnostic(stage, message, sender, flags = {}) {
+    void receiveDiagnostic({ stage, scan_id: 0, navigation_epoch: message.navigation_epoch,
+      correlation_key: message.request_id, ...flags }, sender);
+  }
+
   async function receiveNavigation(message, sender) {
     return authorizeDocument(message, sender);
   }
@@ -518,12 +600,16 @@
     const source = senderSource(sender);
     const raw = message && message.evidence && typeof message.evidence === 'object' ? message.evidence : message;
     const requested = requestedEpoch(raw);
+    evidenceDiagnostic('background_received', raw, sender);
     if (!source || requested === null) return { ok: false, error: 'invalid_evidence' };
     const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
+    evidenceDiagnostic('document_authorized', raw, sender, { document_authorized: authority.ok === true });
     if (!authority.ok) return authority;
     const evidence = evidenceFromMessage(message, source.documentId, authority.navigation_epoch);
     if (!evidence) return { ok: false, error: 'invalid_evidence' };
+    evidenceDiagnostic('bridge_send_attempted', raw, sender);
     const delivered = await postEvidence(evidence);
+    evidenceDiagnostic('bridge_send_finished', raw, sender, { bridge_reply_ok: delivered.ok === true });
     return delivered.ok ? { ok: true, evidence } : delivered;
   }
 
@@ -879,6 +965,7 @@
     register_document: registerDocument,
     navigation: receiveNavigation,
     identity_evidence: receiveEvidence,
+    identity_diagnostic: receiveDiagnostic,
     delivery_claim: claimDelivery,
     delivery_submit_started: deliverySubmitStarted,
     delivery_ack: receiveDeliveryAck,

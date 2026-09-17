@@ -3,7 +3,7 @@ import { basename, dirname, join } from "node:path";
 import { endpoint, localOrigin, type ResolvedSettings } from "./config/settings.js";
 import { isPortInUse, startHttpServer, type HttpServerOptions } from "./mcp/http.js";
 import { REGISTERED_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
-import { startBridge, stopBridge } from "./control-plane/bridge.js";
+import { extensionDeliveryReadiness, startBridge, stopBridge } from "./control-plane/bridge.js";
 import {
   ActuationAuthorizationStore,
   ControlledActuationService,
@@ -225,7 +225,7 @@ export async function startApp(
           storageRoot: context.storageRoot,
           singleWorkspace: context.registry.list().length === 1,
         });
-    const server = await startHttpServer(settings, context, {
+    const server = await startHttpServer(settings, { ...context, browserReadiness: extensionDeliveryReadiness }, {
       oauthClientRegistryPath: options.oauthClientRegistryPath ?? workspaceOAuth?.clientRegistryPath,
       oauthTokenStorePath: options.oauthTokenStorePath
         ?? (options.oauthClientRegistryPath === undefined

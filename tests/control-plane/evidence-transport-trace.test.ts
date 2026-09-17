@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bridgePort, startBridge, stopBridge } from "../../src/control-plane/bridge.js";
+import { bridgePort, bridgeStatus, startBridge, stopBridge } from "../../src/control-plane/bridge.js";
 import {
   EVIDENCE_TRANSPORT_EVENT_HEADER,
   EXTENSION_EVIDENCE_CREATED_EVENT,
@@ -130,6 +130,7 @@ describe("EvidenceTransportTraceService", () => {
     }, {
       storageRoot: root,
       evidenceTransportTrace: trace,
+      browserReadiness: () => ({ ready: true }),
     });
     await pending.accept(input());
 
@@ -216,6 +217,27 @@ describe("EvidenceTransportTraceService", () => {
     expect(result.structuredContent).toEqual({
       events: [{ event: "extension_evidence_created", timestamp: expect.any(String) }],
     });
+  });
+
+  it("persists authenticated strict diagnostics without identity resolution or presence refresh", async () => {
+    const trace = new EvidenceTransportTraceService(await makeRoot('lrm-browser-diagnostic-'));
+    const connector = vi.fn();
+    await startBridge({ ports: [0], evidenceTransportTrace: trace, onIdentityEvidence: connector });
+    const token = await pair();
+    const body = { stage: 'fiber_scanned', scan_id: 1, navigation_epoch: 0,
+      observed_at: new Date().toISOString(), correlation_key_hash: 'a'.repeat(64),
+      conversation_id_hash: '', document_id_hash: 'b'.repeat(64),
+      flags: { current_key_found: true, conversation_unreadable: true }, fiber_evidence_count: 0 };
+    expect((await request('/identity-diagnostic', { method: 'POST', body })).status).toBe(401);
+    expect((await request('/identity-diagnostic', { method: 'POST', token, body: { ...body, prompt: 'SECRET' } })).status).toBe(400);
+    expect((await request('/identity-diagnostic', { method: 'POST', token, body: { ...body, flags: { cookie: true } } })).status).toBe(400);
+    const before = bridgeStatus().lastSeenAt;
+    expect((await request('/identity-diagnostic', { method: 'POST', token, body })).status).toBe(202);
+    expect(bridgeStatus().lastSeenAt).toBe(before);
+    expect(connector).not.toHaveBeenCalled();
+    const saved = await readFile(trace.file, 'utf8');
+    expect(JSON.parse(saved)).toMatchObject({ event: 'browser_identity_diagnostic', diagnostic: body });
+    expect(saved).not.toContain('SECRET');
   });
 
   it("records Bridge rejection for schema errors without invoking the connector", async () => {

@@ -129,7 +129,8 @@ function scanFiber(messages: unknown[]): Record<string, any> {
 
 async function contentMessages(
   reply: Record<string, unknown>,
-  options: { fiberReplyDelayMs?: number; navigateBeforeFiberReply?: string } = {},
+  options: { fiberReplyDelayMs?: number; navigateBeforeFiberReply?: string; dropReply?: boolean;
+    registrationFails?: boolean; workerFails?: boolean } = {},
 ): Promise<Record<string, unknown>[]> {
   const listeners = new Map<string, Set<(event: Record<string, unknown>) => void>>();
   const messages: Record<string, unknown>[] = [];
@@ -154,6 +155,7 @@ async function contentMessages(
     },
     postMessage(data, targetOrigin) {
       if (targetOrigin !== ORIGIN || (data as Record<string, unknown>)?.source !== "lrm-extension-identity-ask") return;
+      if (options.dropReply) return;
       if (options.navigateBeforeFiberReply && !navigated) {
         navigated = true;
         history.pushState({}, "", options.navigateBeforeFiberReply);
@@ -179,8 +181,8 @@ async function contentMessages(
     chrome: { runtime: { sendMessage(message: Record<string, unknown>, callback: (value: object) => void) {
       messages.push(structuredClone(message));
       callback(message.type === "register_document"
-        ? { ok: true, document_id: "document-a", navigation_epoch: 0 }
-        : { ok: true });
+        ? { ok: !options.registrationFails, document_id: "document-a", navigation_epoch: 0 }
+        : { ok: !(options.workerFails && message.type === 'identity_evidence') });
     } } },
     MutationObserver: undefined,
     URL,
@@ -188,13 +190,44 @@ async function contentMessages(
     clearTimeout,
     setInterval: () => 1,
   }, { filename: "content.js" });
-  const settleMs = options.fiberReplyDelayMs && options.fiberReplyDelayMs > 0
+  const settleMs = options.dropReply ? 1800 : options.fiberReplyDelayMs && options.fiberReplyDelayMs > 0
     ? 440 + options.fiberReplyDelayMs : 220;
   await new Promise((resolve) => setTimeout(resolve, settleMs));
   return messages;
 }
 
 describe("Extension submit_goal correlation evidence", () => {
+  it("reports registration, Fiber reply timeout, worker rejection, and navigation fencing independently", async () => {
+    const reply = scanFiber([currentConnectorRequest('a', 'submit_goal', KEY_A)]);
+    const registration = await contentMessages(reply, { registrationFails: true });
+    expect(registration).toContainEqual(expect.objectContaining({ stage: 'document_registered', register_document_ok: false }));
+    expect(registration.some(message => message.stage === 'fiber_scanned')).toBe(false);
+    const timeout = await contentMessages(reply, { dropReply: true });
+    expect(timeout).toContainEqual(expect.objectContaining({ stage: 'fiber_scanned', fiber_reply_received: false }));
+    const rejected = await contentMessages(reply, { workerFails: true });
+    expect(rejected).toContainEqual(expect.objectContaining({ stage: 'worker_send_finished', worker_reply_ok: false }));
+    const navigated = await contentMessages(reply, { navigateBeforeFiberReply: `/c/${CONVERSATION_B}` });
+    expect(navigated).toContainEqual(expect.objectContaining({ stage: 'fiber_scanned', navigation_epoch_unchanged: false }));
+    expect(navigated.some(message => message.type === 'identity_evidence')).toBe(false);
+  });
+  it("distinguishes missing root, missing trusted identity, and a newer non-goal tool without historical claiming", async () => {
+    const noRoot = scanFiberSections([{}]);
+    expect(noRoot.scan_diagnostic).toMatchObject({ fiber_root_detected: false, current_key_found: false });
+    const noIdentity = scanFiberSections([fiberSection([currentConnectorRequest('a', 'submit_goal', KEY_A)], 'turn', 'WEB:00000000-0000-4000-8000-000000000001')]);
+    expect(noIdentity.evidence).toEqual([]);
+    expect(noIdentity.scan_diagnostic).toMatchObject({ fiber_root_detected: true, current_key_found: true,
+      correlation_key: KEY_A, conversation_unreadable: true, conversation_id_found: false });
+    const laterTool = scanFiber([currentConnectorRequest('a', 'submit_goal', KEY_A), request('b', 'get_status')]);
+    expect(laterTool.evidence).toEqual([]);
+    expect(laterTool.scan_diagnostic).toMatchObject({ correlation_key_found: true, current_key_found: false, correlation_key: null });
+    const messages = await contentMessages(noIdentity);
+    expect(messages).toContainEqual(expect.objectContaining({ type: 'identity_diagnostic', stage: 'fiber_scanned',
+      correlation_key: KEY_A, fiber_evidence_count: 0, conversation_unreadable: true }));
+    expect(messages.some(message => message.type === 'identity_evidence')).toBe(false);
+    const mismatch = await contentMessages({ version: 1, evidence: [{ request_id: KEY_A, fiber_conversation_id: CONVERSATION_B }] });
+    expect(mismatch).toContainEqual(expect.objectContaining({ stage: 'route_checked', fiber_route_match: false }));
+    expect(mismatch.some(message => message.type === 'identity_evidence')).toBe(false);
+  });
   it("reports the reloaded conversation identity as matched for the fresh correlation key", () => {
     const FRESH_KEY = "dd3bf476-5a9e-4a5d-b445-a09e5dfe9dec";
     const reply = scanFiberSections([{

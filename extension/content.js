@@ -29,6 +29,19 @@
   let completionInFlight = null;
   let completionScanTimer = null;
   const sent = new Set();
+  let scanSequence = 0;
+  const diagnosticStates = new Map();
+  function identityDiagnostic(stage, scanId, details = {}) {
+    // State changes plus a thirty-second heartbeat; no text or arbitrary objects.
+    try {
+      const signature = JSON.stringify([navigationEpoch, routeConversation(), details]);
+      const prior = diagnosticStates.get(stage);
+      if (prior?.signature === signature && Date.now() - prior.at < 30000) return;
+      diagnosticStates.set(stage, { signature, at: Date.now() });
+      void sendToWorker({ type: 'identity_diagnostic', stage, scan_id: scanId,
+        navigation_epoch: navigationEpoch, conversation_id: routeConversation(), ...details });
+    } catch { /* Observations must not affect scanning. */ }
+  }
 
   function routeConversation(href = location.href) {
     try {
@@ -182,10 +195,20 @@
           if (previous !== undefined && previous !== entry.fiber_conversation_id) conflicts.add(entry.request_id);
           else if (previous === undefined) byRequest.set(entry.request_id, entry.fiber_conversation_id);
         }
-        finish({ evidence: [...byRequest].filter(([requestId]) => !conflicts.has(requestId))
+        const diagnostic = {};
+        for (const key of ['current_turn_present', 'fiber_root_detected', 'messages_found',
+          'submit_goal_found', 'correlation_key_found', 'current_key_found',
+          'conversation_id_found', 'conversation_conflict', 'conversation_unreadable']) {
+          if (typeof data.scan_diagnostic?.[key] === 'boolean') diagnostic[key] = data.scan_diagnostic[key];
+        }
+        const count = data.scan_diagnostic?.assistant_tool_calls_found;
+        if (Number.isSafeInteger(count) && count >= 0 && count <= 100000) diagnostic.assistant_tool_calls_found = count;
+        const key = data.scan_diagnostic?.correlation_key;
+        if (typeof key === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(key)) diagnostic.correlation_key = key;
+        finish({ diagnostic, fiber_reply_received: true, evidence: [...byRequest].filter(([requestId]) => !conflicts.has(requestId))
           .map(([request_id, fiber_conversation_id]) => ({ request_id, fiber_conversation_id })) });
       };
-      timer = setTimeout(() => finish({ evidence: [] }), FIBER_TIMEOUT_MS);
+      timer = setTimeout(() => finish({ evidence: [], fiber_reply_received: false }), FIBER_TIMEOUT_MS);
       window.addEventListener('message', listener);
       try {
         window.postMessage({ source: FIBER_ASK, nonce }, location.origin);
@@ -344,28 +367,43 @@
   }
 
   async function publishEvidence() {
-    if (!alive || scanInFlight) return scanInFlight;
+    if (!alive || scanInFlight) {
+      identityDiagnostic('scan_busy', scanSequence, { scan_in_flight: Boolean(scanInFlight) });
+      return scanInFlight;
+    }
+    const scanId = ++scanSequence;
     scanInFlight = (async () => {
       const askedEpoch = navigationEpoch;
       const askedUrl = location.href;
       const conversationId = routeConversation(askedUrl);
-      if (!conversationId || !(await registerDocument())) return;
+      identityDiagnostic('scan_started', scanId, { route_conversation_present: Boolean(conversationId) });
+      if (!conversationId) return;
+      const registered = await registerDocument();
+      identityDiagnostic('document_registered', scanId, { register_document_ok: registered });
+      if (!registered) return;
       const scan = await fiberScan();
       const stillCurrent = () => askedEpoch === navigationEpoch
         && askedUrl === location.href
         && routeConversation() === conversationId;
+      const observation = { ...scan.diagnostic, fiber_reply_received: scan.fiber_reply_received === true,
+        fiber_evidence_count: scan.evidence.length, navigation_epoch_unchanged: stillCurrent() };
+      identityDiagnostic('fiber_scanned', scanId, observation);
       if (!stillCurrent()) return;
       for (const entry of scan.evidence) {
         if (!stillCurrent()) return;
+        const details = { correlation_key: entry.request_id, fiber_route_match: entry.fiber_conversation_id === conversationId };
+        identityDiagnostic('route_checked', scanId, details);
         if (entry.fiber_conversation_id !== conversationId) continue;
         const key = `${askedEpoch}\u0000${conversationId}\u0000${entry.request_id}`;
-        if (sent.has(key)) continue;
+        if (sent.has(key)) { identityDiagnostic('deduplicated', scanId, details); continue; }
+        identityDiagnostic('worker_send_attempted', scanId, details);
         const reply = await sendToWorker({
           type: 'identity_evidence',
           request_id: entry.request_id,
           conversation_id: conversationId,
           navigation_epoch: askedEpoch
         });
+        identityDiagnostic('worker_send_finished', scanId, { ...details, worker_reply_ok: reply?.ok === true });
         if (reply?.ok === true) sent.add(key);
       }
     })().finally(() => {

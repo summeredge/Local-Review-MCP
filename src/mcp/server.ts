@@ -35,6 +35,7 @@ import {
 } from "../control-plane/evidence-transport-trace.js";
 import {
   PendingGoalSubmissionConflictError,
+  BrowserReadinessError,
   type PendingGoalSubmissionService,
 } from "../control-plane/pending-goal-submission.js";
 import { validateWorkspaceIdentityConsistency } from "../workspace/identity.js";
@@ -303,6 +304,18 @@ interface ListedEntry {
 }
 
 export function toToolError(error: unknown) {
+  if (error instanceof BrowserReadinessError) {
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify({
+        error: "BROWSER_IDENTITY_CHANNEL_NOT_READY",
+        readiness_state: error.readiness.readiness_state,
+        message: error.message,
+        reason: error.readiness.reason,
+        action: error.readiness.action,
+      }) }],
+      isError: true as const,
+    };
+  }
   const code = error instanceof PendingGoalSubmissionConflictError
     ? "CONFLICTING_PENDING_GOAL_SUBMISSION"
     : error instanceof WorkspacePathError || error instanceof GitError
