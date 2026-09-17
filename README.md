@@ -2,14 +2,17 @@
 
 ## Current version
 
-V0.1 Release Candidate / Task 12
+V0.1 Release Candidate / Phase 5.6.1
 
 ## Current capabilities
 
 - MCP Streamable HTTP runtime
 - nineteen read-only tools, including the workspace registry, review context, and
   interactive Session status tools
-- `submit_goal` Control Plane entry point with automatic current-conversation binding
+- `submit_goal` Control Plane entry point with asynchronous exact-current-conversation binding
+- batch CLI and interactive Codex app-server Execution backends
+- normalized interactive Session events with read-only Session/Execution status queries
+- MV3 Browser Extension/Fiber identity evidence and loopback Local Control Bridge
 - fixed loopback host
 - configurable fixed port
 - startup port conflict detection
@@ -24,6 +27,74 @@ V0.1 Release Candidate / Task 12
 - optional Windows Supervisor with health monitoring and bounded recovery
 - optional Windows Tray status/actions and per-user startup registration
 - Remote MCP protocol, authentication, workspace-review, and restart E2E tests
+
+## Architecture
+
+LRM keeps the MCP Data Plane and the Control Plane separate:
+
+```text
+MCP Read-only Data Plane
+  Workspace / Git / Review Context / status / hash-only diagnostics
+
+MCP Control Plane entry
+  submit_goal
+        |
+        v
+Pending Goal identity gate -> Goal -> Phase -> Task
+        |
+        v
+Controlled Actuation -> Execution
+```
+
+The MCP server exposes nineteen read-only tools and the reviewed `submit_goal`
+entry point. Browser Extension/Fiber, Local Control Bridge, Dispatcher, Codex
+execution, and Review Loop work remain Control Plane capabilities; MCP does not
+provide general file-write, shell, commit, push, or agent-control operations.
+
+Execution and review use these current paths:
+
+```text
+batch:        Task -> Execution                 (Codex CLI)
+interactive: Task -> Session -> provider Thread -> Turn -> Execution -> normalized Events
+
+terminal Execution -> Review Request -> Conversation Routing -> Review Delivery
+                   -> Extension Review Completion -> ReviewResult -> ReviewVerdict
+                   -> LoopDecision -> complete | next Execution | human required
+```
+
+Request correlation (`correlation_key -> conversation_id`) is identity evidence
+only; `ConversationRouting.conversation_id` remains the authoritative Review
+Delivery target.
+
+`Session` is the long-lived interactive context and stores the provider Thread
+ID. `Turn` is the provider-level unit for one interactive Execution. Batch
+execution continues through `codex exec --json -` and does not automatically
+create a Session. The Playwright Browser Worker remains an independent path for
+explicit diagnostics and compatibility; it is not an MCP Data Plane capability.
+
+### Interactive Execution and status
+
+`submit_goal` supports `execution_mode: "batch" | "interactive"`, defaulting to
+`batch`, plus optional provider `model` and `reasoning_effort`. Interactive
+Execution uses the Codex app-server backend, discovers the provider catalog with
+`model/list`, creates a Session and Thread, starts a Turn, and persists only
+normalized LRM events. It does not silently select the first model.
+
+The Session status model is `created`, `starting`, `active`, `running_turn`,
+`waiting_input`, `completed`, `failed`, or `terminated`. The currently wired
+interactive path uses `created -> starting -> active -> running_turn ->
+completed|failed`; approval, user input, pause, and resume scheduling are not
+implemented. The compatible Execution status remains `running`, `passed`, or
+`failed`.
+
+The read-only status tools are:
+
+- `get_session_status` by `session_id` or `goal_id`, including Session, Thread,
+  model/effort, Goal, and current Execution status;
+- `get_execution_status` by `execution_id`, including proven Session/Thread/Turn
+  association and bounded agent output;
+- `list_session_events` with ordered, paginated normalized events. Provider
+  JSON-RPC payloads are not exposed.
 
 ## Default endpoint
 
@@ -153,12 +224,11 @@ $env:LOCAL_REVIEW_MCP_REMOTE_TOKEN = $env:LOCAL_REVIEW_MCP_TOKEN
 
 `verify-remote.ps1` checks that unauthenticated and wrong-token health requests
 return HTTP 401, the correct token returns `status=ok`, MCP `initialize` works,
-and `tools/list` contains the read-only tools plus `submit_goal`:
-`workspace_info`, `list_files`, `read_file`, `search_text`, `git_status`, and
-`git_diff`, plus `workspace_list`, `review_summary`, `execution_output`,
-`get_session_status`, `get_execution_status`, `list_session_events`,
-`get_identity_trace`, `get_evidence_transport_trace`, and
-`submit_goal`.
+and `tools/list` matches its embedded tool allowlist. The current runtime
+advertises nineteen read-only tools plus `submit_goal` (20 registered tools);
+this script still contains the older fifteen-tool allowlist, so its final
+comparison is not a complete current-surface check. The remote test suite uses
+the current registered-tool fixture for that check.
 
 ## Remote MCP Setup
 
@@ -216,6 +286,84 @@ hardcodes a tunnel hostname.
    `workspace_info`, `git_status`, `git_diff`, `read_file`, and `search_text`
    with a `workspace_id` when selecting a registered workspace.
 
+### Connector and browser readiness
+
+For a real `submit_goal` handoff, keep the runtime, Tunnel (when remote access
+is enabled), Bridge, and the exact ChatGPT connector available. Run the local
+diagnostic after startup:
+
+```powershell
+npm run diagnose:chatgpt-connector -- --config <config>
+```
+
+If the exact connector has just been created or adopted, call `workspace_info`
+through that exact OAuth connector and confirm it with the returned request ID:
+
+```powershell
+npm run confirm:chatgpt-connector -- --config <config> --request-id <workspace_info.request_id>
+```
+
+Continue only when the diagnostic reports `ok=true`, `connector.status=verified`,
+`connector.action=none`, and ready remote/OAuth checks. The connector workflow
+in [`docs/chatgpt-connector-workflow.md`](docs/chatgpt-connector-workflow.md)
+covers exact-name checking, reauthorization, and adoption of an existing
+ChatGPT connector. Confirmation evidence is OAuth-authenticated `workspace_info`
+evidence for the current workspace and expires after ten minutes.
+
+The unpacked MV3 extension is in `extension/`; it needs to be loaded manually
+in Chrome or Edge and has no build step. After reloading the extension, refresh
+the ChatGPT page so its content scripts are replaced, then use a concrete
+conversation route rather than the New Chat root:
+
+```text
+https://chatgpt.com/c/<conversation_id>
+https://chatgpt.com/g/<project>/c/<conversation_id>
+```
+
+The supported Project form is the one-segment route
+`/g/<project>/c/<conversation_id>`. `fiber.js` runs in the MAIN world and emits
+only bounded evidence from the current turn. For direct `submit_goal`, it
+accepts only the exact assistant tool request for `api_tool.call_tool` or
+`Local_MCP_Connector.submit_goal` whose `args` or `arguments` contains the
+strict UUID v4 `correlation_key`. It never substitutes assistant text, tool
+results, or `message.metadata.request_id` for that direct key. The content and
+background scripts additionally require Fiber/URL conversation equality,
+Chrome `MessageSender.documentId`, and the current `navigation_epoch`; stale,
+conflicting, and new-chat identities produce no canonical evidence. A raw
+`WEB:*` value is provisional and never becomes a canonical owner; only a valid
+same-model `serverId$()` result can resolve it to a canonical conversation ID.
+
+The Local Control Bridge is a separate loopback Control Plane server on
+`127.0.0.1`, discovered on ports `12081` through `12085`, using protocol `3`.
+It pairs one validated Extension Origin and authenticates protected evidence
+transport with a process-local bearer token. `GET /hello` is discovery;
+protected identity evidence is posted to `/identity-evidence`. If the Bridge is
+unavailable, the MCP Data Plane can still start, but `submit_goal` cannot pass
+its Browser identity-channel readiness gate.
+
+`GET http://127.0.0.1:<port>/launcher/readiness` is a loopback,
+static-token-protected status endpoint also shown by the Launcher. `ready` means
+the Bridge is available, the Extension is paired, and Extension presence was
+seen within the ten-second presence window. Presence is only channel
+readiness, not conversation proof. The Launcher may briefly retain a recent
+READY display during its presentation grace period, but `submit_goal` still
+checks live readiness and requires the exact Fiber/URL/document/epoch evidence
+above.
+
+`submit_goal` does not accept `conversation_id`. The model must generate a fresh
+UUID v4 `correlation_key` for every call. The call first returns a durable
+acceptance receipt while a `PendingGoalSubmission` waits for matching canonical
+evidence (default TTL: two minutes); only then does Goal startup happen
+asynchronously. `accepted` is not Goal, Session, Execution, or review
+completion. If the key is not matched before expiry, no Goal is created. The
+read-only `get_identity_trace` and `get_evidence_transport_trace` tools expose
+hash-only, correlation-key-scoped diagnostics and never return raw payloads,
+tokens, cookies, or message text.
+
+After identity matching, Goal preflight still checks runtime readiness, the
+active registered workspace identity, and verified Connector/OAuth/remote
+readiness; Browser presence alone never authorizes a Goal.
+
 The exact ChatGPT Web menu labels and availability depend on the workspace
 plan. The MCP endpoint itself is `/mcp`; `/health` is an authenticated
 readiness check. OpenAI's current [MCP and Connectors guide](https://developers.openai.com/api/docs/guides/tools-connectors-mcp)
@@ -225,13 +373,17 @@ At least one workspace is required. With a registry, the first entry is the
 legacy active workspace unless the top-level `workspace` matches another
 registered path. Without `workspace_id`, tools use that active workspace.
 
-The current read-only tools are `workspace_info`, `list_files`, `read_file`,
-`search_text`, `git_status`, `git_diff`, `workspace_list`, `review_summary`,
+The current nineteen read-only tools are `workspace_info`, `list_files`,
+`read_file`, `search_text`, `git_status`, `git_diff`, `workspace_get_info`,
+`workspace_list_files`, `workspace_read_file`, `workspace_search`,
+`workspace_review_context`, `workspace_list`, `review_summary`,
 `execution_output`, `get_session_status`, `get_execution_status`,
-`list_session_events`, `get_identity_trace`, and `get_evidence_transport_trace`. The Control Plane tool `submit_goal` durably accepts a
-Goal and starts it after canonical Extension evidence proves the conversation.
-All workspace-scoped tools except `workspace_list` accept an optional
-`workspace_id`; an omitted ID preserves the active-workspace behavior.
+`list_session_events`, `get_identity_trace`, and `get_evidence_transport_trace`.
+The Control Plane tool `submit_goal` durably accepts a Goal and starts it after
+canonical Extension evidence proves the conversation. The five explicitly
+scoped `workspace_*` review tools require `workspace_id`; the other
+workspace-scoped tools preserve optional active-workspace behavior, while
+`workspace_list` has no workspace selector.
 Git tools are bound to the selected registered workspace, do not expose Git
 command arguments, and never perform write operations. `workspace_list` returns
 only each workspace's stable `id` and display `name`, never its local path.
@@ -239,6 +391,13 @@ only each workspace's stable `id` and display `name`, never its local path.
 `execution_output` only reads `.review/execution_output.json` and returns
 `{"available":false}` when that file is absent; it never runs the recorded
 command or accepts a file path.
+
+`submit_goal` requires a fresh `correlation_key` and accepts an optional
+`workspace_id`, `title`, `goal`,
+`requirements`, `acceptance_criteria`, `max_iterations` (default `2`),
+`execution_mode` (default `batch`), `model`, and `reasoning_effort`. Its
+`conversation_id` is resolved internally from the exact Extension evidence
+chain; it is not caller-supplied.
 
 The health endpoint requires the configured static `Authorization: Bearer <token>`
 even on localhost and through Cloudflare Tunnel. MCP requests accept either that
@@ -283,10 +442,39 @@ Review Delivery chain with a mock Page and does not require a ChatGPT login:
 npm run diagnose:review-submission
 ```
 
+The interactive app-server smoke uses a temporary state root and requires the
+requested provider selection:
+
+```powershell
+$env:CODEX_INTERACTIVE_MODEL = "gpt-5.6-luna"
+$env:CODEX_INTERACTIVE_EFFORT = "max"
+npm run test:interactive-goal
+```
+
 To probe an already deployed HTTPS endpoint with the optional remote test,
 provide `LOCAL_REVIEW_MCP_REMOTE_URL` and
 `LOCAL_REVIEW_MCP_REMOTE_TOKEN` only in the process environment before running
 the remote test. No token or public URL is stored in the repository.
+
+## LocalReviewLauncher
+
+[`LocalReviewLauncher/README.md`](LocalReviewLauncher/README.md) describes the
+independent PySide6 Windows launcher. `start-launcher.cmd` starts the existing
+`scripts/start-production.ps1` entry point; the launcher does not replace or
+embed the MCP runtime. Its startup and status views cover Start/Stop/Refresh,
+Workspace Registry, configuration validation/open/backup, OAuth client status,
+MCP health, Tunnel/remote status, and Browser readiness through authenticated
+local HTTP checks.
+
+The read-only Task Dashboard lists only interactive `codex_app_server` Sessions
+and shows Goal/Task, Session/Thread, model/effort, status, current Execution,
+and last update. The Session Viewer shows the current Execution and the
+normalized Event Stream; it refreshes every five seconds and provides an
+Open Codex Task locator using the proven Thread/Session IDs. The Launcher only
+observes lifecycle state and does not submit, stop, resume, approve, or control
+a Goal, Execution, Thread, or Turn. Separate cleanup actions can clear the
+display or remove completed/failed/terminated persisted task records; running
+Sessions are retained.
 
 ## Security Notes
 

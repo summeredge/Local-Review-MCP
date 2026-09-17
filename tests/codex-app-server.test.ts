@@ -1,5 +1,8 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
@@ -12,6 +15,11 @@ vi.mock("node:child_process", async () => {
 import { CodexAppServerClient } from "../src/backends/codex_app_server/client.js";
 import { parseCodexAppServerNotification } from "../src/backends/codex_app_server/events.js";
 import { parseRpcLine } from "../src/backends/codex_app_server/protocol.js";
+import { CodexAppServerBackend } from "../src/backends/codex_app_server/backend.js";
+import { ExecutionContextService } from "../src/context/execution-service.js";
+import { SessionStore } from "../src/context/session-store.js";
+import { EventStore } from "../src/control-plane/events/store.js";
+import { WorkspaceRegistry } from "../src/workspace/registry.js";
 
 type FakeRequest = Record<string, unknown>;
 type FakeRequestHandler = (request: FakeRequest, process: FakeAppServerProcess) => void;
@@ -95,6 +103,71 @@ function initializeResult(): Record<string, unknown> {
 }
 
 describe("CodexAppServerClient protocol handling", () => {
+  it("completes Execution through the real event queue after whitespace and empty deltas", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lrm-delta-regression-"));
+    const { client, process } = await startFakeServer((request, fakeProcess) => {
+      if (request.method === "initialize") {
+        fakeProcess.respond({ id: request.id, result: initializeResult() });
+      } else if (request.method === "model/list") {
+        fakeProcess.respond({ id: request.id, result: { data: [], nextCursor: null } });
+      } else if (request.method === "thread/start") {
+        fakeProcess.respond({ id: request.id, result: { thread: { id: "thread-1", sessionId: "provider-session-1" } } });
+      } else if (request.method === "turn/start") {
+        fakeProcess.respond({ id: request.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+      }
+    });
+    const backend = new CodexAppServerBackend(
+      new WorkspaceRegistry([{ id: "workspace-1", name: "Workspace", path: root }]),
+      { storageRoot: root, clientFactory: async () => client },
+    );
+    const terminal = vi.fn();
+    backend.setTerminalListener(terminal);
+    try {
+      const started = await backend.start({
+        workspace_id: "workspace-1", task_id: "task-1", execution_id: "execution-1",
+        goal_id: "goal-1", instruction: "reply", execution_mode: "interactive",
+      });
+      process.respond({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1" } } });
+      for (const delta of ["hello", " ", "", "world", "\n"]) {
+        process.respond({
+          method: "item/agentMessage/delta",
+          params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-1", delta },
+        });
+      }
+      process.respond({
+        method: "item/completed",
+        params: { threadId: "thread-1", turnId: "turn-1", item: { type: "agentMessage", id: "item-1", text: "hello world\n!" } },
+      });
+      process.respond({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
+      await vi.waitFor(() => expect(terminal).toHaveBeenCalledOnce());
+      expect(terminal.mock.calls[0]![0]).toMatchObject({ status: "passed" });
+      await expect(new ExecutionContextService(root).getExecutionContext("workspace-1", "task-1", "execution-1"))
+        .resolves.toMatchObject({ status: "passed" });
+      await expect(new SessionStore(root).getSession(started.session_id!)).resolves.toMatchObject({ status: "completed" });
+      const events = await new EventStore(root).listEvents(started.session_id!);
+      expect(events.map((event) => event.event_type)).toEqual([
+        "turn_started", ...Array(5).fill("agent_message_delta"), "agent_message_completed", "turn_completed",
+      ]);
+      expect(events.filter((event) => event.event_type === "agent_message_delta").map((event) => event.payload.content))
+        .toEqual(["hello", " ", "", "world", "\n"]);
+      expect(events.at(-2)?.payload).toEqual({ content: "!" });
+      expect(client.processInfo.status).toBe("ready");
+    } finally {
+      await backend.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails the event queue closed for a non-string delta", async () => {
+    const { client, process } = await startFakeServer(() => undefined);
+    process.respond({
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-1", delta: { text: "hello" } },
+    });
+    await expect(client.events()[Symbol.asyncIterator]().next()).rejects.toThrow("Invalid item/agentMessage/delta event field: delta.");
+    expect(client.processInfo.status).toBe("failed");
+  });
+
   it("resolves a matching response and records initialized process state", async () => {
     const { client, process } = await startFakeServer((request, fakeProcess) => {
       if (request.method === "initialize") {
@@ -210,6 +283,30 @@ describe("CodexAppServerClient protocol handling", () => {
 });
 
 describe("Codex app-server event parser", () => {
+  // Installed codex-cli 0.155.0-alpha.2.6 schema: required delta has type string, no minLength.
+  it.each(["hello", " ", "", "\n", "\t", " hello "])("preserves string delta %j verbatim", (delta) => {
+    expect(parseCodexAppServerNotification({
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-1", delta },
+    })).toEqual({
+      type: "agent_message_delta", thread_id: "thread-1", turn_id: "turn-1", item_id: "item-1", content: delta,
+    });
+  });
+
+  it.each([undefined, null, 0, false, [], {}, { text: "hello" }].map((delta) => [delta]))("rejects malformed delta %j", (delta) => {
+    expect(() => parseCodexAppServerNotification({
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-1", ...(delta === undefined ? {} : { delta }) },
+    })).toThrow("Invalid item/agentMessage/delta event field: delta.");
+  });
+
+  it.each(["threadId", "turnId", "itemId"])("still rejects blank %s even for an empty delta", (field) => {
+    expect(() => parseCodexAppServerNotification({
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-1", delta: "", [field]: " " },
+    })).toThrow(`Invalid item/agentMessage/delta event field: ${field}.`);
+  });
+
   it("normalizes the supported provider events", () => {
     const notifications = [
       { method: "thread/started", params: { thread: { id: "thread-1", sessionId: "session-1" } } },

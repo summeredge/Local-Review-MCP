@@ -103,14 +103,19 @@ export function parseCodexAppServerNotification(
         turn_id: requiredString(turn, "id", method),
       };
     }
-    case "item/agentMessage/delta":
+    case "item/agentMessage/delta": {
+      // Delta is text, not an identifier: empty and whitespace-only strings are valid.
+      if (typeof params.delta !== "string") {
+        throw new Error(`Invalid ${method} event field: delta.`);
+      }
       return {
         type: "agent_message_delta",
         thread_id: requiredString(params, "threadId", method),
         turn_id: requiredString(params, "turnId", method),
         item_id: requiredString(params, "itemId", method),
-        content: requiredString(params, "delta", method),
+        content: params.delta,
       };
+    }
     case "item/completed": {
       const item = requiredRecord(params.item, method);
       if (item.type !== "agentMessage") return undefined;
