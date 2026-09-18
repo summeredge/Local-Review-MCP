@@ -15,6 +15,7 @@ import {
   EvidenceTransportTraceService,
   evidenceTransportTraceStateFile,
 } from "../../src/control-plane/evidence-transport-trace.js";
+import { identityHash } from "../../src/control-plane/identity-trace.js";
 import type { GoalSubmissionRequest, GoalSubmissionResult } from "../../src/control-plane/goal-submission.js";
 import {
   PendingGoalSubmissionService,
@@ -238,6 +239,31 @@ describe("EvidenceTransportTraceService", () => {
     const saved = await readFile(trace.file, 'utf8');
     expect(JSON.parse(saved)).toMatchObject({ event: 'browser_identity_diagnostic', diagnostic: body });
     expect(saved).not.toContain('SECRET');
+  });
+
+  it("returns hash-only Browser scan details and bounded resolver reasons", async () => {
+    const trace = new EvidenceTransportTraceService(await makeRoot('lrm-browser-diagnostic-query-'));
+    const diagnostic = {
+      stage: 'fiber_scanned' as const,
+      scan_id: 4,
+      navigation_epoch: 2,
+      observed_at: new Date().toISOString(),
+      correlation_key_hash: identityHash(KEY_A),
+      conversation_id_hash: identityHash(CONVERSATION_A),
+      document_id_hash: 'b'.repeat(64),
+      flags: { submit_goal_found: true, current_key_found: true, evidence_generated: true },
+      assistant_tool_calls_found: 1,
+      fiber_evidence_count: 1,
+    };
+    trace.record({ event: 'browser_identity_diagnostic', diagnostic });
+    trace.record({ event: 'evidence_resolve_failed', correlation_key: KEY_A, reason: 'pending_expired' });
+
+    await expect(trace.getEvidenceTransportTrace(KEY_A)).resolves.toEqual({
+      events: [
+        { event: 'browser_identity_diagnostic', timestamp: expect.any(String), diagnostic },
+        { event: 'evidence_resolve_failed', timestamp: expect.any(String), reason: 'pending_expired' },
+      ],
+    });
   });
 
   it("records Bridge rejection for schema errors without invoking the connector", async () => {

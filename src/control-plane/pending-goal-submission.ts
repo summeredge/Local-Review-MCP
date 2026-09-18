@@ -206,7 +206,7 @@ function prune(records: Map<string, PendingGoalSubmission>, now: number): void {
 export class PendingGoalSubmissionService {
   public readonly storageRoot: string;
   private readonly file: string;
-  private readonly correlations: Pick<ConversationCorrelationRegistry, "correlation">;
+  private readonly correlations: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">;
   private readonly goalSubmission: Pick<GoalSubmissionService, "submitGoal">;
   private readonly now: () => number;
   private readonly identityTimeoutMs: number;
@@ -221,7 +221,7 @@ export class PendingGoalSubmissionService {
   private readonly scheduled = new Map<string, Promise<void>>();
 
   public constructor(
-    correlations: Pick<ConversationCorrelationRegistry, "correlation">,
+    correlations: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">,
     goalSubmission: Pick<GoalSubmissionService, "submitGoal">,
     options: PendingGoalSubmissionServiceOptions = {},
   ) {
@@ -297,9 +297,9 @@ export class PendingGoalSubmissionService {
     });
 
     const stored = this.submissions.get(parsed.correlation_key);
-    if (stored?.state === "pending_identity") this.scheduleExpiry(stored);
-    if (this.correlations.correlation(parsed.correlation_key) !== null) {
-      this.scheduleResolve(parsed.correlation_key);
+    if (stored?.state === "pending_identity") {
+      this.scheduleExpiry(stored);
+      this.scheduleIdentityResolution(stored);
     }
     return receipt;
   }
@@ -360,6 +360,7 @@ export class PendingGoalSubmissionService {
           event: "evidence_resolve_failed",
           correlation_key: key,
           conversation_id: this.correlations.correlation(key)?.conversation_id,
+          reason: "pending_missing",
         });
         return null;
       }
@@ -375,6 +376,7 @@ export class PendingGoalSubmissionService {
           event: "evidence_resolve_failed",
           correlation_key: key,
           conversation_id: this.correlations.correlation(key)?.conversation_id,
+          reason: "pending_expired",
         });
         this.cancelExpiry(key);
         return null;
@@ -382,7 +384,11 @@ export class PendingGoalSubmissionService {
       const correlation = this.correlations.correlation(key);
       if (correlation === null) {
         this.traceMatchFailed(current, "missing_evidence");
-        this.traceTransport({ event: "evidence_resolve_failed", correlation_key: key });
+        this.traceTransport({
+          event: "evidence_resolve_failed",
+          correlation_key: key,
+          reason: "correlation_missing",
+        });
         return null;
       }
 
@@ -438,12 +444,18 @@ export class PendingGoalSubmissionService {
         errorMessage(error),
         error instanceof GoalPreflightError ? error.result : undefined,
       );
+      this.traceTransport({
+        event: "evidence_resolve_failed",
+        correlation_key: key,
+        conversation_id: claimed.conversation_id,
+        reason: "goal_start_failed",
+      });
     }
   }
 
   public async recover(): Promise<void> {
     await this.restore();
-    const keys = await this.exclusive(async () => {
+    const pending = await this.exclusive(async () => {
       const now = this.currentTime();
       const next = new Map(this.submissions);
       let changed = false;
@@ -459,11 +471,10 @@ export class PendingGoalSubmissionService {
         this.submissions = next;
       }
       return [...this.submissions.values()]
-        .filter((record) => record.state === "pending_identity")
-        .filter((record) => this.correlations.correlation(record.correlation_key) !== null)
-        .map((record) => record.correlation_key);
+        .filter((record): record is Extract<PendingGoalSubmission, { state: "pending_identity" }> =>
+          record.state === "pending_identity");
     });
-    for (const key of keys) this.scheduleResolve(key);
+    for (const record of pending) this.scheduleIdentityResolution(record);
   }
 
   public async get(correlationKey: string): Promise<PendingGoalSubmission | null> {
@@ -667,6 +678,14 @@ export class PendingGoalSubmissionService {
         : this.indeterminateRecord(current, this.currentTime(), error));
       await this.persist(next);
       this.submissions = next;
+      this.trace({
+        event: "goal_start_failed",
+        correlation_key: current.correlation_key,
+        workspace_id: current.workspace_id,
+        reason: "goal_start_failed",
+        ...(preflight?.failure_stage === undefined ? {} : { failure_stage: preflight.failure_stage }),
+        failure_reason: preflight?.failure_reason ?? error,
+      });
       this.cancelExpiry(key);
     });
   }
@@ -675,6 +694,26 @@ export class PendingGoalSubmissionService {
     const now = this.now();
     if (!Number.isFinite(now)) throw new Error("pending Goal submission clock is invalid");
     return now;
+  }
+
+  private scheduleIdentityResolution(
+    record: Extract<PendingGoalSubmission, { state: "pending_identity" }>,
+  ): void {
+    if (this.correlations.correlation(record.correlation_key) !== null) {
+      this.scheduleResolve(record.correlation_key);
+      return;
+    }
+
+    const timeoutMs = Math.max(0, Math.min(
+      this.identityTimeoutMs,
+      Date.parse(record.expires_at) - this.currentTime(),
+    ));
+    void this.correlations.awaitCorrelation(record.correlation_key, timeoutMs).then(
+      (correlation) => {
+        if (correlation !== null) this.scheduleResolve(record.correlation_key);
+      },
+      () => undefined,
+    );
   }
 
   private trace(input: IdentityTraceRecordInput): void {

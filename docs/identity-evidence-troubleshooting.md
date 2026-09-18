@@ -46,6 +46,7 @@ The main event fields are:
 | `evidence_match_success` | matched correlation and canonical conversation hashes |
 | `evidence_match_failed` | `reason` plus expected/observed hashes where available |
 | `pending_expired` | creation time, expiry time, timeout duration |
+| `goal_start_failed` | bounded failure stage plus a hash of the failure reason; the pending record retains the existing preflight detail |
 | `goal_started` | goal, phase, task, and execution identifiers |
 
 Failure reasons are:
@@ -58,6 +59,8 @@ Failure reasons are:
   different conversation than its proven owner.
 - `expired`: matching evidence was considered after the pending record's
   existing expiry boundary.
+- `goal_start_failed`: identity matched, but Goal preflight or startup failed;
+  inspect the bounded stage and the existing pending preflight record.
 
 ## Query
 
@@ -133,4 +136,6 @@ extension_evidence_created
 failed the existing Extension evidence schema. Missing Bridge events after
 `extension_evidence_created` localize the loss between the Extension and
 Bridge; missing connector or resolver events localize it after Bridge
-forwarding. The transport trace is hash-only and read-only.
+forwarding. Browser scan rows include only allowlisted flags/counters and
+hashes; transport resolver failures expose only bounded reason codes. The
+transport trace is hash-only and read-only.

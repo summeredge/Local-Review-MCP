@@ -222,7 +222,7 @@ describe("Extension submit_goal correlation evidence", () => {
     expect(laterTool.scan_diagnostic).toMatchObject({ correlation_key_found: true, current_key_found: false, correlation_key: null });
     const messages = await contentMessages(noIdentity);
     expect(messages).toContainEqual(expect.objectContaining({ type: 'identity_diagnostic', stage: 'fiber_scanned',
-      correlation_key: KEY_A, fiber_evidence_count: 0, conversation_unreadable: true }));
+      correlation_key: KEY_A, fiber_evidence_count: 0, evidence_generated: false, conversation_unreadable: true }));
     expect(messages.some(message => message.type === 'identity_evidence')).toBe(false);
     const mismatch = await contentMessages({ version: 1, evidence: [{ request_id: KEY_A, fiber_conversation_id: CONVERSATION_B }] });
     expect(mismatch).toContainEqual(expect.objectContaining({ stage: 'route_checked', fiber_route_match: false }));
@@ -301,6 +301,112 @@ describe("Extension submit_goal correlation evidence", () => {
       request_id: KEY_A,
       fiber_conversation_id: CONVERSATION,
     });
+  });
+
+  it("extracts a key from the standard tool-call argument fields", () => {
+    const contentArguments = {
+      id: "content-arguments",
+      author: { role: "assistant" },
+      recipient: "Local_MCP_Connector.submit_goal",
+      content: { content_type: "tool_call", arguments: JSON.stringify({ correlation_key: KEY_A }) },
+    };
+    const messageArguments = {
+      id: "message-arguments",
+      author: { role: "assistant" },
+      recipient: "Local_MCP_Connector.submit_goal",
+      content: { content_type: "tool_call" },
+      arguments: { correlation_key: KEY_B },
+    };
+    expect(scanFiber([contentArguments]).evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+    expect(scanFiber([messageArguments]).evidence).toEqual([{ request_id: KEY_B, fiber_conversation_id: CONVERSATION }]);
+
+    const textPayload = {
+      id: "text-payload",
+      author: { role: "assistant" },
+      recipient: "Local_MCP_Connector.submit_goal",
+      content: { content_type: "tool_call", text: JSON.stringify({ correlation_key: KEY_C }) },
+    };
+    expect(scanFiber([textPayload]).evidence).toEqual([{ request_id: KEY_C, fiber_conversation_id: CONVERSATION }]);
+  });
+
+  it("reports fail-closed submit_goal parsing reasons without generating evidence", async () => {
+    const cases = [
+      {
+        reason: "recipient_mismatch",
+        found: false,
+        message: currentConnectorRequest("other-tool", "workspace_info", KEY_A),
+      },
+      {
+        reason: "unsupported_content_type",
+        found: true,
+        message: {
+          id: "unsupported-content",
+          author: { role: "assistant" },
+          recipient: "Local_MCP_Connector.submit_goal",
+          content: { content_type: "text", text: JSON.stringify({ correlation_key: KEY_A }) },
+        },
+      },
+      {
+        reason: "missing_tool_payload",
+        found: true,
+        message: {
+          id: "missing-payload",
+          author: { role: "assistant" },
+          recipient: "Local_MCP_Connector.submit_goal",
+          content: { content_type: "tool_call" },
+        },
+      },
+      {
+        reason: "invalid_json",
+        found: true,
+        message: {
+          id: "invalid-json",
+          author: { role: "assistant" },
+          recipient: "Local_MCP_Connector.submit_goal",
+          content: { content_type: "tool_call", arguments: "{bad" },
+        },
+      },
+      {
+        reason: "missing_correlation_key",
+        found: true,
+        message: {
+          id: "missing-key",
+          author: { role: "assistant" },
+          recipient: "Local_MCP_Connector.submit_goal",
+          content: { content_type: "tool_call", arguments: {} },
+        },
+      },
+      {
+        reason: "invalid_correlation_key",
+        found: true,
+        message: {
+          id: "invalid-key",
+          author: { role: "assistant" },
+          recipient: "Local_MCP_Connector.submit_goal",
+          content: { content_type: "tool_call", arguments: { correlation_key: "invalid" } },
+        },
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const reply = scanFiber([testCase.message]);
+      expect(reply.evidence).toEqual([]);
+      expect(reply.scan_diagnostic).toMatchObject({
+        submit_goal_found: testCase.found,
+        correlation_key_found: false,
+        submit_goal_reason: testCase.reason,
+      });
+    }
+
+    const missingKey = scanFiber([cases[4].message]);
+    const messages = await contentMessages(missingKey);
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: "identity_diagnostic",
+      stage: "fiber_scanned",
+      submit_goal_reason: "missing_correlation_key",
+      evidence_generated: false,
+    }));
+    expect(messages.some((message) => message.type === "identity_evidence")).toBe(false);
   });
 
   it("does not use another current Connector tool as submit_goal correlation", () => {

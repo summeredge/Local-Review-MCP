@@ -131,6 +131,67 @@ describe("PendingGoalSubmissionService", () => {
     expect(await pending.get(CORRELATION_A)).toMatchObject({ state: 'failed', error: 'pending_identity_expired' });
     expect(submitGoal).not.toHaveBeenCalled();
   });
+  it("waits for delayed correlation evidence and resolves the pending Goal automatically", async () => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const trace = vi.fn();
+    const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => result(request.conversation_id));
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {
+      storageRoot: root,
+      environment: { LRM_PENDING_IDENTITY_TIMEOUT_MS: "500" },
+      identityTrace: { record: trace },
+    });
+
+    await pending.accept(input());
+    expect(await pending.get(CORRELATION_A)).toMatchObject({ state: "pending_identity" });
+    await correlations.observe(evidence());
+    await waitFor(() => submitGoal.mock.calls.length === 1);
+
+    expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
+      conversation_id: "conversation-a",
+    }));
+    expect((await pending.get(CORRELATION_A))?.state).toBe("started");
+    expect(trace.mock.calls.map(([event]) => event.event)).toEqual([
+      "pending_created",
+      "evidence_match_success",
+      "goal_started",
+    ]);
+  });
+
+  it("fails closed after the identity timeout when correlation never arrives", async () => {
+    const root = await makeRoot();
+    const submitGoal = vi.fn(async () => result());
+    const pending = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, {
+      storageRoot: root,
+      environment: { LRM_PENDING_IDENTITY_TIMEOUT_MS: "50" },
+    });
+
+    await pending.accept(input());
+    await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "failed");
+
+    await expect(pending.get(CORRELATION_A)).resolves.toMatchObject({
+      state: "failed",
+      error: "pending_identity_expired",
+    });
+    expect(submitGoal).not.toHaveBeenCalled();
+  });
+
+  it("resolves immediately when correlation already exists", async () => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    await correlations.observe(evidence());
+    const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => result(request.conversation_id));
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+
+    await pending.accept(input());
+    await waitFor(() => submitGoal.mock.calls.length === 1);
+
+    expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
+      conversation_id: "conversation-a",
+    }));
+    expect((await pending.get(CORRELATION_A))?.state).toBe("started");
+  });
+
   it("uses the configured identity timeout in expiry and trace", async () => {
     const root = await makeRoot();
     let now = Date.now();
@@ -195,10 +256,11 @@ describe("PendingGoalSubmissionService", () => {
       submitGoal: vi.fn(async () => result()),
     }, { storageRoot: root });
     await first.accept(input());
-    await correlations.observe(evidence());
+    const restoredCorrelations = new ConversationCorrelationRegistry(root);
+    await restoredCorrelations.observe(evidence());
 
     const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => result(request.conversation_id));
-    const restarted = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    const restarted = new PendingGoalSubmissionService(restoredCorrelations, { submitGoal }, { storageRoot: root });
     await restarted.restore();
     await restarted.recover();
     await waitFor(() => submitGoal.mock.calls.length === 1);

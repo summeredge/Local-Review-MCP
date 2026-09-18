@@ -20,7 +20,15 @@ export const EVIDENCE_TRANSPORT_TRACE_EVENTS = [
   "browser_identity_diagnostic",
 ] as const;
 
+export const EVIDENCE_TRANSPORT_FAILURE_REASONS = [
+  "pending_missing",
+  "pending_expired",
+  "correlation_missing",
+  "goal_start_failed",
+] as const;
+
 export const evidenceTransportTraceEventNameSchema = z.enum(EVIDENCE_TRANSPORT_TRACE_EVENTS);
+export const evidenceTransportTraceFailureReasonSchema = z.enum(EVIDENCE_TRANSPORT_FAILURE_REASONS);
 const timestampSchema = z.string().datetime({ offset: true });
 const hashSchema = z.string().regex(/^(?:[a-f0-9]{64})?$/u);
 export const browserIdentityDiagnosticSchema = z.object({
@@ -39,6 +47,7 @@ export const browserIdentityDiagnosticSchema = z.object({
     'conversation_unreadable', 'fiber_reply_received', 'navigation_epoch_unchanged',
     'fiber_route_match', 'register_document_ok', 'worker_reply_ok', 'bridge_reply_ok',
     'scan_in_flight', 'route_conversation_present', 'document_authorized', 'sender_source_valid',
+    'evidence_generated',
   ].map(key => [key, z.boolean().optional()]))).strict(),
   assistant_tool_calls_found: z.number().int().min(0).max(100000).optional(),
   fiber_evidence_count: z.number().int().min(0).max(200).optional(),
@@ -49,12 +58,15 @@ const evidenceTransportTraceEventSchema = z.object({
   conversation_id_hash: hashSchema,
   timestamp: timestampSchema,
   event: evidenceTransportTraceEventNameSchema,
+  reason: evidenceTransportTraceFailureReasonSchema.optional(),
   diagnostic: browserIdentityDiagnosticSchema.optional(),
 }).strict();
 
 const evidenceTransportTraceQueryEventSchema = z.object({
   event: evidenceTransportTraceEventNameSchema,
   timestamp: timestampSchema,
+  reason: evidenceTransportTraceFailureReasonSchema.optional(),
+  diagnostic: browserIdentityDiagnosticSchema.optional(),
 }).strict();
 
 export type EvidenceTransportTraceEvent = z.infer<typeof evidenceTransportTraceEventSchema>;
@@ -63,6 +75,7 @@ export type EvidenceTransportTraceEventName = typeof EVIDENCE_TRANSPORT_TRACE_EV
 export interface EvidenceTransportTraceRecordInput {
   readonly diagnostic?: z.infer<typeof browserIdentityDiagnosticSchema>;
   readonly event: EvidenceTransportTraceEventName;
+  readonly reason?: z.infer<typeof evidenceTransportTraceFailureReasonSchema>;
   readonly correlation_key?: string | null;
   readonly conversation_id?: string | null;
 }
@@ -114,6 +127,7 @@ export class EvidenceTransportTraceService {
         correlation_key_hash: input.diagnostic?.correlation_key_hash ?? optionalHash(input.correlation_key),
         conversation_id_hash: input.diagnostic?.conversation_id_hash ?? optionalHash(input.conversation_id),
         ...(input.diagnostic ? { diagnostic: input.diagnostic } : {}),
+        ...(input.reason === undefined ? {} : { reason: input.reason }),
         timestamp: timestamp(this.now()),
         event: input.event,
       });
@@ -152,7 +166,12 @@ export class EvidenceTransportTraceService {
       }
       const candidate = evidenceTransportTraceEventSchema.safeParse(value);
       if (!candidate.success || candidate.data.correlation_key_hash !== correlationHash) continue;
-      events.push({ event: candidate.data.event, timestamp: candidate.data.timestamp });
+      events.push({
+        event: candidate.data.event,
+        timestamp: candidate.data.timestamp,
+        ...(candidate.data.reason === undefined ? {} : { reason: candidate.data.reason }),
+        ...(candidate.data.diagnostic === undefined ? {} : { diagnostic: candidate.data.diagnostic }),
+      });
     }
     return evidenceTransportTraceOutputSchema.parse({ events: events.slice(-10_000) });
   }

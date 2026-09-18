@@ -829,12 +829,60 @@ describe("Control Plane control loop integration", () => {
       "task-1",
       goal.execution_id!,
     ))?.status).toBe("failed");
+    const loop = await harness.auto.getLoop(goal.loop_id!);
+    expect(loop).toMatchObject({
+      stage: "failed",
+      terminal_decision: "FAILED",
+      terminal_reason: "EXECUTION_FAILED",
+    });
     expect(harness.codex.starts).toHaveLength(1);
     expect(harness.review.broker.requests).toHaveLength(0);
     expect(harness.review.completionClient.requests).toHaveLength(0);
     expect(await new ReviewRequestService(harness.root).listReviewRequests(value.workspace_id))
       .toHaveLength(0);
+    const extensionState = JSON.parse(await readFile(
+      join(harness.root, "control-plane", "extension-deliveries.json"),
+      "utf8",
+    )) as {
+      deliveries: Array<{
+        conversation_id: string;
+        message: string;
+        phase: string;
+      }>;
+    };
+    expect(extensionState.deliveries).toHaveLength(1);
+    expect(extensionState.deliveries[0]).toMatchObject({
+      conversation_id: value.conversation_id,
+      phase: "queued",
+    });
+    expect(extensionState.deliveries[0]?.message).toContain("reason: EXECUTION_FAILED");
     await assertIdentity(harness, value, "task-1", false);
+  });
+
+  it("keeps Goal failure durable when failure notification enqueue fails", async () => {
+    const harness = await createHarness(["APPROVE"]);
+    const enqueue = vi.spyOn(harness.auto.extensionDeliveries, "enqueue")
+      .mockRejectedValue(new Error("extension delivery state unavailable"));
+    try {
+      const value = plan("goal-failed-notification-unavailable");
+      const { goal } = await startPlan(harness, value);
+      await emitTerminal(harness, goal.execution_id!, "failed");
+
+      expect((await harness.goals.getGoal(value.goal_id))?.status).toBe("failed");
+      expect((await harness.auto.getLoop(goal.loop_id!))).toMatchObject({
+        stage: "failed",
+        terminal_decision: "FAILED",
+        terminal_reason: "EXECUTION_FAILED",
+      });
+      expect((await harness.tasks.getTaskContext("task-1"))?.status).toBe("failed");
+      expect((await harness.executions.getExecutionContext(
+        value.workspace_id,
+        "task-1",
+        goal.execution_id!,
+      ))?.status).toBe("failed");
+    } finally {
+      enqueue.mockRestore();
+    }
   });
 
   it("recovers a created Review Request without creating it twice", async () => {

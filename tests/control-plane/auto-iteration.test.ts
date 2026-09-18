@@ -864,6 +864,116 @@ describe("AutoIterationService", () => {
     });
     expect(await new ReviewRequestService(value.root).listReviewRequests("workspace-a"))
       .toHaveLength(0);
+
+    const state = JSON.parse(await readFile(
+      join(value.root, "control-plane", "extension-deliveries.json"),
+      "utf8",
+    )) as {
+      deliveries: Array<{
+        logical_delivery_id?: string;
+        conversation_id: string;
+        message: string;
+        phase: string;
+      }>;
+    };
+    expect(state.deliveries).toHaveLength(1);
+    const notification = state.deliveries[0]!;
+    expect(notification).toMatchObject({
+      logical_delivery_id: expect.stringMatching(/^auto-failure-notification-/),
+      conversation_id: "conversation-001",
+      phase: "queued",
+    });
+    expect(notification.message).toContain("workspace_id: workspace-a");
+    expect(notification.message).toContain("task_id: task-001");
+    expect(notification.message).toContain("execution_id: execution-001");
+    expect(notification.message).toContain("loop_id: loop-001");
+    expect(notification.message).toContain("reason: EXECUTION_FAILED");
+    expect(notification.message).toContain("summary: execution failed");
+    expect(notification.message).not.toContain("Review this change");
+    expect(notification.message).not.toContain("<lrm-review-result>");
+    expect(notification.message).not.toContain("review_request_id");
+    expect(notification.message).not.toContain("APPROVE");
+    expect(notification.message).not.toContain("ITERATE");
+  });
+
+  it("reuses the failure notification through duplicate terminal events and recovery", async () => {
+    const value = await fixture(["APPROVE"]);
+    await value.executionService.updateExecutionContext(
+      "workspace-a",
+      "task-001",
+      "execution-001",
+      { status: "failed", summary: "execution failed" },
+    );
+    await value.auto.start(startInput());
+    const execution = await value.executionService.getExecutionContext(
+      "workspace-a",
+      "task-001",
+      "execution-001",
+    );
+    if (execution === null) throw new Error("Failed execution was not persisted.");
+    await value.auto.onExecutionTerminal(execution);
+
+    const restarted = new AutoIterationService(value.registry, { storageRoot: value.root });
+    await restarted.recover();
+    const state = JSON.parse(await readFile(
+      join(value.root, "control-plane", "extension-deliveries.json"),
+      "utf8",
+    )) as { deliveries: Array<{ delivery_id: string; logical_delivery_id: string; phase: string }> };
+    expect(state.deliveries).toHaveLength(1);
+    const notification = state.deliveries[0]!;
+    const owner = {
+      conversation_id: "conversation-001",
+      client_id: "client-failure",
+      document_id: "document-failure",
+      navigation_epoch: 0,
+    };
+    const claimed = await restarted.extensionDeliveries.claim(owner);
+    expect(claimed).toMatchObject({
+      delivery_id: notification.delivery_id,
+      conversation_id: "conversation-001",
+    });
+    await restarted.extensionDeliveries.acknowledge({
+      ...owner,
+      delivery_id: notification.delivery_id,
+      status: "sent",
+      message_id: "message-failure",
+    });
+    await expect(restarted.extensionDeliveries.get(notification.delivery_id))
+      .resolves.toMatchObject({
+        logical_delivery_id: notification.logical_delivery_id,
+        phase: "delivered",
+        receipt: { status: "delivered", message_id: "message-failure" },
+      });
+  });
+
+  it("keeps the failed state when failure notification enqueue fails", async () => {
+    const value = await fixture(["APPROVE"]);
+    const enqueue = vi.spyOn(value.auto.extensionDeliveries, "enqueue")
+      .mockRejectedValue(new Error("extension persistence unavailable"));
+    try {
+      await value.executionService.updateExecutionContext(
+        "workspace-a",
+        "task-001",
+        "execution-001",
+        { status: "failed", summary: "execution failed" },
+      );
+
+      await expect(value.auto.start(startInput())).resolves.toMatchObject({
+        stage: "failed",
+        terminal_decision: "FAILED",
+        terminal_reason: "EXECUTION_FAILED",
+        terminal_summary: "execution failed",
+      });
+      expect(await value.executionService.getExecutionContext(
+        "workspace-a",
+        "task-001",
+        "execution-001",
+      )).toMatchObject({ status: "failed", summary: "execution failed" });
+      expect(await new TaskContextService(value.root).getTaskContext("task-001"))
+        .toMatchObject({ status: "failed" });
+    } finally {
+      enqueue.mockRestore();
+    }
   });
 
   it("starts the review chain from the live execution terminal notification", async () => {

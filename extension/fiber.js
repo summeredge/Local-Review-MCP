@@ -12,6 +12,7 @@
   const MAX_TURNS = 100;
   const MAX_COMPLETION_MESSAGE_CANDIDATES = 20;
   const MAX_COMPLETION_CONTENT = 256 * 1024;
+  const MAX_TOOL_PAYLOAD = 512 * 1024;
   const REQUEST_ID = /^[A-Za-z0-9_-]{1,100}$/u;
   const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
   const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
@@ -407,52 +408,122 @@
     return parts[parts.length - 1];
   }
 
-  function submitGoalCandidateOf(message) {
-    if (!message || typeof message !== 'object' || message.author?.role !== 'assistant') return null;
+  function toolPayloadSourceOf(message, content) {
+    if (own(content, 'arguments')) return { field: 'content.arguments', value: content.arguments };
+    if (own(message, 'arguments')) return { field: 'message.arguments', value: message.arguments };
+    if (own(content, 'text')) return { field: 'content.text', value: content.text };
+    return null;
+  }
+
+  function parseToolPayloadSourceOf(source) {
+    if (!source || (source.field === 'content.text' && typeof source.value !== 'string')) {
+      return { payload: null, reason: 'missing_tool_payload' };
+    }
+    if (typeof source.value !== 'string') return { payload: source.value, reason: null };
+    if (source.value.length === 0) return { payload: null, reason: 'missing_tool_payload' };
+    if (source.value.length > MAX_TOOL_PAYLOAD) return { payload: null, reason: 'invalid_json' };
+    try {
+      return { payload: JSON.parse(source.value), reason: null };
+    } catch {
+      return { payload: null, reason: 'invalid_json' };
+    }
+  }
+
+  function submitGoalInspectionOf(message) {
+    const inspection = { recognized: false, key: null, reason: 'recipient_mismatch' };
+    if (!message || typeof message !== 'object' || message.author?.role !== 'assistant') return inspection;
     const recipient = message.recipient;
     const legacy = recipient === 'api_tool.call_tool';
     const current = recipient === 'Local_MCP_Connector.submit_goal';
-    if (!legacy && !current) return null;
+    if (!legacy && !current) return inspection;
+    inspection.recognized = current;
+
     const content = message.content;
-    if (!content || typeof content !== 'object' || !['code', 'tool_call'].includes(content.content_type)) return null;
-    const text = content && typeof content === 'object' ? content.text : null;
-    if (typeof text !== 'string' || text.length === 0 || text.length > 512 * 1024) return null;
-    let payload;
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      return null;
+    if (!content || typeof content !== 'object' || !['code', 'tool_call'].includes(content.content_type)) {
+      inspection.reason = 'unsupported_content_type';
+      return inspection;
     }
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    if (own(content, 'name') && content.name !== 'submit_goal') {
+      inspection.recognized = false;
+      return inspection;
+    }
+
+    const parsed = parseToolPayloadSourceOf(toolPayloadSourceOf(message, content));
+    if (parsed.reason !== null) {
+      inspection.reason = parsed.reason;
+      return inspection;
+    }
+    const payload = parsed.payload;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      inspection.reason = 'missing_tool_payload';
+      return inspection;
+    }
+
     const pathName = own(payload, 'path') ? toolNameFromPath(payload.path) : null;
-    if ((legacy && pathName !== 'submit_goal') || (own(payload, 'path') && pathName !== 'submit_goal')) return null;
-    for (const key of ['name', 'tool', 'tool_name']) {
-      if (own(payload, key) && payload[key] !== 'submit_goal') return null;
+    if ((legacy && pathName !== 'submit_goal') || (own(payload, 'path') && pathName !== 'submit_goal')) {
+      inspection.recognized = false;
+      return inspection;
     }
+    for (const key of ['name', 'tool', 'tool_name']) {
+      if (own(payload, key) && payload[key] !== 'submit_goal') {
+        inspection.recognized = false;
+        return inspection;
+      }
+    }
+    inspection.recognized = true;
+
     const argumentKeys = ['args', 'arguments'].filter((key) => own(payload, key));
-    if (argumentKeys.length !== 1) return null;
-    let args = payload[argumentKeys[0]];
+    if (argumentKeys.length > 1) {
+      inspection.reason = 'missing_tool_payload';
+      return inspection;
+    }
+    let args = argumentKeys.length === 1 ? payload[argumentKeys[0]] : payload;
     if (typeof args === 'string') {
-      if (args.length === 0 || args.length > 512 * 1024) return null;
+      if (args.length === 0) {
+        inspection.reason = 'missing_tool_payload';
+        return inspection;
+      }
+      if (args.length > MAX_TOOL_PAYLOAD) {
+        inspection.reason = 'invalid_json';
+        return inspection;
+      }
       try {
         args = JSON.parse(args);
       } catch {
-        return null;
+        inspection.reason = 'invalid_json';
+        return inspection;
       }
     }
-    const key = args && typeof args === 'object' && !Array.isArray(args) && own(args, 'correlation_key')
-      ? args.correlation_key : null;
-    return typeof key === 'string' && CORRELATION_KEY.test(key) ? key : null;
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      inspection.reason = 'missing_tool_payload';
+      return inspection;
+    }
+    if (!own(args, 'correlation_key')) {
+      inspection.reason = 'missing_correlation_key';
+      return inspection;
+    }
+    if (typeof args.correlation_key !== 'string' || !CORRELATION_KEY.test(args.correlation_key)) {
+      inspection.reason = 'invalid_correlation_key';
+      return inspection;
+    }
+    inspection.key = args.correlation_key;
+    inspection.reason = null;
+    return inspection;
+  }
+
+  function submitGoalCandidateOf(message) {
+    return submitGoalInspectionOf(message).key;
   }
 
   function currentToolCorrelationOf(messages) {
-    if (!Array.isArray(messages)) return { found: false, key: null };
+    if (!Array.isArray(messages)) return { found: false, key: null, submit_goal_found: false, reason: 'recipient_mismatch' };
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (!requestOf(message)) continue;
-      return { found: true, key: submitGoalCandidateOf(message) };
+      const inspection = submitGoalInspectionOf(message);
+      return { found: true, key: inspection.key, submit_goal_found: inspection.recognized, reason: inspection.reason };
     }
-    return { found: false, key: null };
+    return { found: false, key: null, submit_goal_found: false, reason: 'recipient_mismatch' };
   }
 
   function turnsOf(sections) {
@@ -505,10 +576,9 @@
     }
 
     const assistantToolCalls = Array.isArray(messages) ? messages.filter(requestOf) : [];
-    const submitGoalFound = assistantToolCalls.some((message) =>
-      message.recipient === 'Local_MCP_Connector.submit_goal'
-      || submitGoalCandidateOf(message) !== null);
-    const correlationKeyFound = assistantToolCalls.some((message) => submitGoalCandidateOf(message) !== null);
+    const submitGoalInspections = assistantToolCalls.map(submitGoalInspectionOf);
+    const submitGoalFound = submitGoalInspections.some((inspection) => inspection.recognized);
+    const correlationKeyFound = submitGoalInspections.some((inspection) => inspection.key !== null);
     try {
       console.debug(JSON.stringify({
         timestamp: new Date().toISOString(),
@@ -516,6 +586,7 @@
         assistant_tool_calls_found: assistantToolCalls.length,
         submit_goal_found: submitGoalFound,
         correlation_key_found: correlationKeyFound,
+        submit_goal_reason: currentTool.reason,
         conversation_id_found: Boolean(currentTurnConversationId),
         conversation_conflict: conversation?.conflict === true,
         conversation_unreadable: conversation?.unreadable === true,
@@ -542,6 +613,7 @@
         assistant_tool_calls_found: assistantToolCalls.length,
         submit_goal_found: submitGoalFound,
         correlation_key_found: correlationKeyFound,
+        submit_goal_reason: currentTool.reason,
         current_key_found: Boolean(currentTool.key),
         correlation_key: currentTool.key,
         conversation_id_found: Boolean(currentTurnConversationId),

@@ -23,6 +23,7 @@ import type {
   GoalSubmissionRequest,
   GoalSubmissionResult,
 } from "../../src/control-plane/goal-submission.js";
+import { GoalPreflightError } from "../../src/control-plane/goal-preflight.js";
 import { createMcpServer } from "../../src/mcp/server.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
@@ -223,5 +224,45 @@ describe("IdentityTraceService", () => {
       observed_correlation_key_hash: identityHash(KEY_B),
       conversation_id_hash: identityHash("conversation-b"),
     });
+  });
+
+  it("records a bounded Goal start failure without storing its reason text", async () => {
+    const root = await makeRoot("local-review-mcp-identity-trace-start-failure-");
+    const trace = new IdentityTraceService(root);
+    const correlations = new ConversationCorrelationRegistry(root);
+    const failureReason = "Connector readiness failed at the configured endpoint.";
+    const pending = new PendingGoalSubmissionService(correlations, {
+      submitGoal: vi.fn(async () => {
+        throw new GoalPreflightError({
+          ready: false,
+          runtime: { ready: true },
+          connector: { ready: false },
+          extension: { ready: false },
+          workspace: { valid: true, workspace_id: "workspace-a" },
+          conversation: { valid: true, conversation_id: "conversation-a" },
+          failure_stage: "connector",
+          failure_reason: failureReason,
+        });
+      }),
+    }, { storageRoot: root, identityTrace: trace });
+
+    await pending.accept(input());
+    await correlations.observe(evidence(KEY_A, "conversation-a"));
+    await waitFor(async () => (await pending.get(KEY_A))?.state === "failed");
+
+    await expect(trace.getIdentityTrace(KEY_A)).resolves.toMatchObject({
+      events: [
+        { event: "pending_created" },
+        { event: "evidence_match_success" },
+        {
+          event: "goal_start_failed",
+          reason: "goal_start_failed",
+          failure_stage: "connector",
+          failure_reason_hash: identityHash(failureReason),
+        },
+      ],
+    });
+    const contents = await readFile(trace.file, "utf8");
+    expect(contents).not.toContain(failureReason);
   });
 });

@@ -13,6 +13,7 @@ export const IDENTITY_TRACE_EVENTS = [
   "evidence_match_success",
   "evidence_match_failed",
   "pending_expired",
+  "goal_start_failed",
   "goal_started",
 ] as const;
 
@@ -21,7 +22,10 @@ export const IDENTITY_TRACE_FAILURE_REASONS = [
   "correlation_mismatch",
   "conversation_mismatch",
   "expired",
+  "goal_start_failed",
 ] as const;
+
+const failureStageSchema = z.enum(["runtime", "workspace", "conversation", "connector", "extension"]);
 
 export const identityTraceEventNameSchema = z.enum(IDENTITY_TRACE_EVENTS);
 export const identityTraceFailureReasonSchema = z.enum(IDENTITY_TRACE_FAILURE_REASONS);
@@ -42,6 +46,8 @@ const identityTraceEventSchema = z.object({
   expires_at: timestampSchema.optional(),
   timeout_ms: z.number().int().nonnegative().safe().optional(),
   execution_mode: z.string().min(1).max(64).optional(),
+  failure_stage: failureStageSchema.optional(),
+  failure_reason_hash: hashSchema.optional(),
   observed_correlation_key_hash: hashSchema.optional(),
   expected_conversation_id_hash: hashSchema.optional(),
   goal_id: traceIdSchema.optional(),
@@ -64,6 +70,8 @@ export interface IdentityTraceRecordInput {
   readonly expires_at?: string;
   readonly timeout_ms?: number;
   readonly execution_mode?: string;
+  readonly failure_stage?: z.infer<typeof failureStageSchema>;
+  readonly failure_reason?: string;
   readonly observed_correlation_key?: string;
   readonly expected_conversation_id?: string;
   readonly goal_id?: string;
@@ -84,6 +92,8 @@ const identityTraceQueryEventSchema = z.object({
   expires_at: timestampSchema.optional(),
   timeout_ms: z.number().int().nonnegative().safe().optional(),
   execution_mode: z.string().min(1).max(64).optional(),
+  failure_stage: failureStageSchema.optional(),
+  failure_reason_hash: hashSchema.optional(),
   observed_correlation_key_hash: hashSchema.optional(),
   expected_conversation_id_hash: hashSchema.optional(),
   goal_id: traceIdSchema.optional(),
@@ -152,6 +162,8 @@ export class IdentityTraceService {
         ...(input.expires_at === undefined ? {} : { expires_at: input.expires_at }),
         ...(input.timeout_ms === undefined ? {} : { timeout_ms: input.timeout_ms }),
         ...(input.execution_mode === undefined ? {} : { execution_mode: input.execution_mode }),
+        ...(input.failure_stage === undefined ? {} : { failure_stage: input.failure_stage }),
+        ...(input.failure_reason === undefined ? {} : { failure_reason_hash: identityHash(input.failure_reason) }),
         ...(input.observed_correlation_key === undefined
           ? {}
           : { observed_correlation_key_hash: identityHash(input.observed_correlation_key) }),

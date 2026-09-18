@@ -25,6 +25,10 @@ Filter by SHA-256 of the exact correlation key. Also inspect the surrounding doc
 observations: before a key can be extracted, `correlation_key_hash` is empty; those rows cannot be
 attributed definitively to a Goal. They must never be used to bind a pending Goal.
 
+The read-only `get_evidence_transport_trace` result now includes the same
+allowlisted `diagnostic` object for `browser_identity_diagnostic` rows, so the
+scan branch can be inspected without reading the local JSONL directly.
+
 Fields: `observed_at` (worker observation time), outer `timestamp` (local receipt),
 `document_id_hash` (browser sender document), `conversation_id_hash` (sender route observation only),
 `navigation_epoch`, `scan_id` (content scan counter; background stages use 0), `stage`, `flags`,
@@ -38,6 +42,7 @@ so missing stages within one scan alone do not prove loss; consult the preceding
 | `scan_busy`, scan_in_flight=true repeatedly | Previous scan is still awaiting registration/Fiber/worker; preceding stage narrows the await |
 | `document_registered`, register_document_ok=false | Document registration failed; no Fiber scan is attempted |
 | `fiber_scanned`, fiber_reply_received=false | MAIN-world reply timed out or postMessage failed |
+| `fiber_scanned`, evidence_generated=false | Fiber replied but no validated identity evidence was produced |
 | fiber_root_detected=false / messages_found=false | Current turn root / message collection unavailable |
 | assistant_tool_calls_found=0 | No recognized assistant tool request in selected current turn |
 | submit_goal_found=false / correlation_key_found=false | No recognized valid submit_goal candidate / no strict direct key in this turn |

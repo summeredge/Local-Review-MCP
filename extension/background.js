@@ -519,7 +519,8 @@
     'submit_goal_found', 'correlation_key_found', 'current_key_found', 'conversation_id_found',
     'conversation_conflict', 'conversation_unreadable', 'fiber_reply_received',
     'navigation_epoch_unchanged', 'fiber_route_match', 'register_document_ok', 'worker_reply_ok',
-    'bridge_reply_ok', 'scan_in_flight', 'route_conversation_present', 'document_authorized', 'sender_source_valid'];
+    'bridge_reply_ok', 'scan_in_flight', 'route_conversation_present', 'document_authorized', 'sender_source_valid',
+    'evidence_generated'];
   let diagnosticQueue = Promise.resolve();
   let diagnosticFlush = null;
   async function diagnosticHash(value) {

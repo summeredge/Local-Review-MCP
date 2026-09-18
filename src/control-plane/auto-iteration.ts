@@ -35,6 +35,7 @@ import {
 } from "./extension-delivery.js";
 import { extensionDeliveryReadiness } from "./bridge.js";
 import { ExtensionDeliveryAdapter } from "../delivery/extension-delivery-adapter.js";
+import { buildExecutionFailureMessage } from "../delivery/execution-failure-message.js";
 import type { ReviewDeliveryAdapter } from "../delivery/review-delivery-adapter.js";
 import { BrowserRouter } from "../router/browser-router.js";
 import { ReviewCompletionRouter } from "../router/review-completion-router.js";
@@ -198,6 +199,14 @@ function stableIdentity(kind: string, loopId: string, iteration: number): string
     .digest("hex")
     .slice(0, 32);
   return `auto-${kind}-${digest}`;
+}
+
+function executionFailureNotificationId(loop: Pick<AutoIteration, "loop_id" | "iteration" | "execution_id">): string {
+  const digest = createHash("sha256")
+    .update(`${loop.loop_id}\0${loop.iteration}\0${loop.execution_id}\0execution-failure-notification`)
+    .digest("hex")
+    .slice(0, 32);
+  return `auto-failure-notification-${digest}`;
 }
 
 function iterationInstruction(iteration: ReviewVerdictIteration): string {
@@ -476,6 +485,7 @@ export class AutoIterationService {
     const loops = await this.store.list();
     for (const loop of loops) {
       if (loop.stage === "completed" || loop.stage === "human_required" || loop.stage === "failed") {
+        if (loop.stage === "failed") await this.enqueueExecutionFailureNotification(loop);
         this.notifyTerminal(loop);
         continue;
       }
@@ -1030,8 +1040,38 @@ export class AutoIterationService {
     } catch (error: unknown) {
       console.warn(`Auto Iterate task failure update failed for loop "${current.loop_id}"`, errorMessage(error));
     }
+    await this.enqueueExecutionFailureNotification(current);
     this.notifyTerminal(current);
     return current;
+  }
+
+  private async enqueueExecutionFailureNotification(loop: AutoIteration): Promise<void> {
+    if (loop.stage !== "failed" || loop.terminal_reason !== "EXECUTION_FAILED") return;
+    try {
+      const execution = await this.executions.getExecutionContext(
+        loop.workspace_id,
+        loop.task_id,
+        loop.execution_id,
+      );
+      if (execution?.status !== "failed") return;
+      await this.extensionDeliveries.enqueue(
+        loop.conversation_id,
+        buildExecutionFailureMessage({
+          workspace_id: loop.workspace_id,
+          task_id: loop.task_id,
+          execution_id: loop.execution_id,
+          loop_id: loop.loop_id,
+          reason: "EXECUTION_FAILED",
+          summary: execution.summary,
+        }),
+        executionFailureNotificationId(loop),
+      );
+    } catch (error: unknown) {
+      console.warn(
+        `Auto Iterate execution failure notification enqueue failed for loop "${loop.loop_id}"`,
+        errorMessage(error).slice(0, 500),
+      );
+    }
   }
 
   private async humanRequired(

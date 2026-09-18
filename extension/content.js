@@ -201,6 +201,11 @@
           'conversation_id_found', 'conversation_conflict', 'conversation_unreadable']) {
           if (typeof data.scan_diagnostic?.[key] === 'boolean') diagnostic[key] = data.scan_diagnostic[key];
         }
+        const submitGoalReason = data.scan_diagnostic?.submit_goal_reason;
+        if (['recipient_mismatch', 'unsupported_content_type', 'missing_tool_payload',
+          'invalid_json', 'missing_correlation_key', 'invalid_correlation_key'].includes(submitGoalReason)) {
+          diagnostic.submit_goal_reason = submitGoalReason;
+        }
         const count = data.scan_diagnostic?.assistant_tool_calls_found;
         if (Number.isSafeInteger(count) && count >= 0 && count <= 100000) diagnostic.assistant_tool_calls_found = count;
         const key = data.scan_diagnostic?.correlation_key;
@@ -386,7 +391,8 @@
         && askedUrl === location.href
         && routeConversation() === conversationId;
       const observation = { ...scan.diagnostic, fiber_reply_received: scan.fiber_reply_received === true,
-        fiber_evidence_count: scan.evidence.length, navigation_epoch_unchanged: stillCurrent() };
+        fiber_evidence_count: scan.evidence.length, evidence_generated: scan.evidence.length > 0,
+        navigation_epoch_unchanged: stillCurrent() };
       identityDiagnostic('fiber_scanned', scanId, observation);
       if (!stillCurrent()) return;
       for (const entry of scan.evidence) {
