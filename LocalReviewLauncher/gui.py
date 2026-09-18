@@ -487,6 +487,7 @@ class LauncherWindow(QMainWindow):
             self.execution_details_label.setText("\n".join([
                 f"execution_id: {execution.execution_id}",
                 f"status: {execution.status}",
+                f"summary: {execution.summary or '—'}",
                 f"current turn: {execution.turn_id or '—'}",
                 f"started_at: {self._format_timestamp(execution.started_at)}",
                 f"finished_at: {self._format_timestamp(execution.finished_at)}",

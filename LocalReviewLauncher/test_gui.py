@@ -389,6 +389,26 @@ class LauncherDashboardTests(unittest.TestCase):
                 self.assertEqual(window.event_table.item(0, 0).text(), expected.strftime("%H:%M:%S"))
                 self.assertEqual(view.updated_at, timestamp)
 
+    def test_execution_summary_matches_status_schema_and_survives_turn_fallback(self) -> None:
+        session, execution, events, summary = self._payloads()
+        execution.pop("turn_id")
+        for text in ("", "  diagnostic\n", "x" * 4000, "😀" * 2000):
+            with self.subTest(text_length=len(text)):
+                view = build_session_view_model(session, {**execution, "summary": text}, events)
+                self.assertEqual(view.execution.summary, text)
+                self.assertEqual(view.execution.turn_id, "turn-1")
+        for invalid in (None, 42, False, [], {}, "x" * 4001, "😀" * 2001):
+            with self.subTest(invalid_type=type(invalid)), self.assertRaises(StatusQueryError):
+                build_session_view_model(session, {**execution, "summary": invalid}, events)
+        for payload in (execution, None):
+            view = build_session_view_model(session, payload, events)
+            self.assertIsNone(view.execution.summary)
+            window = self._window()
+            window._render_session_dashboard((view,))
+            window.session_table.selectRow(0)
+            window._render_selected_session()
+            self.assertIn("summary: —", window.execution_details_label.text())
+
     def test_empty_dashboard_shows_no_active_sessions(self) -> None:
         window = self._window()
 
@@ -404,6 +424,7 @@ class LauncherDashboardTests(unittest.TestCase):
         session["status"] = "failed"
         session["current_execution"]["status"] = "failed"
         execution["status"] = "failed"
+        execution["summary"] = "Events could not be saved. [code=EPERM syscall=rename errno=-4048]"
         execution["finished_at"] = "2026-09-15T12:35:00+08:00"
         events["events"][-1] = {
             **events["events"][-1],
@@ -418,6 +439,8 @@ class LauncherDashboardTests(unittest.TestCase):
         LauncherWindow._render_selected_session(window)  # type: ignore[arg-type]
 
         self.assertEqual(window.session_table.item(0, 1).text(), "failed")
+        self.assertEqual(view.execution.summary, execution["summary"])
+        self.assertIn("summary: " + execution["summary"], window.execution_details_label.text())
         self.assertEqual(window.event_table.item(3, 1).text(), "execution_failed")
         self.assertEqual(window.event_table.item(3, 2).text(), "provider failed")
 

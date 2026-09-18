@@ -1,9 +1,11 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { mkdtemp, rm } from "node:fs/promises";
+import * as fs from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CodexEventAdapter,
   EventStore,
@@ -28,11 +30,34 @@ import { goalOrchestrationSchema, type GoalOrchestration } from "../../src/contr
 import { StatusQueryService } from "../../src/control-plane/status-query.js";
 import { createMcpServer } from "../../src/mcp/server.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
+import { eventsFile } from "../../src/control-plane/events/store.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, writeFile: vi.fn(actual.writeFile), rename: vi.fn(actual.rename), readFile: vi.fn(actual.readFile) };
+});
+vi.mock("node:timers/promises", () => ({ setTimeout: vi.fn(async () => undefined) }));
+
+const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+function platform(value: string): void {
+  Object.defineProperty(process, "platform", { ...platformDescriptor, value });
+}
+
+function ioError(code: string, syscall: string): NodeJS.ErrnoException {
+  return Object.assign(new Error("I/O failed at C:/private/session/.events-secret.tmp"), {
+    code, syscall, errno: -4048, path: "C:/private/session/.events-secret.tmp",
+  });
+}
 
 const temporaryDirectories: string[] = [];
 const clients: Client[] = [];
 
 afterEach(async () => {
+  Object.defineProperty(process, "platform", platformDescriptor);
+  vi.mocked(fs.writeFile).mockReset();
+  vi.mocked(fs.rename).mockReset();
+  vi.mocked(fs.readFile).mockReset();
+  vi.mocked(delay).mockClear();
   await Promise.all(clients.splice(0).map((client) => client.close()));
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {
     recursive: true,
@@ -157,6 +182,115 @@ describe("Codex Event Adapter and LRM event stream", () => {
     expect(events.map((event) => event.event_type)).toEqual(["session_started", "turn_started"]);
   });
 
+  it.each(["writeFile", "rename"] as const)("retries Windows %s contention without duplicate events", async (operation) => {
+    platform("win32");
+    const root = await mkdtemp(join(tmpdir(), "lrm-event-retry-"));
+    temporaryDirectories.push(root);
+    const store = new EventStore(root);
+    const event = adapter().adapt(providerEvents()[0]!)!;
+    const expected = [await store.appendEvent(event)];
+    const file = eventsFile(root, "session-1");
+    for (const code of ["EPERM", "EACCES", "EBUSY"]) {
+      const before = await fs.readFile(file, "utf8");
+      const mock = vi.mocked(fs[operation]);
+      mock.mockClear();
+      vi.mocked(delay).mockClear();
+      mock.mockImplementationOnce(async () => {
+        expect(await fs.readFile(file, "utf8")).toBe(before);
+        throw ioError(code, operation === "rename" ? "rename" : "open");
+      });
+      expected.push(await store.appendEvent(event));
+      expect(mock).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(delay).mock.calls).toEqual([[10]]);
+      expect(await store.listEvents("session-1")).toEqual(expected);
+      expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual(expected);
+      expect(await fs.readdir(store.eventsDirectory)).toEqual(["session-1.json"]);
+    }
+    expect(expected.map((event) => event.sequence)).toEqual([1, 2, 3, 4]);
+  });
+
+  it.each(["writeFile", "rename"] as const)("bounds persistent Windows %s errors and preserves cause", async (operation) => {
+    platform("win32");
+    const root = await mkdtemp(join(tmpdir(), "lrm-event-failure-"));
+    temporaryDirectories.push(root);
+    const store = new EventStore(root);
+    const event = adapter().adapt(providerEvents()[0]!)!;
+    const first = await store.appendEvent(event);
+    const mock = vi.mocked(fs[operation]);
+    mock.mockClear();
+    const error = ioError("EPERM", operation === "rename" ? "rename" : "open");
+    mock.mockRejectedValue(error);
+    const caught = await store.appendEvent(event).catch((error: unknown) => error);
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).toMatchObject({ cause: error,
+      message: "Events could not be saved. [code=EPERM syscall=" + error.syscall + " errno=-4048]" });
+    expect((caught as Error).cause).toBe(error);
+    expect((caught as Error).message).not.toContain(error.path);
+    expect(mock).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(delay).mock.calls).toEqual([[10], [20]]);
+    expect(await store.listEvents("session-1")).toEqual([first]);
+    mock.mockReset();
+    expect((await store.appendEvent(event)).sequence).toBe(2);
+    expect(await fs.readdir(store.eventsDirectory)).toEqual(["session-1.json"]);
+  });
+
+  it.each([
+    ["win32", "ENOSPC"], ["win32", "EINVAL"], ["win32", "ENOENT"],
+    ["linux", "EPERM"], ["darwin", "EACCES"], ["linux", "EBUSY"],
+  ])("does not retry %s %s", async (os, code) => {
+    platform(os);
+    const root = await mkdtemp(join(tmpdir(), "lrm-event-no-retry-"));
+    temporaryDirectories.push(root);
+    const store = new EventStore(root);
+    const error = ioError(code, "open");
+    vi.mocked(fs.writeFile).mockRejectedValue(error);
+    await expect(store.appendEvent(adapter().adapt(providerEvents()[0]!)!)).rejects.toMatchObject({ cause: error });
+    expect(fs.writeFile).toHaveBeenCalledTimes(1);
+    expect(fs.rename).not.toHaveBeenCalled();
+    expect(delay).not.toHaveBeenCalled();
+  });
+
+  it("omits absent and unsafe diagnostic fields instead of exposing messages", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lrm-event-safe-error-"));
+    temporaryDirectories.push(root);
+    const store = new EventStore(root);
+    for (const error of [new Error("private path"), Object.assign(new Error("private path"), {
+      code: "EPERM secret/path", syscall: "rename C:/private", errno: "private path",
+    })]) {
+      vi.mocked(fs.writeFile).mockRejectedValueOnce(error);
+      await expect(store.appendEvent(adapter().adapt(providerEvents()[0]!)!)).rejects.toMatchObject({
+        message: "Events could not be saved.", cause: error,
+      });
+    }
+  });
+
+  it("preserves serialization, read validation and corrupt files without retry", async () => {
+    platform("win32");
+    const root = await mkdtemp(join(tmpdir(), "lrm-event-validation-"));
+    temporaryDirectories.push(root);
+    const store = new EventStore(root);
+    const eventAdapter = adapter();
+    const normalized = providerEvents().map((event) => eventAdapter.adapt(event)!);
+    const saved = await Promise.all(normalized.map((event) => store.appendEvent(event)));
+    expect(saved.map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5]);
+    expect(await store.listEvents("session-1")).toEqual(saved);
+    const file = eventsFile(root, "session-1");
+    for (const corrupt of ["{", "{}", JSON.stringify([{ ...saved[0], sequence: 2 }]),
+      JSON.stringify([{ ...saved[0], session_id: "other" }]),
+      JSON.stringify([{ ...saved[0], unexpected: true }])]) {
+      await fs.writeFile(file, corrupt);
+      vi.mocked(fs.writeFile).mockClear();
+      await expect(store.listEvents("session-1")).rejects.toThrow("invalid");
+      await expect(store.appendEvent(normalized[0]!)).rejects.toThrow("invalid");
+      expect(fs.writeFile).not.toHaveBeenCalled();
+      expect(await fs.readFile(file, "utf8")).toBe(corrupt);
+    }
+    expect(() => store.appendEvent({ ...normalized[0], unexpected: true } as unknown as LrmEvent)).toThrow();
+    vi.mocked(fs.readFile).mockRejectedValueOnce(ioError("EPERM", "open"));
+    await expect(store.listEvents("session-1")).rejects.toThrow("Events could not be read.");
+    expect(delay).not.toHaveBeenCalled();
+  });
+
   it("supports the Session lifecycle including running_turn and waiting_input", async () => {
     const root = await mkdtemp(join(tmpdir(), "local-review-mcp-session-events-"));
     temporaryDirectories.push(root);
@@ -178,11 +312,13 @@ describe("Codex Event Adapter and LRM event stream", () => {
     expect((await store.getSession(session.session_id))?.status).toBe("completed");
   });
 
-  it("syncs interactive turn events to Execution and Session status", async () => {
+  it.each(["success", "retry", "EPERM", "ENOSPC"])("syncs interactive events and safe failure summaries: %s", async (mode) => {
+    platform("win32");
     const root = await mkdtemp(join(tmpdir(), "local-review-mcp-event-backend-"));
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-event-workspace-"));
     temporaryDirectories.push(root, workspace);
     const registry = new WorkspaceRegistry([{ id: "workspace-1", name: "Workspace", path: workspace }]);
+    await new TaskContextService(root).createTaskContext({ task_id: "task-1", workspace_id: "workspace-1" });
     const stream = new FakeEventStream();
     const client = {
       processInfo: {
@@ -227,16 +363,42 @@ describe("Codex Event Adapter and LRM event stream", () => {
     stream.push(rawEvents[0]!);
     stream.push(rawEvents[1]!);
     await waitFor(async () => (await sessions.getSession(session!.session_id))?.status === "running_turn");
+    await waitFor(async () => (await events.listEvents(session!.session_id)).length === 2);
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    let eventWrites = 0;
+    vi.mocked(fs.writeFile).mockImplementation(async (...args) => {
+      if (String(args[0]).includes(".events-")) {
+        eventWrites++;
+        if (mode === "EPERM" || mode === "ENOSPC" || (mode === "retry" && eventWrites === 1)) {
+          throw ioError(mode === "ENOSPC" ? "ENOSPC" : "EPERM", "open");
+        }
+      }
+      return actual.writeFile(...args);
+    });
     stream.push(rawEvents[2]!);
     stream.push(rawEvents[3]!);
     stream.push(rawEvents[4]!);
-    await waitFor(async () => (await sessions.getSession(session!.session_id))?.status === "completed");
+    const failed = mode === "EPERM" || mode === "ENOSPC";
+    await waitFor(async () => (await sessions.getSession(session!.session_id))?.status === (failed ? "failed" : "completed"));
 
     await expect(new ExecutionContextService(root).getExecutionContext(
       "workspace-1",
       "task-1",
       "execution-1",
-    )).resolves.toMatchObject({ status: "passed" });
+    )).resolves.toMatchObject({ status: failed ? "failed" : "passed" });
+    if (failed) {
+      expect(eventWrites).toBe(mode === "EPERM" ? 3 : 1);
+      const query = new StatusQueryService({ storageRoot: root });
+      await expect(query.getExecutionStatus({
+        execution_id: "execution-1", workspace_id: "workspace-1", session_id: session!.session_id,
+      })).resolves.toMatchObject({
+        status: "failed",
+        summary: "Events could not be saved. [code=" + mode + " syscall=open errno=-4048]",
+      });
+      expect((await events.listEvents(session!.session_id)).map((event) => event.sequence)).toEqual([1, 2]);
+      await backend.close();
+      return;
+    }
     expect((await events.listEvents(session!.session_id)).map((event) => event.event_type)).toEqual([
       "session_started",
       "turn_started",

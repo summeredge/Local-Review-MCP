@@ -77,6 +77,7 @@ class ExecutionViewModel:
     started_at: str | None = None
     finished_at: str | None = None
     turn_id: str | None = None
+    summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -225,12 +226,19 @@ def _parse_execution_status(
     thread_id = _optional_text(document.get("thread_id"), "thread_id")
     if thread_id is not None and session.get("thread_id") is not None and thread_id != session["thread_id"]:
         raise StatusQueryError("Execution Thread does not match the Session")
+    summary = document.get("summary")
+    if "summary" in document and (
+        not isinstance(summary, str)
+        or len(summary.encode("utf-16-le", errors="surrogatepass")) // 2 > 4_000
+    ):
+        raise StatusQueryError("summary must be a string of at most 4000 UTF-16 code units")
     return ExecutionViewModel(
         execution_id=execution_id,
         status=_status(document.get("status"), "status", EXECUTION_STATUSES),
         started_at=_timestamp(document.get("started_at"), "started_at"),
         finished_at=None if document.get("finished_at") is None else _timestamp(document.get("finished_at"), "finished_at"),
         turn_id=_optional_text(document.get("turn_id"), "turn_id"),
+        summary=summary,
     )
 
 
@@ -304,6 +312,7 @@ def build_session_view_model(
                 started_at=execution.started_at,
                 finished_at=execution.finished_at,
                 turn_id=current["turn_id"],
+                summary=execution.summary,
             )
     elif isinstance(current, dict):
         execution = ExecutionViewModel(

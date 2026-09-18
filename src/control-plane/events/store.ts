@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { sessionIdSchema } from "../../context/schema.js";
 import { defaultTaskContextStorageRoot } from "../../context/task.js";
 import {
@@ -28,7 +29,30 @@ function json(events: readonly StoredLrmEvent[]): string {
   return `${JSON.stringify(events, null, 2)}\n`;
 }
 
+function safeErrorDetails(error: unknown): string {
+  if (!(error instanceof Error)) return "";
+  const { code, syscall, errno } = error as NodeJS.ErrnoException;
+  const fields: string[] = [];
+  if (typeof code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(code)) fields.push("code=" + code);
+  if (typeof syscall === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(syscall)) fields.push("syscall=" + syscall);
+  if (typeof errno === "number" && Number.isSafeInteger(errno)) fields.push("errno=" + errno);
+  return fields.length === 0 ? "" : " [" + fields.join(" ") + "]";
+}
+
 async function writeEvents(file: string, events: readonly StoredLrmEvent[]): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await writeEventsOnce(file, events);
+      return;
+    } catch (error: unknown) {
+      if (process.platform !== "win32" || attempt >= 2
+        || !["EPERM", "EACCES", "EBUSY"].includes(errorCode(error) ?? "")) throw error;
+      await delay(10 * (attempt + 1));
+    }
+  }
+}
+
+async function writeEventsOnce(file: string, events: readonly StoredLrmEvent[]): Promise<void> {
   const temporary = join(dirname(file), `.events-${process.pid}-${randomUUID()}.tmp`);
   try {
     await writeFile(temporary, json(events), { encoding: "utf8", mode: 0o600 });
@@ -62,7 +86,7 @@ export class EventStore {
       try {
         await writeEvents(eventsFile(this.storageRoot, parsed.session_id), [...current, next]);
       } catch (error: unknown) {
-        throw new Error("Events could not be saved.", { cause: error });
+        throw new Error("Events could not be saved." + safeErrorDetails(error), { cause: error });
       }
       return next;
     });
