@@ -13,7 +13,15 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QTableWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+)
 
 from config_manager import LauncherConfig
 from gui import LauncherState, LauncherWindow
@@ -113,6 +121,77 @@ class LauncherLogTests(unittest.TestCase):
             with patch("gui.QFileDialog.getSaveFileName", return_value=(str(target), "")):
                 LauncherWindow.save_log(window)
             self.assertEqual(target.read_bytes(), "启动完成 ✓".encode("utf-8"))
+
+    def test_task_dashboard_layout_and_event_copy(self) -> None:
+        manager = Mock()
+        manager.load.return_value = LauncherConfig("", "config.production.json", False)
+        with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
+            LauncherWindow, "refresh_status"
+        ), patch.object(LauncherWindow, "_render_runtime_info"):
+            process.return_value.has_started = False
+            window = LauncherWindow(Path.cwd(), manager)
+            self.addCleanup(window.close)
+
+        self.assertFalse(window.session_viewer_toggle.isChecked())
+        self.assertTrue(window.session_viewer_content.isHidden())
+        window.session_viewer_toggle.click()
+        self.assertTrue(window.session_viewer_toggle.isChecked())
+        self.assertFalse(window.session_viewer_content.isHidden())
+        window.session_viewer_toggle.click()
+        self.assertTrue(window.session_viewer_content.isHidden())
+        self.assertEqual(window.event_table.minimumHeight(), 270)
+        self.assertLessEqual(
+            window.session_table.maximumHeight(),
+            window.session_table.horizontalHeader().sizeHint().height()
+            + window.session_table.verticalHeader().defaultSectionSize() * 5
+            + 2 * window.session_table.frameWidth(),
+        )
+
+        window.event_table.setRowCount(1)
+        window.event_table.setItem(0, 2, QTableWidgetItem("完整消息\n第二行"))
+        window.event_table.selectRow(0)
+        LauncherWindow.copy_event_stream(window)
+        self.assertEqual(QApplication.clipboard().text(), "完整消息\n第二行")
+
+    def test_clear_task_cache_hides_terminal_records_but_keeps_active_tasks_visible(self) -> None:
+        manager = Mock()
+        manager.load.return_value = LauncherConfig("", "config.production.json", False)
+        session = SessionViewModel(
+            "Goal", "Task", "completed", "codex_app_server", "model", "max",
+            "session-1", "thread-1", "2026-09-18T12:00:00+08:00", "goal-1", "task-1", None, (),
+        )
+        status = LauncherStatus(True, True, True, sessions=(session,))
+        with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
+            LauncherWindow, "_request_status_check"
+        ), patch.object(LauncherWindow, "_render_runtime_info"):
+            process.return_value.has_started = False
+            window = LauncherWindow(Path.cwd(), manager)
+            self.addCleanup(window.close)
+
+        window._render_status(status)
+        self.assertEqual(window.session_table.rowCount(), 1)
+        window.clear_task_cache()
+        window._render_status(status)
+        self.assertEqual(window.session_table.rowCount(), 0)
+        self.assertEqual(window._cleared_session_keys, {("session-1", None)})
+
+        active_session = replace(session, status="running_turn")
+        new_session = replace(active_session, session_id="session-2", task_id="task-2")
+        status_with_active_sessions = LauncherStatus(True, True, True, sessions=(active_session, new_session))
+
+        with patch.object(window, "_request_status_check"), patch.object(window, "_render_runtime_info"):
+            window._refresh_status_automatically()
+        window._render_status(status_with_active_sessions)
+        self.assertEqual(window.session_table.rowCount(), 2)
+        self.assertEqual(
+            [window.session_table.item(row, 5).text() for row in range(2)],
+            ["session-1", "session-2"],
+        )
+
+        with patch.object(window, "_request_status_check"), patch.object(window, "_render_runtime_info"):
+            window.refresh_button.click()
+        window._render_status(status)
+        self.assertEqual(window.session_table.rowCount(), 1)
 
     def test_clear_log_only_clears_display(self) -> None:
         window = self._window()

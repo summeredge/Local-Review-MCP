@@ -70,7 +70,8 @@ refresh.
 The task tab provides two separate cleanup actions:
 
 - **清理界面缓存** clears the current launcher display without touching
-  persisted records. A later refresh can load them again.
+  persisted records. Automatic refreshes keep cleared terminal records hidden,
+  while active or new Sessions remain visible; manual **刷新状态** reloads all.
 - **清理持久化任务记录** removes completed, failed, or terminated Session,
   Event, Execution, and corresponding Task records for the active Workspace.
   Running Sessions and their records are retained. The action uses the

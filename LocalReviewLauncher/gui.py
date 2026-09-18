@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -46,6 +47,9 @@ STARTUP_TIMEOUT_SECONDS = 60
 STARTUP_POLL_INTERVAL_MS = 2_000
 BROWSER_PRESENCE_GRACE_SECONDS = 15
 MAX_EVENT_STREAM_ROWS = 500
+MAX_DASHBOARD_ROWS = 5
+EVENT_STREAM_MIN_HEIGHT = 270
+CLEARED_TERMINAL_SESSION_STATUSES = frozenset({"completed", "failed", "terminated"})
 
 
 class LauncherState(str, Enum):
@@ -72,6 +76,7 @@ class LauncherWindow(QMainWindow):
         self._browser_missing_since: float | None = None
         self._status_check_scheduler = StatusCheckScheduler()
         self._status_check_generation = 0
+        self._cleared_session_keys: set[tuple[str, str | None]] = set()
         self._status_thread_pool = QThreadPool(self)
         self._status_thread_pool.setMaxThreadCount(1)
         self._closing = False
@@ -120,6 +125,11 @@ class LauncherWindow(QMainWindow):
         self.session_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.session_table.horizontalHeader().setStretchLastSection(True)
         self.session_table.setMinimumHeight(160)
+        self.session_table.setMaximumHeight(
+            self.session_table.horizontalHeader().sizeHint().height()
+            + self.session_table.verticalHeader().defaultSectionSize() * MAX_DASHBOARD_ROWS
+            + 2 * self.session_table.frameWidth()
+        )
         self.session_empty_label = QLabel("No active sessions")
         self.session_details_label = QLabel("Select a Session to view details.")
         self.session_details_label.setWordWrap(True)
@@ -129,7 +139,9 @@ class LauncherWindow(QMainWindow):
         self.event_table.setHorizontalHeaderLabels(["时间", "事件类型", "内容"])
         self.event_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.event_table.horizontalHeader().setStretchLastSection(True)
-        self.event_table.setMinimumHeight(180)
+        self.event_table.setMinimumHeight(EVENT_STREAM_MIN_HEIGHT)
+        self.event_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self.event_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.event_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._session_view_models: tuple[SessionViewModel, ...] = ()
         self.message_label = QLabel()
@@ -178,6 +190,7 @@ class LauncherWindow(QMainWindow):
         self.validate_config_button.clicked.connect(self.validate_config)
         self.open_codex_task_button.clicked.connect(self.open_codex_task)
         self.session_table.itemSelectionChanged.connect(self._render_selected_session)
+        self.event_table.addAction(self._copy_event_stream_action())
         self.copy_log_button.clicked.connect(self.copy_log)
         self.clear_log_button.clicked.connect(self.clear_log)
         self.save_log_button.clicked.connect(self.save_log)
@@ -253,11 +266,20 @@ class LauncherWindow(QMainWindow):
         task_layout.addWidget(self.session_table)
         task_layout.addWidget(self.session_empty_label)
         task_layout.addWidget(self.open_codex_task_button)
-        task_layout.addWidget(QLabel("Session Viewer"))
-        task_layout.addWidget(self.session_details_label)
-        task_layout.addWidget(self.execution_details_label)
+        self.session_viewer_toggle = QToolButton()
+        self.session_viewer_toggle.setText("Session Viewer")
+        self.session_viewer_toggle.setCheckable(True)
+        self.session_viewer_toggle.toggled.connect(self._set_session_viewer_expanded)
+        self.session_viewer_content = QWidget()
+        session_viewer_layout = QVBoxLayout(self.session_viewer_content)
+        session_viewer_layout.setContentsMargins(0, 0, 0, 0)
+        session_viewer_layout.addWidget(self.session_details_label)
+        session_viewer_layout.addWidget(self.execution_details_label)
+        task_layout.addWidget(self.session_viewer_toggle)
+        task_layout.addWidget(self.session_viewer_content)
         task_layout.addWidget(QLabel("Event Stream"))
         task_layout.addWidget(self.event_table)
+        self._set_session_viewer_expanded(False)
 
         startup_container = QWidget()
         startup_container.setLayout(startup_layout)
@@ -278,7 +300,7 @@ class LauncherWindow(QMainWindow):
         self.resize(820, 680)
 
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.refresh_status)
+        self.timer.timeout.connect(self._refresh_status_automatically)
         self.timer.start(5_000)
         self.startup_timer = QTimer(self)
         self.startup_timer.setInterval(STARTUP_POLL_INTERVAL_MS)
@@ -303,10 +325,18 @@ class LauncherWindow(QMainWindow):
         return row
 
     def refresh_status(self) -> None:
+        self._refresh_status(restore_task_cache=True)
+
+    def _refresh_status(self, restore_task_cache: bool) -> None:
         if self.state == LauncherState.STARTING:
             return
+        if restore_task_cache:
+            self._cleared_session_keys.clear()
         self._render_runtime_info()
         self._request_status_check("normal")
+
+    def _refresh_status_automatically(self) -> None:
+        self._refresh_status(restore_task_cache=False)
 
     def refresh_oauth_status(self) -> None:
         self.refresh_status()
@@ -331,7 +361,15 @@ class LauncherWindow(QMainWindow):
         self._apply_controls(status)
 
     def _render_status(self, status: LauncherStatus) -> None:
-        self._last_status = status
+        sessions = tuple(
+            session
+            for session in getattr(status, "sessions", ())
+            if (
+                (session.session_id, session.execution_id) not in self._cleared_session_keys
+                or session.status not in CLEARED_TERMINAL_SESSION_STATUSES
+            )
+        )
+        self._last_status = replace(status, sessions=sessions)
         self._set_status(self.mcp_status, "Running" if status.mcp_running else "Stopped", status.mcp_running)
         self._set_status(self.tunnel_status, "Connected" if status.tunnel_connected else "Offline", status.tunnel_connected)
         self._set_status(self.remote_status, "Online" if status.remote_online else "Offline", status.remote_online)
@@ -360,7 +398,7 @@ class LauncherWindow(QMainWindow):
             if display_state == "READY" and not browser.ready else ""
         )
         self._render_oauth_status(status.oauth_registry)
-        self._render_session_dashboard(getattr(status, "sessions", ()))
+        self._render_session_dashboard(sessions)
         self.workspace_label.setText(self._current_workspace_text())
         self.cloudflared_version_label.setText(getattr(status, "cloudflared_version", "unavailable"))
 
@@ -427,6 +465,33 @@ class LauncherWindow(QMainWindow):
             (session for session in self._session_view_models if session.session_id == session_id),
             None,
         )
+
+    def _set_session_viewer_expanded(self, expanded: bool) -> None:
+        self.session_viewer_toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self.session_viewer_content.setVisible(expanded)
+
+    def _copy_event_stream_action(self):
+        from PySide6.QtGui import QAction, QKeySequence
+
+        action = QAction("复制事件内容", self.event_table)
+        action.setShortcut(QKeySequence.StandardKey.Copy)
+        action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        action.triggered.connect(self.copy_event_stream)
+        return action
+
+    def copy_event_stream(self) -> None:
+        rows = dict.fromkeys(item.row() for item in self.event_table.selectedItems())
+        if not rows and self.event_table.currentItem() is not None:
+            rows[self.event_table.currentItem().row()] = None
+        contents = [
+            item.text()
+            for row in rows
+            if (item := self.event_table.item(row, 2)) is not None
+        ]
+        if contents:
+            QApplication.clipboard().setText("\n".join(contents))
 
     def _render_session_dashboard(self, sessions: tuple[SessionViewModel, ...]) -> None:
         selected_id = self._selected_session_id()
@@ -534,6 +599,10 @@ class LauncherWindow(QMainWindow):
         self.event_table.setRowCount(0)
 
     def clear_task_cache(self) -> None:
+        self._cleared_session_keys.update(
+            (session.session_id, session.execution_id)
+            for session in self._session_view_models
+        )
         self._status_check_generation += 1
         self._session_view_models = ()
         self._last_status = replace(self._last_status, sessions=())
@@ -541,7 +610,9 @@ class LauncherWindow(QMainWindow):
         self.session_empty_label.setText("No active sessions")
         self.session_empty_label.setVisible(True)
         self._clear_session_view()
-        self.message_label.setText("Task dashboard interface cache cleared.")
+        self.message_label.setText(
+            "Task dashboard interface cache cleared. Active/new tasks remain visible; press 刷新状态 to reload all."
+        )
 
     def clear_persisted_task_records(self) -> None:
         if (
