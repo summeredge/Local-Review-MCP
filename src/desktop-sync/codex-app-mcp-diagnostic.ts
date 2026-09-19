@@ -443,8 +443,14 @@ export async function connectCodexAppMcp(
   options: ConnectionOptions = {},
 ): Promise<ConnectedCodexAppMcp> {
   const { client, transport } = createCodexAppMcpConnection(runtime, options);
-  await client.connect(transport, options.signal === undefined ? undefined : { signal: options.signal });
-  return { client, transport };
+  try {
+    await client.connect(transport, options.signal === undefined ? undefined : { signal: options.signal });
+    return { client, transport };
+  } catch (error: unknown) {
+    await client.close().catch(() => undefined);
+    await transport.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 function resultFrom(
