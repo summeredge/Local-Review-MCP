@@ -13,6 +13,7 @@
     "diagnose:chatgpt-connector": "npm run build && node dist/src/cli.js diagnose-chatgpt-connector",
     "diagnose:desktop-ipc": "npm run build && node dist/src/cli.js diagnose-desktop-ipc",
     "diagnose:desktop-thread-visibility": "npm run build && node dist/src/cli.js diagnose-desktop-thread-visibility",
+    "diagnose:codex-app-mcp": "npm run build && node dist/src/cli.js diagnose-codex-app-mcp",
     "confirm:chatgpt-connector": "npm run build && node dist/src/cli.js confirm-chatgpt-connector",
     "diagnose:conversation-routing": "npm run build && node dist/src/cli.js diagnose-conversation-routing",
     "diagnose:review-delivery": "npm run build && node dist/src/cli.js diagnose-review-delivery",

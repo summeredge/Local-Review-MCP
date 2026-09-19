@@ -1,5 +1,42 @@
 # Errors
 
+## [ERR-20260919-001] PowerShell discovery script omitted statement separator
+
+**Priority**: low
+**Status**: resolved
+**Area**: tools
+
+### 摘要
+
+The first real codex-app MCP diagnostic run returned `desktop_not_running` even
+though ChatGPT.exe was running because the generated PowerShell command joined
+the preference assignment and `Get-CimInstance` without a semicolon.
+
+### 错误信息
+
+```text
+diagnostic result: stage=desktop_not_running
+evidence: Get-CimInstance Win32_Process returned no parsed records
+```
+
+### 上下文
+
+- `npm run diagnose:codex-app-mcp`
+- PowerShell process discovery command assembled from multiple tokens
+
+### 建议修复
+
+When assembling a PowerShell command from tokens, terminate assignment
+statements explicitly before appending the next command; rerun the real
+diagnostic instead of trusting a structured false negative.
+
+### 元数据
+
+- Reproducible: yes
+- See Also: ERR-20260912-001
+
+---
+
 ## [ERR-20260913-001] Closure audit exposed non-atomic review completion recovery
 
 **Priority**: medium

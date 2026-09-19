@@ -33,6 +33,7 @@ import { WindowsTrayApp } from "./supervisor/tray.js";
 import { WorkspaceManager } from "./workspace/manager.js";
 import { runDesktopIPCDiagnostic } from "./desktop-sync/desktop-ipc-observer.js";
 import { runDesktopThreadVisibilityDiagnostic } from "./desktop-sync/desktop-thread-visibility-diagnostic.js";
+import { runCodexAppMcpDiagnostic } from "./desktop-sync/codex-app-mcp-diagnostic.js";
 
 function printErrorDetails(error: unknown, warning = false): void {
   const log = warning ? console.warn : console.error;
@@ -59,6 +60,10 @@ try {
     await runDesktopIPCDiagnostic(argv.slice(1));
   } else if (argv[0] === "diagnose-desktop-thread-visibility") {
     await runDesktopThreadVisibilityDiagnostic(argv.slice(1));
+  } else if (argv[0] === "diagnose-codex-app-mcp") {
+    const diagnostic = await runCodexAppMcpDiagnostic(argv.slice(1));
+    console.log(JSON.stringify(diagnostic, null, 2));
+    if (!diagnostic.ok) process.exitCode = 1;
   } else if (argv[0] === "diagnose-chatgpt-connector") {
     try {
       const settings = await loadSettings(argv.slice(1));

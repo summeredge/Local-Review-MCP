@@ -3,6 +3,7 @@
 <!-- SCHEMA: {"ts":"ISO-8601","action":"add|promote|extract|resolve","type":"learning|error|feature","id":"entry ID","summary":"≤100字","target":"晋升目标(可选)"} -->
 
 ```jsonl
+{"ts":"2026-09-19T14:46:00+08:00","action":"add","type":"error","id":"ERR-20260919-001","summary":"PowerShell process discovery 组合命令缺少分号，误报 Desktop 未运行；修复后重跑真实诊断"}
 {"ts":"2026-09-05T21:30:00+08:00","action":"add","type":"error","id":"ERR-20260905-002","summary":"Browser Worker 默认 Profile 目录受 sandbox 权限限制；提升目录访问后测试通过"}
 {"ts":"2026-09-05T21:30:00+08:00","action":"add","type":"learning","id":"LRN-20260905-001","summary":"Navigator 用 mock Page 验证导航，但保留 Profile Manager 生命周期边界"}
 {"ts":"2026-09-05T11:24:00+08:00","action":"add","type":"error","id":"ERR-20260905-001","summary":"当前 checkout 的 Git smoke test 受 sandbox 用户与仓库所有者不一致的 safe.directory 检查阻断"}
