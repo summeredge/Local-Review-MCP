@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "diagnose:chatgpt-connector": "npm run build && node dist/src/cli.js diagnose-chatgpt-connector",
+    "diagnose:desktop-ipc": "npm run build && node dist/src/cli.js diagnose-desktop-ipc",
     "confirm:chatgpt-connector": "npm run build && node dist/src/cli.js confirm-chatgpt-connector",
     "diagnose:conversation-routing": "npm run build && node dist/src/cli.js diagnose-conversation-routing",
     "diagnose:review-delivery": "npm run build && node dist/src/cli.js diagnose-review-delivery",

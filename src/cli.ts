@@ -31,6 +31,7 @@ import { createStartupManager } from "./supervisor/startup.js";
 import { createSupervisor } from "./supervisor/supervisor.js";
 import { WindowsTrayApp } from "./supervisor/tray.js";
 import { WorkspaceManager } from "./workspace/manager.js";
+import { runDesktopIPCDiagnostic } from "./desktop-sync/desktop-ipc-observer.js";
 
 function printErrorDetails(error: unknown, warning = false): void {
   const log = warning ? console.warn : console.error;
@@ -53,7 +54,9 @@ function connectorCommandError(error: unknown): void {
 
 try {
   const argv = process.argv.slice(2);
-  if (argv[0] === "diagnose-chatgpt-connector") {
+  if (argv[0] === "diagnose-desktop-ipc") {
+    await runDesktopIPCDiagnostic(argv.slice(1));
+  } else if (argv[0] === "diagnose-chatgpt-connector") {
     try {
       const settings = await loadSettings(argv.slice(1));
       const result = await diagnoseChatGPTConnector(settings);
