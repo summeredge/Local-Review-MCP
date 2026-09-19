@@ -26,12 +26,31 @@ the existing execution chain remain unchanged.
 
 ## Desktop Sync status
 
-The startup overview also shows the read-only Desktop Sync status from the
-local runtime's `DesktopIPCObserver`. The launcher reads the authenticated,
-loopback-only `/launcher/desktop-sync` endpoint; it never reads the Desktop
-named pipe itself and does not control Desktop or change the Codex execution
-backend. When Desktop is not running or IPC is unavailable, the display is
-`Unavailable` and LRM continues normally.
+The startup overview shows the read-only Desktop Sync status from the local
+runtime's `DesktopIPCObserver` through `DesktopSyncManager`. The launcher reads
+the authenticated, loopback-only `/launcher/desktop-sync` endpoint; it never
+reads the Desktop named pipe itself and does not control Desktop.
+
+`mode` is currently always `auto`:
+
+```text
+Desktop IPC Primary
+  valid connected + current conversation evidence
+  → observes and exactly associates the Desktop conversation/thread
+
+Legacy app-server Fallback
+  Desktop disconnected or evidence not established
+  → exposes no guessed Desktop identity; existing LRM Session.thread_id remains authoritative
+
+Codex execution
+  always uses Codex app-server
+```
+
+A connected Desktop conversation whose exact `conversationId` matches no LRM
+Session is reported as `Source: Desktop IPC` with `Association: Unmatched`.
+Multiple exact Session matches are `Association: Conflict`; neither case is
+silently converted into fallback. The Manager is read-only and keeps its
+derived state in memory.
 
 ## Dashboard
 

@@ -142,6 +142,17 @@ class DesktopSyncStatus:
     following_threads: tuple[str, ...] = ()
     owner_client_id: str | None = None
     last_event_time: str | None = None
+    # Fail-closed defaults describe an unavailable Desktop source, not a matched P2 thread.
+    mode: str = "auto"
+    active_source: str = "legacy_app_server"
+    association_status: str = "unavailable"
+    association_reason: str | None = None
+    fallback_reason: str | None = "desktop_disconnected"
+    session_id: str | None = None
+    goal_id: str | None = None
+    task_id: str | None = None
+    execution_id: str | None = None
+    thread_id: str | None = None
 
     @property
     def last_event_display(self) -> str:
@@ -471,6 +482,90 @@ class StatusChecker:
             if not connected and (current_id is not None or following_value is not None
                                   or following_threads or owner_id is not None):
                 raise StatusQueryError("Disconnected Desktop Sync state contains evidence")
+
+            manager_fields = {
+                "mode", "activeSource", "associationStatus", "associationReason", "fallbackReason",
+                "sessionId", "goalId", "taskId", "executionId", "threadId",
+            }
+            present_manager_fields = manager_fields.intersection(document)
+            if not present_manager_fields:
+                has_evidence = connected and current_id is not None
+                return DesktopSyncStatus(
+                    connected=connected,
+                    current_conversation_id=current_id if has_evidence else None,
+                    following=following_value if has_evidence else None,
+                    following_threads=following_threads if has_evidence else (),
+                    owner_client_id=owner_id if has_evidence else None,
+                    last_event_time=last_event_time,
+                    mode="auto",
+                    active_source="desktop_ipc" if has_evidence else "legacy_app_server",
+                    association_status="unavailable",
+                    fallback_reason=(
+                        None
+                        if has_evidence
+                        else "desktop_evidence_unavailable" if connected else "desktop_disconnected"
+                    ),
+                )
+            if present_manager_fields != manager_fields:
+                raise StatusQueryError("Desktop Sync Manager fields are incomplete")
+
+            mode = _status(document["mode"], "mode", frozenset({"auto"}))
+            active_source = _status(
+                document["activeSource"], "activeSource", frozenset({"desktop_ipc", "legacy_app_server"})
+            )
+            association_status = _status(
+                document["associationStatus"],
+                "associationStatus",
+                frozenset({"matched", "unmatched", "unavailable", "conflict"}),
+            )
+            association_reason_value = document["associationReason"]
+            association_reason = None if association_reason_value is None else _status(
+                association_reason_value,
+                "associationReason",
+                frozenset({"ambiguous_thread_mapping", "session_lookup_unavailable"}),
+            )
+            fallback_reason_value = document["fallbackReason"]
+            fallback_reason = None if fallback_reason_value is None else _status(
+                fallback_reason_value,
+                "fallbackReason",
+                frozenset({"desktop_disconnected", "desktop_evidence_unavailable"}),
+            )
+            identifiers = {
+                key: None if document[key] is None else _identifier(document[key], key)
+                for key in ("sessionId", "goalId", "taskId", "executionId", "threadId")
+            }
+            if active_source == "desktop_ipc":
+                if not connected or current_id is None or following_value is None or fallback_reason is not None:
+                    raise StatusQueryError("Desktop IPC source is inconsistent")
+                if association_status == "matched":
+                    if (
+                        association_reason is not None
+                        or identifiers["sessionId"] is None
+                        or identifiers["goalId"] is None
+                        or identifiers["taskId"] is None
+                        or identifiers["threadId"] != current_id
+                    ):
+                        raise StatusQueryError("Matched Desktop association is incomplete")
+                elif any(value is not None for value in identifiers.values()):
+                    raise StatusQueryError("Unmatched Desktop association contains identity")
+                if association_status == "conflict" and association_reason != "ambiguous_thread_mapping":
+                    raise StatusQueryError("Conflict Desktop association lacks its reason")
+                if association_status == "unavailable" and association_reason != "session_lookup_unavailable":
+                    raise StatusQueryError("Unavailable Desktop association lacks its reason")
+                if association_status == "unmatched" and association_reason is not None:
+                    raise StatusQueryError("Unmatched Desktop association has a reason")
+            else:
+                if (
+                    current_id is not None
+                    or following_value is not None
+                    or following_threads
+                    or owner_id is not None
+                    or association_status != "unavailable"
+                    or association_reason is not None
+                    or any(value is not None for value in identifiers.values())
+                    or fallback_reason is None
+                ):
+                    raise StatusQueryError("Legacy Desktop Sync state contains Desktop evidence")
             return DesktopSyncStatus(
                 connected=connected,
                 current_conversation_id=current_id,
@@ -478,6 +573,16 @@ class StatusChecker:
                 following_threads=following_threads,
                 owner_client_id=owner_id,
                 last_event_time=last_event_time,
+                mode=mode,
+                active_source=active_source,
+                association_status=association_status,
+                association_reason=association_reason,
+                fallback_reason=fallback_reason,
+                session_id=identifiers["sessionId"],
+                goal_id=identifiers["goalId"],
+                task_id=identifiers["taskId"],
+                execution_id=identifiers["executionId"],
+                thread_id=identifiers["threadId"],
             )
         except StatusQueryError:
             return DesktopSyncStatus()

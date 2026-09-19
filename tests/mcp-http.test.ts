@@ -200,6 +200,58 @@ describe("MCP HTTP runtime", () => {
     });
   });
 
+  it("serves the DesktopSyncManager state while preserving loopback auth and no-store", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-launcher-desktop-manager-"));
+    temporaryDirectories.push(workspace);
+    const registry = new WorkspaceRegistry([{
+      id: "desktop-manager-workspace",
+      name: "Desktop Manager Workspace",
+      path: workspace,
+    }]);
+    const server = createHttpServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
+    }, {
+      registry,
+      desktopSyncManager: {
+        getState: async () => ({
+          mode: "auto" as const,
+          activeSource: "desktop_ipc" as const,
+          connected: true,
+          currentConversationId: "thread-A",
+          following: true,
+          followingThreads: ["thread-A"],
+          ownerClientId: "desktop-1",
+          lastEventTime: "2026-09-19T01:09:59.933Z",
+          associationStatus: "unmatched" as const,
+          associationReason: null,
+          fallbackReason: null,
+          sessionId: null,
+          goalId: null,
+          taskId: null,
+          executionId: null,
+          threadId: null,
+        }),
+      },
+    });
+    runningServers.push(server);
+    const port = await listen(server);
+    const url = `http://127.0.0.1:${port}/launcher/desktop-sync`;
+    const response = await fetch(url, { headers: { authorization: "Bearer test-token" } });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({
+      mode: "auto",
+      activeSource: "desktop_ipc",
+      associationStatus: "unmatched",
+      fallbackReason: null,
+    });
+  });
+
   it("starts and disposes the Desktop IPC observer with the runtime lifecycle", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-desktop-sync-lifecycle-"));
     temporaryDirectories.push(workspace);

@@ -402,18 +402,38 @@ class LauncherWindow(QMainWindow):
             if display_state == "READY" and not browser.ready else ""
         )
         desktop_sync = getattr(status, "desktop_sync", DesktopSyncStatus())
-        if not desktop_sync.connected:
+        if desktop_sync.active_source == "legacy_app_server":
+            reason = {
+                "desktop_disconnected": "Desktop unavailable",
+                "desktop_evidence_unavailable": "Desktop evidence unavailable",
+            }.get(desktop_sync.fallback_reason, "Desktop Sync unavailable")
+            self.desktop_sync_status.setText("\n".join((
+                "Unavailable",
+                "Mode: Auto",
+                "Source: Legacy app-server",
+                f"Reason: {reason}",
+            )))
+            self.desktop_sync_status.setStyleSheet("color: #666666")
+        elif not desktop_sync.connected:
             self.desktop_sync_status.setText("Unavailable")
             self.desktop_sync_status.setStyleSheet("color: #666666")
         else:
-            self.desktop_sync_status.setText("\n".join((
+            lines = [
                 "Connected",
+                "Mode: Auto",
+                "Source: Desktop IPC",
                 f"Conversation: {desktop_sync.current_conversation_id or '—'}",
                 f"Following: {'Yes' if desktop_sync.following is True else 'No' if desktop_sync.following is False else '—'}",
                 f"Owner: {desktop_sync.owner_client_id or '—'}",
                 f"Last Event: {desktop_sync.last_event_display}",
-            )))
-            self.desktop_sync_status.setStyleSheet("color: #16803c")
+            ]
+            if desktop_sync.association_status != "matched":
+                lines.append(f"Association: {desktop_sync.association_status.title()}")
+            self.desktop_sync_status.setText("\n".join(lines))
+            self.desktop_sync_status.setStyleSheet(
+                "color: #946200" if desktop_sync.association_status in {"conflict", "unavailable"}
+                else "color: #16803c"
+            )
         self._render_oauth_status(status.oauth_registry)
         self._render_session_dashboard(sessions)
         self.workspace_label.setText(self._current_workspace_text())

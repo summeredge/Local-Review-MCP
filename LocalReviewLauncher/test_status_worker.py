@@ -245,6 +245,10 @@ class StatusCheckerTests(unittest.TestCase):
             following_threads=("conversation-1", "thread-2"),
             owner_client_id="desktop-1",
             last_event_time="2026-09-19T01:09:59.933Z",
+            mode="auto",
+            active_source="desktop_ipc",
+            association_status="unavailable",
+            fallback_reason=None,
         ))
         request = open_url.call_args.args[0]
         self.assertEqual(request.full_url, "http://127.0.0.1:12080/launcher/desktop-sync")
@@ -279,6 +283,110 @@ class StatusCheckerTests(unittest.TestCase):
         with patch.object(checker, "_request_json", side_effect=StatusQueryError("unreachable")):
             self.assertEqual(checker.desktop_sync_status(), DesktopSyncStatus())
         with patch.object(checker, "_request_json", return_value=invalid[-1]):
+            self.assertEqual(checker.desktop_sync_status(), DesktopSyncStatus())
+
+    def test_legacy_p2_status_maps_to_a_consistent_fail_closed_source(self) -> None:
+        disconnected = {
+            "connected": False,
+            "currentConversationId": None,
+            "following": None,
+            "followingThreads": [],
+            "ownerClientId": None,
+            "lastEventTime": None,
+        }
+        checker = StatusChecker()
+        with patch.object(checker, "_request_json", return_value=disconnected):
+            self.assertEqual(checker.desktop_sync_status(), DesktopSyncStatus())
+
+        no_evidence = {**disconnected, "connected": True}
+        with patch.object(checker, "_request_json", return_value=no_evidence):
+            status = checker.desktop_sync_status()
+            self.assertEqual(status.active_source, "legacy_app_server")
+            self.assertEqual(status.association_status, "unavailable")
+            self.assertEqual(status.fallback_reason, "desktop_evidence_unavailable")
+
+    def test_desktop_sync_manager_status_keeps_source_and_association_distinct(self) -> None:
+        common = {
+            "mode": "auto",
+            "connected": True,
+            "currentConversationId": "thread-A",
+            "following": True,
+            "followingThreads": ["thread-A"],
+            "ownerClientId": "desktop-1",
+            "lastEventTime": "2026-09-19T01:09:59.933Z",
+            "associationReason": None,
+            "fallbackReason": None,
+            "sessionId": "session-1",
+            "goalId": "goal-1",
+            "taskId": "task-1",
+            "executionId": "execution-1",
+            "threadId": "thread-A",
+        }
+        primary = {**common, "activeSource": "desktop_ipc", "associationStatus": "matched"}
+        checker = StatusChecker()
+        with patch.object(checker, "_request_json", return_value=primary):
+            self.assertEqual(checker.desktop_sync_status().association_status, "matched")
+            self.assertEqual(checker.desktop_sync_status().active_source, "desktop_ipc")
+
+        unmatched = {
+            **common,
+            "activeSource": "desktop_ipc",
+            "associationStatus": "unmatched",
+            "associationReason": None,
+            "sessionId": None,
+            "goalId": None,
+            "taskId": None,
+            "executionId": None,
+            "threadId": None,
+        }
+        with patch.object(checker, "_request_json", return_value=unmatched):
+            status = checker.desktop_sync_status()
+            self.assertEqual(status.active_source, "desktop_ipc")
+            self.assertEqual(status.association_status, "unmatched")
+            self.assertIsNone(status.fallback_reason)
+
+        fallback = {
+            "mode": "auto",
+            "activeSource": "legacy_app_server",
+            "connected": False,
+            "currentConversationId": None,
+            "following": None,
+            "followingThreads": [],
+            "ownerClientId": None,
+            "lastEventTime": None,
+            "associationStatus": "unavailable",
+            "associationReason": None,
+            "fallbackReason": "desktop_disconnected",
+            "sessionId": None,
+            "goalId": None,
+            "taskId": None,
+            "executionId": None,
+            "threadId": None,
+        }
+        with patch.object(checker, "_request_json", return_value=fallback):
+            status = checker.desktop_sync_status()
+            self.assertEqual(status.active_source, "legacy_app_server")
+            self.assertEqual(status.fallback_reason, "desktop_disconnected")
+
+        conflict = {
+            **common,
+            "activeSource": "desktop_ipc",
+            "associationStatus": "conflict",
+            "associationReason": "ambiguous_thread_mapping",
+            "sessionId": None,
+            "goalId": None,
+            "taskId": None,
+            "executionId": None,
+            "threadId": None,
+        }
+        with patch.object(checker, "_request_json", return_value=conflict):
+            status = checker.desktop_sync_status()
+            self.assertEqual(status.association_status, "conflict")
+            self.assertEqual(status.association_reason, "ambiguous_thread_mapping")
+            self.assertIsNone(status.fallback_reason)
+
+        malformed = {**primary, "mode": "manual"}
+        with patch.object(checker, "_request_json", return_value=malformed):
             self.assertEqual(checker.desktop_sync_status(), DesktopSyncStatus())
 
     def test_mcp_sse_tool_response_is_decoded(self) -> None:

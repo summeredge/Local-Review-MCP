@@ -16,6 +16,7 @@ import {
 import { authenticationSource, isAuthenticated } from "../auth/middleware.js";
 import type { ExtensionDeliveryReadiness } from "../control-plane/extension-delivery.js";
 import type { DesktopIPCObserver } from "../desktop-sync/desktop-ipc-observer.js";
+import type { DesktopSyncManager } from "../desktop-sync/desktop-sync-manager.js";
 import type { DesktopSyncState } from "../desktop-sync/desktop-sync-state.js";
 import {
   APP_VERSION,
@@ -47,6 +48,7 @@ type HttpStatusQuery = NonNullable<McpRuntimeContext["statusQuery"]> & {
 type HttpRuntimeContext = Omit<McpRuntimeContext, "statusQuery"> & {
   readonly browserReadiness?: () => ExtensionDeliveryReadiness;
   readonly desktopSyncObserver?: Pick<DesktopIPCObserver, "getState">;
+  readonly desktopSyncManager?: Pick<DesktopSyncManager, "getState">;
   readonly statusQuery?: HttpStatusQuery;
   readonly tunnel?: Pick<TunnelProvider, "status">;
 };
@@ -216,12 +218,12 @@ function desktopSyncStatus(state: DesktopSyncState | undefined): Record<string, 
   };
 }
 
-function handleLauncherDesktopSyncRequest(
+async function handleLauncherDesktopSyncRequest(
   request: IncomingMessage,
   response: ServerResponse,
   context: HttpRuntimeContext,
   authToken: string,
-): void {
+): Promise<void> {
   request.resume();
   if (!isDirectLoopbackRequest(request)) {
     sendJson(response, 404, { error: "not_found" });
@@ -234,6 +236,27 @@ function handleLauncherDesktopSyncRequest(
   if (request.method !== "GET") {
     sendJson(response, 405, { error: "method_not_allowed" });
     return;
+  }
+  if (context.desktopSyncManager !== undefined) {
+    try {
+      sendJson(response, 200, await context.desktopSyncManager.getState(), { "cache-control": "no-store" });
+      return;
+    } catch {
+      sendJson(response, 200, {
+        mode: "auto",
+        activeSource: "legacy_app_server",
+        ...desktopSyncStatus(undefined),
+        associationStatus: "unavailable",
+        associationReason: null,
+        fallbackReason: "desktop_disconnected",
+        sessionId: null,
+        goalId: null,
+        taskId: null,
+        executionId: null,
+        threadId: null,
+      }, { "cache-control": "no-store" });
+      return;
+    }
   }
   let state: DesktopSyncState | undefined;
   try {
@@ -786,7 +809,7 @@ export function createHttpServer(
       }
 
       if (path === LAUNCHER_DESKTOP_SYNC_PATH) {
-        handleLauncherDesktopSyncRequest(request, response, context, settings.auth.token);
+        await handleLauncherDesktopSyncRequest(request, response, context, settings.auth.token);
         return;
       }
 

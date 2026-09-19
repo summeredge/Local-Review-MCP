@@ -76,13 +76,51 @@ class LauncherLogTests(unittest.TestCase):
                 following=True,
                 following_threads=("conversation-1",),
                 owner_client_id="desktop-1",
+                active_source="desktop_ipc",
+                association_status="unavailable",
+                fallback_reason=None,
             )
+            state_before = window.state
             window._render_status(LauncherStatus(True, True, True, desktop_sync=connected_desktop))
             self.assertIn("Connected", window.desktop_sync_status.text())
+            self.assertIn("Mode: Auto", window.desktop_sync_status.text())
+            self.assertIn("Source: Desktop IPC", window.desktop_sync_status.text())
             self.assertIn("Conversation: conversation-1", window.desktop_sync_status.text())
             self.assertIn("Following: Yes", window.desktop_sync_status.text())
+
+            unmatched = replace(connected_desktop, association_status="unmatched")
+            window._render_status(LauncherStatus(True, True, True, desktop_sync=unmatched))
+            self.assertIn("Source: Desktop IPC", window.desktop_sync_status.text())
+            self.assertIn("Association: Unmatched", window.desktop_sync_status.text())
+            self.assertNotIn("Legacy app-server", window.desktop_sync_status.text())
+
+            conflict = replace(connected_desktop, association_status="conflict")
+            window._render_status(LauncherStatus(True, True, True, desktop_sync=conflict))
+            self.assertIn("Association: Conflict", window.desktop_sync_status.text())
+
+            fallback = DesktopSyncStatus(
+                active_source="legacy_app_server",
+                association_status="unavailable",
+                fallback_reason="desktop_disconnected",
+            )
+            window._render_status(LauncherStatus(True, True, True, desktop_sync=fallback))
+            self.assertEqual(window.desktop_sync_status.text(),
+                             "Unavailable\nMode: Auto\nSource: Legacy app-server\nReason: Desktop unavailable")
+
+            evidence_unavailable = replace(
+                fallback,
+                connected=True,
+                fallback_reason="desktop_evidence_unavailable",
+            )
+            window._render_status(LauncherStatus(True, True, True, desktop_sync=evidence_unavailable))
+            self.assertIn("Source: Legacy app-server", window.desktop_sync_status.text())
+            self.assertIn("Reason: Desktop evidence unavailable", window.desktop_sync_status.text())
+
+            self.assertEqual(window.state, state_before)
+            self.assertTrue(window._last_status.mcp_running)
             window._render_status(LauncherStatus(True, True, True, desktop_sync=DesktopSyncStatus()))
-            self.assertEqual(window.desktop_sync_status.text(), "Unavailable")
+            self.assertEqual(window.desktop_sync_status.text(),
+                             "Unavailable\nMode: Auto\nSource: Legacy app-server\nReason: Desktop unavailable")
             for state, reason in (("extension_not_paired", "Extension is not paired."),
                                   ("extension_not_present", "Extension is not connected.")):
                 browser = BrowserReadiness(False, state, True, state == "extension_not_present", False,

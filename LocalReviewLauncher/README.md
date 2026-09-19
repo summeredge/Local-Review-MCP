@@ -33,7 +33,14 @@ The read-only Task Dashboard, Session Viewer, Event Stream, and Codex Task
 locator are documented in [`docs/launcher-dashboard.md`](../docs/launcher-dashboard.md).
 
 The startup overview includes a read-only Desktop Sync Status supplied by the
-local runtime's Desktop IPC Observer through the authenticated loopback
-`/launcher/desktop-sync` endpoint. The launcher does not read the named pipe or
-control Desktop, and this does not change the Codex execution backend. If
-Desktop is not running, it shows `Unavailable` without affecting LRM.
+local runtime's `DesktopSyncManager` through the authenticated loopback
+`/launcher/desktop-sync` endpoint. `mode` is currently `auto`: valid Desktop
+IPC conversation evidence is the Primary observation/association source;
+when Desktop is disconnected or has not established evidence, the status uses
+the existing app-server `Session.thread_id` as the Legacy fallback source.
+The endpoint does not guess a current Session when no unambiguous context is
+available.
+The launcher does not read the named pipe or control Desktop. Codex execution
+always remains on the existing Codex app-server backend. Unmatched or
+conflicting Desktop identities remain visible as Desktop IPC association
+states and are not disguised as fallback.
