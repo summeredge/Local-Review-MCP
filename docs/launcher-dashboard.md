@@ -24,6 +24,15 @@ JSON-RPC payloads, or Codex transcripts directly. The catalog endpoint is only
 for discovering IDs and is not an additional MCP tool, so the MCP tool list and
 the existing execution chain remain unchanged.
 
+## Desktop Sync status
+
+The startup overview also shows the read-only Desktop Sync status from the
+local runtime's `DesktopIPCObserver`. The launcher reads the authenticated,
+loopback-only `/launcher/desktop-sync` endpoint; it never reads the Desktop
+named pipe itself and does not control Desktop or change the Codex execution
+backend. When Desktop is not running or IPC is unavailable, the display is
+`Unavailable` and LRM continues normally.
+
 ## Dashboard
 
 The Task Dashboard shows interactive (`codex_app_server`) Sessions with:

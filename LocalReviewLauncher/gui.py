@@ -39,7 +39,7 @@ from config_manager import (
     LauncherConfigError,
 )
 from process_manager import ProductionProcessManager
-from status_checker import LauncherStatus, OAuthRegistryStatus, SessionViewModel, StatusChecker
+from status_checker import DesktopSyncStatus, LauncherStatus, OAuthRegistryStatus, SessionViewModel, StatusChecker
 from status_worker import StatusCheckScheduler, StatusCheckWorker
 
 
@@ -91,6 +91,9 @@ class LauncherWindow(QMainWindow):
         self.browser_status = QLabel("NOT READY")
         self.browser_status.setWordWrap(True)
         self.browser_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.desktop_sync_status = QLabel("Unavailable")
+        self.desktop_sync_status.setWordWrap(True)
+        self.desktop_sync_status.setTextFormat(Qt.TextFormat.PlainText)
         self.oauth_status_label = QLabel("Unavailable")
         self.oauth_status_label.setWordWrap(True)
         self.workspace_label = QLabel()
@@ -205,6 +208,7 @@ class LauncherWindow(QMainWindow):
         overview_layout.addWidget(self._row("Cloudflare Tunnel:", self.tunnel_status))
         overview_layout.addWidget(self._row("Remote Endpoint:", self.remote_status))
         overview_layout.addWidget(self._row("Browser:", self.browser_status))
+        overview_layout.addWidget(self._row("Desktop Sync:", self.desktop_sync_status))
         overview_layout.addWidget(self._row("OAuth Status:", self.oauth_status_label))
         overview_layout.addWidget(self._row("Workspace:", self.workspace_label))
         top_actions = QWidget()
@@ -397,6 +401,19 @@ class LauncherWindow(QMainWindow):
             "Display grace period: recent presence is missing; submit_goal still checks live readiness."
             if display_state == "READY" and not browser.ready else ""
         )
+        desktop_sync = getattr(status, "desktop_sync", DesktopSyncStatus())
+        if not desktop_sync.connected:
+            self.desktop_sync_status.setText("Unavailable")
+            self.desktop_sync_status.setStyleSheet("color: #666666")
+        else:
+            self.desktop_sync_status.setText("\n".join((
+                "Connected",
+                f"Conversation: {desktop_sync.current_conversation_id or '—'}",
+                f"Following: {'Yes' if desktop_sync.following is True else 'No' if desktop_sync.following is False else '—'}",
+                f"Owner: {desktop_sync.owner_client_id or '—'}",
+                f"Last Event: {desktop_sync.last_event_display}",
+            )))
+            self.desktop_sync_status.setStyleSheet("color: #16803c")
         self._render_oauth_status(status.oauth_registry)
         self._render_session_dashboard(sessions)
         self.workspace_label.setText(self._current_workspace_text())

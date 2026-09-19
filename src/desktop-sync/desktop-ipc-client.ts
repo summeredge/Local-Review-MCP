@@ -195,7 +195,8 @@ export class DesktopIPCClient {
       if (message === undefined) {
         continue;
       }
-      if (message.kind === "response" && this.initializeRequestId !== undefined && message.id === this.initializeRequestId) {
+      if (message.kind === "response") {
+        if (this.initializeRequestId === undefined || message.id !== this.initializeRequestId) continue;
         this.initializeRequestId = undefined;
         if (message.error !== undefined) {
           const reason = typeof message.error === "string" ? message.error : message.error.message;

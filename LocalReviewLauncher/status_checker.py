@@ -19,6 +19,7 @@ LOCAL_OAUTH_CLIENTS_URL = "http://127.0.0.1:12080/oauth/clients"
 LOCAL_MCP_URL = "http://127.0.0.1:12080/mcp"
 LOCAL_SESSION_CATALOG_URL = "http://127.0.0.1:12080/launcher/sessions"
 LOCAL_BROWSER_READINESS_URL = "http://127.0.0.1:12080/launcher/readiness"
+LOCAL_DESKTOP_SYNC_URL = "http://127.0.0.1:12080/launcher/desktop-sync"
 REMOTE_STATUS_URL = "https://review.syqiu.kdns.fr/.well-known/oauth-protected-resource"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 MAX_STATUS_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -134,6 +135,20 @@ class BrowserReadiness:
 
 
 @dataclass(frozen=True)
+class DesktopSyncStatus:
+    connected: bool = False
+    current_conversation_id: str | None = None
+    following: bool | None = None
+    following_threads: tuple[str, ...] = ()
+    owner_client_id: str | None = None
+    last_event_time: str | None = None
+
+    @property
+    def last_event_display(self) -> str:
+        return "—" if self.last_event_time is None else _display_event_time(self.last_event_time)
+
+
+@dataclass(frozen=True)
 class LauncherStatus:
     mcp_running: bool
     tunnel_connected: bool
@@ -142,6 +157,7 @@ class LauncherStatus:
     oauth_registry: OAuthRegistryStatus | None = None
     sessions: tuple[SessionViewModel, ...] = ()
     browser: BrowserReadiness = BrowserReadiness()
+    desktop_sync: DesktopSyncStatus = DesktopSyncStatus()
 
 
 def _object(value: object, label: str) -> dict[str, object]:
@@ -175,6 +191,17 @@ def _timestamp(value: object, label: str) -> str:
         datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError as error:
         raise StatusQueryError(f"{label} must be an RFC3339 timestamp") from error
+    return text
+
+
+def _rfc3339_timestamp(value: object, label: str) -> str:
+    text = _timestamp(value, label)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise StatusQueryError(f"{label} must be an RFC3339 timestamp") from error
+    if "T" not in text or parsed.tzinfo is None:
+        raise StatusQueryError(f"{label} must be an RFC3339 timestamp")
     return text
 
 
@@ -371,6 +398,7 @@ class StatusChecker:
         session_catalog_url: str = LOCAL_SESSION_CATALOG_URL,
         workspace_id: str | None = None,
         browser_readiness_url: str = LOCAL_BROWSER_READINESS_URL,
+        desktop_sync_url: str = LOCAL_DESKTOP_SYNC_URL,
     ) -> None:
         self.auth_token = auth_token
         self.oauth_clients_url = oauth_clients_url
@@ -378,6 +406,7 @@ class StatusChecker:
         self.session_catalog_url = session_catalog_url
         self.workspace_id = workspace_id
         self.browser_readiness_url = browser_readiness_url
+        self.desktop_sync_url = desktop_sync_url
 
     def browser_readiness(self) -> BrowserReadiness:
         try:
@@ -407,6 +436,51 @@ class StatusChecker:
             return BrowserReadiness(ready, state, available, paired, present, seen, reason, action)
         except StatusQueryError:
             return BrowserReadiness()
+
+    def desktop_sync_status(self) -> DesktopSyncStatus:
+        try:
+            document = _object(self._request_json(self.desktop_sync_url), "Desktop Sync")
+            required = {
+                "connected", "currentConversationId", "following", "followingThreads",
+                "ownerClientId", "lastEventTime",
+            }
+            if not required.issubset(document):
+                raise StatusQueryError("Desktop Sync fields are incomplete")
+            connected = document["connected"]
+            if type(connected) is not bool:
+                raise StatusQueryError("connected must be a boolean")
+            current = document["currentConversationId"]
+            current_id = None if current is None else _identifier(current, "currentConversationId")
+            following_value = document["following"]
+            if following_value is not None and type(following_value) is not bool:
+                raise StatusQueryError("following must be a boolean or null")
+            thread_values = document["followingThreads"]
+            if not isinstance(thread_values, list):
+                raise StatusQueryError("followingThreads must be an array")
+            following_threads = tuple(
+                _text(value, "followingThreads[]", 128) for value in thread_values
+            )
+            owner = document["ownerClientId"]
+            owner_id = None if owner is None else _identifier(owner, "ownerClientId")
+            last_event = document["lastEventTime"]
+            last_event_time = None if last_event is None else _rfc3339_timestamp(last_event, "lastEventTime")
+            if current_id is None and following_value is not None:
+                raise StatusQueryError("following requires a current conversation")
+            if current_id is not None and following_value != (current_id in following_threads):
+                raise StatusQueryError("following does not match the current conversation")
+            if not connected and (current_id is not None or following_value is not None
+                                  or following_threads or owner_id is not None):
+                raise StatusQueryError("Disconnected Desktop Sync state contains evidence")
+            return DesktopSyncStatus(
+                connected=connected,
+                current_conversation_id=current_id,
+                following=following_value,
+                following_threads=following_threads,
+                owner_client_id=owner_id,
+                last_event_time=last_event_time,
+            )
+        except StatusQueryError:
+            return DesktopSyncStatus()
 
     def check(self) -> LauncherStatus:
         mcp_running = self._reachable(LOCAL_HEALTH_URL)

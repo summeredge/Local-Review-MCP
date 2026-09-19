@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 
-from status_checker import BrowserReadiness, LauncherStatus, StatusChecker
+from status_checker import BrowserReadiness, DesktopSyncStatus, LauncherStatus, StatusChecker
 
 
 class StatusCheckScheduler:
@@ -55,6 +55,14 @@ class StatusCheckWorker(QRunnable):
                 browser = browser_readiness()
             except Exception:
                 browser = BrowserReadiness()
+        desktop_sync = DesktopSyncStatus()
+        desktop_sync_status = getattr(self.status_checker, "desktop_sync_status", None)
+        if status.mcp_running and callable(desktop_sync_status):
+            try:
+                candidate = desktop_sync_status()
+                desktop_sync = candidate if isinstance(candidate, DesktopSyncStatus) else DesktopSyncStatus()
+            except Exception:
+                desktop_sync = DesktopSyncStatus()
         oauth_status = getattr(self.status_checker, "oauth_status", None)
         if status.mcp_running and callable(oauth_status):
             try:
@@ -69,12 +77,13 @@ class StatusCheckWorker(QRunnable):
             except Exception:
                 sessions = ()
         status = LauncherStatus(
-            status.mcp_running,
-            status.tunnel_connected,
-            status.remote_online,
-            version if isinstance(version, str) else "unavailable",
-            oauth_registry,
-            sessions,
-            browser,
+            mcp_running=status.mcp_running,
+            tunnel_connected=status.tunnel_connected,
+            remote_online=status.remote_online,
+            cloudflared_version=version if isinstance(version, str) else "unavailable",
+            oauth_registry=oauth_registry,
+            sessions=sessions,
+            browser=browser,
+            desktop_sync=desktop_sync,
         )
         self.signals.finished.emit(self.generation, status)

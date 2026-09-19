@@ -27,6 +27,7 @@ from config_manager import LauncherConfig
 from gui import LauncherState, LauncherWindow
 from status_checker import (
     BrowserReadiness,
+    DesktopSyncStatus,
     LauncherStatus,
     OAuthClientStatus,
     OAuthRegistryStatus,
@@ -69,6 +70,19 @@ class LauncherLogTests(unittest.TestCase):
             self.assertGreater(actions.y(), title.geometry().bottom())
             self.assertLess(actions.geometry().bottom(), window.launcher_state.parentWidget().y())
             self.assertTrue(any(label.text() == "Browser:" for label in window.findChildren(QLabel)))
+            connected_desktop = DesktopSyncStatus(
+                connected=True,
+                current_conversation_id="conversation-1",
+                following=True,
+                following_threads=("conversation-1",),
+                owner_client_id="desktop-1",
+            )
+            window._render_status(LauncherStatus(True, True, True, desktop_sync=connected_desktop))
+            self.assertIn("Connected", window.desktop_sync_status.text())
+            self.assertIn("Conversation: conversation-1", window.desktop_sync_status.text())
+            self.assertIn("Following: Yes", window.desktop_sync_status.text())
+            window._render_status(LauncherStatus(True, True, True, desktop_sync=DesktopSyncStatus()))
+            self.assertEqual(window.desktop_sync_status.text(), "Unavailable")
             for state, reason in (("extension_not_paired", "Extension is not paired."),
                                   ("extension_not_present", "Extension is not connected.")):
                 browser = BrowserReadiness(False, state, True, state == "extension_not_present", False,

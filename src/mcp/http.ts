@@ -15,6 +15,8 @@ import {
 } from "../auth/oauth.js";
 import { authenticationSource, isAuthenticated } from "../auth/middleware.js";
 import type { ExtensionDeliveryReadiness } from "../control-plane/extension-delivery.js";
+import type { DesktopIPCObserver } from "../desktop-sync/desktop-ipc-observer.js";
+import type { DesktopSyncState } from "../desktop-sync/desktop-sync-state.js";
 import {
   APP_VERSION,
   DEFAULT_HOST,
@@ -30,6 +32,7 @@ import { createMcpServer, registeredMcpToolsMessage, type McpRuntimeContext } fr
 export const MAX_MCP_REQUEST_BYTES = 1024 * 1024;
 export const OAUTH_CLIENTS_PATH = "/oauth/clients";
 export const LAUNCHER_SESSION_CATALOG_PATH = "/launcher/sessions";
+export const LAUNCHER_DESKTOP_SYNC_PATH = "/launcher/desktop-sync";
 const SAFE_OAUTH_STORAGE_PATH = "oauth/clients.json";
 
 type HttpStatusQuery = NonNullable<McpRuntimeContext["statusQuery"]> & {
@@ -43,6 +46,7 @@ type HttpStatusQuery = NonNullable<McpRuntimeContext["statusQuery"]> & {
 
 type HttpRuntimeContext = Omit<McpRuntimeContext, "statusQuery"> & {
   readonly browserReadiness?: () => ExtensionDeliveryReadiness;
+  readonly desktopSyncObserver?: Pick<DesktopIPCObserver, "getState">;
   readonly statusQuery?: HttpStatusQuery;
   readonly tunnel?: Pick<TunnelProvider, "status">;
 };
@@ -196,6 +200,48 @@ async function handleLauncherSessionCatalogRequest(
   } catch {
     sendJson(response, 500, { error: "task_record_cleanup_failed" });
   }
+}
+
+function desktopSyncStatus(state: DesktopSyncState | undefined): Record<string, unknown> {
+  const currentConversationId = state?.currentConversationId;
+  return {
+    connected: state?.connected ?? false,
+    currentConversationId: currentConversationId ?? null,
+    following: state === undefined || currentConversationId === undefined
+      ? null
+      : state.followingThreads.has(currentConversationId),
+    followingThreads: state === undefined ? [] : [...state.followingThreads].sort(),
+    ownerClientId: state?.ownerClientId ?? null,
+    lastEventTime: state?.lastEventTime ?? null,
+  };
+}
+
+function handleLauncherDesktopSyncRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: HttpRuntimeContext,
+  authToken: string,
+): void {
+  request.resume();
+  if (!isDirectLoopbackRequest(request)) {
+    sendJson(response, 404, { error: "not_found" });
+    return;
+  }
+  if (!isAuthenticated(request, authToken)) {
+    sendUnauthorized(response);
+    return;
+  }
+  if (request.method !== "GET") {
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+  let state: DesktopSyncState | undefined;
+  try {
+    state = context.desktopSyncObserver?.getState();
+  } catch {
+    state = undefined;
+  }
+  sendJson(response, 200, desktopSyncStatus(state), { "cache-control": "no-store" });
 }
 
 async function handleMcpRequest(
@@ -736,6 +782,11 @@ export function createHttpServer(
           sendJson(response, 200, { ...readiness, reason: readiness.reason ?? null, action: readiness.action ?? null },
             { "cache-control": "no-store" });
         }
+        return;
+      }
+
+      if (path === LAUNCHER_DESKTOP_SYNC_PATH) {
+        handleLauncherDesktopSyncRequest(request, response, context, settings.auth.token);
         return;
       }
 

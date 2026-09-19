@@ -31,3 +31,9 @@ Run the launcher-only configuration check with:
 
 The read-only Task Dashboard, Session Viewer, Event Stream, and Codex Task
 locator are documented in [`docs/launcher-dashboard.md`](../docs/launcher-dashboard.md).
+
+The startup overview includes a read-only Desktop Sync Status supplied by the
+local runtime's Desktop IPC Observer through the authenticated loopback
+`/launcher/desktop-sync` endpoint. The launcher does not read the named pipe or
+control Desktop, and this does not change the Codex execution backend. If
+Desktop is not running, it shows `Unavailable` without affecting LRM.

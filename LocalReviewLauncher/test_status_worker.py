@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, Mock, patch
 from PySide6.QtCore import QCoreApplication, QThreadPool
 from status_checker import (
     BrowserReadiness,
+    DesktopSyncStatus,
     StatusQueryError,
     OAuthClientStatus,
     OAuthRegistryStatus,
@@ -46,6 +47,43 @@ class StatusCheckWorkerTests(unittest.TestCase):
         probe.side_effect = TimeoutError()
         worker.run()
         self.assertEqual(results[-1].browser, BrowserReadiness())
+
+    def test_worker_includes_desktop_sync_only_when_mcp_is_running(self) -> None:
+        desktop = DesktopSyncStatus(
+            connected=True,
+            current_conversation_id="conversation-1",
+            following=True,
+            following_threads=("conversation-1",),
+            owner_client_id="desktop-1",
+            last_event_time="2026-09-19T01:09:59.933Z",
+        )
+        probe = Mock(return_value=desktop)
+        checker = SimpleNamespace(
+            check=lambda: LauncherStatus(True, True, True),
+            desktop_sync_status=probe,
+        )
+        results: list[LauncherStatus] = []
+        worker = StatusCheckWorker(checker)  # type: ignore[arg-type]
+        worker.signals.finished.connect(lambda _generation, status: results.append(status))
+
+        worker.run()
+
+        self.assertEqual(results[-1].desktop_sync, desktop)
+        probe.side_effect = TimeoutError()
+        worker.run()
+        self.assertEqual(results[-1].desktop_sync, DesktopSyncStatus())
+
+        offline_probe = Mock()
+        offline_checker = SimpleNamespace(
+            check=lambda: LauncherStatus(False, False, False),
+            desktop_sync_status=offline_probe,
+        )
+        offline_results: list[LauncherStatus] = []
+        offline_worker = StatusCheckWorker(offline_checker)  # type: ignore[arg-type]
+        offline_worker.signals.finished.connect(lambda _generation, status: offline_results.append(status))
+        offline_worker.run()
+        offline_probe.assert_not_called()
+        self.assertEqual(offline_results[-1].desktop_sync, DesktopSyncStatus())
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -184,6 +222,64 @@ class StatusCheckerTests(unittest.TestCase):
                 self.assertEqual(checker.browser_readiness(), BrowserReadiness())
         with patch.object(checker, "_request_json", side_effect=StatusQueryError("unreachable")):
             self.assertEqual(checker.browser_readiness(), BrowserReadiness())
+
+    def test_desktop_sync_status_parses_evidence_and_sends_bearer_auth(self) -> None:
+        response = MagicMock()
+        response.read.return_value = json.dumps({
+            "connected": True,
+            "currentConversationId": "conversation-1",
+            "following": True,
+            "followingThreads": ["conversation-1", "thread-2"],
+            "ownerClientId": "desktop-1",
+            "lastEventTime": "2026-09-19T01:09:59.933Z",
+        }).encode()
+        response.headers.get.return_value = "application/json"
+        response.__enter__.return_value = response
+        with patch("status_checker.urlopen", return_value=response) as open_url:
+            status = StatusChecker(auth_token="secret").desktop_sync_status()
+
+        self.assertEqual(status, DesktopSyncStatus(
+            connected=True,
+            current_conversation_id="conversation-1",
+            following=True,
+            following_threads=("conversation-1", "thread-2"),
+            owner_client_id="desktop-1",
+            last_event_time="2026-09-19T01:09:59.933Z",
+        ))
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:12080/launcher/desktop-sync")
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+
+    def test_desktop_sync_status_fails_closed_on_invalid_or_unreachable_response(self) -> None:
+        valid = {
+            "connected": True,
+            "currentConversationId": "conversation-1",
+            "following": True,
+            "followingThreads": ["conversation-1"],
+            "ownerClientId": "desktop-1",
+            "lastEventTime": "2026-09-19T01:09:59.933Z",
+        }
+        invalid = [
+            None,
+            {**valid, "connected": "true"},
+            {**valid, "currentConversationId": 1},
+            {**valid, "following": "true"},
+            {**valid, "followingThreads": [1]},
+            {**valid, "ownerClientId": []},
+            {**valid, "lastEventTime": "not-a-timestamp"},
+            {**valid, "following": False},
+            {**valid, "connected": False, "currentConversationId": None, "following": None,
+             "followingThreads": ["thread-1"], "ownerClientId": None},
+        ]
+        checker = StatusChecker()
+        for payload in invalid[:-1]:
+            with self.subTest(payload=payload), patch.object(checker, "_request_json", return_value=payload):
+                self.assertEqual(checker.desktop_sync_status(), DesktopSyncStatus())
+        with patch.object(checker, "_request_json", side_effect=StatusQueryError("unreachable")):
+            self.assertEqual(checker.desktop_sync_status(), DesktopSyncStatus())
+        with patch.object(checker, "_request_json", return_value=invalid[-1]):
+            self.assertEqual(checker.desktop_sync_status(), DesktopSyncStatus())
 
     def test_mcp_sse_tool_response_is_decoded(self) -> None:
         response = MagicMock()

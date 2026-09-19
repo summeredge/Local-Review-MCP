@@ -156,7 +156,6 @@ describe("Desktop IPC observer", () => {
       type: "response",
       requestId: initialize.requestId,
       resultType: "success",
-      method: "initialize",
       result: { currentConversationId: "conversation-1", ownerClientId: "desktop-1" },
     });
     first.send({
@@ -234,6 +233,69 @@ describe("Desktop IPC observer", () => {
 
     observer.stop();
     expect(observer.getState().connected).toBe(false);
+  });
+
+  it("only applies the response matching the current initialize request", () => {
+    const connection = new FakeConnection();
+    const warn = vi.fn();
+    const client = new DesktopIPCClient({
+      pipePath: "\\\\.\\pipe\\codex-ipc-test",
+      createConnection: () => connection,
+    });
+    const observer = new DesktopIPCObserver({ client, logger: { warn } });
+
+    observer.start();
+    connection.connect();
+    const initialize = writtenMessage(connection, 0);
+    connection.send({
+      type: "response",
+      requestId: "unrelated-error",
+      resultType: "error",
+      method: "initialize",
+      error: { code: -1, message: "unrelated failure" },
+    });
+    expect(observer.getState().connected).toBe(true);
+    expect(observer.getState().currentConversationId).toBeUndefined();
+    expect(observer.getState().ownerClientId).toBeUndefined();
+    expect(observer.getState().followingThreads).toEqual(new Set());
+    expect(warn).not.toHaveBeenCalled();
+
+    connection.send({
+      type: "response",
+      requestId: initialize.requestId,
+      resultType: "success",
+      result: {
+        currentConversationId: "conversation-1",
+        ownerClientId: "desktop-1",
+        followingThreads: ["thread-1"],
+      },
+    });
+    expect(observer.getState()).toMatchObject({
+      connected: true,
+      currentConversationId: "conversation-1",
+      ownerClientId: "desktop-1",
+    });
+    expect(observer.getState().followingThreads).toEqual(new Set(["thread-1"]));
+
+    connection.send({
+      type: "response",
+      requestId: "unrelated-success",
+      resultType: "success",
+      result: {
+        currentConversationId: "wrong-conversation",
+        ownerClientId: "wrong-client",
+        followingThreads: ["wrong-thread"],
+      },
+    });
+    expect(observer.getState()).toMatchObject({
+      connected: true,
+      currentConversationId: "conversation-1",
+      ownerClientId: "desktop-1",
+    });
+    expect(observer.getState().followingThreads).toEqual(new Set(["thread-1"]));
+    expect(warn).not.toHaveBeenCalled();
+
+    observer.stop();
   });
 
   it("keeps an absent pipe fail-closed and does not throw from start", () => {

@@ -9,6 +9,7 @@ import { startApp } from "../src/app.js";
 import { createHttpServer } from "../src/mcp/http.js";
 import { inboundRequestId } from "../src/mcp/inbound.js";
 import { StatusQueryService } from "../src/control-plane/status-query.js";
+import type { DesktopSyncState } from "../src/desktop-sync/desktop-sync-state.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
 import { EXPECTED_REGISTERED_TOOL_NAMES } from "./fixtures/v01-tools.js";
 
@@ -134,6 +135,94 @@ describe("MCP HTTP runtime", () => {
       deleted_events: 0,
       deleted_tasks: 0,
     });
+  });
+
+  it("serves the authenticated loopback Desktop Sync status without exposing the Set", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-launcher-desktop-sync-"));
+    temporaryDirectories.push(workspace);
+    const registry = new WorkspaceRegistry([{
+      id: "desktop-sync-workspace",
+      name: "Desktop Sync Workspace",
+      path: workspace,
+    }]);
+    let state: DesktopSyncState = { connected: false, followingThreads: new Set() };
+    const server = createHttpServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
+    }, {
+      registry,
+      desktopSyncObserver: { getState: () => state },
+    });
+    runningServers.push(server);
+    const port = await listen(server);
+    const url = `http://127.0.0.1:${port}/launcher/desktop-sync`;
+    const headers = { authorization: "Bearer test-token" };
+
+    expect((await fetch(url)).status).toBe(401);
+    expect((await fetch(url, { method: "POST", headers })).status).toBe(405);
+    expect((await fetch(url, { headers: { ...headers, "x-forwarded-for": "127.0.0.1" } })).status).toBe(404);
+
+    state = {
+      connected: true,
+      currentConversationId: "conversation-1",
+      followingThreads: new Set(["thread-2", "conversation-1"]),
+      ownerClientId: "desktop-1",
+      lastEventTime: "2026-09-19T01:09:59.933Z",
+    };
+    const connected = await fetch(url, { headers });
+    expect(connected.status).toBe(200);
+    expect(connected.headers.get("cache-control")).toBe("no-store");
+    await expect(connected.json()).resolves.toEqual({
+      connected: true,
+      currentConversationId: "conversation-1",
+      following: true,
+      followingThreads: ["conversation-1", "thread-2"],
+      ownerClientId: "desktop-1",
+      lastEventTime: "2026-09-19T01:09:59.933Z",
+    });
+
+    state = {
+      connected: false,
+      followingThreads: new Set(),
+      lastEventTime: "2026-09-19T01:09:59.933Z",
+    };
+    await expect((await fetch(url, { headers })).json()).resolves.toEqual({
+      connected: false,
+      currentConversationId: null,
+      following: null,
+      followingThreads: [],
+      ownerClientId: null,
+      lastEventTime: "2026-09-19T01:09:59.933Z",
+    });
+  });
+
+  it("starts and disposes the Desktop IPC observer with the runtime lifecycle", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-desktop-sync-lifecycle-"));
+    temporaryDirectories.push(workspace);
+    const settings = {
+      host: "127.0.0.1" as const,
+      port: await getFreePort(),
+      workspace,
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
+    };
+    const observer = {
+      start: vi.fn(),
+      stop: vi.fn(),
+      dispose: vi.fn(),
+      getState: vi.fn((): DesktopSyncState => ({ connected: false, followingThreads: new Set() })),
+    };
+    const server = await startApp(settings, undefined, { bridgePorts: [], desktopSyncObserver: observer, silent: true });
+    expect(observer.start).toHaveBeenCalledTimes(1);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    const index = runningServers.indexOf(server);
+    if (index >= 0) runningServers.splice(index, 1);
+    expect(observer.dispose).toHaveBeenCalledTimes(1);
   });
 
   it("propagates the normalized request id into an MCP tool call", async () => {

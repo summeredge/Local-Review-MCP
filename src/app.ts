@@ -57,6 +57,7 @@ import {
 } from "./control-plane/runtime-diagnostic-logger.js";
 import { IdentityTraceService } from "./control-plane/identity-trace.js";
 import { EvidenceTransportTraceService } from "./control-plane/evidence-transport-trace.js";
+import { DesktopIPCObserver } from "./desktop-sync/desktop-ipc-observer.js";
 
 export interface AppContext extends McpRuntimeContext {
   readonly storageRoot?: string;
@@ -87,6 +88,7 @@ export interface AppStartOptions extends HttpServerOptions {
   readonly bridgePorts?: readonly number[];
   readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => void | Promise<void>;
   readonly runtimeDiagnosticLogger?: RuntimeDiagnosticLogger;
+  readonly desktopSyncObserver?: Pick<DesktopIPCObserver, "start" | "stop" | "dispose" | "getState">;
 }
 
 export function createAppContext(
@@ -217,6 +219,8 @@ export async function startApp(
   options: AppStartOptions = {},
 ): Promise<Server> {
   const runtimeDiagnosticLogger = options.runtimeDiagnosticLogger ?? new FileRuntimeDiagnosticLogger();
+  const desktopSyncObserver = options.desktopSyncObserver
+    ?? new DesktopIPCObserver();
   try {
     const workspaceOAuth = context.storageRoot === undefined
       ? undefined
@@ -225,7 +229,11 @@ export async function startApp(
           storageRoot: context.storageRoot,
           singleWorkspace: context.registry.list().length === 1,
         });
-    const server = await startHttpServer(settings, { ...context, browserReadiness: extensionDeliveryReadiness }, {
+    const server = await startHttpServer(settings, {
+      ...context,
+      browserReadiness: extensionDeliveryReadiness,
+      desktopSyncObserver,
+    }, {
       oauthClientRegistryPath: options.oauthClientRegistryPath ?? workspaceOAuth?.clientRegistryPath,
       oauthTokenStorePath: options.oauthTokenStorePath
         ?? (options.oauthClientRegistryPath === undefined
@@ -346,6 +354,11 @@ export async function startApp(
       );
     }
     server.once("close", () => {
+      try {
+        desktopSyncObserver.dispose();
+      } catch {
+        // Desktop observation must not affect runtime shutdown.
+      }
       context.goalPreflight?.setRuntimeReady(false);
       void context.executionService?.close().catch(() => undefined);
       void stopBridge().catch(() => undefined);
@@ -382,6 +395,11 @@ export async function startApp(
       await context.pendingGoalSubmission?.recover();
     } catch {
       console.warn("Pending Goal submission recovery failed; local MCP remains available");
+    }
+    try {
+      desktopSyncObserver.start();
+    } catch {
+      console.warn("Desktop IPC Observer unavailable; local MCP remains available");
     }
     return server;
   } catch (error: unknown) {
