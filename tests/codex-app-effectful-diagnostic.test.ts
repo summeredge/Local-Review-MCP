@@ -8,7 +8,15 @@ import {
 } from "../src/desktop-sync/codex-app-effectful-diagnostic.js";
 
 type FakeMode =
-  | "create-success"
+  | "success"
+  | "first-unverifiable"
+  | "send-result-error"
+  | "send-exception"
+  | "first-wait-timeout"
+  | "second-wait-timeout"
+  | "send-schema-incompatible"
+  | "no-completion-tools"
+  | "read-fallback"
   | "create-result-error"
   | "create-exception"
   | "list-result-error"
@@ -20,6 +28,7 @@ const EXECUTOR_THREAD = "019d1c2a-8c46-7b1b-8ab1-123456789abc";
 const CREATED_THREAD = "019d1c2a-8c46-7b1b-8ab1-9876543210ab";
 const WORKSPACE_PATH = "C:/workspace/Local-Review-MCP";
 const CREATE_PROMPT = "Only return LRM_CODEX_APP_P5_1_CREATE_PASS. Do not modify any files, create commits, or push.";
+const SECOND_PROMPT = "Only return LRM_CODEX_APP_P5_1_SECOND_PASS. Do not modify any files, create commits, or push.";
 const temporaryRoots: string[] = [];
 
 afterEach(() => {
@@ -58,6 +67,61 @@ function createSchema(): Record<string, unknown> {
   };
 }
 
+function sendSchema(incompatible: boolean): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      ...(incompatible ? {} : { threadId: { type: "string" } }),
+      prompt: { type: "string" },
+      hostId: { type: "string" },
+    },
+    required: incompatible ? ["prompt"] : ["threadId", "prompt"],
+    additionalProperties: false,
+  };
+}
+
+function waitSchema(incompatible: boolean): Record<string, unknown> {
+  return incompatible
+    ? { type: "object", properties: {}, required: ["unsupported"], additionalProperties: false }
+    : {
+      type: "object",
+      properties: {
+        targets: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              threadId: { type: "string", minLength: 1 },
+              hostId: { type: "string", minLength: 1 },
+              afterCursor: { type: "string", minLength: 1 },
+            },
+            required: ["threadId"],
+            additionalProperties: false,
+          },
+        },
+        timeoutMs: { type: "integer", minimum: 0, maximum: 120000 },
+      },
+      required: ["targets"],
+      additionalProperties: false,
+    };
+}
+
+function readSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      threadId: { type: "string" },
+      hostId: { type: "string" },
+      cursor: { type: "string" },
+      turnLimit: { type: "integer", minimum: 1, maximum: 10 },
+      includeOutputs: { type: "boolean" },
+      maxOutputCharsPerItem: { type: "integer", minimum: 0, maximum: 20000 },
+    },
+    required: ["threadId"],
+    additionalProperties: false,
+  };
+}
+
 function projectsForMode(mode: ProjectMode): Array<Record<string, unknown>> {
   const project = (
     projectId: string,
@@ -83,9 +147,11 @@ function fakeServer(
   projectMode: ProjectMode = "one",
   errorText = "approval required",
 ): { server: string; log: string } {
-  const root = temporaryRoot("codex-app-effectful-p5-1-5");
+  const root = temporaryRoot("codex-app-effectful-p5-1-6");
   const server = join(root, "server.mjs");
   const log = join(root, "requests.log");
+  const includeCompletionTools = mode !== "no-completion-tools";
+  const useReadFallback = mode === "read-fallback";
   writeFileSync(server, `
 import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -95,6 +161,10 @@ const errorText = ${JSON.stringify(errorText)};
 const log = ${JSON.stringify(log)};
 const projects = ${JSON.stringify(projectsForMode(projectMode))};
 const createSchema = ${JSON.stringify(createSchema())};
+const sendSchema = ${JSON.stringify(sendSchema(mode === "send-schema-incompatible"))};
+const waitSchema = ${JSON.stringify(waitSchema(useReadFallback))};
+const readSchema = ${JSON.stringify(readSchema())};
+let completionCalls = 0;
 
 function reply(message) {
   process.stdout.write(JSON.stringify(message) + "\\n");
@@ -102,6 +172,18 @@ function reply(message) {
 function record(value) {
   appendFileSync(log, JSON.stringify(value) + "\\n");
 }
+  function completionResult(marker, status = "completed") {
+    return {
+      content: [{ type: "text", text: JSON.stringify({
+      threads: [{
+        threadId: ${JSON.stringify(CREATED_THREAD)},
+        turnCompleted: status === "completed",
+        latestAssistantMessage: marker,
+        errors: [],
+      }],
+      }) }],
+    };
+  }
 
 const input = createInterface({ input: process.stdin });
 input.on("line", (line) => {
@@ -118,18 +200,16 @@ input.on("line", (line) => {
       },
     });
   } else if (request.method === "tools/list") {
-    reply({
-      jsonrpc: "2.0",
-      id: request.id,
-      result: {
-        tools: ["list_projects", "create_thread", "send_message_to_thread"].map((name) => ({
-          name,
-          inputSchema: name === "create_thread"
-            ? createSchema
-            : { type: "object", properties: {}, required: [] },
-        })),
-      },
-    });
+    const tools = [
+      { name: "list_projects", inputSchema: { type: "object", properties: {}, required: [] } },
+      { name: "create_thread", inputSchema: createSchema },
+      { name: "send_message_to_thread", inputSchema: sendSchema },
+      ...(${includeCompletionTools} ? [
+        { name: "wait_threads", inputSchema: waitSchema },
+        { name: "read_thread", inputSchema: readSchema },
+      ] : []),
+    ];
+    reply({ jsonrpc: "2.0", id: request.id, result: { tools } });
   } else if (request.method === "tools/call") {
     const name = request.params?.name;
     if (name === "list_projects") {
@@ -166,11 +246,35 @@ input.on("line", (line) => {
           content: [{ type: "text", text: JSON.stringify({ threadId: ${JSON.stringify(CREATED_THREAD)}, hostId: "local" }) }],
         } });
       }
+    } else if (name === "send_message_to_thread") {
+      if (mode === "send-exception") {
+        reply({ jsonrpc: "2.0", id: request.id, error: { code: -32002, message: errorText } });
+      } else if (mode === "send-result-error") {
+        reply({ jsonrpc: "2.0", id: request.id, result: {
+          isError: true,
+          content: [{ type: "text", text: errorText }],
+        } });
+      } else {
+        reply({ jsonrpc: "2.0", id: request.id, result: { content: [] } });
+      }
+    } else if (name === "wait_threads" || name === "read_thread") {
+      completionCalls += 1;
+      if ((mode === "first-wait-timeout" && completionCalls === 1)
+        || (mode === "second-wait-timeout" && completionCalls === 2)) {
+        return;
+      }
+      const marker = completionCalls === 1
+        ? "LRM_CODEX_APP_P5_1_CREATE_PASS"
+        : "LRM_CODEX_APP_P5_1_SECOND_PASS";
+      const status = mode === "first-unverifiable" && completionCalls === 1 ? "running" : "completed";
+      reply({ jsonrpc: "2.0", id: request.id, result: completionResult(marker, status) });
     } else {
       reply({ jsonrpc: "2.0", id: request.id, result: { content: [] } });
     }
   }
 });
+input.on("close", () => process.exit(0));
+setInterval(() => {}, 1000);
 `, "utf8");
   return { server, log };
 }
@@ -194,13 +298,13 @@ function runArgs(fake: { server: string }, ...extra: string[]): string[] {
   return ["--confirm-effectful", "--executor-thread", EXECUTOR_THREAD, "--server", fake.server, ...extra];
 }
 
-function runDependencies(): { environment: NodeJS.ProcessEnv; workspacePath: string } {
-  return { environment: {}, workspacePath: WORKSPACE_PATH };
+function runDependencies(timeoutMs?: number): { environment: NodeJS.ProcessEnv; workspacePath: string; timeoutMs?: number } {
+  return { environment: {}, workspacePath: WORKSPACE_PATH, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
 }
 
-describe("codex app P5.1.5 Desktop-owned create_thread diagnostic", () => {
+describe("codex app P5.1.6 send_message_to_thread continuity diagnostic", () => {
   it("fails closed without an executor thread and performs zero tools/call requests", async () => {
-    const fake = fakeServer("create-success");
+    const fake = fakeServer("success");
     const result = await runCodexAppEffectfulDiagnostic(
       ["--confirm-effectful", "--server", fake.server],
       runDependencies(),
@@ -235,27 +339,33 @@ describe("codex app P5.1.5 Desktop-owned create_thread diagnostic", () => {
     });
   });
 
-  it("uses the same request-level executor metadata for list_projects and create_thread", async () => {
-    const fake = fakeServer("create-success");
+  it("waits, sends to the created target thread, waits again, and reuses executor metadata", async () => {
+    const fake = fakeServer("success");
     const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies());
 
     expect(result).toMatchObject({
       ok: true,
-      stage: "create_thread_succeeded",
+      stage: "continuity_succeeded",
       metadataGatePassed: true,
       listProjectsSucceeded: true,
       resolvedProject: true,
-      projectResolutionSource: "list_projects",
-      resolvedProjectId: "project-one",
       targetSchemaValid: true,
       environmentType: "local",
       createThreadCalled: true,
       threadCreated: true,
+      createdThreadSuffix: CREATED_THREAD.slice(-8),
       threadIdSuffix: CREATED_THREAD.slice(-8),
       hostId: "local",
-      sendMessageCalled: false,
+      firstTurnCompleted: true,
+      firstMarkerObserved: true,
+      sendMessageCalled: true,
+      sendTargetMatchesCreatedThread: true,
+      secondTurnCompleted: true,
+      secondMarkerObserved: true,
+      sameThread: true,
+      writerConflictObserved: false,
       readThreadCalled: false,
-      waitThreadsCalled: false,
+      waitThreadsCalled: true,
     });
     expect(JSON.stringify(result)).not.toContain(CREATED_THREAD);
 
@@ -266,24 +376,43 @@ describe("codex app P5.1.5 Desktop-owned create_thread diagnostic", () => {
       "tools/list",
       "tools/call",
       "tools/call",
+      "tools/call",
+      "tools/call",
+      "tools/call",
     ]);
-    expect(toolCalls(fake.log)).toHaveLength(2);
-    expect(toolCallParams(fake.log, 0)._meta).toEqual({ "openai/threadId": EXECUTOR_THREAD });
-    expect(toolCallParams(fake.log, 1)._meta).toEqual({ "openai/threadId": EXECUTOR_THREAD });
+    expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name)).toEqual([
+      "list_projects",
+      "create_thread",
+      "wait_threads",
+      "send_message_to_thread",
+      "wait_threads",
+    ]);
+    expect(toolCalls(fake.log)).toHaveLength(5);
+    for (const call of toolCalls(fake.log)) {
+      expect((call.params as Record<string, unknown>)._meta).toEqual({ "openai/threadId": EXECUTOR_THREAD });
+    }
 
     expect(toolCallParams(fake.log, 0)).toMatchObject({ name: "list_projects", arguments: {} });
-    const createParams = toolCallParams(fake.log, 1);
-    expect(createParams.name).toBe("create_thread");
-    expect(createParams.arguments).toMatchObject({
-      prompt: CREATE_PROMPT,
-      target: {
-        type: "project",
-        projectId: "project-one",
-        environment: { type: "local" },
+    expect(toolCallParams(fake.log, 1)).toMatchObject({
+      name: "create_thread",
+      arguments: {
+        prompt: CREATE_PROMPT,
+        target: { type: "project", projectId: "project-one", environment: { type: "local" } },
       },
     });
-    expect(createParams.arguments).not.toHaveProperty("threadId");
-    expect(createParams.arguments).not.toHaveProperty("thread_id");
+    expect(toolCallParams(fake.log, 2)).toMatchObject({
+      name: "wait_threads",
+      arguments: { targets: [{ threadId: CREATED_THREAD, hostId: "local" }] },
+    });
+    expect(toolCallParams(fake.log, 3)).toMatchObject({
+      name: "send_message_to_thread",
+      arguments: { threadId: CREATED_THREAD, hostId: "local", prompt: SECOND_PROMPT },
+    });
+    expect(toolCallParams(fake.log, 4)).toMatchObject({
+      name: "wait_threads",
+      arguments: { targets: [{ threadId: CREATED_THREAD, hostId: "local" }] },
+    });
+    expect(toolCallParams(fake.log, 3).arguments).not.toHaveProperty("executorThreadId");
   });
 
   it.each([
@@ -292,7 +421,7 @@ describe("codex app P5.1.5 Desktop-owned create_thread diagnostic", () => {
     ["non-local project kind", "invalid-kind", "desktop_project_not_found"],
     ["non-local project host", "invalid-host", "desktop_project_not_found"],
   ] as const)("fails closed for %s before create_thread", async (_label, projectMode, stage) => {
-    const fake = fakeServer("create-success", projectMode);
+    const fake = fakeServer("success", projectMode);
     const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies());
 
     expect(result).toMatchObject({
@@ -302,10 +431,9 @@ describe("codex app P5.1.5 Desktop-owned create_thread diagnostic", () => {
       listProjectsSucceeded: true,
       resolvedProject: false,
       createThreadCalled: false,
-      threadCreated: false,
+      sendMessageCalled: false,
     });
     expect(toolCalls(fake.log)).toHaveLength(1);
-    expect(toolCallParams(fake.log, 0).name).toBe("list_projects");
   });
 
   it.each([
@@ -322,18 +450,15 @@ describe("codex app P5.1.5 Desktop-owned create_thread diagnostic", () => {
       ok: false,
       stage: "create_thread_failed",
       metadataGatePassed: true,
-      listProjectsSucceeded: true,
       resolvedProject: true,
       createThreadCalled: true,
       threadCreated: false,
       failureClass,
       sendMessageCalled: false,
-      readThreadCalled: false,
-      waitThreadsCalled: false,
+      firstTurnCompleted: false,
     });
-    expect(toolCalls(fake.log)).toHaveLength(2);
-    expect(toolCallParams(fake.log, 0).name).toBe("list_projects");
-    expect(toolCallParams(fake.log, 1).name).toBe("create_thread");
+    expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
+      .toEqual(["list_projects", "create_thread"]);
   });
 
   it("stops after a create_thread exception without retry", async () => {
@@ -348,41 +473,164 @@ describe("codex app P5.1.5 Desktop-owned create_thread diagnostic", () => {
       createThreadCalled: true,
       threadCreated: false,
       sendMessageCalled: false,
-      readThreadCalled: false,
-      waitThreadsCalled: false,
     });
     expect(toolCalls(fake.log)).toHaveLength(2);
   });
 
-  it("classifies the original list_projects metadata rejection without entering create_thread", async () => {
-    const fake = fakeServer("metadata-gate-error");
+  it("fails closed when first-turn completion cannot be verified", async () => {
+    const fake = fakeServer("first-unverifiable");
     const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies());
 
     expect(result).toMatchObject({
       ok: false,
+      stage: "first_turn_completion_unverifiable",
+      metadataGatePassed: true,
+      threadCreated: true,
+      firstTurnCompleted: false,
+      sendMessageCalled: false,
+      waitThreadsCalled: true,
+    });
+    expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
+      .toEqual(["list_projects", "create_thread", "wait_threads"]);
+  });
+
+  it("classifies a first-turn wait timeout without sending", async () => {
+    const fake = fakeServer("first-wait-timeout");
+    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies(5));
+
+    expect(result).toMatchObject({
+      ok: false,
+      stage: "first_turn_timeout",
+      failureClass: "first_turn_timeout",
+      threadCreated: true,
+      firstTurnCompleted: false,
+      sendMessageCalled: false,
+    });
+    expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
+      .toEqual(["list_projects", "create_thread", "wait_threads"]);
+  });
+
+  it("does not send when the dynamic send schema is incompatible", async () => {
+    const fake = fakeServer("send-schema-incompatible");
+    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies());
+
+    expect(result).toMatchObject({
+      ok: false,
+      stage: "send_message_schema_incompatible",
+      firstTurnCompleted: true,
+      sendMessageCalled: false,
+      secondTurnCompleted: false,
+    });
+    expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
+      .toEqual(["list_projects", "create_thread", "wait_threads"]);
+  });
+
+  it("classifies the active-turn steer race without retry", async () => {
+    const fake = fakeServer("send-result-error", "one", "Cannot steer conversation because its active turn already ended");
+    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies());
+
+    expect(result).toMatchObject({
+      ok: false,
+      stage: "steer_race",
+      failureClass: "steer_race",
+      firstTurnCompleted: true,
+      sendMessageCalled: true,
+      sendTargetMatchesCreatedThread: true,
+      secondTurnCompleted: false,
+    });
+    expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
+      .toEqual(["list_projects", "create_thread", "wait_threads", "send_message_to_thread"]);
+  });
+
+  it("classifies a send exception and never retries", async () => {
+    const fake = fakeServer("send-exception", "one", "permission denied by native bridge");
+    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies());
+
+    expect(result).toMatchObject({
+      ok: false,
+      stage: "send_message_failed",
+      failureClass: "permission_denied",
+      firstTurnCompleted: true,
+      sendMessageCalled: true,
+      secondTurnCompleted: false,
+    });
+    expect(toolCalls(fake.log)).toHaveLength(4);
+  });
+
+  it("classifies a second-turn timeout without retry", async () => {
+    const fake = fakeServer("second-wait-timeout");
+    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies(5));
+
+    expect(result).toMatchObject({
+      ok: false,
+      stage: "second_turn_timeout",
+      failureClass: "second_turn_timeout",
+      firstTurnCompleted: true,
+      sendMessageCalled: true,
+      sendTargetMatchesCreatedThread: true,
+      secondTurnCompleted: false,
+      sameThread: false,
+    });
+    expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
+      .toEqual(["list_projects", "create_thread", "wait_threads", "send_message_to_thread", "wait_threads"]);
+  });
+
+  it("uses read_thread only when wait_threads schema is incompatible", async () => {
+    const fake = fakeServer("read-fallback");
+    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies());
+
+    expect(result).toMatchObject({
+      ok: true,
+      stage: "continuity_succeeded",
+      firstTurnCompleted: true,
+      secondTurnCompleted: true,
+      firstMarkerObserved: true,
+      secondMarkerObserved: true,
+      readThreadCalled: true,
+      waitThreadsCalled: false,
+      sameThread: true,
+    });
+    expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
+      .toEqual(["list_projects", "create_thread", "read_thread", "send_message_to_thread", "read_thread"]);
+  });
+
+  it("fails closed when neither wait_threads nor read_thread is available", async () => {
+    const fake = fakeServer("no-completion-tools");
+    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies());
+
+    expect(result).toMatchObject({
+      ok: false,
+      stage: "first_turn_completion_unverifiable",
+      threadCreated: true,
+      sendMessageCalled: false,
+      firstTurnCompleted: false,
+      waitThreadsCalled: false,
+      readThreadCalled: false,
+    });
+    expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
+      .toEqual(["list_projects", "create_thread"]);
+  });
+
+  it("classifies the original and downstream list_projects -32602 errors without create_thread", async () => {
+    const metadataGate = fakeServer("metadata-gate-error");
+    const metadataResult = await runCodexAppEffectfulDiagnostic(runArgs(metadataGate), runDependencies());
+    expect(metadataResult).toMatchObject({
       stage: "list_projects_failed",
       errorCode: -32602,
       failureClass: "executor_metadata_rejected",
       metadataGatePassed: false,
-      listProjectsCalled: true,
       createThreadCalled: false,
     });
-    expect(toolCalls(fake.log)).toHaveLength(1);
-  });
 
-  it("classifies a downstream native list_projects error without retry", async () => {
-    const fake = fakeServer("native-request-error");
-    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies());
-
-    expect(result).toMatchObject({
-      ok: false,
+    const native = fakeServer("native-request-error");
+    const nativeResult = await runCodexAppEffectfulDiagnostic(runArgs(native), runDependencies());
+    expect(nativeResult).toMatchObject({
       stage: "list_projects_failed",
       errorCode: -32602,
       failureClass: "native_request_invalid",
       metadataGatePassed: true,
       createThreadCalled: false,
     });
-    expect(toolCalls(fake.log)).toHaveLength(1);
   });
 
   it("stops after a list_projects result failure without retry", async () => {

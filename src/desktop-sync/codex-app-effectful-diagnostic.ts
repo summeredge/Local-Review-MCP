@@ -14,6 +14,9 @@ import {
 } from "./codex-app-mcp-diagnostic.js";
 
 const CREATE_PROMPT = "Only return LRM_CODEX_APP_P5_1_CREATE_PASS. Do not modify any files, create commits, or push.";
+const SECOND_PROMPT = "Only return LRM_CODEX_APP_P5_1_SECOND_PASS. Do not modify any files, create commits, or push.";
+const FIRST_MARKER = "LRM_CODEX_APP_P5_1_CREATE_PASS";
+const SECOND_MARKER = "LRM_CODEX_APP_P5_1_SECOND_PASS";
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 120_000;
 const EXECUTOR_METADATA_KEY = "openai/threadId" as const;
@@ -23,6 +26,7 @@ const EXECUTOR_METADATA_ERROR_FINGERPRINT = "9eb0c658fe43c9440be141bdfba1c400db5
 const NATIVE_REQUEST_ERROR_FINGERPRINT = "4ba5282b280ceabcfb431897e91c387578cabc4be5572d19493465f8927a5bd9";
 const READ_ONLY_ALLOWLIST = new Set(["list_projects"]);
 const EFFECTFUL_ALLOWLIST = new Set(["create_thread"]);
+const CONTINUITY_ALLOWLIST = new Set(["wait_threads", "read_thread", "send_message_to_thread"]);
 
 export type CreateThreadFailureClass =
   | "approval_required"
@@ -43,7 +47,20 @@ export type MetadataGateFailureClass =
   | "native_request_invalid"
   | "list_projects_failed";
 
-export type CodexAppEffectfulFailureClass = CreateThreadFailureClass | MetadataGateFailureClass;
+export type ContinuityFailureClass =
+  | "first_turn_timeout"
+  | "first_turn_completion_unverifiable"
+  | "send_message_schema_incompatible"
+  | "send_message_failed"
+  | "second_turn_timeout"
+  | "second_turn_completion_unverifiable"
+  | "thread_identity_mismatch"
+  | "steer_race";
+
+export type CodexAppEffectfulFailureClass =
+  | CreateThreadFailureClass
+  | MetadataGateFailureClass
+  | ContinuityFailureClass;
 
 export type CodexAppEffectfulDiagnosticStage =
   | Exclude<CodexAppMcpDiagnosticStage, "ok">
@@ -53,11 +70,20 @@ export type CodexAppEffectfulDiagnosticStage =
   | "create_thread_schema_incompatible"
   | "create_thread_failed"
   | "create_thread_succeeded"
+  | "continuity_succeeded"
   | "thread_identity_missing"
   | "list_projects_schema_incompatible"
   | "list_projects_failed"
   | "desktop_project_not_found"
-  | "desktop_project_ambiguous";
+  | "desktop_project_ambiguous"
+  | "first_turn_timeout"
+  | "first_turn_completion_unverifiable"
+  | "send_message_schema_incompatible"
+  | "send_message_failed"
+  | "second_turn_timeout"
+  | "second_turn_completion_unverifiable"
+  | "thread_identity_mismatch"
+  | "steer_race";
 
 // Kept as the old public name for callers that imported the P5.1 result type.
 export type CodexAppEffectfulErrorClass = CreateThreadFailureClass | MetadataGateFailureClass;
@@ -110,12 +136,19 @@ export interface CodexAppEffectfulDiagnosticResult {
   readonly resolvedProjectId?: string;
   readonly createThreadCalled: boolean;
   readonly threadCreated: boolean;
+  readonly createdThreadSuffix?: string;
+  /** Compatibility alias retained for the P5.1.5 diagnostic result. */
   readonly threadIdSuffix?: string;
   readonly hostId?: string;
-  readonly sendMessageCalled: false;
-  readonly readThreadCalled: false;
-  readonly waitThreadsCalled: false;
-  readonly sameThread: false;
+  readonly firstTurnCompleted: boolean;
+  readonly firstMarkerObserved: boolean | "unknown";
+  readonly sendMessageCalled: boolean;
+  readonly sendTargetMatchesCreatedThread: boolean;
+  readonly secondTurnCompleted: boolean;
+  readonly secondMarkerObserved: boolean | "unknown";
+  readonly readThreadCalled: boolean;
+  readonly waitThreadsCalled: boolean;
+  readonly sameThread: boolean;
   readonly writerConflictObserved: boolean;
   readonly targetType?: "project";
   readonly environmentType?: "local" | "worktree";
@@ -169,8 +202,18 @@ interface MutableResultState {
   resolvedProjectId?: string;
   createThreadCalled: boolean;
   threadCreated: boolean;
+  createdThreadSuffix?: string;
   threadIdSuffix?: string;
   hostId?: string;
+  firstTurnCompleted: boolean;
+  firstMarkerObserved: boolean | "unknown";
+  sendMessageCalled: boolean;
+  sendTargetMatchesCreatedThread: boolean;
+  secondTurnCompleted: boolean;
+  secondMarkerObserved: boolean | "unknown";
+  readThreadCalled: boolean;
+  waitThreadsCalled: boolean;
+  sameThread: boolean;
   writerConflictObserved: boolean;
   targetType?: "project";
   environmentType?: "local" | "worktree";
@@ -208,6 +251,20 @@ interface CreateThreadPlan {
   readonly build: (prompt: string, projectId: string) => Record<string, unknown>;
 }
 
+interface SendMessagePlan {
+  readonly build: (threadId: string, prompt: string, hostId: string | undefined) => Record<string, unknown> | undefined;
+}
+
+interface CompletionPlan {
+  readonly tool: "wait_threads" | "read_thread";
+  readonly build: (threadId: string, hostId: string | undefined, timeoutMs: number) => Record<string, unknown> | undefined;
+}
+
+interface CompletionEvidence {
+  readonly completed: boolean;
+  readonly markerObserved: boolean;
+}
+
 interface DesktopProject {
   readonly projectId: string;
   readonly path: string;
@@ -238,6 +295,11 @@ interface ListProjectsFailureClassification {
 
 class ToolCallTimeout extends Error {}
 class DiagnosticInterrupted extends Error {}
+class ContinuityToolFailure extends Error {
+  public constructor(readonly evidence: ErrorEvidence) {
+    super("continuity tool failed");
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -451,6 +513,103 @@ function validateCreateThreadTool(tool: ToolContract | undefined): CreateThreadP
   };
 }
 
+function propertySchema(schema: JsonSchema, name: string): JsonSchema | undefined {
+  return schemaProperties(schema)[name];
+}
+
+function isIntegerSchema(schema: JsonSchema | undefined): boolean {
+  return schema !== undefined && (schemaType(schema, "integer") || schemaType(schema, "number"));
+}
+
+function isBooleanSchema(schema: JsonSchema | undefined): boolean {
+  return schema !== undefined && schemaType(schema, "boolean");
+}
+
+function validateSendMessageTool(tool: ToolContract | undefined): SendMessagePlan | undefined {
+  if (tool === undefined) return undefined;
+  const schema = tool.inputSchema;
+  const properties = schemaProperties(schema);
+  if (!requirementsWithin(schema, new Set(["threadId", "hostId", "prompt"]))) return undefined;
+  if (!isStringSchema(properties.threadId) || !isStringSchema(properties.prompt)) return undefined;
+  const hostRequired = requiredFields(schema).includes("hostId");
+  if (hostRequired && !isStringSchema(properties.hostId)) return undefined;
+  return {
+    build: (threadId, prompt, hostId) => {
+      if (hostRequired && hostId === undefined) return undefined;
+      return {
+        threadId,
+        prompt,
+        ...(isStringSchema(properties.hostId) && hostId !== undefined ? { hostId } : {}),
+      };
+    },
+  };
+}
+
+function validateWaitThreadsTool(tool: ToolContract | undefined): CompletionPlan | undefined {
+  if (tool === undefined) return undefined;
+  const schema = tool.inputSchema;
+  const properties = schemaProperties(schema);
+  if (!requirementsWithin(schema, new Set(["targets", "timeoutMs"]))) return undefined;
+  const targetsSchema = properties.targets;
+  if (targetsSchema === undefined || !schemaType(targetsSchema, "array")) return undefined;
+  const targetSchema = schemaRecord(targetsSchema.items);
+  if (targetSchema === undefined) return undefined;
+  const targetProperties = schemaProperties(targetSchema);
+  if (!requirementsWithin(targetSchema, new Set(["threadId", "hostId", "afterCursor"]))) return undefined;
+  if (!isStringSchema(targetProperties.threadId)) return undefined;
+  const hostRequired = requiredFields(targetSchema).includes("hostId");
+  if (hostRequired && !isStringSchema(targetProperties.hostId)) return undefined;
+  if (properties.timeoutMs !== undefined && !isIntegerSchema(properties.timeoutMs)) return undefined;
+  if (requiredFields(schema).includes("timeoutMs") && properties.timeoutMs === undefined) return undefined;
+  return {
+    tool: "wait_threads",
+    build: (threadId, hostId, timeoutMs) => {
+      if (hostRequired && hostId === undefined) return undefined;
+      const target = {
+        threadId,
+        ...(isStringSchema(targetProperties.hostId) && hostId !== undefined ? { hostId } : {}),
+      };
+      return {
+        targets: [target],
+        ...(properties.timeoutMs === undefined ? {} : { timeoutMs }),
+      };
+    },
+  };
+}
+
+function validateReadThreadTool(tool: ToolContract | undefined): CompletionPlan | undefined {
+  if (tool === undefined) return undefined;
+  const schema = tool.inputSchema;
+  const properties = schemaProperties(schema);
+  if (!requirementsWithin(schema, new Set(["threadId", "hostId", "turnLimit", "includeOutputs", "maxOutputCharsPerItem"]))) {
+    return undefined;
+  }
+  if (!isStringSchema(properties.threadId)) return undefined;
+  const hostRequired = requiredFields(schema).includes("hostId");
+  if (hostRequired && !isStringSchema(properties.hostId)) return undefined;
+  if (properties.turnLimit !== undefined && !isIntegerSchema(properties.turnLimit)) return undefined;
+  if (properties.includeOutputs !== undefined && !isBooleanSchema(properties.includeOutputs)) return undefined;
+  if (properties.maxOutputCharsPerItem !== undefined && !isIntegerSchema(properties.maxOutputCharsPerItem)) return undefined;
+  return {
+    tool: "read_thread",
+    build: (threadId, hostId) => {
+      if (hostRequired && hostId === undefined) return undefined;
+      return {
+        threadId,
+        ...(isStringSchema(properties.hostId) && hostId !== undefined ? { hostId } : {}),
+        ...(isIntegerSchema(properties.turnLimit) ? { turnLimit: 10 } : {}),
+        ...(isBooleanSchema(properties.includeOutputs) ? { includeOutputs: false } : {}),
+        ...(isIntegerSchema(properties.maxOutputCharsPerItem) ? { maxOutputCharsPerItem: 2_000 } : {}),
+      };
+    },
+  };
+}
+
+function completionPlan(contracts: ReadonlyMap<string, ToolContract>): CompletionPlan | undefined {
+  return validateWaitThreadsTool(contracts.get("wait_threads"))
+    ?? validateReadThreadTool(contracts.get("read_thread"));
+}
+
 function safeScalar(value: unknown): string | number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) return value;
@@ -623,6 +782,52 @@ function safeIdentity(value: string | undefined): string | undefined {
   return value !== undefined && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(value) ? value : undefined;
 }
 
+function completionEvidence(value: unknown, marker: string): CompletionEvidence {
+  const statuses = new Set<string>();
+  const seen = new Set<object>();
+  let markerObserved = false;
+  let turnCompleted: boolean | undefined;
+  let hasErrors = false;
+  const visit = (candidate: unknown): void => {
+    if (typeof candidate === "string") {
+      markerObserved ||= candidate.includes(marker);
+      const parsed = parseJsonText(candidate);
+      if (parsed !== undefined) visit(parsed);
+      return;
+    }
+    if (!isRecord(candidate) && !Array.isArray(candidate)) return;
+    if (seen.has(candidate)) return;
+    seen.add(candidate);
+    if (isRecord(candidate)) {
+      if (typeof candidate.turnCompleted === "boolean") {
+        turnCompleted = turnCompleted === false ? false : candidate.turnCompleted;
+      }
+      const errors = candidate.errors;
+      hasErrors ||= (Array.isArray(errors) && errors.length > 0)
+        || (typeof errors === "string" && errors.trim() !== "")
+        || (isRecord(errors) && Object.keys(errors).length > 0);
+      for (const key of ["status", "state", "turnStatus", "turn_status"]) {
+        const status = candidate[key];
+        if (typeof status === "string") statuses.add(status.trim().toLowerCase());
+      }
+      for (const nested of Object.values(candidate)) visit(nested);
+      return;
+    }
+    for (const nested of candidate) visit(nested);
+  };
+  visit(value);
+  const completed = [...statuses].some((status) => ["complete", "completed", "success", "succeeded", "idle"].includes(status));
+  const failed = [...statuses].some((status) => ["failed", "failure", "error", "interrupted", "cancelled", "canceled"].includes(status));
+  return { completed: (turnCompleted ?? completed) && !failed && !hasErrors, markerObserved };
+}
+
+function classifyContinuityFailure(evidence: ErrorEvidence): CodexAppEffectfulFailureClass {
+  if (/steerturninactiveerror|noactiveturn|cannot steer conversation .*active turn already ended/.test(evidence.normalizedErrorText)) {
+    return "steer_race";
+  }
+  return evidence.failureClass;
+}
+
 function copyRuntimeState(state: MutableResultState, runtime: CodexAppMcpRuntime): void {
   state.desktopDetected = runtime.desktopDetected;
   state.bundleDetected = runtime.bundleDetected;
@@ -676,6 +881,15 @@ function initialState(
     resolvedProject: false,
     createThreadCalled: false,
     threadCreated: false,
+    firstTurnCompleted: false,
+    firstMarkerObserved: "unknown",
+    sendMessageCalled: false,
+    sendTargetMatchesCreatedThread: false,
+    secondTurnCompleted: false,
+    secondMarkerObserved: "unknown",
+    readThreadCalled: false,
+    waitThreadsCalled: false,
+    sameThread: false,
     writerConflictObserved: false,
     targetSchemaValid: false,
     argumentKeys: [],
@@ -695,13 +909,11 @@ function finish(
   startedAt: number,
   now: () => number,
 ): CodexAppEffectfulDiagnosticResult {
-  const passed = stage === "metadata_gate_passed" || stage === "create_thread_succeeded";
+  const passed = stage === "metadata_gate_passed"
+    || stage === "create_thread_succeeded"
+    || stage === "continuity_succeeded";
   return {
     ...state,
-    sendMessageCalled: false,
-    readThreadCalled: false,
-    waitThreadsCalled: false,
-    sameThread: false,
     ok: passed,
     result: passed ? "pass" : "fail",
     stage,
@@ -764,6 +976,39 @@ async function callAllowedTool(
     if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
     if (abortHandler !== undefined) signal.removeEventListener("abort", abortHandler);
   }
+}
+
+async function waitForThread(
+  client: Client,
+  plan: CompletionPlan,
+  threadId: string,
+  hostId: string | undefined,
+  marker: string,
+  executorThreadId: string,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<CompletionEvidence> {
+  const args = plan.build(threadId, hostId, timeoutMs);
+  if (args === undefined) throw new ContinuityToolFailure({
+    isError: null,
+    contentItemTypes: [],
+    structuredContentPresent: false,
+    errorFields: [],
+    failureClass: "unknown_tool_error",
+    normalizedErrorText: "",
+    hasErrorText: false,
+  });
+  const result = await callAllowedTool(
+    client,
+    plan.tool,
+    args,
+    executorThreadId,
+    timeoutMs,
+    signal,
+    CONTINUITY_ALLOWLIST,
+  );
+  if (isRecord(result) && result.isError === true) throw new ContinuityToolFailure(createFailureEvidence(result));
+  return completionEvidence(result, marker);
 }
 
 function parseArgs(argv: readonly string[]): CodexAppEffectfulDiagnosticArgs {
@@ -960,9 +1205,124 @@ export async function runCodexAppEffectfulDiagnostic(
       return finish(state, "thread_identity_missing", startedAt, now);
     }
     state.threadCreated = true;
-    state.threadIdSuffix = executorThreadSuffix(threadId);
+    state.createdThreadSuffix = executorThreadSuffix(threadId);
+    state.threadIdSuffix = state.createdThreadSuffix;
     state.hostId = safeIdentity(identity.hostId);
-    return finish(state, "create_thread_succeeded", startedAt, now);
+
+    const completion = completionPlan(contracts);
+    if (completion === undefined) {
+      state.failureClass = "first_turn_completion_unverifiable";
+      return finish(state, "first_turn_completion_unverifiable", startedAt, now);
+    }
+
+    let firstCompletion: CompletionEvidence;
+    try {
+      if (completion.tool === "wait_threads") state.waitThreadsCalled = true;
+      else state.readThreadCalled = true;
+      firstCompletion = await waitForThread(
+        client,
+        completion,
+        threadId,
+        state.hostId,
+        FIRST_MARKER,
+        executorThreadId,
+        timeoutMs,
+        abortController.signal,
+      );
+    } catch (error: unknown) {
+      if (error instanceof ContinuityToolFailure) applyFailureEvidence(state, error.evidence);
+      if (error instanceof DiagnosticInterrupted || interrupted) return finish(state, "diagnostic_interrupted", startedAt, now);
+      if (error instanceof ToolCallTimeout) {
+        state.failureClass = "first_turn_timeout";
+        return finish(state, "first_turn_timeout", startedAt, now);
+      }
+      state.failureClass = "first_turn_completion_unverifiable";
+      return finish(state, "first_turn_completion_unverifiable", startedAt, now);
+    }
+    if (!firstCompletion.completed) {
+      state.failureClass = "first_turn_completion_unverifiable";
+      return finish(state, "first_turn_completion_unverifiable", startedAt, now);
+    }
+    state.firstTurnCompleted = true;
+    state.firstMarkerObserved = firstCompletion.markerObserved ? true : "unknown";
+
+    const sendPlan = validateSendMessageTool(contracts.get("send_message_to_thread"));
+    if (sendPlan === undefined) {
+      state.failureClass = "send_message_schema_incompatible";
+      return finish(state, "send_message_schema_incompatible", startedAt, now);
+    }
+    const sendArgs = sendPlan.build(threadId, SECOND_PROMPT, state.hostId);
+    if (sendArgs === undefined) {
+      state.failureClass = "send_message_schema_incompatible";
+      return finish(state, "send_message_schema_incompatible", startedAt, now);
+    }
+    const sendTargetThreadId = nonEmpty(sendArgs.threadId);
+    if (sendTargetThreadId !== threadId) {
+      state.failureClass = "thread_identity_mismatch";
+      return finish(state, "thread_identity_mismatch", startedAt, now);
+    }
+    state.sendTargetMatchesCreatedThread = true;
+    state.sendMessageCalled = true;
+
+    let sendResult: unknown;
+    try {
+      sendResult = await callAllowedTool(
+        client,
+        "send_message_to_thread",
+        sendArgs,
+        executorThreadId,
+        timeoutMs,
+        abortController.signal,
+        CONTINUITY_ALLOWLIST,
+      );
+    } catch (error: unknown) {
+      if (error instanceof DiagnosticInterrupted || interrupted) return finish(state, "diagnostic_interrupted", startedAt, now);
+      const evidence = createFailureEvidence(error);
+      applyFailureEvidence(state, evidence);
+      const failureClass = classifyContinuityFailure(evidence);
+      state.failureClass = failureClass;
+      return finish(state, failureClass === "steer_race" ? "steer_race" : "send_message_failed", startedAt, now);
+    }
+    if (isRecord(sendResult) && sendResult.isError === true) {
+      const evidence = createFailureEvidence(sendResult);
+      applyFailureEvidence(state, evidence);
+      const failureClass = classifyContinuityFailure(evidence);
+      state.failureClass = failureClass;
+      return finish(state, failureClass === "steer_race" ? "steer_race" : "send_message_failed", startedAt, now);
+    }
+
+    let secondCompletion: CompletionEvidence;
+    try {
+      if (completion.tool === "wait_threads") state.waitThreadsCalled = true;
+      else state.readThreadCalled = true;
+      secondCompletion = await waitForThread(
+        client,
+        completion,
+        threadId,
+        state.hostId,
+        SECOND_MARKER,
+        executorThreadId,
+        timeoutMs,
+        abortController.signal,
+      );
+    } catch (error: unknown) {
+      if (error instanceof ContinuityToolFailure) applyFailureEvidence(state, error.evidence);
+      if (error instanceof DiagnosticInterrupted || interrupted) return finish(state, "diagnostic_interrupted", startedAt, now);
+      if (error instanceof ToolCallTimeout) {
+        state.failureClass = "second_turn_timeout";
+        return finish(state, "second_turn_timeout", startedAt, now);
+      }
+      state.failureClass = "second_turn_completion_unverifiable";
+      return finish(state, "second_turn_completion_unverifiable", startedAt, now);
+    }
+    if (!secondCompletion.completed) {
+      state.failureClass = "second_turn_completion_unverifiable";
+      return finish(state, "second_turn_completion_unverifiable", startedAt, now);
+    }
+    state.secondTurnCompleted = true;
+    state.secondMarkerObserved = secondCompletion.markerObserved ? true : "unknown";
+    state.sameThread = state.sendTargetMatchesCreatedThread && state.secondTurnCompleted;
+    return finish(state, "continuity_succeeded", startedAt, now);
   } finally {
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
