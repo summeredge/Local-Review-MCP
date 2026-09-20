@@ -183,7 +183,9 @@ async function fixture(): Promise<{
     storageRoot: root,
     clientFactory: appFactory,
   });
-  const cliStart = vi.fn(async (input: ExecutionBackendStartRequest): Promise<ExecutionStartResult> => {
+  const cliStart = vi.fn(async (
+    input: ExecutionBackendStartRequest,
+  ): Promise<ExecutionStartResult & { readonly process_id: number }> => {
     const execution = await executions.createExecutionContext({
       execution_id: input.execution_id,
       task_id: input.task_id,
@@ -193,7 +195,7 @@ async function fixture(): Promise<{
     });
     return {
       execution_id: execution.execution_id,
-      process_id: execution.process_id!,
+      process_id: 9_002,
       started_at: execution.started_at,
       accepted: "new",
     };

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHttpServer } from "../src/mcp/http.js";
+import { startApp } from "../src/app.js";
 import type { ResolvedSettings } from "../src/config/settings.js";
 import {
   DesktopToolsPipeHandoff,
@@ -125,6 +126,41 @@ describe("Desktop tools pipe handoff", () => {
     expect(handoff.pipePathFor(connectedState(OWNER, "conversation-2"))).toBe(PIPE);
     now = "2026-09-20T02:00:00.000Z";
     expect(new DesktopToolsPipeHandoff().pipePathFor(connectedState())).toBeUndefined();
+  });
+
+  it("permanently invalidates a capability after disconnect and owner changes", () => {
+    const handoff = new DesktopToolsPipeHandoff();
+    handoff.accept(PIPE, OWNER);
+    handoff.observeDesktopState(connectedState());
+    expect(handoff.pipePathFor(connectedState())).toBe(PIPE);
+
+    handoff.observeDesktopState({ connected: false, followingThreads: new Set() });
+    expect(handoff.pipePathFor(connectedState())).toBeUndefined();
+    handoff.observeDesktopState(connectedState());
+    expect(handoff.pipePathFor(connectedState())).toBeUndefined();
+
+    handoff.accept(PIPE, OWNER);
+    handoff.observeDesktopState(connectedState("desktop-instance-2"));
+    expect(handoff.pipePathFor(connectedState("desktop-instance-2"))).toBeUndefined();
+    const replacementPipe = "\\\\.\\pipe\\codex-tools-test-owner-b";
+    handoff.accept(replacementPipe, "desktop-instance-2");
+    expect(handoff.pipePathFor(connectedState("desktop-instance-2"))).toBe(replacementPipe);
+    handoff.observeDesktopState(connectedState());
+    expect(handoff.pipePathFor(connectedState())).toBeUndefined();
+  });
+
+  it("preserves a capability across same-owner conversation changes and accepts a new handoff", () => {
+    const handoff = new DesktopToolsPipeHandoff();
+    handoff.accept(PIPE, OWNER);
+    handoff.observeDesktopState(connectedState(OWNER, "conversation-1"));
+    handoff.observeDesktopState(connectedState(OWNER, "conversation-2"));
+    expect(handoff.pipePathFor(connectedState(OWNER, "conversation-2"))).toBe(PIPE);
+
+    handoff.observeDesktopState({ connected: false, followingThreads: new Set() });
+    const newPipe = "\\\\.\\pipe\\codex-tools-test-new";
+    handoff.accept(newPipe, OWNER);
+    handoff.observeDesktopState(connectedState(OWNER, "conversation-3"));
+    expect(handoff.pipePathFor(connectedState(OWNER, "conversation-3"))).toBe(newPipe);
   });
 
   it("uses the explicit handed-off pipe and only probes tools/list", async () => {
@@ -281,4 +317,52 @@ it("does not accept an OAuth-shaped bearer as a desktop handoff credential", asy
     body: JSON.stringify({ pipePath: PIPE }),
   });
   expect(response.status).toBe(401);
+});
+
+it("wires Desktop IPC state changes into handoff invalidation and removes the listener on close", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-tools-pipe-wiring-"));
+  temporaryDirectories.push(workspace);
+  let state = connectedState();
+  let stateListener: ((next: DesktopSyncState) => void) | undefined;
+  const unsubscribe = vi.fn();
+  const observer = {
+    start: vi.fn(),
+    stop: vi.fn(),
+    dispose: vi.fn(),
+    getState: vi.fn(() => state),
+    onStateChanged: vi.fn((listener: (next: DesktopSyncState) => void) => {
+      stateListener = listener;
+      return unsubscribe;
+    }),
+  };
+  const server = await startApp(settings(workspace), undefined, {
+    bridgePorts: [],
+    desktopSyncObserver: observer,
+    silent: true,
+  });
+  runningServers.push(server);
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("test server has no port");
+  const url = `http://127.0.0.1:${address.port}${LAUNCHER_DESKTOP_TOOLS_PIPE_PATH}`;
+  const probeUrl = `http://127.0.0.1:${address.port}${LAUNCHER_DESKTOP_TOOLS_PIPE_PROBE_PATH}`;
+  const headers = { authorization: "Bearer test-token", "content-type": "application/json" };
+  const accepted = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ pipePath: PIPE }),
+  });
+  expect(accepted.status).toBe(200);
+  expect(observer.onStateChanged).toHaveBeenCalledTimes(1);
+  expect(stateListener).toBeDefined();
+
+  state = { connected: false, followingThreads: new Set() };
+  stateListener!(state);
+  state = connectedState();
+  stateListener!(state);
+  const staleProbe = await fetch(probeUrl, { method: "POST", headers });
+  expect(staleProbe.status).toBe(409);
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  const index = runningServers.indexOf(server);
+  if (index >= 0) runningServers.splice(index, 1);
+  expect(unsubscribe).toHaveBeenCalledTimes(1);
 });

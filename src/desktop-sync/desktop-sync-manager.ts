@@ -10,7 +10,7 @@ export interface DesktopSyncSessionSummary {
   readonly session_id: string;
   readonly goal_id: string;
   readonly task_id: string;
-  readonly backend_type: "cli" | "codex_app_server";
+  readonly backend_type: "cli" | "codex_app_server" | "desktop_codex_app";
   readonly thread_id?: string;
   readonly current_execution?: { readonly execution_id: string };
 }

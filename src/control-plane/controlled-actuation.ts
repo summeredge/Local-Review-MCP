@@ -12,6 +12,9 @@ import {
 } from "../context/schema.js";
 import { defaultTaskContextStorageRoot } from "../context/task.js";
 import { TaskContextService } from "../context/service.js";
+import { SessionStore } from "../context/session-store.js";
+import { DesktopThreadBindingStore } from "../desktop-codex/desktop-thread-binding-store.js";
+import type { ExecutionContext } from "../context/types.js";
 import { isReservedWindowsName } from "../workspace/path.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
 import {
@@ -198,7 +201,7 @@ const stateSchema = z.object({
 
 export const controlledActuationStartResultSchema = z.object({
   execution_id: executionIdSchema,
-  process_id: z.number().int().positive(),
+  process_id: z.number().int().positive().optional(),
   started_at: timestampSchema,
   accepted: z.enum(["new", "existing"]),
   session_id: sessionIdSchema.optional(),
@@ -445,6 +448,8 @@ export interface ControlledActuationServiceOptions {
   readonly authorizationStore?: ActuationAuthorizationStore;
   readonly taskContextService?: TaskContextService;
   readonly executionContextService?: ExecutionContextService;
+  readonly sessionStore?: Pick<SessionStore, "listSessions">;
+  readonly desktopThreadBindingStore?: Pick<DesktopThreadBindingStore, "load">;
   readonly adapter?: ExecutionBackend;
 }
 
@@ -454,6 +459,8 @@ export class ControlledActuationService {
   public readonly adapter: ExecutionBackend;
   private readonly tasks: TaskContextService;
   private readonly executions: ExecutionContextService;
+  private readonly sessions: Pick<SessionStore, "listSessions">;
+  private readonly desktopBindings: Pick<DesktopThreadBindingStore, "load">;
 
   public constructor(
     private readonly registry: WorkspaceRegistry,
@@ -469,6 +476,8 @@ export class ControlledActuationService {
     this.authorizationStore = options.authorizationStore ?? new ActuationAuthorizationStore(this.storageRoot);
     this.tasks = options.taskContextService ?? new TaskContextService(this.storageRoot);
     this.executions = options.executionContextService ?? new ExecutionContextService(this.storageRoot);
+    this.sessions = options.sessionStore ?? new SessionStore(this.storageRoot);
+    this.desktopBindings = options.desktopThreadBindingStore ?? new DesktopThreadBindingStore(this.storageRoot);
     this.adapter = options.adapter ?? new CodexExecutionAdapter(this.registry, { storageRoot: this.storageRoot });
     for (const dependency of [
       this.authorizationStore.storageRoot,
@@ -612,20 +621,55 @@ export class ControlledActuationService {
       );
     }
     if (execution.process_id === undefined) {
-      throw new Error(
-        `Execution "${authorization.execution_id}" has an ambiguous launch state; refusing to spawn another process.`,
-      );
+      if (!await this.hasDesktopLaunchEvidence(authorization, execution)) {
+        throw new Error(
+          `Execution "${authorization.execution_id}" has an ambiguous launch state; refusing to spawn another process.`,
+        );
+      }
     }
     const recoveredActuation = actuation.status === "starting"
       ? await this.authorizationStore.setActuationStatus(actuation.actuation_id, "started")
       : actuation;
     return {
       execution_id: execution.execution_id,
-      process_id: execution.process_id,
+      ...(execution.process_id === undefined ? {} : { process_id: execution.process_id }),
       started_at: execution.started_at,
       accepted: "existing",
       actuation: recoveredActuation,
     };
+  }
+
+  /**
+   * Desktop executions own no LRM process, so a missing process_id is only acceptable when the
+   * full durable Desktop launch evidence is present: a matching goal/task Session whose thread_id
+   * matches the persisted DesktopThreadBinding for that Session.
+   */
+  private async hasDesktopLaunchEvidence(
+    authorization: ActuationAuthorization,
+    execution: ExecutionContext,
+  ): Promise<boolean> {
+    if (authorization.goal_id === undefined) return false;
+    const sessions = (await this.sessions.listSessions()).filter((session) =>
+      session.goal_id === authorization.goal_id
+      && session.task_id === authorization.task_id
+      && session.backend_type === "desktop_codex_app");
+    if (sessions.length !== 1) return false;
+    const session = sessions[0]!;
+    if (session.thread_id === undefined || session.thread_id.trim() === "") return false;
+    let binding;
+    try {
+      binding = await this.desktopBindings.load(authorization.workspace_id, session.session_id);
+    } catch {
+      return false;
+    }
+    return binding !== undefined
+      && binding.workspace_id === authorization.workspace_id
+      && binding.task_id === authorization.task_id
+      && binding.session_id === session.session_id
+      && binding.backend_identity === "desktop_codex_app"
+      && binding.target_thread_id === session.thread_id
+      && execution.task_id === authorization.task_id
+      && execution.workspace_id === authorization.workspace_id;
   }
 
   private async markFailed(actuationId: string, error: unknown): Promise<void> {
@@ -669,9 +713,14 @@ export class ControlledActuationService {
       );
     }
     if (execution.process_id === undefined) {
-      throw new Error(
-        `Execution "${target.execution_id}" has an ambiguous launch state; refusing to actuate it.`,
-      );
+      const authorization = target.goal_id === undefined
+        ? null
+        : await this.authorizationStore.getAuthorizationByActuation(target.actuation_id);
+      if (authorization === null || !await this.hasDesktopLaunchEvidence(authorization, execution)) {
+        throw new Error(
+          `Execution "${target.execution_id}" has an ambiguous launch state; refusing to actuate it.`,
+        );
+      }
     }
   }
 }

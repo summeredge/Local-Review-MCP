@@ -324,3 +324,64 @@ Codex app-server
 `current_execution`，以及当前 Execution 的状态、Session/Turn 关联和已记录的
 agent output。它们不改变 `submit_goal` receipt，也不改变默认 `execution_mode=batch`
 或 CLI `codex exec --json -` 路径。
+
+## 10. P5.4.1 Desktop codex_app interactive route
+
+The production interactive route is now the Desktop codex_app backend:
+
+```text
+submit_goal(execution_mode="interactive")
+        -> Goal / Task / ControlledActuation
+        -> ExecutionService (ExecutionBackendRouter)
+        -> DesktopCodexBackend
+        -> DesktopThreadCoordinator (DesktopThreadBindingStore)
+        -> DesktopCodexThreadCommands -> create_thread
+        -> DesktopCompletionObserver
+        -> Session / Execution terminal projection
+        -> EventStore (turn_completed)
+        -> terminal listener -> ExecutionRoutingService
+```
+
+`CodexAppServerBackend` is retained but is no longer selected for the normal production
+interactive route. There is no automatic fallback: a Desktop failure fails closed and never
+silently routes the same Execution to the private app-server backend.
+
+### Backend identity
+
+`SESSION_BACKEND_TYPES` adds `desktop_codex_app` alongside `cli` and `codex_app_server`.
+Desktop Sessions persist `backend_type = "desktop_codex_app"` and `thread_id = targetThreadId`,
+which is the Desktop-owned Codex thread, never the Desktop executor conversation.
+
+### Executor and target stay separate
+
+`executorThreadId` is the Desktop `currentConversationId` captured once per Execution and passed
+only through the `openai/threadId` tool metadata. It is never written to Session,
+DesktopThreadBinding, Execution, or any other durable record. The durable target identity is
+`DesktopThreadBinding.target_thread_id`, mirrored into `Session.thread_id`, and the two must
+differ.
+
+### Process identity
+
+Desktop executions own no LRM OS process, so `ExecutionStartResult.process_id` and
+`controlledActuationStartResultSchema.process_id` are now optional. CLI and private app-server
+executions still always provide one. `ControlledActuationService` accepts a missing `process_id`
+only when the complete durable Desktop evidence is present: a matching goal/task Session with a
+non-empty `thread_id` whose `desktop_codex_app` DesktopThreadBinding matches the same
+workspace/task/session and target thread. Anything else still fails closed as an ambiguous launch
+state.
+
+### First-turn completion
+
+`create_thread` already carries the prompt, so it dispatches the first turn. For a target the
+current operation just created, the baseline is exactly
+`{ targetThreadId, hostId, turnIds: [] }` because no earlier turn can exist. The
+`DesktopCompletionObserver` then requires exactly one first-seen turn: zero is pending, one locks
+the candidate, and more than one is `ambiguous_new_turn` and fails closed. Completion evidence is
+the observer alone; no marker text, thread title, message matching, or fixed sleep is used.
+
+### Status queries
+
+`get_session_status` and `get_execution_status` accept and return
+`backend_type = "desktop_codex_app"` with `thread_id = targetThreadId` and the observed Desktop
+`turn_id`. `agent_output` remains empty in this phase because Desktop agent message deltas are
+not projected yet.

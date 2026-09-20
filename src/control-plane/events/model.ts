@@ -65,7 +65,12 @@ const turnCompletedEventSchema = z.object({
 const executionFailedEventSchema = z.object({
   ...commonEventFields,
   event_type: z.literal("execution_failed"),
-  turn_id: providerIdSchema,
+  /**
+   * Optional because a Desktop execution can fail before any verifiable turn exists
+   * (completion timeout, unknown completion, or a pre-target launch failure). Providers that do
+   * have a real turn id still always supply it.
+   */
+  turn_id: providerIdSchema.optional(),
   payload: z.object({ reason: z.string().max(4_000).optional() }).strict(),
 }).strict();
 

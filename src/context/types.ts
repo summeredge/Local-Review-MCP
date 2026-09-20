@@ -43,6 +43,7 @@ export interface ExecutionContext {
   readonly task_id: string;
   readonly workspace_id: string;
   readonly status: ExecutionStatus;
+  /** LRM-owned OS process identity. Desktop executions own no process and omit it. */
   readonly process_id?: number;
   readonly command?: string;
   readonly started_at: string;
@@ -70,6 +71,7 @@ export interface UpdateExecutionContextInput {
 export const SESSION_BACKEND_TYPES = [
   "cli",
   "codex_app_server",
+  "desktop_codex_app",
 ] as const;
 
 export type SessionBackendType = typeof SESSION_BACKEND_TYPES[number];

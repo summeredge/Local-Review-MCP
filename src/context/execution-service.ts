@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { createExecutionId, executionFile, taskExecutionsDirectory } from "./execution.js";
 import {
   createExecutionContextInputSchema,
@@ -24,13 +25,23 @@ function json(context: ExecutionContext): string {
 }
 
 async function writeExecutionContext(file: string, context: ExecutionContext): Promise<void> {
-  const temporary = join(dirname(file), `.execution-${process.pid}-${randomUUID()}.tmp`);
-  try {
-    await writeFile(temporary, json(context), { encoding: "utf8", mode: 0o600 });
-    await rename(temporary, file);
-    await chmod(file, 0o600).catch(() => undefined);
-  } finally {
-    await rm(temporary, { force: true }).catch(() => undefined);
+  const contents = json(context);
+  for (let attempt = 0; ; attempt += 1) {
+    const temporary = join(dirname(file), `.execution-${process.pid}-${randomUUID()}.tmp`);
+    try {
+      await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+      await writeFile(temporary, contents, { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, file);
+      await chmod(file, 0o600).catch(() => undefined);
+      return;
+    } catch (error: unknown) {
+      // Windows can transiently refuse the publish while another handle holds the destination.
+      if (process.platform !== "win32" || attempt >= 2
+        || !["EPERM", "EACCES", "EBUSY", "ENOENT"].includes(errorCode(error) ?? "")) throw error;
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
+    await delay(10 * (attempt + 1));
   }
 }
 

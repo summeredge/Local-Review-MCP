@@ -623,7 +623,7 @@ async function runPhaseA(
     const coordinator = new DesktopThreadCoordinator({ commands, bindings });
     let created;
     try {
-      created = await coordinator.createOrReuseThread({
+      created = (await coordinator.createOrReuseThread({
         workspace_id: workspaceId,
         task_id: taskId,
         session_id: sessionId,
@@ -631,7 +631,7 @@ async function runPhaseA(
         projectId: project.projectId,
         prompt: `Only return LRM_P522C_CREATE_${runId}. Do not modify any files. Do not create commits. Do not push.`,
         timeoutMs: args.timeoutMs,
-      });
+      })).binding;
     } catch (error: unknown) {
       const failureClass = error instanceof CodexAppRuntimeError && error.code === "thread_identity_conflict"
         ? "thread_identity_conflict"
@@ -835,7 +835,7 @@ async function runPhaseB(
     const coordinator = new DesktopThreadCoordinator({ commands, bindings });
     let reused;
     try {
-      reused = await coordinator.createOrReuseThread({
+      reused = (await coordinator.createOrReuseThread({
         workspace_id: state.workspace_id,
         task_id: state.task_id,
         session_id: state.session_id,
@@ -843,7 +843,7 @@ async function runPhaseB(
         projectId: state.project_id,
         prompt: `Only return LRM_P522C_REUSE_${state.run_id}. Do not modify any files. Do not create commits. Do not push.`,
         timeoutMs: args.timeoutMs,
-      });
+      })).binding;
     } catch (error: unknown) {
       const createCount = live.requests.filter((request) => request.tool === "create_thread").length;
       if (createCount > 0) return failureResult("phase-b", "duplicate_create_after_restart", {

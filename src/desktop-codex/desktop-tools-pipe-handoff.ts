@@ -84,6 +84,13 @@ export class DesktopToolsPipeHandoff {
       : undefined;
   }
 
+  public observeDesktopState(state: DesktopSyncState): void {
+    if (this.capability === undefined) return;
+    if (!state.connected || ownerClientId(state.ownerClientId) !== this.capability.ownerClientId) {
+      this.clear();
+    }
+  }
+
   public clear(): void {
     this.capability = undefined;
   }

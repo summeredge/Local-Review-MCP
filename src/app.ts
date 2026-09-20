@@ -28,6 +28,7 @@ import { PendingGoalSubmissionService } from "./control-plane/pending-goal-submi
 import { ExecutionRoutingService } from "./control-plane/execution-routing.js";
 import {
   CliExecutionBackend,
+  type ExecutionBackend,
   ExecutionBackendRouter,
   ExecutionService,
 } from "./control-plane/execution-service.js";
@@ -61,6 +62,7 @@ import { DesktopIPCObserver } from "./desktop-sync/desktop-ipc-observer.js";
 import { DesktopSyncManager } from "./desktop-sync/desktop-sync-manager.js";
 import { DesktopToolsPipeHandoff } from "./desktop-codex/desktop-tools-pipe-handoff.js";
 import { DesktopCodexRuntimeFactory } from "./desktop-codex/desktop-tools-pipe-probe.js";
+import { DesktopCodexBackend } from "./desktop-codex/desktop-codex-backend.js";
 
 export interface AppContext extends McpRuntimeContext {
   readonly storageRoot?: string;
@@ -91,7 +93,8 @@ export interface AppStartOptions extends HttpServerOptions {
   readonly bridgePorts?: readonly number[];
   readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => void | Promise<void>;
   readonly runtimeDiagnosticLogger?: RuntimeDiagnosticLogger;
-  readonly desktopSyncObserver?: Pick<DesktopIPCObserver, "start" | "stop" | "dispose" | "getState">;
+  readonly desktopSyncObserver?: Pick<DesktopIPCObserver, "start" | "stop" | "dispose" | "getState">
+    & Partial<Pick<DesktopIPCObserver, "onStateChanged">>;
 }
 
 export function createAppContext(
@@ -238,6 +241,28 @@ export async function startApp(
     desktopToolsPipeHandoff,
     () => desktopSyncObserver.getState(),
   );
+  // The production interactive route is the Desktop codex_app backend. It must reuse the exact
+  // Desktop tools-pipe handoff, observer state, and runtime factory owned by this host so the HTTP
+  // handoff and the execution backend share one memory domain. Bind before HTTP/MCP accepts Goals.
+  if (context.executionService !== undefined && context.storageRoot !== undefined) {
+    context.executionService.bindInteractive(new DesktopCodexBackend(context.registry, {
+      storageRoot: context.storageRoot,
+      eventStore: context.eventStore,
+      runtimeFactory: desktopCodexRuntimeFactory,
+      desktopState: () => desktopSyncObserver.getState(),
+    }));
+    // The terminal listener was registered on the previous interactive backend; rebind it so the
+    // Desktop route still reaches durable Review routing.
+    context.executionService.setTerminalListener(
+      (execution) => context.executionRouter?.onExecutionTerminal(execution),
+    );
+  }
+  let removeDesktopToolsPipeStateListener: (() => void) | undefined;
+  const cleanupDesktopToolsPipeLifecycle = (): void => {
+    removeDesktopToolsPipeStateListener?.();
+    removeDesktopToolsPipeStateListener = undefined;
+    desktopToolsPipeHandoff.clear();
+  };
   try {
     const workspaceOAuth = context.storageRoot === undefined
       ? undefined
@@ -260,6 +285,9 @@ export async function startApp(
           ? workspaceOAuth?.tokenStorePath
           : join(dirname(options.oauthClientRegistryPath), "tokens.json")),
       silent: options.silent,
+    });
+    removeDesktopToolsPipeStateListener = desktopSyncObserver.onStateChanged?.((state) => {
+      desktopToolsPipeHandoff.observeDesktopState(state);
     });
     try {
       const extensionDeliveries = context.extensionDeliveries;
@@ -374,6 +402,7 @@ export async function startApp(
       );
     }
     server.once("close", () => {
+      cleanupDesktopToolsPipeLifecycle();
       try {
         desktopSyncObserver.dispose();
       } catch {
@@ -423,6 +452,7 @@ export async function startApp(
     }
     return server;
   } catch (error: unknown) {
+    cleanupDesktopToolsPipeLifecycle();
     if (isPortInUse(error)) {
       throw new Error(
         `Local Review MCP cannot start because ${settings.host}:${settings.port} is already in use. `

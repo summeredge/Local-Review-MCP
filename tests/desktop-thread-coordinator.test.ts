@@ -9,6 +9,7 @@ import { DesktopThreadBindingStore } from "../src/desktop-codex/desktop-thread-b
 import {
   DesktopThreadCoordinator,
   type CreateOrReuseThreadInput,
+  type DesktopThreadBindingResult,
 } from "../src/desktop-codex/desktop-thread-coordinator.js";
 import { DesktopCodexThreadCommands } from "../src/desktop-codex/thread-commands.js";
 import type { DesktopThreadBinding } from "../src/desktop-codex/desktop-thread-binding.js";
@@ -116,10 +117,11 @@ describe("DesktopThreadCoordinator", () => {
     const bindings = new DesktopThreadBindingStore(root);
     const coordinator = new DesktopThreadCoordinator({ commands, bindings });
 
-    const result = await coordinator.createOrReuseThread(input());
+    const { binding: result, created } = await coordinator.createOrReuseThread(input());
 
     expect(result.target_thread_id).toBe("target-thread-1");
     expect(result.host_id).toBe("local");
+    expect(created).toBe(true);
     expect(calls).toHaveLength(1);
     expect(calls[0]?._meta?.["openai/threadId"]).toBe("executor-A");
     await expect(bindings.load("workspace-1", "session-1")).resolves.toEqual(result);
@@ -140,7 +142,7 @@ describe("DesktopThreadCoordinator", () => {
     await expect(coordinator.createOrReuseThread(input({
       executorThreadId: "executor-B",
       prompt: "different prompt",
-    }))).resolves.toEqual(existing);
+    }))).resolves.toEqual({ binding: existing, created: false });
     expect(calls).toHaveLength(0);
   });
 
@@ -155,7 +157,8 @@ describe("DesktopThreadCoordinator", () => {
         return toolResult({ threadId: "target-thread-1", hostId: "local" });
       }),
     });
-    await first.createOrReuseThread(input());
+    const firstCreate = await first.createOrReuseThread(input());
+    expect(firstCreate.created).toBe(true);
 
     const calls: CallToolRequestParams[] = [];
     const restarted = new DesktopThreadCoordinator({
@@ -290,10 +293,10 @@ describe("DesktopThreadCoordinator", () => {
       right.createOrReuseThread(input({ prompt: "right" })),
     ]);
     const fulfilled = outcomes.filter(
-      (outcome): outcome is PromiseFulfilledResult<DesktopThreadBinding> => outcome.status === "fulfilled",
+      (outcome): outcome is PromiseFulfilledResult<DesktopThreadBindingResult> => outcome.status === "fulfilled",
     );
     const rejected = outcomes.filter((outcome) => outcome.status === "rejected");
-    const winner = fulfilled[0]?.value;
+    const winner = fulfilled[0]?.value.binding;
     const raw = readFileSync(join(root, ".task", "desktop_thread_bindings", "workspace-1", "session-1.json"), "utf8");
 
     expect(fulfilled).toHaveLength(1);

@@ -37,6 +37,16 @@ export interface CreateOrReuseThreadInput extends DesktopCodexCommandOptions {
   readonly prompt: string;
 }
 
+/**
+ * The durable winner of createOrReuseThread plus whether this call created it.
+ * "created" is derived from the coordinator's own durable write, never from file
+ * timestamps or thread counts.
+ */
+export interface DesktopThreadBindingResult {
+  readonly binding: DesktopThreadBinding;
+  readonly created: boolean;
+}
+
 export interface SendToBoundThreadInput extends DesktopCodexCommandOptions {
   readonly workspace_id: string;
   readonly task_id: string;
@@ -63,11 +73,11 @@ export class DesktopThreadCoordinator {
 
   public async createOrReuseThread(
     input: CreateOrReuseThreadInput,
-  ): Promise<DesktopThreadBinding> {
+  ): Promise<DesktopThreadBindingResult> {
     const existing = await this.bindings.load(input.workspace_id, input.session_id);
     if (existing !== undefined) {
       this.assertOwnership(existing, input);
-      return existing;
+      return { binding: existing, created: false };
     }
 
     const created = await this.commands.createThread({
@@ -96,7 +106,9 @@ export class DesktopThreadCoordinator {
           "Desktop thread binding target differs from the created target.",
         );
       }
-      return durable;
+      // ponytail: a lost create-race still reports created=false, which is the honest answer
+      // for the losing caller; callers that need "did I dispatch the first turn" must check it.
+      return { binding: durable, created: true };
     } catch (error: unknown) {
       if (error instanceof DesktopThreadBindingConflictError) {
         throw new DesktopThreadCoordinatorError("binding_conflict", error.message, error);

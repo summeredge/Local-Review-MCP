@@ -100,3 +100,9 @@ LRM MCP → Read-only Data Plane
 * `exec` / `shell`
 * `git commit`
 * `git push`
+
+## Language
+
+All user-facing responses, plans, progress updates, explanations, and final summaries must be written in Simplified Chinese.
+
+Keep code, identifiers, commands, file paths, API names, error messages, and technical terms in their original form when appropriate.

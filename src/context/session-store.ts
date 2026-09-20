@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   createSessionId,
   sessionFile,
@@ -27,13 +28,41 @@ function json(session: Session): string {
   return `${JSON.stringify(session, null, 2)}\n`;
 }
 
+/**
+ * Per-file write serialization. Session records are written by more than one SessionStore instance
+ * that shares a storage root (for example the execution backend and the status query service), so
+ * the queue must be keyed by the target file rather than owned by one instance.
+ */
+const sessionWriteQueues = new Map<string, Promise<void>>();
+
+function serializedByFile<T>(file: string, operation: () => Promise<T>): Promise<T> {
+  const previous = sessionWriteQueues.get(file) ?? Promise.resolve();
+  const result = previous.then(operation, operation);
+  const settled = result.then(() => undefined, () => undefined);
+  sessionWriteQueues.set(file, settled);
+  void settled.finally(() => {
+    if (sessionWriteQueues.get(file) === settled) sessionWriteQueues.delete(file);
+  });
+  return result;
+}
+
 async function writeSession(file: string, session: Session): Promise<void> {
-  const temporary = join(dirname(file), `.session-${process.pid}-${randomUUID()}.tmp`);
-  try {
-    await writeFile(temporary, json(session), { encoding: "utf8", mode: 0o600 });
-    await rename(temporary, file);
-  } finally {
-    await rm(temporary, { force: true }).catch(() => undefined);
+  const contents = json(session);
+  for (let attempt = 0; ; attempt += 1) {
+    const temporary = join(dirname(file), `.session-${process.pid}-${randomUUID()}.tmp`);
+    try {
+      await writeFile(temporary, contents, { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, file);
+      return;
+    } catch (error: unknown) {
+      // Windows can transiently refuse the publish while another handle (indexer, antivirus, or a
+      // concurrent reader) holds the destination. Retry a bounded number of times before failing.
+      if (process.platform !== "win32" || attempt >= 2
+        || !["EPERM", "EACCES", "EBUSY", "ENOENT"].includes(errorCode(error) ?? "")) throw error;
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
+    await delay(10 * (attempt + 1));
   }
 }
 
@@ -119,7 +148,9 @@ export class SessionStore {
       updated_at: new Date().toISOString(),
     });
     try {
-      await writeSession(sessionFile(this.storageRoot, sessionId), next);
+      const file = sessionFile(this.storageRoot, sessionId);
+      await mkdir(this.sessionsDirectory, { recursive: true, mode: 0o700 });
+      await serializedByFile(file, () => writeSession(file, next));
     } catch (error: unknown) {
       throw new Error("Session could not be saved.", { cause: error });
     }
