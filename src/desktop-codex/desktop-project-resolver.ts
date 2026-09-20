@@ -102,8 +102,10 @@ export function resolveDesktopProject(
   workspacePath: string,
 ): DesktopProject {
   const expectedPath = normalizedPath(workspacePath);
-  const matches = parseDesktopProjects(result)
-    .filter((project) => project.projectKind === "local" && project.hostId === "local")
+  const matches = projectRecords(result)
+    .filter((record) => nonEmpty(record.projectKind) === "local")
+    .map(parseProject)
+    .filter((project) => project.hostId === "local")
     .filter((project) => normalizedPath(project.path) === expectedPath);
   if (matches.length === 0) {
     throw new CodexAppRuntimeError("project_not_found", "No exact local Desktop project matched the workspace.");

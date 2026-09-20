@@ -467,6 +467,10 @@ export class CodexAppRuntime {
     }
   }
 
+  public get mcpClient(): Pick<CodexAppMcpClient, "callTool"> {
+    return this.client;
+  }
+
   public callTool(input: Omit<CallCodexAppToolInput, "client">): Promise<CallToolResult> {
     return callCodexAppTool({ ...input, client: this.client });
   }

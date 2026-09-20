@@ -35,6 +35,10 @@ import { runDesktopIPCDiagnostic } from "./desktop-sync/desktop-ipc-observer.js"
 import { runDesktopThreadVisibilityDiagnostic } from "./desktop-sync/desktop-thread-visibility-diagnostic.js";
 import { runCodexAppMcpDiagnostic } from "./desktop-sync/codex-app-mcp-diagnostic.js";
 import { runCodexAppEffectfulDiagnostic } from "./desktop-sync/codex-app-effectful-diagnostic.js";
+import {
+  formatDesktopThreadDurableSmokeResult,
+  runDesktopThreadDurableSmoke,
+} from "./desktop-sync/desktop-thread-durable-smoke.js";
 
 function printErrorDetails(error: unknown, warning = false): void {
   const log = warning ? console.warn : console.error;
@@ -68,6 +72,10 @@ try {
   } else if (argv[0] === "diagnose-codex-app-effectful") {
     const diagnostic = await runCodexAppEffectfulDiagnostic(argv.slice(1));
     console.log(JSON.stringify(diagnostic, null, 2));
+    if (!diagnostic.ok) process.exitCode = 1;
+  } else if (argv[0] === "diagnostic-p522c") {
+    const diagnostic = await runDesktopThreadDurableSmoke(argv.slice(1));
+    console.log(formatDesktopThreadDurableSmokeResult(diagnostic));
     if (!diagnostic.ok) process.exitCode = 1;
   } else if (argv[0] === "diagnose-chatgpt-connector") {
     try {

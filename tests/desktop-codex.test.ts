@@ -155,6 +155,26 @@ describe("desktop-codex command primitives", () => {
     })).rejects.toMatchObject({ code: "thread_identity_conflict" });
     expect(calls).toHaveLength(0);
   });
+
+  it("rejects a create_thread result that targets the executor", async () => {
+    const calls: CallToolRequestParams[] = [];
+    const callTool: CodexAppMcpClient["callTool"] = async (params) => {
+      calls.push(params);
+      return toolResult({ threadId: EXECUTOR_THREAD, hostId: "local" });
+    };
+    const commands = new DesktopCodexThreadCommands({
+      client: { callTool },
+      contracts: createCodexAppToolContracts(appTools()),
+    });
+
+    await expect(commands.createThread({
+      executorThreadId: EXECUTOR_THREAD,
+      projectId: "project-one",
+      prompt: "create",
+    })).rejects.toMatchObject({ code: "thread_identity_conflict" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.name).toBe("create_thread");
+  });
 });
 
 describe("desktop-codex runtime", () => {
@@ -249,6 +269,16 @@ describe("desktop project resolver", () => {
       project("project-one", workspacePath),
       project("project-two", workspacePath),
     ]), workspacePath)).toThrowError(expect.objectContaining({ code: "project_ambiguous" }));
+  });
+
+  it("ignores ChatGPT project records without local path fields", () => {
+    expect(resolveDesktopProject(projectResult([
+      project("project-one", workspacePath),
+      { projectId: "g-p-project", projectKind: "chatgpt" } as unknown as DesktopProjectRecord,
+    ]), workspacePath)).toMatchObject({
+      projectId: "project-one",
+      hostId: "local",
+    });
   });
 
   it("rejects malformed project records", () => {

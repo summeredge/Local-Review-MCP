@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "run_id": "b959d9de-b558-45c8-ab2a-5996b3441295",
+  "workspace_id": "legacy-workspace",
+  "task_id": "51b89f2c-a662-4669-9ffa-8e32a636dc82",
+  "session_id": "d776f692-10e2-4d06-95ce-6f20b502e751",
+  "workspace_path": "C:\\Users\\shaoy\\Documents\\Local-Review-MCP",
+  "project_id": "39eebb0b-7398-4548-8d0a-727a3139085b",
+  "phase_a_executor_thread_id": "01a0bce3-6102-7353-851a-a09f8d2a5c37",
+  "target_thread_id": "01a0bcf1-3bf0-7640-ac06-0bc4a360adca",
+  "host_id": "local",
+  "storage_root": "C:\\Users\\shaoy\\Documents\\Local-Review-MCP\\.review\\p5-2-2-c-smoke\\b959d9de-b558-45c8-ab2a-5996b3441295",
+  "created_at": "2026-09-20T03:52:01.737Z"
+}

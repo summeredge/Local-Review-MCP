@@ -1,9 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CallToolRequestParams, CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { createCodexAppToolContracts } from "../src/desktop-codex/codex-app-contracts.js";
+import { desktopThreadBindingFile } from "../src/desktop-codex/desktop-thread-binding.js";
 import { DesktopThreadBindingStore } from "../src/desktop-codex/desktop-thread-binding-store.js";
 import {
   DesktopThreadCoordinator,
@@ -245,6 +246,33 @@ describe("DesktopThreadCoordinator", () => {
       prompt: "send",
     })).rejects.toMatchObject({ code: "thread_identity_conflict" });
     expect(calls).toHaveLength(0);
+  });
+
+  it("does not persist a create_thread target equal to the executor", async () => {
+    const root = createRoot();
+    const bindings = new DesktopThreadBindingStore(root);
+    let createIfAbsentCalls = 0;
+    const commands = createCommands(async () => toolResult({
+      threadId: "executor-A",
+      hostId: "local",
+    }));
+    const coordinator = new DesktopThreadCoordinator({
+      commands,
+      bindings: {
+        load: bindings.load.bind(bindings),
+        createIfAbsent: async (binding) => {
+          createIfAbsentCalls += 1;
+          return bindings.createIfAbsent(binding);
+        },
+      },
+    });
+
+    await expect(coordinator.createOrReuseThread(input()))
+      .rejects.toMatchObject({ code: "thread_identity_conflict" });
+
+    expect(createIfAbsentCalls).toBe(0);
+    await expect(bindings.load("workspace-1", "session-1")).resolves.toBeUndefined();
+    expect(existsSync(desktopThreadBindingFile(root, "workspace-1", "session-1"))).toBe(false);
   });
 
   it("returns only the durable winner during a create race", async () => {

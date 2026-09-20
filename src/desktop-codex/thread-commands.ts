@@ -114,6 +114,15 @@ function parseThreadIdentity(result: CallToolResult): DesktopThreadIdentity {
   return { targetThreadId, hostId };
 }
 
+function assertDistinctThreadIdentity(executorThreadId: string, targetThreadId: string): void {
+  if (executorThreadId === targetThreadId) {
+    throw new CodexAppRuntimeError(
+      "thread_identity_conflict",
+      "executorThreadId and targetThreadId must remain distinct.",
+    );
+  }
+}
+
 function callInput(
   client: Pick<CodexAppMcpClient, "callTool">,
   tool: string,
@@ -158,19 +167,16 @@ export class DesktopCodexThreadCommands {
       args,
       { ...input, executorThreadId },
     ));
-    return parseThreadIdentity(result);
+    const identity = parseThreadIdentity(result);
+    assertDistinctThreadIdentity(executorThreadId, identity.targetThreadId);
+    return identity;
   }
 
   public async sendMessageToThread(input: SendMessageToThreadInput): Promise<CallToolResult> {
     const executorThreadId = nonEmpty(input.executorThreadId, "executor_thread_missing");
     const targetThreadId = nonEmpty(input.targetThreadId, "thread_identity_missing");
     const hostId = nonEmpty(input.hostId, "thread_identity_missing");
-    if (executorThreadId === targetThreadId) {
-      throw new CodexAppRuntimeError(
-        "thread_identity_conflict",
-        "executorThreadId and targetThreadId must remain distinct.",
-      );
-    }
+    assertDistinctThreadIdentity(executorThreadId, targetThreadId);
     const args = this.context.contracts.sendMessageToThreadArguments(
       targetThreadId,
       hostId,
