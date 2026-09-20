@@ -51,6 +51,7 @@ export interface DesktopToolsPipeCapability {
 
 export class DesktopToolsPipeHandoff {
   private capability: DesktopToolsPipeCapability | undefined;
+  private acceptedOnce = false;
   private readonly now: () => string;
 
   public constructor(now: () => string = () => new Date().toISOString()) {
@@ -72,6 +73,7 @@ export class DesktopToolsPipeHandoff {
       receivedAt: this.now(),
       source: "desktop_environment",
     };
+    this.acceptedOnce = true;
     return this.capability;
   }
 
@@ -82,6 +84,18 @@ export class DesktopToolsPipeHandoff {
       && this.capability?.ownerClientId === currentOwner
       ? this.capability.pipePath
       : undefined;
+  }
+
+  /**
+   * Read-only evidence about this handoff instance, not about the current Desktop.
+   *
+   * It reports whether a capability has ever been accepted here, including after the existing
+   * lifecycle invalidated and cleared it. The lifecycle, owner binding, and validity rules are
+   * unchanged: this only lets a caller tell "no handoff was ever handed to this process" apart
+   * from "the handoff is gone", so a stale handoff is never silently replaced by a weaker source.
+   */
+  public hasAcceptedCapability(): boolean {
+    return this.acceptedOnce;
   }
 
   public observeDesktopState(state: DesktopSyncState): void {

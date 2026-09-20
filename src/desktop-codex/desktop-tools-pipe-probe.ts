@@ -4,10 +4,12 @@ import {
   type CodexAppRuntimeMetadata,
   type CodexAppRuntimeDiscoveryOptions,
 } from "./codex-app-runtime.js";
+import type { DesktopToolsPipeHandoff } from "./desktop-tools-pipe-handoff.js";
 import {
-  DesktopToolsPipeHandoff,
-  DesktopToolsPipeHandoffError,
-} from "./desktop-tools-pipe-handoff.js";
+  DesktopToolsPipeResolver,
+  type DesktopToolsPipeResolverOptions,
+  type DesktopToolsPipeSource,
+} from "./desktop-tools-pipe-resolver.js";
 import type { DesktopSyncState } from "../desktop-sync/desktop-sync-state.js";
 
 export interface DesktopCodexRuntimeLike {
@@ -24,24 +26,31 @@ const connectRuntime: DesktopCodexRuntimeConnector = (options) => CodexAppRuntim
 
 export class DesktopCodexRuntimeFactory {
   private readonly connectRuntime: DesktopCodexRuntimeConnector;
+  private readonly resolver: DesktopToolsPipeResolver;
+  private resolvedSource: DesktopToolsPipeSource | undefined;
 
   public constructor(
-    private readonly handoff: DesktopToolsPipeHandoff,
-    private readonly stateReader: () => DesktopSyncState,
+    handoff: DesktopToolsPipeHandoff,
+    stateReader: () => DesktopSyncState,
     connect: DesktopCodexRuntimeConnector = connectRuntime,
+    options: DesktopToolsPipeResolverOptions = {},
   ) {
     this.connectRuntime = connect;
+    this.resolver = new DesktopToolsPipeResolver(handoff, stateReader, options);
   }
 
   public async connect(): Promise<DesktopCodexRuntimeLike> {
-    const pipePath = this.handoff.pipePathFor(this.stateReader());
-    if (pipePath === undefined) {
-      throw new DesktopToolsPipeHandoffError(
-        "desktop_tools_pipe_unavailable",
-        "Desktop tools pipe handoff is unavailable.",
-      );
-    }
-    return this.connectRuntime({ pipePath });
+    const resolved = this.resolver.resolve();
+    this.resolvedSource = resolved.source;
+    return this.connectRuntime({ pipePath: resolved.pipePath });
+  }
+
+  /**
+   * The pipe source used by the most recent connect, or undefined before any successful
+   * resolution. It never re-resolves, so a probe reports the source it actually connected with.
+   */
+  public pipeSource(): DesktopToolsPipeSource | undefined {
+    return this.resolvedSource;
   }
 }
 
@@ -65,13 +74,15 @@ export interface DesktopToolsPipeProbeResult {
   readonly nativeDesktopTransport?: "windows_named_pipe" | "unknown";
   readonly desktopVersion?: string;
   readonly codexAppToolsVersion?: string;
-  readonly pipeSource: "handoff";
+  readonly pipeSource: DesktopToolsPipeSource;
   readonly toolCount: number;
   readonly requiredToolsPresent: RequiredDesktopToolsPresent;
 }
 
 export interface DesktopCodexRuntimeProvider {
   connect(): Promise<DesktopCodexRuntimeLike>;
+  /** The pipe source the provider last resolved from; omitted providers report "handoff". */
+  pipeSource?(): DesktopToolsPipeSource | undefined;
 }
 
 export async function probeDesktopToolsPipe(
@@ -97,7 +108,7 @@ export async function probeDesktopToolsPipe(
       ...(runtime.info.codexAppToolsVersion === undefined
         ? {}
         : { codexAppToolsVersion: runtime.info.codexAppToolsVersion }),
-      pipeSource: "handoff",
+      pipeSource: provider.pipeSource?.() ?? "handoff",
       toolCount: listed.tools.length,
       requiredToolsPresent,
     };

@@ -21,7 +21,12 @@ import { TaskContextService } from "../src/context/service.js";
 import { EventStore } from "../src/control-plane/events/store.js";
 import { DesktopCodexBackend } from "../src/desktop-codex/desktop-codex-backend.js";
 import { DesktopThreadBindingStore } from "../src/desktop-codex/desktop-thread-binding-store.js";
-import type { DesktopCodexRuntimeLike } from "../src/desktop-codex/desktop-tools-pipe-probe.js";
+import { DesktopToolsPipeHandoff } from "../src/desktop-codex/desktop-tools-pipe-handoff.js";
+import {
+  DesktopCodexRuntimeFactory,
+  type DesktopCodexRuntimeLike,
+  type DesktopCodexRuntimeProvider,
+} from "../src/desktop-codex/desktop-tools-pipe-probe.js";
 import type { DesktopSyncState } from "../src/desktop-sync/desktop-sync-state.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
 import type { ExecutionContext } from "../src/context/types.js";
@@ -266,6 +271,7 @@ async function fixture(options: {
   readonly desktop?: FakeDesktop;
   readonly state?: () => DesktopSyncState;
   readonly projectPath?: string;
+  readonly runtimeFactory?: DesktopCodexRuntimeProvider;
 } = {}): Promise<Fixture> {
   const root = createRoot();
   const workspaceRoot = mkdtempSync(join(tmpdir(), "lrm-p541-ws-"));
@@ -308,7 +314,7 @@ async function fixture(options: {
   const desktopBackend = new DesktopCodexBackend(registry, {
     storageRoot: root,
     eventStore: events,
-    runtimeFactory: desktop.runtimeFactory,
+    runtimeFactory: options.runtimeFactory ?? desktop.runtimeFactory,
     desktopState: options.state ?? (() => desktopState()),
     completionTimeoutMs: 1_500,
     pollIntervalMs: 1,
@@ -445,6 +451,33 @@ describe("P5.4.1 route selection", () => {
 });
 
 describe("P5.4.1 Desktop preflight fail-closed", () => {
+  it("connects through the current environment pipe when no handoff capability exists", async () => {
+    const desktop = fakeDesktop();
+    desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+    const seenPipePaths: string[] = [];
+    const environmentPipe = "\\\\.\\pipe\\codex-env-pipe";
+    // No handoff capability is ever accepted here, so the runtime must resolve the pipe from the
+    // current environment instead of failing with desktop_tools_pipe_unavailable.
+    const runtimeFactory = new DesktopCodexRuntimeFactory(
+      new DesktopToolsPipeHandoff(),
+      () => desktopState(),
+      async ({ pipePath }) => {
+        seenPipePaths.push(pipePath!);
+        return desktop.runtime as DesktopCodexRuntimeLike;
+      },
+      { environment: { CODEX_APP_TOOLS_PIPE_PATH: environmentPipe } },
+    );
+    const value = await fixture({ desktop, runtimeFactory });
+    // The fixture only auto-binds the Desktop project record for its own default fake.
+    desktop.setProjectPath(value.registry.active.manager.canonicalRoot);
+    await authorizeAndActuate(value);
+
+    expect(seenPipePaths).toEqual([environmentPipe]);
+    const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
+    expect(execution?.status).toBe("passed");
+    expect(value.desktop.createThreadCount()).toBe(1);
+  });
+
   it("fails closed when Desktop is disconnected", async () => {
     const value = await fixture({ state: () => desktopState({ connected: false }) });
     await seedTask(value);

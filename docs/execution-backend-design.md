@@ -385,3 +385,20 @@ the observer alone; no marker text, thread title, message matching, or fixed sle
 `backend_type = "desktop_codex_app"` with `thread_id = targetThreadId` and the observed Desktop
 `turn_id`. `agent_output` remains empty in this phase because Desktop agent message deltas are
 not projected yet.
+
+### Desktop tools pipe resolution
+
+`DesktopToolsPipeResolver` is the single place that turns Desktop evidence into a pipe path. The
+resolution order is fixed and exhaustive:
+
+1. a verified `DesktopToolsPipeHandoff` capability, already bound to the current Desktop owner;
+2. `CODEX_APP_TOOLS_PIPE_PATH` from this process environment, trusted only while the existing
+   Desktop connection constraint (`state.connected`) holds;
+3. otherwise fail closed with `desktop_tools_pipe_unavailable`.
+
+Pipe enumeration and pipe name guessing are never used, and the handoff lifecycle, owner binding,
+and invalidation rules are unchanged. A handoff that was accepted and later invalidated (Desktop
+disconnect or owner change) is stale evidence rather than missing evidence, so it is never silently
+downgraded to the weaker `current_environment` source. `DesktopCodexRuntimeFactory` and the
+launcher probe both consume this resolver, and the probe reports the source it actually connected
+with as `pipeSource` (`"handoff"` or `"current_environment"`) without echoing the pipe path.
