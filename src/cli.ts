@@ -40,6 +40,10 @@ import {
   runDesktopThreadDurableSmoke,
 } from "./desktop-sync/desktop-thread-durable-smoke.js";
 import { runDesktopCompletionContractProbe } from "./desktop-sync/desktop-completion-contract-probe.js";
+import {
+  DesktopToolsPipeHandoffError,
+  sendDesktopToolsPipeHandoff,
+} from "./desktop-codex/desktop-tools-pipe-handoff.js";
 
 function printErrorDetails(error: unknown, warning = false): void {
   const log = warning ? console.warn : console.error;
@@ -82,6 +86,20 @@ try {
     const diagnostic = await runDesktopCompletionContractProbe(argv.slice(1));
     console.log(JSON.stringify(diagnostic, null, 2));
     if (!diagnostic.ok) process.exitCode = 1;
+  } else if (argv[0] === "handoff-desktop-tools-pipe") {
+    try {
+      const settings = await loadSettings(argv.slice(1));
+      const result = await sendDesktopToolsPipeHandoff(settings);
+      console.log(JSON.stringify({ ok: true, ...result }, null, 2));
+    } catch (error: unknown) {
+      console.log(JSON.stringify({
+        ok: false,
+        error: error instanceof DesktopToolsPipeHandoffError
+          ? error.code
+          : "desktop_tools_pipe_handoff_failed",
+      }, null, 2));
+      process.exitCode = 1;
+    }
   } else if (argv[0] === "diagnose-chatgpt-connector") {
     try {
       const settings = await loadSettings(argv.slice(1));

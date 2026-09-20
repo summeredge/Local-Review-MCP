@@ -6,3 +6,5 @@ export * from "./thread-commands.js";
 export * from "./desktop-thread-binding.js";
 export * from "./desktop-thread-binding-store.js";
 export * from "./desktop-thread-coordinator.js";
+export * from "./desktop-tools-pipe-handoff.js";
+export * from "./desktop-tools-pipe-probe.js";

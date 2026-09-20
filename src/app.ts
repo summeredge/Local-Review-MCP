@@ -59,6 +59,8 @@ import { IdentityTraceService } from "./control-plane/identity-trace.js";
 import { EvidenceTransportTraceService } from "./control-plane/evidence-transport-trace.js";
 import { DesktopIPCObserver } from "./desktop-sync/desktop-ipc-observer.js";
 import { DesktopSyncManager } from "./desktop-sync/desktop-sync-manager.js";
+import { DesktopToolsPipeHandoff } from "./desktop-codex/desktop-tools-pipe-handoff.js";
+import { DesktopCodexRuntimeFactory } from "./desktop-codex/desktop-tools-pipe-probe.js";
 
 export interface AppContext extends McpRuntimeContext {
   readonly storageRoot?: string;
@@ -231,6 +233,11 @@ export async function startApp(
         },
     workspaceId: context.registry.active.id,
   });
+  const desktopToolsPipeHandoff = new DesktopToolsPipeHandoff();
+  const desktopCodexRuntimeFactory = new DesktopCodexRuntimeFactory(
+    desktopToolsPipeHandoff,
+    () => desktopSyncObserver.getState(),
+  );
   try {
     const workspaceOAuth = context.storageRoot === undefined
       ? undefined
@@ -244,6 +251,8 @@ export async function startApp(
       browserReadiness: extensionDeliveryReadiness,
       desktopSyncObserver,
       desktopSyncManager,
+      desktopToolsPipeHandoff,
+      desktopCodexRuntimeFactory,
     }, {
       oauthClientRegistryPath: options.oauthClientRegistryPath ?? workspaceOAuth?.clientRegistryPath,
       oauthTokenStorePath: options.oauthTokenStorePath

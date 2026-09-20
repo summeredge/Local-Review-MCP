@@ -19,6 +19,16 @@ import type { DesktopIPCObserver } from "../desktop-sync/desktop-ipc-observer.js
 import type { DesktopSyncManager } from "../desktop-sync/desktop-sync-manager.js";
 import type { DesktopSyncState } from "../desktop-sync/desktop-sync-state.js";
 import {
+  DesktopToolsPipeHandoff,
+  DesktopToolsPipeHandoffError,
+  LAUNCHER_DESKTOP_TOOLS_PIPE_PATH,
+  LAUNCHER_DESKTOP_TOOLS_PIPE_PROBE_PATH,
+} from "../desktop-codex/desktop-tools-pipe-handoff.js";
+import {
+  probeDesktopToolsPipe,
+  type DesktopCodexRuntimeProvider,
+} from "../desktop-codex/desktop-tools-pipe-probe.js";
+import {
   APP_VERSION,
   DEFAULT_HOST,
   HEALTH_PATH,
@@ -49,6 +59,8 @@ type HttpRuntimeContext = Omit<McpRuntimeContext, "statusQuery"> & {
   readonly browserReadiness?: () => ExtensionDeliveryReadiness;
   readonly desktopSyncObserver?: Pick<DesktopIPCObserver, "getState">;
   readonly desktopSyncManager?: Pick<DesktopSyncManager, "getState">;
+  readonly desktopToolsPipeHandoff?: DesktopToolsPipeHandoff;
+  readonly desktopCodexRuntimeFactory?: DesktopCodexRuntimeProvider;
   readonly statusQuery?: HttpStatusQuery;
   readonly tunnel?: Pick<TunnelProvider, "status">;
 };
@@ -265,6 +277,118 @@ async function handleLauncherDesktopSyncRequest(
     state = undefined;
   }
   sendJson(response, 200, desktopSyncStatus(state), { "cache-control": "no-store" });
+}
+
+async function handleLauncherDesktopToolsPipeRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: HttpRuntimeContext,
+  authToken: string,
+): Promise<void> {
+  if (!isDirectLoopbackRequest(request)) {
+    request.resume();
+    sendJson(response, 404, { error: "not_found" });
+    return;
+  }
+  if (!isAuthenticated(request, authToken)) {
+    request.resume();
+    sendUnauthorized(response);
+    return;
+  }
+  if (request.method !== "POST") {
+    request.resume();
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+
+  let body: unknown;
+  try {
+    body = await parseBody(request);
+  } catch (error: unknown) {
+    sendJson(response, error instanceof RequestBodyTooLargeError ? 413 : 400, {
+      error: error instanceof RequestBodyTooLargeError ? "payload_too_large" : "invalid_json_body",
+    });
+    return;
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)
+    || typeof (body as { pipePath?: unknown }).pipePath !== "string") {
+    sendJson(response, 400, { error: "desktop_tools_pipe_invalid" });
+    return;
+  }
+
+  let state: DesktopSyncState | undefined;
+  try {
+    state = context.desktopSyncObserver?.getState();
+  } catch {
+    state = undefined;
+  }
+  const ownerClientId = state?.connected ? state.ownerClientId : undefined;
+  if (context.desktopToolsPipeHandoff === undefined
+    || state?.connected !== true
+    || typeof ownerClientId !== "string"
+    || ownerClientId.trim() === "") {
+    sendJson(response, 409, { error: "desktop_tools_pipe_unavailable" });
+    return;
+  }
+
+  try {
+    const capability = context.desktopToolsPipeHandoff.accept(
+      (body as { pipePath: string }).pipePath,
+      ownerClientId,
+    );
+    sendJson(response, 200, {
+      accepted: true,
+      source: capability.source,
+      received_at: capability.receivedAt,
+      desktop_owner_bound: true,
+    }, { "cache-control": "no-store" });
+  } catch (error: unknown) {
+    const code = error instanceof DesktopToolsPipeHandoffError
+      ? error.code
+      : "desktop_tools_pipe_invalid";
+    sendJson(response, 400, { error: code });
+  }
+}
+
+async function handleLauncherDesktopToolsPipeProbeRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: HttpRuntimeContext,
+  authToken: string,
+): Promise<void> {
+  if (!isDirectLoopbackRequest(request)) {
+    request.resume();
+    sendJson(response, 404, { error: "not_found" });
+    return;
+  }
+  if (!isAuthenticated(request, authToken)) {
+    request.resume();
+    sendUnauthorized(response);
+    return;
+  }
+  if (request.method !== "POST") {
+    request.resume();
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+  request.resume();
+  if (context.desktopToolsPipeHandoff === undefined
+    || context.desktopCodexRuntimeFactory === undefined) {
+    sendJson(response, 503, { connected: false, error: "desktop_tools_pipe_unavailable" });
+    return;
+  }
+  try {
+    sendJson(response, 200, await probeDesktopToolsPipe(context.desktopCodexRuntimeFactory), {
+      "cache-control": "no-store",
+    });
+  } catch (error: unknown) {
+    const unavailable = error instanceof DesktopToolsPipeHandoffError
+      && error.code === "desktop_tools_pipe_unavailable";
+    sendJson(response, unavailable ? 409 : 502, {
+      connected: false,
+      error: unavailable ? "desktop_tools_pipe_unavailable" : "desktop_tools_pipe_probe_failed",
+    }, { "cache-control": "no-store" });
+  }
 }
 
 async function handleMcpRequest(
@@ -810,6 +934,16 @@ export function createHttpServer(
 
       if (path === LAUNCHER_DESKTOP_SYNC_PATH) {
         await handleLauncherDesktopSyncRequest(request, response, context, settings.auth.token);
+        return;
+      }
+
+      if (path === LAUNCHER_DESKTOP_TOOLS_PIPE_PATH) {
+        await handleLauncherDesktopToolsPipeRequest(request, response, context, settings.auth.token);
+        return;
+      }
+
+      if (path === LAUNCHER_DESKTOP_TOOLS_PIPE_PROBE_PATH) {
+        await handleLauncherDesktopToolsPipeProbeRequest(request, response, context, settings.auth.token);
         return;
       }
 

@@ -17,6 +17,7 @@
     "diagnose:codex-app-effectful": "npm run build && node dist/src/cli.js diagnose-codex-app-effectful",
     "diagnostic:p522c": "npm run build && node dist/src/cli.js diagnostic-p522c",
     "diagnostic:p530b": "npm run build && node dist/src/cli.js diagnostic-p530b",
+    "handoff:desktop-tools-pipe": "npm run build && node dist/src/cli.js handoff-desktop-tools-pipe",
     "confirm:chatgpt-connector": "npm run build && node dist/src/cli.js confirm-chatgpt-connector",
     "diagnose:conversation-routing": "npm run build && node dist/src/cli.js diagnose-conversation-routing",
     "diagnose:review-delivery": "npm run build && node dist/src/cli.js diagnose-review-delivery",
