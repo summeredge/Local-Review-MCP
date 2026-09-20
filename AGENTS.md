@@ -103,6 +103,5 @@ LRM MCP → Read-only Data Plane
 
 ## Language
 
-All user-facing responses, plans, progress updates, explanations, and final summaries must be written in Simplified Chinese.
-
-Keep code, identifiers, commands, file paths, API names, error messages, and technical terms in their original form when appropriate.
+所有面向用户的思维链、回复、计划、进度更新、说明和最终总结都必须使用简体中文撰写。
+在适当的情况下，代码、标识符、命令、文件路径、API 名称、错误消息和技术术语应保留其原始形式。

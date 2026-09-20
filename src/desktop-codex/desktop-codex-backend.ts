@@ -227,6 +227,9 @@ export class DesktopCodexBackend implements ExecutionBackend {
     const runtime = await this.connectRuntime();
     let session: Session | undefined;
     let execution: ExecutionContext | undefined;
+    // Runtime ownership starts here and moves to the completion watch exactly once. Until the
+    // transfer happens, this frame is responsible for closing the runtime on every exit path.
+    let runtimeOwnedByWatch = false;
     try {
       const { commands, contracts, client } = await this.prepare(runtime);
       // Every codex_app tools/call in this Execution must use the executor captured above, so the
@@ -300,6 +303,9 @@ export class DesktopCodexBackend implements ExecutionBackend {
         if (this.completions.get(sessionId) === completion) this.completions.delete(sessionId);
       });
 
+      // The watch owns the runtime from here on; its own finally releases it exactly once.
+      runtimeOwnedByWatch = true;
+
       return {
         execution_id: execution.execution_id,
         started_at: execution.started_at,
@@ -311,6 +317,12 @@ export class DesktopCodexBackend implements ExecutionBackend {
       if (session !== undefined) this.runtimes.delete(session.session_id);
       await this.failLaunch(request, session, execution, error);
       throw error;
+    } finally {
+      // Preflight/launch failures must not leak a successfully connected runtime. The success path
+      // already handed ownership to the completion watch, so this closes nothing in that case.
+      if (!runtimeOwnedByWatch) {
+        await runtime.close().catch(() => undefined);
+      }
     }
   }
 

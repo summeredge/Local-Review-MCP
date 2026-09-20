@@ -136,6 +136,7 @@ interface FakeDesktop {
   readonly calls: CallToolRequestParams[];
   readonly createThreadCount: () => number;
   readonly sendCount: () => number;
+  readonly runtimeCloseCount: () => number;
   readonly runtime: DesktopCodexRuntimeLike & { readonly mcpClient: { callTool(params: CallToolRequestParams): Promise<CallToolResult> } };
   readonly runtimeFactory: { connect(): Promise<DesktopCodexRuntimeLike> };
   setTurns(turns: readonly Turn[]): void;
@@ -167,6 +168,7 @@ function fakeDesktop(options: {
   let tools: readonly Tool[] = desktopTools();
   let projectPath = options.projectPath ?? OTHER_WORKSPACE_PATH;
   let connectError: Error | undefined;
+  let runtimeCloses = 0;
 
   const client = {
     callTool: async (params: CallToolRequestParams): Promise<CallToolResult> => {
@@ -212,7 +214,7 @@ function fakeDesktop(options: {
       nativeDesktopTransport: "windows_named_pipe" as const,
     },
     listTools: async () => ({ tools: tools as never }),
-    close: async () => undefined,
+    close: async () => { runtimeCloses += 1; },
     mcpClient: client,
   };
 
@@ -220,6 +222,7 @@ function fakeDesktop(options: {
     calls,
     createThreadCount: () => calls.filter((call) => call.name === "create_thread").length,
     sendCount: () => calls.filter((call) => call.name === "send_message_to_thread").length,
+    runtimeCloseCount: () => runtimeCloses,
     runtime,
     runtimeFactory: {
       connect: async () => {
@@ -897,6 +900,156 @@ describe("P5.4.1 FIX failure terminal projection", () => {
       expect(entry.session).toBe("failed");
     }
     expect(observed.length).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("P5.4.1 FIX Desktop runtime ownership", () => {
+  it("never closes a runtime that failed to connect", async () => {
+    const desktop = fakeDesktop();
+    desktop.failConnect(new Error("transport failed"));
+    const value = await fixture({ desktop });
+    await seedTask(value);
+
+    await expect(value.service.start(interactiveRequest())).rejects.toBeDefined();
+
+    // No runtime was ever acquired, so cleanup must not fabricate one.
+    expect(value.desktop.runtimeCloseCount()).toBe(0);
+    expect(value.desktop.createThreadCount()).toBe(0);
+    expect(value.appServerStart).not.toHaveBeenCalled();
+  });
+
+  it("closes the runtime exactly once when the tools contract is incompatible", async () => {
+    const desktop = fakeDesktop();
+    desktop.setListTools([{ name: "list_projects", inputSchema: { type: "object", properties: {} } }]);
+    const value = await fixture({ desktop });
+    await seedTask(value);
+
+    await expect(value.service.start(interactiveRequest())).rejects.toBeDefined();
+
+    expect(value.desktop.runtimeCloseCount()).toBe(1);
+    expect(value.desktop.createThreadCount()).toBe(0);
+    expect(value.appServerStart).not.toHaveBeenCalled();
+  });
+
+  it("closes the runtime exactly once when no exact local project matches", async () => {
+    const value = await fixture({ projectPath: "C:\\other\\project" });
+    await seedTask(value);
+
+    await expect(value.service.start(interactiveRequest())).rejects.toBeDefined();
+
+    expect(value.desktop.runtimeCloseCount()).toBe(1);
+    expect(value.desktop.createThreadCount()).toBe(0);
+    expect(value.appServerStart).not.toHaveBeenCalled();
+  });
+
+  it("closes the runtime exactly once when more than one exact local project matches", async () => {
+    const desktop = fakeDesktop();
+    const original = desktop.runtime.mcpClient.callTool;
+    let workspacePath = OTHER_WORKSPACE_PATH;
+    desktop.runtime.mcpClient.callTool = async (params: CallToolRequestParams) => {
+      if (params.name !== "list_projects") return original(params);
+      return jsonResult({
+        projects: [
+          { projectId: "project-1", hostId: "local", projectKind: "local", path: workspacePath },
+          { projectId: "project-2", hostId: "local", projectKind: "local", path: workspacePath },
+        ],
+      });
+    };
+    const value = await fixture({ desktop });
+    workspacePath = value.registry.active.manager.canonicalRoot;
+    await seedTask(value);
+
+    await expect(value.service.start(interactiveRequest())).rejects.toBeDefined();
+
+    expect(value.desktop.runtimeCloseCount()).toBe(1);
+    expect(value.desktop.createThreadCount()).toBe(0);
+    expect(value.appServerStart).not.toHaveBeenCalled();
+  });
+
+  it("closes the runtime exactly once when create_thread fails after the Session exists", async () => {
+    const value = await fixture();
+    const original = value.desktop.runtime.mcpClient.callTool;
+    value.desktop.runtime.mcpClient.callTool = async (params: CallToolRequestParams) => {
+      if (params.name === "create_thread") {
+        // Record the attempt so the assertion sees the effectful call, then fail it.
+        value.desktop.calls.push(params);
+        throw new Error("create_thread transport failed");
+      }
+      return original(params);
+    };
+
+    await seedTask(value);
+    await expect(value.service.start(interactiveRequest())).rejects.toBeDefined();
+    await value.backend.whenIdle();
+
+    expect(value.desktop.createThreadCount()).toBe(1);
+    expect(value.desktop.runtimeCloseCount()).toBe(1);
+    expect(value.appServerStart).not.toHaveBeenCalled();
+
+    // The launch failure still projects terminal Session/Execution state before the listener.
+    const session = (await value.sessions.listSessions())[0]!;
+    expect(session.status).toBe("failed");
+    const execution = await value.executions.getExecutionContext(
+      "workspace-a",
+      TASK_ID,
+      EXECUTION_ID,
+    );
+    expect(execution?.status).toBe("failed");
+  });
+
+  it("keeps the runtime open through the completion watch and closes it once afterwards", async () => {
+    const value = await fixture();
+    value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 2 }]);
+
+    await authorizeAndActuate(value);
+
+    // The watch owns the runtime: exactly one close, and only after the Execution terminated.
+    expect(value.desktop.runtimeCloseCount()).toBe(1);
+    const execution = await value.executions.getExecutionContext(
+      "workspace-a",
+      TASK_ID,
+      EXECUTION_ID,
+    );
+    expect(execution?.status).toBe("passed");
+    expect((await value.sessions.listSessions())[0]!.status).toBe("completed");
+  });
+
+  it("closes the runtime exactly once when the Desktop turn times out", async () => {
+    const value = await fixture();
+    // No completed turn ever appears, so the observer reports timed_out.
+    value.desktop.setTurns([]);
+
+    await authorizeAndActuate(value);
+
+    expect(value.desktop.runtimeCloseCount()).toBe(1);
+    const execution = await value.executions.getExecutionContext(
+      "workspace-a",
+      TASK_ID,
+      EXECUTION_ID,
+    );
+    expect(execution?.status).toBe("failed");
+    expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
+  });
+
+  it("closes a runtime held in the active map when the backend is shut down", async () => {
+    const value = await fixture();
+    // A non-completing turn keeps the watch (and its runtime) active while close() runs.
+    value.desktop.setTurns([]);
+    await seedTask(value);
+
+    const started = value.service.start(interactiveRequest());
+    // Wait until the runtime has been registered as active before shutting the backend down.
+    const deadline = Date.now() + 5_000;
+    while (value.desktop.runtimeCloseCount() === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    await value.backend.close();
+    await started.catch(() => undefined);
+    await value.backend.whenIdle();
+
+    // Shutdown and the watch finally must not double close the same runtime.
+    expect(value.desktop.runtimeCloseCount()).toBe(1);
   });
 });
 
