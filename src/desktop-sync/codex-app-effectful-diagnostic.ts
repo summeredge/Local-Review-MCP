@@ -1,7 +1,5 @@
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import type { CallToolRequestParams } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   CodexAppMcpDiagnosticError,
   connectCodexAppMcp,
@@ -12,6 +10,17 @@ import {
   type CodexAppMcpDiagnosticStage,
   type CodexAppMcpRuntime,
 } from "./codex-app-mcp-diagnostic.js";
+import {
+  callCodexAppTool,
+  CodexAppRuntimeError,
+  type CodexAppMcpClient,
+} from "../desktop-codex/codex-app-runtime.js";
+import { createCodexAppToolContracts } from "../desktop-codex/codex-app-contracts.js";
+import {
+  parseDesktopProjects,
+  resolveDesktopProject,
+} from "../desktop-codex/desktop-project-resolver.js";
+import { DesktopCodexThreadCommands } from "../desktop-codex/thread-commands.js";
 
 const CREATE_PROMPT = "Only return LRM_CODEX_APP_P5_1_CREATE_PASS. Do not modify any files, create commits, or push.";
 const SECOND_PROMPT = "Only return LRM_CODEX_APP_P5_1_SECOND_PASS. Do not modify any files, create commits, or push.";
@@ -24,8 +33,6 @@ const EXECUTOR_METADATA_ERROR_TEXT = "codex app tools require thread metadata fr
 const NATIVE_REQUEST_ERROR_TEXT = "invalid app tool request";
 const EXECUTOR_METADATA_ERROR_FINGERPRINT = "9eb0c658fe43c9440be141bdfba1c400db55308b73a48decbcc8ecdc84f1dca9";
 const NATIVE_REQUEST_ERROR_FINGERPRINT = "4ba5282b280ceabcfb431897e91c387578cabc4be5572d19493465f8927a5bd9";
-const READ_ONLY_ALLOWLIST = new Set(["list_projects"]);
-const EFFECTFUL_ALLOWLIST = new Set(["create_thread"]);
 const CONTINUITY_ALLOWLIST = new Set(["wait_threads", "read_thread", "send_message_to_thread"]);
 
 export type CreateThreadFailureClass =
@@ -245,16 +252,6 @@ interface MutableResultState {
   pipeDiscovery?: "explicit_override" | "current_environment" | "unavailable";
 }
 
-interface CreateThreadPlan {
-  readonly schema: CreateThreadSchemaSummary;
-  readonly environmentType: "local" | "worktree";
-  readonly build: (prompt: string, projectId: string) => Record<string, unknown>;
-}
-
-interface SendMessagePlan {
-  readonly build: (threadId: string, prompt: string, hostId: string | undefined) => Record<string, unknown> | undefined;
-}
-
 interface CompletionPlan {
   readonly tool: "wait_threads" | "read_thread";
   readonly build: (threadId: string, hostId: string | undefined, timeoutMs: number) => Record<string, unknown> | undefined;
@@ -263,13 +260,6 @@ interface CompletionPlan {
 interface CompletionEvidence {
   readonly completed: boolean;
   readonly markerObserved: boolean;
-}
-
-interface DesktopProject {
-  readonly projectId: string;
-  readonly path: string;
-  readonly projectKind: string;
-  readonly hostId: string;
 }
 
 interface ErrorEvidence {
@@ -361,8 +351,7 @@ function isStringSchema(schema: JsonSchema | undefined): boolean {
 
 function acceptsLiteral(schema: JsonSchema | undefined, value: string): boolean {
   if (schema === undefined) return false;
-  if (schema.const === value) return true;
-  return Array.isArray(schema.enum) && schema.enum.includes(value);
+  return schema.const === value || (Array.isArray(schema.enum) && schema.enum.includes(value));
 }
 
 function variantForType(schema: JsonSchema | undefined, value: string): JsonSchema | undefined {
@@ -373,68 +362,34 @@ function variantForType(schema: JsonSchema | undefined, value: string): JsonSche
   return undefined;
 }
 
-function toolContracts(value: readonly unknown[]): Map<string, ToolContract> {
-  const result = new Map<string, ToolContract>();
-  for (const candidate of value) {
-    if (!isRecord(candidate)) continue;
-    const name = nonEmpty(candidate.name);
-    const inputSchema = schemaRecord(candidate.inputSchema);
-    if (name !== undefined && inputSchema !== undefined) result.set(name, { name, inputSchema });
+function unionBranches(schema: JsonSchema | undefined): readonly JsonSchema[] {
+  if (schema === undefined) return [];
+  for (const key of ["anyOf", "oneOf"]) {
+    if (!Array.isArray(schema[key])) continue;
+    const branches = schema[key]
+      .map((value) => schemaRecord(value))
+      .filter((value): value is JsonSchema => value !== undefined);
+    if (branches.length > 0) return branches;
   }
-  return result;
+  return [schema];
 }
 
-function validateListProjectsTool(tool: ToolContract | undefined): boolean {
-  return tool !== undefined && requiredFields(tool.inputSchema).length === 0;
-}
-
-function parseJsonText(value: string): unknown {
-  const trimmed = value.trim();
-  if (!(trimmed.startsWith("{") || trimmed.startsWith("["))) return undefined;
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    return undefined;
-  }
-}
-
-function projectRecords(value: unknown, output: Record<string, unknown>[] = [], seen = new Set<object>()): readonly Record<string, unknown>[] {
-  if (typeof value === "string") {
-    const parsed = parseJsonText(value);
-    if (parsed !== undefined) projectRecords(parsed, output, seen);
-    return output;
-  }
-  if (!isRecord(value) && !Array.isArray(value)) return output;
-  if (seen.has(value)) return output;
-  seen.add(value);
-  if (isRecord(value) && Array.isArray(value.projects)) {
-    for (const project of value.projects) if (isRecord(project)) output.push(project);
-    return output;
-  }
-  for (const nested of Array.isArray(value) ? value : Object.values(value)) projectRecords(nested, output, seen);
-  return output;
-}
-
-function normalizePathForMatch(value: string): string {
-  return resolve(value).replace(/[\\/]+/g, "\\").replace(/\\$/, "").toLowerCase();
-}
-
-function resolveDesktopProject(value: unknown, workspacePath: string): readonly DesktopProject[] {
-  const expectedPath = normalizePathForMatch(workspacePath);
-  return projectRecords(value)
-    .map((project) => {
-      const projectId = nonEmpty(project.projectId);
-      const path = nonEmpty(project.path);
-      const projectKind = nonEmpty(project.projectKind);
-      const hostId = nonEmpty(project.hostId);
-      if (projectId === undefined || path === undefined || projectKind === undefined || hostId === undefined) {
-        return undefined;
-      }
-      return { projectId, path, projectKind, hostId };
-    })
-    .filter((project): project is DesktopProject => project !== undefined)
-    .filter((project) => normalizePathForMatch(project.path) === expectedPath)
-    .filter((project) => project.projectKind === "local" && project.hostId === "local");
+function schemaVariantSummary(schema: JsonSchema): SchemaVariantSummary {
+  const typeSchema = schemaProperties(schema).type;
+  const values = typeSchema === undefined
+    ? []
+    : [
+      ...(typeof typeSchema.const === "string" ? [typeSchema.const] : []),
+      ...(Array.isArray(typeSchema.enum)
+        ? typeSchema.enum.filter((value): value is string => typeof value === "string")
+        : []),
+    ];
+  const uniqueValues = [...new Set(values)];
+  return {
+    ...(uniqueValues[0] === undefined ? {} : { type: uniqueValues[0] }),
+    ...(uniqueValues.length === 0 ? {} : { typeEnum: uniqueValues }),
+    required: [...requiredFields(schema)],
+  };
 }
 
 function schemaSummary(schema: JsonSchema): CreateThreadSchemaSummary {
@@ -452,69 +407,25 @@ function schemaSummary(schema: JsonSchema): CreateThreadSchemaSummary {
   };
 }
 
-function unionBranches(schema: JsonSchema | undefined): readonly JsonSchema[] {
-  if (schema === undefined) return [];
-  for (const key of ["anyOf", "oneOf"]) {
-    if (!Array.isArray(schema[key])) continue;
-    const branches = schema[key]
-      .map((value) => schemaRecord(value))
-      .filter((value): value is JsonSchema => value !== undefined);
-    if (branches.length > 0) return branches;
+function toolContracts(value: readonly unknown[]): Map<string, ToolContract> {
+  const result = new Map<string, ToolContract>();
+  for (const candidate of value) {
+    if (!isRecord(candidate)) continue;
+    const name = nonEmpty(candidate.name);
+    const inputSchema = schemaRecord(candidate.inputSchema);
+    if (name !== undefined && inputSchema !== undefined) result.set(name, { name, inputSchema });
   }
-  return [schema];
+  return result;
 }
 
-function literalValues(schema: JsonSchema | undefined): readonly string[] {
-  if (schema === undefined) return [];
-  const values: string[] = [];
-  if (typeof schema.const === "string") values.push(schema.const);
-  if (Array.isArray(schema.enum)) {
-    for (const value of schema.enum) if (typeof value === "string") values.push(value);
+function parseJsonText(value: string): unknown {
+  const trimmed = value.trim();
+  if (!(trimmed.startsWith("{") || trimmed.startsWith("["))) return undefined;
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return undefined;
   }
-  return [...new Set(values)];
-}
-
-function schemaVariantSummary(schema: JsonSchema): SchemaVariantSummary {
-  const values = literalValues(schemaProperties(schema).type);
-  return {
-    ...(values[0] === undefined ? {} : { type: values[0] }),
-    ...(values.length === 0 ? {} : { typeEnum: values }),
-    required: [...requiredFields(schema)],
-  };
-}
-
-function validateCreateThreadTool(tool: ToolContract | undefined): CreateThreadPlan | undefined {
-  if (tool === undefined) return undefined;
-  const schema = tool.inputSchema;
-  const properties = schemaProperties(schema);
-  if (!requirementsWithin(schema, new Set(["prompt", "target"]))) return undefined;
-  if (!isStringSchema(properties.prompt)) return undefined;
-
-  const projectTarget = variantForType(properties.target, "project");
-  if (projectTarget === undefined) return undefined;
-  const targetProperties = schemaProperties(projectTarget);
-  if (!requirementsWithin(projectTarget, new Set(["type", "projectId", "environment"]))) return undefined;
-  if (!isStringSchema(targetProperties.projectId)) return undefined;
-
-  const localEnvironment = variantForType(targetProperties.environment, "local");
-  if (localEnvironment === undefined || !requirementsWithin(localEnvironment, new Set(["type"]))) return undefined;
-
-  return {
-    schema: schemaSummary(schema),
-    environmentType: "local",
-    build: (prompt, projectId) => ({
-      prompt,
-      target: {
-        type: "project",
-        projectId,
-        environment: { type: "local" },
-      },
-    }),
-  };
-}
-
-function propertySchema(schema: JsonSchema, name: string): JsonSchema | undefined {
-  return schemaProperties(schema)[name];
 }
 
 function isIntegerSchema(schema: JsonSchema | undefined): boolean {
@@ -523,26 +434,6 @@ function isIntegerSchema(schema: JsonSchema | undefined): boolean {
 
 function isBooleanSchema(schema: JsonSchema | undefined): boolean {
   return schema !== undefined && schemaType(schema, "boolean");
-}
-
-function validateSendMessageTool(tool: ToolContract | undefined): SendMessagePlan | undefined {
-  if (tool === undefined) return undefined;
-  const schema = tool.inputSchema;
-  const properties = schemaProperties(schema);
-  if (!requirementsWithin(schema, new Set(["threadId", "hostId", "prompt"]))) return undefined;
-  if (!isStringSchema(properties.threadId) || !isStringSchema(properties.prompt)) return undefined;
-  const hostRequired = requiredFields(schema).includes("hostId");
-  if (hostRequired && !isStringSchema(properties.hostId)) return undefined;
-  return {
-    build: (threadId, prompt, hostId) => {
-      if (hostRequired && hostId === undefined) return undefined;
-      return {
-        threadId,
-        prompt,
-        ...(isStringSchema(properties.hostId) && hostId !== undefined ? { hostId } : {}),
-      };
-    },
-  };
 }
 
 function validateWaitThreadsTool(tool: ToolContract | undefined): CompletionPlan | undefined {
@@ -634,13 +525,26 @@ function contentInfo(value: unknown): { types: string[]; texts: string[] } {
 
 function errorSources(value: unknown): readonly Record<string, unknown>[] {
   if (value instanceof Error) {
+    const cause = value.cause;
     const source: Record<string, unknown> = {
       code: (value as Error & { code?: unknown }).code,
       name: value.name,
       message: value.message,
-      cause: value.cause,
+      cause,
     };
-    return [source, ...(isRecord(value.cause) ? [value.cause] : [])];
+    const causeRecord = cause instanceof Error
+      ? {
+        code: (cause as Error & { code?: unknown }).code,
+        name: cause.name,
+        message: cause.message,
+        cause: cause.cause,
+      }
+      : undefined;
+    return [
+      source,
+      ...(isRecord(cause) ? [cause] : []),
+      ...(causeRecord === undefined ? [] : [causeRecord]),
+    ];
   }
   if (!isRecord(value)) return [];
   const sources: Record<string, unknown>[] = [value];
@@ -656,6 +560,7 @@ function errorSources(value: unknown): readonly Record<string, unknown>[] {
 function errorTexts(value: unknown, contentTexts: readonly string[]): readonly string[] {
   const texts = [...contentTexts];
   for (const source of errorSources(value)) {
+    texts.push(...contentInfo(source).texts);
     if (typeof source.message === "string") texts.push(source.message);
   }
   return texts.filter((text) => text.trim() !== "");
@@ -697,13 +602,21 @@ function createFailureEvidence(value: unknown): ErrorEvidence {
   const first = sources[0] ?? {};
   const errorSource = sources.find((source) => isRecord(source.error))?.error;
   const error = isRecord(errorSource) ? errorSource : undefined;
-  const code = safeScalar(first.code) ?? safeScalar(error?.code);
+  const codes = sources
+    .map((source) => safeScalar(source.code))
+    .filter((value): value is string | number => value !== undefined);
+  const code = codes.find((value): value is number => typeof value === "number")
+    ?? codes.find((value) => value !== "tool_call_failed")
+    ?? safeScalar(first.code)
+    ?? safeScalar(error?.code);
   const type = safeClass(first.type) ?? safeClass(error?.type);
   const name = safeClass(first.name) ?? safeClass(error?.name);
   const sdkErrorClass = value instanceof Error ? safeClass(value.constructor.name) : undefined;
   const cause = value instanceof Error ? value.cause : undefined;
   const sdkCauseClass = cause instanceof Error ? safeClass(cause.constructor.name) : undefined;
-  const isError = isRecord(value) && typeof value.isError === "boolean" ? value.isError : null;
+  const isError = isRecord(value) && typeof value.isError === "boolean"
+    ? value.isError
+    : sources.find((source) => typeof source.isError === "boolean")?.isError as boolean | undefined ?? null;
   return {
     isError,
     contentItemTypes: content.types,
@@ -753,33 +666,6 @@ function applyFailureEvidence(state: MutableResultState, evidence: ErrorEvidence
   state.hasErrorText = evidence.hasErrorText;
   state.errorFingerprint = evidence.errorFingerprint;
   state.writerConflictObserved = evidence.failureClass === "writer_conflict";
-}
-
-function identityOf(value: unknown): { threadId?: string; hostId?: string } {
-  if (typeof value === "string") {
-    const parsed = parseJsonText(value);
-    return parsed === undefined ? {} : identityOf(parsed);
-  }
-  if (Array.isArray(value)) {
-    for (const nested of value) {
-      const identity = identityOf(nested);
-      if (identity.threadId !== undefined) return identity;
-    }
-    return {};
-  }
-  if (!isRecord(value)) return {};
-  const threadId = nonEmpty(value.threadId);
-  const hostId = nonEmpty(value.hostId);
-  if (threadId !== undefined) return { threadId, ...(hostId === undefined ? {} : { hostId }) };
-  for (const nested of Object.values(value)) {
-    const identity = identityOf(nested);
-    if (identity.threadId !== undefined) return identity;
-  }
-  return {};
-}
-
-function safeIdentity(value: string | undefined): string | undefined {
-  return value !== undefined && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(value) ? value : undefined;
 }
 
 function completionEvidence(value: unknown, marker: string): CompletionEvidence {
@@ -938,48 +824,35 @@ async function waitAfterFailure(milliseconds: number, signal: AbortSignal): Prom
 }
 
 async function callAllowedTool(
-  client: Client,
+  client: CodexAppMcpClient,
   name: string,
   args: Record<string, unknown>,
   executorThreadId: string,
   timeoutMs: number,
   signal: AbortSignal,
   allowlist: ReadonlySet<string>,
-): Promise<unknown> {
+): Promise<CallToolResult> {
   if (!allowlist.has(name)) throw new Error("disallowed diagnostic tool");
-  if (signal.aborted) throw new DiagnosticInterrupted();
-  const controller = new AbortController();
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  let abortHandler: (() => void) | undefined;
   try {
-    const params: CallToolRequestParams = {
-      name,
+    return await callCodexAppTool({
+      client,
+      tool: name,
       arguments: args,
-      _meta: { [EXECUTOR_METADATA_KEY]: executorThreadId },
-    };
-    const request = client.callTool(params, undefined, { signal: controller.signal });
-    const interrupted = new Promise<never>((_, reject) => {
-      abortHandler = (): void => {
-        controller.abort();
-        reject(new DiagnosticInterrupted());
-      };
-      signal.addEventListener("abort", abortHandler, { once: true });
+      executorThreadId,
+      timeoutMs,
+      signal,
     });
-    const timeout = new Promise<never>((_, reject) => {
-      timeoutHandle = setTimeout(() => {
-        controller.abort();
-        reject(new ToolCallTimeout());
-      }, Math.max(1, timeoutMs));
-    });
-    return await Promise.race([request, interrupted, timeout]);
-  } finally {
-    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
-    if (abortHandler !== undefined) signal.removeEventListener("abort", abortHandler);
+  } catch (error: unknown) {
+    if (error instanceof CodexAppRuntimeError) {
+      if (error.code === "tool_call_timeout") throw new ToolCallTimeout();
+      if (error.code === "tool_call_aborted") throw new DiagnosticInterrupted();
+    }
+    throw error;
   }
 }
 
 async function waitForThread(
-  client: Client,
+  client: CodexAppMcpClient,
   plan: CompletionPlan,
   threadId: string,
   hostId: string | undefined,
@@ -1072,7 +945,7 @@ export async function runCodexAppEffectfulDiagnostic(
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
 
-  let client: Client | undefined;
+  let client: CodexAppMcpClient | undefined;
   let transport: { close(): Promise<void> } | undefined;
   try {
     let runtime: CodexAppMcpRuntime;
@@ -1103,9 +976,9 @@ export async function runCodexAppEffectfulDiagnostic(
       return finish(state, interrupted ? "diagnostic_interrupted" : "mcp_initialize_failed", startedAt, now);
     }
 
-    let listed: Awaited<ReturnType<Client["listTools"]>>;
+    let listed: Awaited<ReturnType<CodexAppMcpClient["listTools"]>>;
     try {
-      listed = await client.listTools(undefined, { signal: abortController.signal });
+      listed = await client!.listTools(undefined, { signal: abortController.signal });
       state.toolsListed = true;
       state.toolCount = listed.tools.length;
       state.tools = listed.tools.map((tool) => tool.name);
@@ -1113,103 +986,94 @@ export async function runCodexAppEffectfulDiagnostic(
       return finish(state, interrupted ? "diagnostic_interrupted" : "tools_list_failed", startedAt, now);
     }
 
-    const contracts = toolContracts(listed.tools);
-    const listProjectsTool = contracts.get("list_projects");
-    if (!validateListProjectsTool(listProjectsTool)) {
+    const diagnosticContracts = toolContracts(listed.tools);
+    let formalContracts: ReturnType<typeof createCodexAppToolContracts>;
+    try {
+      formalContracts = createCodexAppToolContracts(listed.tools);
+      formalContracts.requireListProjects();
+    } catch {
       return finish(state, "list_projects_schema_incompatible", startedAt, now);
     }
+    const commands = new DesktopCodexThreadCommands({ client: client!, contracts: formalContracts });
 
     state.listProjectsCalled = true;
-    let projectsResult: unknown;
+    let projectsResult: CallToolResult;
     try {
-      projectsResult = await callAllowedTool(
-        client,
-        "list_projects",
-        {},
+      projectsResult = await commands.listProjects({
         executorThreadId,
         timeoutMs,
-        abortController.signal,
-        READ_ONLY_ALLOWLIST,
-      );
+        signal: abortController.signal,
+      });
     } catch (error: unknown) {
       const evidence = createFailureEvidence(error);
       applyFailureEvidence(state, evidence);
-      const classification = classifyListProjectsFailure(evidence, false);
+      const classification = classifyListProjectsFailure(evidence, evidence.isError === true);
       state.failureClass = classification.failureClass;
       state.metadataGatePassed = classification.metadataGatePassed;
       return finish(state, interrupted ? "diagnostic_interrupted" : "list_projects_failed", startedAt, now);
     }
-    if (isRecord(projectsResult) && projectsResult.isError === true) {
-      const evidence = createFailureEvidence(projectsResult);
-      applyFailureEvidence(state, evidence);
-      const classification = classifyListProjectsFailure(evidence, true);
-      state.failureClass = classification.failureClass;
-      state.metadataGatePassed = classification.metadataGatePassed;
-      return finish(state, "list_projects_failed", startedAt, now);
-    }
 
     state.metadataGatePassed = true;
     state.listProjectsSucceeded = true;
-    state.projectCount = projectRecords(projectsResult).length;
-
     state.projectResolutionSource = "list_projects";
-    const projects = resolveDesktopProject(projectsResult, dependencies.workspacePath ?? process.cwd());
-    if (projects.length === 0) return finish(state, "desktop_project_not_found", startedAt, now);
-    if (projects.length > 1) return finish(state, "desktop_project_ambiguous", startedAt, now);
+    let project;
+    try {
+      state.projectCount = parseDesktopProjects(projectsResult).length;
+      project = resolveDesktopProject(projectsResult, dependencies.workspacePath ?? process.cwd());
+    } catch (error: unknown) {
+      if (error instanceof CodexAppRuntimeError && error.code === "project_not_found") {
+        return finish(state, "desktop_project_not_found", startedAt, now);
+      }
+      if (error instanceof CodexAppRuntimeError && error.code === "project_ambiguous") {
+        return finish(state, "desktop_project_ambiguous", startedAt, now);
+      }
+      state.failureClass = "unknown_tool_error";
+      return finish(state, "list_projects_failed", startedAt, now);
+    }
     state.resolvedProject = true;
-    state.resolvedProjectId = safeIdentity(projects[0]!.projectId);
+    state.resolvedProjectId = project.projectId;
 
-    const createPlan = validateCreateThreadTool(contracts.get("create_thread"));
-    if (createPlan === undefined) return finish(state, "create_thread_schema_incompatible", startedAt, now);
-    state.createThreadSchema = createPlan.schema;
+    let createArgs: Record<string, unknown>;
+    try {
+      const createTool = diagnosticContracts.get("create_thread");
+      if (createTool !== undefined) state.createThreadSchema = schemaSummary(createTool.inputSchema);
+      createArgs = formalContracts.createThreadArguments(CREATE_PROMPT, project.projectId);
+    } catch {
+      return finish(state, "create_thread_schema_incompatible", startedAt, now);
+    }
     state.targetType = "project";
-    state.environmentType = createPlan.environmentType;
+    state.environmentType = "local";
     state.targetSchemaValid = true;
     state.createThreadCalled = true;
-    const createArgs = createPlan.build(CREATE_PROMPT, projects[0]!.projectId);
     state.argumentKeys = Object.keys(createArgs);
 
-    let createResult: unknown;
+    let identity: { readonly targetThreadId: string; readonly hostId: string };
     try {
-      createResult = await callAllowedTool(
-        client,
-        "create_thread",
-        createArgs,
+      identity = await commands.createThread({
         executorThreadId,
+        projectId: project.projectId,
+        prompt: CREATE_PROMPT,
         timeoutMs,
-        abortController.signal,
-        EFFECTFUL_ALLOWLIST,
-      );
+        signal: abortController.signal,
+      });
     } catch (error: unknown) {
+      if (error instanceof CodexAppRuntimeError && error.code === "thread_identity_missing") {
+        state.failureClass = "unknown_tool_error";
+        return finish(state, "thread_identity_missing", startedAt, now);
+      }
       applyFailureEvidence(state, createFailureEvidence(error));
       state.desktopApprovalUi = args.waitAfterFailureMs > 0 ? "manual_observation_required" : "not_observed";
       await waitAfterFailure(args.waitAfterFailureMs, abortController.signal);
       return finish(state, error instanceof DiagnosticInterrupted ? "diagnostic_interrupted" : "create_thread_failed", startedAt, now);
     }
 
-    if (isRecord(createResult) && createResult.isError === true) {
-      applyFailureEvidence(state, createFailureEvidence(createResult));
-      state.desktopApprovalUi = args.waitAfterFailureMs > 0 ? "manual_observation_required" : "not_observed";
-      await waitAfterFailure(args.waitAfterFailureMs, abortController.signal);
-      return finish(state, "create_thread_failed", startedAt, now);
-    }
-
-    const identity = identityOf(createResult);
-    if (identity.threadId === undefined) {
-      state.failureClass = "unknown_tool_error";
-      return finish(state, "thread_identity_missing", startedAt, now);
-    }
-    const threadId = safeIdentity(identity.threadId);
-    if (threadId === undefined) {
-      state.failureClass = "unknown_tool_error";
-      return finish(state, "thread_identity_missing", startedAt, now);
-    }
+    const threadId = identity.targetThreadId;
     state.threadCreated = true;
     state.createdThreadSuffix = executorThreadSuffix(threadId);
     state.threadIdSuffix = state.createdThreadSuffix;
-    state.hostId = safeIdentity(identity.hostId);
+    state.hostId = identity.hostId;
 
-    const completion = completionPlan(contracts);
+    const completion = completionPlan(diagnosticContracts);
     if (completion === undefined) {
       state.failureClass = "first_turn_completion_unverifiable";
       return finish(state, "first_turn_completion_unverifiable", startedAt, now);
@@ -1220,7 +1084,7 @@ export async function runCodexAppEffectfulDiagnostic(
       if (completion.tool === "wait_threads") state.waitThreadsCalled = true;
       else state.readThreadCalled = true;
       firstCompletion = await waitForThread(
-        client,
+        client!,
         completion,
         threadId,
         state.hostId,
@@ -1246,45 +1110,27 @@ export async function runCodexAppEffectfulDiagnostic(
     state.firstTurnCompleted = true;
     state.firstMarkerObserved = firstCompletion.markerObserved ? true : "unknown";
 
-    const sendPlan = validateSendMessageTool(contracts.get("send_message_to_thread"));
-    if (sendPlan === undefined) {
+    try {
+      formalContracts.sendMessageToThreadArguments(threadId, state.hostId!, SECOND_PROMPT);
+    } catch {
       state.failureClass = "send_message_schema_incompatible";
       return finish(state, "send_message_schema_incompatible", startedAt, now);
-    }
-    const sendArgs = sendPlan.build(threadId, SECOND_PROMPT, state.hostId);
-    if (sendArgs === undefined) {
-      state.failureClass = "send_message_schema_incompatible";
-      return finish(state, "send_message_schema_incompatible", startedAt, now);
-    }
-    const sendTargetThreadId = nonEmpty(sendArgs.threadId);
-    if (sendTargetThreadId !== threadId) {
-      state.failureClass = "thread_identity_mismatch";
-      return finish(state, "thread_identity_mismatch", startedAt, now);
     }
     state.sendTargetMatchesCreatedThread = true;
     state.sendMessageCalled = true;
 
-    let sendResult: unknown;
     try {
-      sendResult = await callAllowedTool(
-        client,
-        "send_message_to_thread",
-        sendArgs,
+      await commands.sendMessageToThread({
         executorThreadId,
+        targetThreadId: threadId,
+        hostId: state.hostId!,
+        prompt: SECOND_PROMPT,
         timeoutMs,
-        abortController.signal,
-        CONTINUITY_ALLOWLIST,
-      );
+        signal: abortController.signal,
+      });
     } catch (error: unknown) {
       if (error instanceof DiagnosticInterrupted || interrupted) return finish(state, "diagnostic_interrupted", startedAt, now);
       const evidence = createFailureEvidence(error);
-      applyFailureEvidence(state, evidence);
-      const failureClass = classifyContinuityFailure(evidence);
-      state.failureClass = failureClass;
-      return finish(state, failureClass === "steer_race" ? "steer_race" : "send_message_failed", startedAt, now);
-    }
-    if (isRecord(sendResult) && sendResult.isError === true) {
-      const evidence = createFailureEvidence(sendResult);
       applyFailureEvidence(state, evidence);
       const failureClass = classifyContinuityFailure(evidence);
       state.failureClass = failureClass;
@@ -1296,7 +1142,7 @@ export async function runCodexAppEffectfulDiagnostic(
       if (completion.tool === "wait_threads") state.waitThreadsCalled = true;
       else state.readThreadCalled = true;
       secondCompletion = await waitForThread(
-        client,
+        client!,
         completion,
         threadId,
         state.hostId,
