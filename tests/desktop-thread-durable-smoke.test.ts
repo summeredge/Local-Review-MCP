@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   aggregateDurableContinuityEvidence,
@@ -9,11 +10,14 @@ import {
   checkPhaseBExecutorIdentity,
   checkTargetPreserved,
   cleanupSmokeRun,
+  finalizeDurableContinuityEvidence,
+  formatDesktopThreadDurableSmokeResult,
   readSmokeState,
   smokeRunDirectory,
   writeSmokeState,
   type DesktopThreadDurableSmokeState,
 } from "../src/desktop-sync/desktop-thread-durable-smoke.js";
+import { hasAgentMessageMarker } from "../src/desktop-sync/diagnostic-marker-sequencing.js";
 
 const roots: string[] = [];
 
@@ -35,6 +39,15 @@ function state(workspacePath: string, runId: string): DesktopThreadDurableSmokeS
     host_id: "local",
     storage_root: smokeRunDirectory(workspacePath, runId),
     created_at: "2026-09-20T00:00:00.000Z",
+  };
+}
+
+function markerPayload(item: Record<string, unknown>): CallToolResult {
+  return {
+    content: [{
+      type: "text",
+      text: JSON.stringify({ turns: [{ id: "turn-1", items: [item] }] }),
+    }],
   };
 }
 
@@ -146,5 +159,50 @@ describe("P5.2.2-C desktop durable smoke helpers", () => {
       ok: false,
       result: "fail",
     });
+  });
+
+  it("accepts only an embedded agentMessage marker", () => {
+    expect(hasAgentMessageMarker(markerPayload({
+      type: "agentMessage",
+      text: "LRM_P522C_RESUME_run",
+    }), "LRM_P522C_RESUME_run")).toBe(true);
+    expect(hasAgentMessageMarker(markerPayload({
+      type: "functionCallOutput",
+      output: { text: "LRM_P522C_RESUME_run" },
+    }), "LRM_P522C_RESUME_run")).toBe(false);
+  });
+
+  it("keeps Phase A formal observer verification unknown", () => {
+    const formatted = formatDesktopThreadDurableSmokeResult({
+      ok: true,
+      phase: "phase-a",
+      result: "pass",
+      first_turn_content_verified: true,
+      completion_observer_verified: "unknown",
+    });
+    expect(formatted).toContain("first_turn_content_verified: true");
+    expect(formatted).toContain("completion_observer_verified: unknown");
+  });
+
+  it("requires both Observer completion and marker content for final Phase B pass", () => {
+    const evidence = {
+      executor_changed: true,
+      binding_survived_process_restart: true,
+      target_preserved: true,
+      host_preserved: true,
+      phase_b_metadata_uses_new_executor: true,
+      phase_b_arguments_use_old_target: true,
+      second_turn_dispatch_verified: true,
+      second_turn_same_target: true,
+      binding_unchanged: true,
+      executor_not_persisted: true,
+      second_turn_content_verified: "unknown" as const,
+      completion_observer_verified: true as const,
+    };
+    expect(finalizeDurableContinuityEvidence(evidence)).toMatchObject({ ok: false, result: "fail" });
+    expect(finalizeDurableContinuityEvidence({
+      ...evidence,
+      second_turn_content_verified: true,
+    })).toMatchObject({ ok: true, result: "pass" });
   });
 });

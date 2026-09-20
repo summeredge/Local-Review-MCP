@@ -10,9 +10,11 @@ import {
 type FakeMode =
   | "success"
   | "first-unverifiable"
+  | "first-prompt-echo"
+  | "second-prompt-echo"
   | "send-result-error"
   | "send-exception"
-  | "first-wait-timeout"
+  | "first-read-timeout"
   | "second-wait-timeout"
   | "send-schema-incompatible"
   | "no-completion-tools"
@@ -29,6 +31,8 @@ const CREATED_THREAD = "019d1c2a-8c46-7b1b-8ab1-9876543210ab";
 const WORKSPACE_PATH = "C:/workspace/Local-Review-MCP";
 const CREATE_PROMPT = "Only return LRM_CODEX_APP_P5_1_CREATE_PASS. Do not modify any files, create commits, or push.";
 const SECOND_PROMPT = "Only return LRM_CODEX_APP_P5_1_SECOND_PASS. Do not modify any files, create commits, or push.";
+const FIRST_MARKER = "LRM_CODEX_APP_P5_1_CREATE_PASS";
+const SECOND_MARKER = "LRM_CODEX_APP_P5_1_SECOND_PASS";
 const temporaryRoots: string[] = [];
 
 afterEach(() => {
@@ -164,7 +168,10 @@ const createSchema = ${JSON.stringify(createSchema())};
 const sendSchema = ${JSON.stringify(sendSchema(mode === "send-schema-incompatible"))};
 const waitSchema = ${JSON.stringify(waitSchema(useReadFallback))};
 const readSchema = ${JSON.stringify(readSchema())};
-let completionCalls = 0;
+const firstMarker = ${JSON.stringify(FIRST_MARKER)};
+const secondMarker = ${JSON.stringify(SECOND_MARKER)};
+let readCalls = 0;
+let waitCalls = 0;
 
 function reply(message) {
   process.stdout.write(JSON.stringify(message) + "\\n");
@@ -172,18 +179,61 @@ function reply(message) {
 function record(value) {
   appendFileSync(log, JSON.stringify(value) + "\\n");
 }
-  function completionResult(marker, status = "completed") {
-    return {
-      content: [{ type: "text", text: JSON.stringify({
-      threads: [{
-        threadId: ${JSON.stringify(CREATED_THREAD)},
-        turnCompleted: status === "completed",
-        latestAssistantMessage: marker,
-        errors: [],
-      }],
-      }) }],
-    };
+function item(type, text) {
+  return type === "agentMessage"
+    ? { type, id: "item-" + readCalls, text }
+    : { type, output: { text } };
+}
+function turn(id, status, items = []) {
+  return {
+    id,
+    status,
+    error: null,
+    completedAt: status === "completed" ? "2026-09-20T00:00:00.000Z" : null,
+    items,
+  };
+}
+function readResult(turns) {
+  return {
+    content: [{ type: "text", text: JSON.stringify({
+      thread: { id: ${JSON.stringify(CREATED_THREAD)}, hostId: "local", status: { type: "idle" } },
+      turns,
+    }) }],
+  };
+}
+function readCompletion() {
+  readCalls += 1;
+  if (mode === "first-read-timeout") return;
+  if (mode === "first-unverifiable" || mode === "first-prompt-echo") {
+    return readResult([turn("turn-a", "completed", [item("functionCallOutput", firstMarker)])]);
   }
+  if (readCalls === 1) return readResult([turn("turn-a", "completed", [item("agentMessage", firstMarker)])]);
+  if (readCalls === 2) return readResult([turn("turn-a", "completed")]);
+  if (readCalls === 3) return readResult([
+    turn("turn-b", "inProgress"),
+    turn("turn-a", "completed"),
+  ]);
+  return readResult([
+    turn("turn-b", "completed", [item(
+      mode === "second-prompt-echo" ? "functionCallOutput" : "agentMessage",
+      secondMarker,
+    )]),
+    turn("turn-a", "completed"),
+  ]);
+}
+function waitResult() {
+  waitCalls += 1;
+  if (mode === "second-wait-timeout" && waitCalls === 1) return;
+  return {
+    content: [{ type: "text", text: JSON.stringify({
+      wake: { threadId: ${JSON.stringify(CREATED_THREAD)}, hostId: "local", turnId: "turn-b" },
+      polls: [{ cursor: "cursor-" + waitCalls }],
+    }) }],
+  };
+}
+function completionResult(name) {
+  return name === "wait_threads" ? waitResult() : readCompletion();
+}
 
 const input = createInterface({ input: process.stdin });
 input.on("line", (line) => {
@@ -258,16 +308,9 @@ input.on("line", (line) => {
         reply({ jsonrpc: "2.0", id: request.id, result: { content: [] } });
       }
     } else if (name === "wait_threads" || name === "read_thread") {
-      completionCalls += 1;
-      if ((mode === "first-wait-timeout" && completionCalls === 1)
-        || (mode === "second-wait-timeout" && completionCalls === 2)) {
-        return;
-      }
-      const marker = completionCalls === 1
-        ? "LRM_CODEX_APP_P5_1_CREATE_PASS"
-        : "LRM_CODEX_APP_P5_1_SECOND_PASS";
-      const status = mode === "first-unverifiable" && completionCalls === 1 ? "running" : "completed";
-      reply({ jsonrpc: "2.0", id: request.id, result: completionResult(marker, status) });
+      const result = completionResult(name);
+      if (result === undefined) return;
+      reply({ jsonrpc: "2.0", id: request.id, result });
     } else {
       reply({ jsonrpc: "2.0", id: request.id, result: { content: [] } });
     }
@@ -364,7 +407,7 @@ describe("codex app P5.1.6 send_message_to_thread continuity diagnostic", () => 
       secondMarkerObserved: true,
       sameThread: true,
       writerConflictObserved: false,
-      readThreadCalled: false,
+      readThreadCalled: true,
       waitThreadsCalled: true,
     });
     expect(JSON.stringify(result)).not.toContain(CREATED_THREAD);
@@ -374,20 +417,20 @@ describe("codex app P5.1.6 send_message_to_thread continuity diagnostic", () => 
       "initialize",
       "notifications/initialized",
       "tools/list",
-      "tools/call",
-      "tools/call",
-      "tools/call",
-      "tools/call",
-      "tools/call",
+      ...Array.from({ length: 9 }, () => "tools/call"),
     ]);
     expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name)).toEqual([
       "list_projects",
       "create_thread",
-      "wait_threads",
+      "read_thread",
+      "read_thread",
       "send_message_to_thread",
+      "read_thread",
       "wait_threads",
+      "read_thread",
+      "read_thread",
     ]);
-    expect(toolCalls(fake.log)).toHaveLength(5);
+    expect(toolCalls(fake.log)).toHaveLength(9);
     for (const call of toolCalls(fake.log)) {
       expect((call.params as Record<string, unknown>)._meta).toEqual({ "openai/threadId": EXECUTOR_THREAD });
     }
@@ -401,18 +444,66 @@ describe("codex app P5.1.6 send_message_to_thread continuity diagnostic", () => 
       },
     });
     expect(toolCallParams(fake.log, 2)).toMatchObject({
-      name: "wait_threads",
-      arguments: { targets: [{ threadId: CREATED_THREAD, hostId: "local" }] },
+      name: "read_thread",
+      arguments: { threadId: CREATED_THREAD, hostId: "local" },
     });
     expect(toolCallParams(fake.log, 3)).toMatchObject({
+      name: "read_thread",
+      arguments: { threadId: CREATED_THREAD, hostId: "local" },
+    });
+    expect(toolCallParams(fake.log, 4)).toMatchObject({
       name: "send_message_to_thread",
       arguments: { threadId: CREATED_THREAD, hostId: "local", prompt: SECOND_PROMPT },
     });
-    expect(toolCallParams(fake.log, 4)).toMatchObject({
+    expect(toolCallParams(fake.log, 5)).toMatchObject({
+      name: "read_thread",
+      arguments: { threadId: CREATED_THREAD, hostId: "local" },
+    });
+    expect(toolCallParams(fake.log, 6)).toMatchObject({
       name: "wait_threads",
       arguments: { targets: [{ threadId: CREATED_THREAD, hostId: "local" }] },
     });
-    expect(toolCallParams(fake.log, 3).arguments).not.toHaveProperty("executorThreadId");
+    expect(toolCallParams(fake.log, 7)).toMatchObject({
+      name: "read_thread",
+      arguments: { threadId: CREATED_THREAD, hostId: "local" },
+    });
+    expect(toolCallParams(fake.log, 8)).toMatchObject({
+      name: "read_thread",
+      arguments: { threadId: CREATED_THREAD, hostId: "local" },
+    });
+    expect(toolCallParams(fake.log, 3).arguments).not.toHaveProperty("prompt");
+    expect(toolCallParams(fake.log, 4).arguments).not.toHaveProperty("executorThreadId");
+  });
+
+  it("does not treat a prompt echo as the first agentMessage marker", async () => {
+    const fake = fakeServer("first-prompt-echo");
+    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies(1_000));
+
+    expect(result).toMatchObject({
+      ok: false,
+      stage: "first_turn_completion_unverifiable",
+      threadCreated: true,
+      firstTurnCompleted: false,
+      sendMessageCalled: false,
+    });
+    const names = toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name);
+    expect(names.slice(0, 3)).toEqual(["list_projects", "create_thread", "read_thread"]);
+    expect(names.slice(2).every((name) => name === "read_thread")).toBe(true);
+    expect(names).not.toContain("send_message_to_thread");
+  });
+
+  it("does not treat a prompt echo as the second agentMessage marker", async () => {
+    const fake = fakeServer("second-prompt-echo");
+    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies());
+
+    expect(result).toMatchObject({
+      ok: false,
+      stage: "second_turn_completion_unverifiable",
+      firstTurnCompleted: true,
+      sendMessageCalled: true,
+      secondTurnCompleted: true,
+      secondMarkerObserved: "unknown",
+    });
   });
 
   it.each([
@@ -479,7 +570,7 @@ describe("codex app P5.1.6 send_message_to_thread continuity diagnostic", () => 
 
   it("fails closed when first-turn completion cannot be verified", async () => {
     const fake = fakeServer("first-unverifiable");
-    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies());
+    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies(1_000));
 
     expect(result).toMatchObject({
       ok: false,
@@ -488,15 +579,18 @@ describe("codex app P5.1.6 send_message_to_thread continuity diagnostic", () => 
       threadCreated: true,
       firstTurnCompleted: false,
       sendMessageCalled: false,
-      waitThreadsCalled: true,
+      waitThreadsCalled: false,
+      readThreadCalled: true,
     });
-    expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
-      .toEqual(["list_projects", "create_thread", "wait_threads"]);
+    const names = toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name);
+    expect(names.slice(0, 3)).toEqual(["list_projects", "create_thread", "read_thread"]);
+    expect(names.slice(2).every((name) => name === "read_thread")).toBe(true);
+    expect(names).not.toContain("send_message_to_thread");
   });
 
-  it("classifies a first-turn wait timeout without sending", async () => {
-    const fake = fakeServer("first-wait-timeout");
-    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies(5));
+  it("classifies a first-turn read timeout without sending", async () => {
+    const fake = fakeServer("first-read-timeout");
+    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies(250));
 
     expect(result).toMatchObject({
       ok: false,
@@ -507,7 +601,7 @@ describe("codex app P5.1.6 send_message_to_thread continuity diagnostic", () => 
       sendMessageCalled: false,
     });
     expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
-      .toEqual(["list_projects", "create_thread", "wait_threads"]);
+      .toEqual(["list_projects", "create_thread", "read_thread"]);
   });
 
   it("does not send when the dynamic send schema is incompatible", async () => {
@@ -522,7 +616,7 @@ describe("codex app P5.1.6 send_message_to_thread continuity diagnostic", () => 
       secondTurnCompleted: false,
     });
     expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
-      .toEqual(["list_projects", "create_thread", "wait_threads"]);
+      .toEqual(["list_projects", "create_thread", "read_thread"]);
   });
 
   it("classifies the active-turn steer race without retry", async () => {
@@ -539,7 +633,7 @@ describe("codex app P5.1.6 send_message_to_thread continuity diagnostic", () => 
       secondTurnCompleted: false,
     });
     expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
-      .toEqual(["list_projects", "create_thread", "wait_threads", "send_message_to_thread"]);
+      .toEqual(["list_projects", "create_thread", "read_thread", "read_thread", "send_message_to_thread"]);
   });
 
   it("classifies a send exception and never retries", async () => {
@@ -554,12 +648,12 @@ describe("codex app P5.1.6 send_message_to_thread continuity diagnostic", () => 
       sendMessageCalled: true,
       secondTurnCompleted: false,
     });
-    expect(toolCalls(fake.log)).toHaveLength(4);
+    expect(toolCalls(fake.log)).toHaveLength(5);
   });
 
   it("classifies a second-turn timeout without retry", async () => {
     const fake = fakeServer("second-wait-timeout");
-    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies(5));
+    const result = await runCodexAppEffectfulDiagnostic(runArgs(fake), runDependencies(1_000));
 
     expect(result).toMatchObject({
       ok: false,
@@ -572,7 +666,15 @@ describe("codex app P5.1.6 send_message_to_thread continuity diagnostic", () => 
       sameThread: false,
     });
     expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
-      .toEqual(["list_projects", "create_thread", "wait_threads", "send_message_to_thread", "wait_threads"]);
+      .toEqual([
+        "list_projects",
+        "create_thread",
+        "read_thread",
+        "read_thread",
+        "send_message_to_thread",
+        "read_thread",
+        "wait_threads",
+      ]);
   });
 
   it("uses read_thread only when wait_threads schema is incompatible", async () => {
@@ -591,7 +693,16 @@ describe("codex app P5.1.6 send_message_to_thread continuity diagnostic", () => 
       sameThread: true,
     });
     expect(toolCalls(fake.log).map((call) => (call.params as Record<string, unknown>).name))
-      .toEqual(["list_projects", "create_thread", "read_thread", "send_message_to_thread", "read_thread"]);
+      .toEqual([
+        "list_projects",
+        "create_thread",
+        "read_thread",
+        "read_thread",
+        "send_message_to_thread",
+        "read_thread",
+        "read_thread",
+        "read_thread",
+      ]);
   });
 
   it("fails closed when neither wait_threads nor read_thread is available", async () => {

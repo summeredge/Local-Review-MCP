@@ -39,6 +39,7 @@ import {
   formatDesktopThreadDurableSmokeResult,
   runDesktopThreadDurableSmoke,
 } from "./desktop-sync/desktop-thread-durable-smoke.js";
+import { runDesktopCompletionContractProbe } from "./desktop-sync/desktop-completion-contract-probe.js";
 
 function printErrorDetails(error: unknown, warning = false): void {
   const log = warning ? console.warn : console.error;
@@ -76,6 +77,10 @@ try {
   } else if (argv[0] === "diagnostic-p522c") {
     const diagnostic = await runDesktopThreadDurableSmoke(argv.slice(1));
     console.log(formatDesktopThreadDurableSmokeResult(diagnostic));
+    if (!diagnostic.ok) process.exitCode = 1;
+  } else if (argv[0] === "diagnostic-p530b") {
+    const diagnostic = await runDesktopCompletionContractProbe(argv.slice(1));
+    console.log(JSON.stringify(diagnostic, null, 2));
     if (!diagnostic.ok) process.exitCode = 1;
   } else if (argv[0] === "diagnose-chatgpt-connector") {
     try {

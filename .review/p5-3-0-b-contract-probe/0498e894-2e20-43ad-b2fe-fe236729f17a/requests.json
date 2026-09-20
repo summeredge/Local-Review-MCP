@@ -1,0 +1,285 @@
+[
+  {
+    "name": "list_projects",
+    "arguments": {},
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "create_thread",
+    "arguments": {
+      "prompt": "Only return LRM_P530B_TURN_A_0498e894-2e20-43ad-b2fe-fe236729f17a. Do not modify files. Do not create commits. Do not push.",
+      "target": {
+        "type": "project",
+        "projectId": "39eebb0b-7398-4548-8d0a-727a3139085b",
+        "environment": {
+          "type": "local"
+        }
+      }
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "send_message_to_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "prompt": "Only return LRM_P530B_TURN_B_0498e894-2e20-43ad-b2fe-fe236729f17a. Do not modify files. Do not create commits. Do not push."
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "wait_threads",
+    "arguments": {
+      "targets": [
+        {
+          "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+          "hostId": "local"
+        }
+      ],
+      "timeoutMs": 30000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0bd38-8001-78d1-95ab-eeb145798bb4",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0bd16-3893-7721-9c92-77bc7e5f3ade"
+    }
+  }
+]

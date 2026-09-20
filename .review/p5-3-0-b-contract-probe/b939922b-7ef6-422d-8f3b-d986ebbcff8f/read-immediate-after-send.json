@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"schemaVersion\":1,\"thread\":{\"id\":\"01a0bd34-dde8-7773-b9d9-1b4115cff34e\",\"kind\":\"codex\",\"hostId\":\"local\",\"title\":null,\"preview\":\"\",\"status\":{\"type\":\"active\",\"activeFlags\":[]},\"cwd\":\"C:\\\\Users\\\\shaoy\\\\Documents\\\\Local-Review-MCP\",\"createdAt\":1789880753,\"updatedAt\":1789880757},\"page\":{\"order\":\"newest_first\",\"limit\":10,\"nextCursor\":null,\"hasMore\":false},\"turns\":[{\"id\":\"01a0bd34-dfe1-74f0-85d6-bbb31234bce4\",\"status\":\"inProgress\",\"error\":null,\"startedAt\":1789880754,\"completedAt\":null,\"durationMs\":null,\"items\":[{\"type\":\"functionCallOutput\",\"id\":\"fco_01a0bd34-e006-7ff1-a46e-36f7a38a4d0b\",\"name\":\"create_thread\",\"namespace\":\"codex_app\",\"output\":{\"text\":\"<codex_delegation>\\n  <source_thread_id>01a0bd16-3893-7721-9c92-77bc7e5f3ade</source_thread_id>\\n  <input>Only return LRM_P530B_TURN_A_b939922b-7ef6-422d-8f3b-d986ebbcff8f. Do not modify files. Do not create commits. Do not push.</input>\\n</codex_delegation>\",\"truncated\":false}}]}]}"
+    }
+  ],
+  "isError": false
+}

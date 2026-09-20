@@ -2,14 +2,17 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
-import type { CallToolRequestParams, CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolRequestParams, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
-  callCodexAppTool,
   CodexAppRuntime,
   CodexAppRuntimeError,
   type CodexAppMcpClient,
 } from "../desktop-codex/codex-app-runtime.js";
 import { createCodexAppToolContracts } from "../desktop-codex/codex-app-contracts.js";
+import {
+  DesktopCompletionObserver,
+  type DesktopCompletionResult,
+} from "../desktop-codex/completion-observer.js";
 import { resolveDesktopProject } from "../desktop-codex/desktop-project-resolver.js";
 import { desktopThreadBindingFile } from "../desktop-codex/desktop-thread-binding.js";
 import { DesktopThreadBindingStore } from "../desktop-codex/desktop-thread-binding-store.js";
@@ -19,6 +22,10 @@ import {
 } from "../desktop-codex/desktop-thread-coordinator.js";
 import { DesktopCodexThreadCommands } from "../desktop-codex/thread-commands.js";
 import { DesktopIPCObserver } from "./desktop-ipc-observer.js";
+import {
+  readAgentMessageMarker,
+  waitForAgentMessageMarker,
+} from "./diagnostic-marker-sequencing.js";
 import { WorkspaceManager } from "../workspace/manager.js";
 import { sessionIdSchema, taskIdSchema, workspaceIdSchema } from "../context/schema.js";
 
@@ -165,17 +172,6 @@ interface RequestEvidence {
   readonly hostId?: string;
 }
 
-interface CompletionPlan {
-  readonly tool: "wait_threads" | "read_thread";
-  readonly build: (threadId: string, hostId: string, timeoutMs: number) => Record<string, unknown>;
-}
-
-interface CompletionObservation {
-  readonly attempted: boolean;
-  readonly completed: boolean;
-  readonly markerObserved: boolean;
-}
-
 class SmokeFailure extends Error {
   public constructor(public readonly failureClass: DesktopThreadDurableSmokeFailureClass) {
     super(failureClass);
@@ -311,6 +307,20 @@ export function aggregateDurableContinuityEvidence(
   };
 }
 
+export function finalizeDurableContinuityEvidence(
+  evidence: DurableContinuityEvidence,
+): DurableContinuityAggregation {
+  const structural = aggregateDurableContinuityEvidence(evidence);
+  const diagnosticPass = structural.ok
+    && evidence.second_turn_content_verified === true
+    && evidence.completion_observer_verified === true;
+  return {
+    ...structural,
+    ok: diagnosticPass,
+    result: diagnosticPass ? "pass" : "fail",
+  };
+}
+
 function parsePositiveTimeout(value: string, argument: string): number {
   if (!/^\d+$/u.test(value)) throw new Error(`${argument} requires a positive integer.`);
   const parsed = Number(value);
@@ -404,7 +414,6 @@ function smokeFailure(error: unknown, fallback: DesktopThreadDurableSmokeFailure
 
 interface LiveRuntime {
   readonly runtime: CodexAppRuntime;
-  readonly tools: readonly Tool[];
   readonly contracts: ReturnType<typeof createCodexAppToolContracts>;
   readonly client: Pick<CodexAppMcpClient, "callTool">;
   readonly requests: RequestEvidence[];
@@ -438,7 +447,6 @@ async function openRuntime(args: DesktopThreadDurableSmokeArgs): Promise<LiveRun
     };
     return {
       runtime,
-      tools,
       contracts: createCodexAppToolContracts(tools),
       client: { callTool },
       requests,
@@ -531,127 +539,6 @@ function bindingIdentityMatches(
     && binding.task_id === state.task_id
     && binding.session_id === state.session_id
     && binding.backend_identity === "desktop_codex_app";
-}
-
-function completionPlan(tools: readonly Tool[]): CompletionPlan | undefined {
-  if (tools.some((tool) => tool.name === "wait_threads")) {
-    return {
-      tool: "wait_threads",
-      build: (threadId, hostId, timeoutMs) => ({
-        targets: [{ threadId, hostId }],
-        timeoutMs,
-      }),
-    };
-  }
-  if (tools.some((tool) => tool.name === "read_thread")) {
-    return {
-      tool: "read_thread",
-      build: (threadId, hostId) => ({
-        threadId,
-        hostId,
-        turnLimit: 10,
-        includeOutputs: true,
-        maxOutputCharsPerItem: 2_000,
-      }),
-    };
-  }
-  return undefined;
-}
-
-function completionScan(
-  value: unknown,
-  marker: string,
-  targetThreadId: string,
-  seen = new Set<object>(),
-  depth = 0,
-  budget = { remaining: 2_000 },
-): { readonly markerObserved: boolean; readonly targetObserved: boolean; readonly completed: boolean } {
-  if (budget.remaining-- <= 0 || depth > 12) return { markerObserved: false, targetObserved: false, completed: false };
-  if (typeof value === "string") {
-    let parsed: unknown;
-    try {
-      parsed = value.trim().startsWith("{") || value.trim().startsWith("[") ? JSON.parse(value) as unknown : undefined;
-    } catch {
-      parsed = undefined;
-    }
-    const nested = parsed === undefined
-      ? { markerObserved: false, targetObserved: false, completed: false }
-      : completionScan(parsed, marker, targetThreadId, seen, depth + 1, budget);
-    return {
-      markerObserved: value.includes(marker) || nested.markerObserved,
-      targetObserved: value.includes(targetThreadId) || nested.targetObserved,
-      completed: nested.completed,
-    };
-  }
-  if (!isRecord(value) && !Array.isArray(value)) return { markerObserved: false, targetObserved: false, completed: false };
-  if (seen.has(value as object)) return { markerObserved: false, targetObserved: false, completed: false };
-  seen.add(value as object);
-  let markerObserved = false;
-  let targetObserved = false;
-  let completed = false;
-  let failed = false;
-  if (isRecord(value)) {
-    markerObserved ||= Object.values(value).some((nested) => typeof nested === "string" && nested.includes(marker));
-    targetObserved ||= ["threadId", "thread_id", "conversationId", "conversation_id"]
-      .some((field) => value[field] === targetThreadId);
-    completed ||= value.turnCompleted === true;
-    for (const field of ["status", "state", "turnStatus", "turn_status"]) {
-      const status = value[field];
-      if (typeof status === "string") {
-        const normalized = status.trim().toLowerCase();
-        completed ||= ["complete", "completed", "success", "succeeded", "idle"].includes(normalized);
-        failed ||= ["failed", "failure", "error", "interrupted", "cancelled", "canceled"].includes(normalized);
-      }
-    }
-    const errors = value.errors;
-    failed ||= (Array.isArray(errors) && errors.length > 0)
-      || (typeof errors === "string" && errors.trim() !== "")
-      || (isRecord(errors) && Object.keys(errors).length > 0);
-    for (const nested of Object.values(value)) {
-      const result = completionScan(nested, marker, targetThreadId, seen, depth + 1, budget);
-      markerObserved ||= result.markerObserved;
-      targetObserved ||= result.targetObserved;
-      completed ||= result.completed;
-    }
-  } else {
-    for (const nested of value) {
-      const result = completionScan(nested, marker, targetThreadId, seen, depth + 1, budget);
-      markerObserved ||= result.markerObserved;
-      targetObserved ||= result.targetObserved;
-      completed ||= result.completed;
-    }
-  }
-  return { markerObserved, targetObserved, completed: completed && !failed };
-}
-
-async function observeCompletion(
-  live: LiveRuntime,
-  executorThreadId: string,
-  targetThreadId: string,
-  hostId: string,
-  marker: string,
-  timeoutMs: number,
-): Promise<CompletionObservation> {
-  const plan = completionPlan(live.tools);
-  if (plan === undefined) return { attempted: false, completed: false, markerObserved: false };
-  try {
-    const result: CallToolResult = await callCodexAppTool({
-      client: live.client,
-      tool: plan.tool,
-      arguments: plan.build(targetThreadId, hostId, timeoutMs),
-      executorThreadId,
-      timeoutMs,
-    });
-    if (result.isError === true) return { attempted: true, completed: false, markerObserved: false };
-    const evidence = completionScan(result, marker, targetThreadId);
-    return {
-      attempted: true,
-      completed: evidence.completed && evidence.markerObserved,
-      markerObserved: evidence.markerObserved,
-    };
-  } catch {
-    return { attempted: true, completed: false, markerObserved: false };
-  }
 }
 
 function failureResult(
@@ -785,14 +672,35 @@ async function runPhaseA(
       return failureResult("phase-a", "binding_conflict", { run_id: runId, phase_a_create_thread_count: createCount });
     }
 
-    const firstObservation = await observeCompletion(
-      live,
-      executorThreadId,
-      created.target_thread_id,
-      created.host_id,
-      `LRM_P522C_CREATE_${runId}`,
-      args.timeoutMs,
-    );
+    let firstMarkerObserved: boolean;
+    try {
+      firstMarkerObserved = await waitForAgentMessageMarker({
+        client: live.client,
+        contracts: live.contracts,
+        executorThreadId,
+        targetThreadId: created.target_thread_id,
+        hostId: created.host_id,
+        marker: `LRM_P522C_CREATE_${runId}`,
+        timeoutMs: args.timeoutMs,
+      });
+    } catch {
+      return failureResult("phase-a", "completion_unverifiable", {
+        run_id: runId,
+        phase_a_create_thread_count: createCount,
+        binding_persisted: true,
+        first_turn_content_verified: "unknown",
+        completion_observer_verified: "unknown",
+      });
+    }
+    if (!firstMarkerObserved) {
+      return failureResult("phase-a", "completion_unverifiable", {
+        run_id: runId,
+        phase_a_create_thread_count: createCount,
+        binding_persisted: true,
+        first_turn_content_verified: "unknown",
+        completion_observer_verified: "unknown",
+      });
+    }
     const state = desktopThreadDurableSmokeStateSchema.parse({
       schema_version: 1,
       run_id: runId,
@@ -828,8 +736,8 @@ async function runPhaseA(
       host_id: created.host_id,
       phase_a_create_thread_count: createCount,
       binding_persisted: true,
-      first_turn_content_verified: firstObservation.markerObserved ? true : "unknown",
-      completion_observer_verified: firstObservation.completed ? true : "unknown",
+      first_turn_content_verified: true,
+      completion_observer_verified: "unknown",
     };
   } catch (error: unknown) {
     const failure = smokeFailure(error, "state_persistence_failed");
@@ -966,6 +874,27 @@ async function runPhaseB(
     if (!targetPreserved) return failureResult("phase-b", "target_changed", { run_id: state.run_id, phase_b_create_thread_count: createCount });
     if (!hostPreserved) return failureResult("phase-b", "host_changed", { run_id: state.run_id, phase_b_create_thread_count: createCount });
 
+    const observer = new DesktopCompletionObserver({
+      client: live.client,
+      contracts: live.contracts,
+    });
+    let baseline: Awaited<ReturnType<DesktopCompletionObserver["captureBaseline"]>>;
+    try {
+      baseline = await observer.captureBaseline({
+        executorThreadId,
+        targetThreadId: state.target_thread_id,
+        hostId: state.host_id,
+        timeoutMs: args.timeoutMs,
+      });
+    } catch {
+      return failureResult("phase-b", "completion_unverifiable", {
+        run_id: state.run_id,
+        phase_b_create_thread_count: createCount,
+        executor_changed: true,
+        target_reuse_verified: true,
+      });
+    }
+
     try {
       await coordinator.sendToBoundThread({
         workspace_id: state.workspace_id,
@@ -989,14 +918,57 @@ async function runPhaseB(
       && sendRequest.hostId === state.host_id;
     const secondTurnDispatchVerified = sendRequest !== undefined;
     const secondTurnSameTarget = phaseBArgumentsUseOldTarget;
-    const secondObservation = await observeCompletion(
-      live,
-      executorThreadId,
-      state.target_thread_id,
-      state.host_id,
-      `LRM_P522C_RESUME_${state.run_id}`,
-      args.timeoutMs,
-    );
+    let completion: DesktopCompletionResult;
+    try {
+      completion = await observer.waitForCompletion({
+        executorThreadId,
+        targetThreadId: state.target_thread_id,
+        hostId: state.host_id,
+        timeoutMs: args.timeoutMs,
+        baseline,
+      });
+    } catch {
+      return failureResult("phase-b", "completion_unverifiable", {
+        run_id: state.run_id,
+        phase_b_create_thread_count: createCount,
+        executor_changed: true,
+        target_reuse_verified: true,
+        phase_b_metadata_uses_new_executor: phaseBMetadataUsesNewExecutor,
+        phase_b_arguments_use_old_target: phaseBArgumentsUseOldTarget,
+        second_turn_dispatch_verified: secondTurnDispatchVerified,
+        second_turn_same_target: secondTurnSameTarget,
+        completion_observer_verified: "unknown",
+      });
+    }
+    if (completion.status !== "completed") {
+      return failureResult("phase-b", "completion_unverifiable", {
+        run_id: state.run_id,
+        phase_b_create_thread_count: createCount,
+        executor_changed: true,
+        target_reuse_verified: true,
+        phase_b_metadata_uses_new_executor: phaseBMetadataUsesNewExecutor,
+        phase_b_arguments_use_old_target: phaseBArgumentsUseOldTarget,
+        second_turn_dispatch_verified: secondTurnDispatchVerified,
+        second_turn_same_target: secondTurnSameTarget,
+        second_turn_content_verified: "unknown",
+        completion_observer_verified: "unknown",
+      });
+    }
+
+    let secondMarkerObserved: boolean;
+    try {
+      secondMarkerObserved = await readAgentMessageMarker({
+        client: live.client,
+        contracts: live.contracts,
+        executorThreadId,
+        targetThreadId: state.target_thread_id,
+        hostId: state.host_id,
+        marker: `LRM_P522C_RESUME_${state.run_id}`,
+        timeoutMs: args.timeoutMs,
+      });
+    } catch {
+      secondMarkerObserved = false;
+    }
 
     let after: Awaited<ReturnType<DesktopThreadBindingStore["load"]>>;
     let afterExecutorNotPersisted: boolean;
@@ -1013,7 +985,7 @@ async function runPhaseB(
       && before !== undefined
       && sameBinding(before as unknown as Record<string, unknown>, after as unknown as Record<string, unknown>);
     const executorNotPersisted = beforeExecutorNotPersisted && afterExecutorNotPersisted;
-    const evidence = aggregateDurableContinuityEvidence({
+    const evidence = finalizeDurableContinuityEvidence({
       executor_changed: true,
       binding_survived_process_restart: after !== undefined,
       target_preserved: targetPreserved,
@@ -1024,15 +996,14 @@ async function runPhaseB(
       second_turn_same_target: secondTurnSameTarget,
       binding_unchanged: bindingUnchanged,
       executor_not_persisted: executorNotPersisted,
-      second_turn_content_verified: secondObservation.markerObserved ? true : "unknown",
-      completion_observer_verified: secondObservation.completed ? true : "unknown",
+      second_turn_content_verified: secondMarkerObserved ? true : "unknown",
+      completion_observer_verified: true,
     });
     return {
       ...evidence,
       phase: "phase-b",
       run_id: state.run_id,
-      result: evidence.result,
-      failure_class: failureClassForEvidence(evidence),
+      failure_class: evidence.ok ? undefined : failureClassForEvidence(evidence),
       target_thread_suffix: threadSuffix(state.target_thread_id),
       executor_thread_suffix: threadSuffix(executorThreadId),
       host_id: state.host_id,
