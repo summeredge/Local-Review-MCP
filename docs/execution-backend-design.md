@@ -392,8 +392,8 @@ not projected yet.
 resolution order is fixed and exhaustive:
 
 1. a verified `DesktopToolsPipeHandoff` capability, already bound to the current Desktop owner;
-2. `CODEX_APP_TOOLS_PIPE_PATH` from this process environment, trusted only while the existing
-   Desktop connection constraint (`state.connected`) holds;
+2. `CODEX_APP_TOOLS_PIPE_PATH` **already inherited by this LRM process**, trusted only while
+   the existing Desktop connection constraint (`state.connected`) holds;
 3. otherwise fail closed with `desktop_tools_pipe_unavailable`.
 
 Pipe enumeration and pipe name guessing are never used, and the handoff lifecycle, owner binding,
@@ -402,3 +402,45 @@ disconnect or owner change) is stale evidence rather than missing evidence, so i
 downgraded to the weaker `current_environment` source. `DesktopCodexRuntimeFactory` and the
 launcher probe both consume this resolver, and the probe reports the source it actually connected
 with as `pipeSource` (`"handoff"` or `"current_environment"`) without echoing the pipe path.
+
+#### The two sources are not equivalent
+
+The two accepted sources have different production meanings and must not be conflated:
+
+- **trusted handoff** is the formal seam by which a standalone production LRM Host obtains a
+  Desktop-owned tools pipe capability. It is the only source a Launcher-started LRM Host can be
+  expected to acquire on its own, and it is bound to a verified Desktop owner.
+- **current_environment** is a compatibility path only. It is valid **only when the current LRM
+  process already holds** `CODEX_APP_TOOLS_PIPE_PATH` because some Desktop/Codex-owned execution
+  context exported it. It is **not** an automatic Desktop pipe acquisition for a
+  LocalReviewLauncher-started LRM Host, and it is never presented or tested as a production
+  fallback for that case.
+
+Historical success artifacts that recorded `pipeDiscovery = current_environment` came from a
+Desktop/Codex-owned execution context, not from an independent Launcher-started LRM Host. That is
+why a Launcher-started Host without an accepted handoff and without an inherited
+`CODEX_APP_TOOLS_PIPE_PATH` fails closed: there is no production pipe capability source yet.
+
+#### Interactive preflight observability
+
+Because that failure would otherwise only appear after a Goal already started, the interactive
+Desktop route is checked **before** any Goal, Task, or Execution is created. The preflight runs the
+same three conditions the Desktop backend enforces, in the same order:
+
+1. Desktop IPC connected;
+2. executor conversation identity available;
+3. the resolver can currently resolve a pipe.
+
+If the pipe is unavailable, the Goal submission fails closed with the existing
+`desktop_tools_pipe_unavailable` reason and no Session, Task, or Execution is created. The result
+is durable and queryable rather than a binary `failed`:
+
+- `goalPreflightResultSchema.desktop` carries `{ ready, reason, pipe_source }`, and
+  `failure_stage = "desktop"` identifies the blocked stage;
+- the reason is hashed into the identity trace with `failure_stage = "desktop"` on
+  `goal_start_failed`, and the preflight result is persisted on the pending Goal submission;
+- the read-only loopback endpoint `/launcher/desktop-interactive` reports
+  `{ ready, reason, pipeSource }` for the current evidence without ever returning a pipe path.
+
+Current live status is **P5.4.1 BLOCKED_DESKTOP_PIPE_CAPABILITY**: there is no real production pipe
+capability source for an independently started LRM Host yet, so P5.4.1 is not claimed as PASS.

@@ -28,6 +28,7 @@ import {
   probeDesktopToolsPipe,
   type DesktopCodexRuntimeProvider,
 } from "../desktop-codex/desktop-tools-pipe-probe.js";
+import type { DesktopInteractiveReadiness } from "../desktop-codex/desktop-interactive-preflight.js";
 import {
   APP_VERSION,
   DEFAULT_HOST,
@@ -44,6 +45,7 @@ export const MAX_MCP_REQUEST_BYTES = 1024 * 1024;
 export const OAUTH_CLIENTS_PATH = "/oauth/clients";
 export const LAUNCHER_SESSION_CATALOG_PATH = "/launcher/sessions";
 export const LAUNCHER_DESKTOP_SYNC_PATH = "/launcher/desktop-sync";
+export const LAUNCHER_DESKTOP_INTERACTIVE_PREFLIGHT_PATH = "/launcher/desktop-interactive";
 const SAFE_OAUTH_STORAGE_PATH = "oauth/clients.json";
 
 type HttpStatusQuery = NonNullable<McpRuntimeContext["statusQuery"]> & {
@@ -61,6 +63,12 @@ type HttpRuntimeContext = Omit<McpRuntimeContext, "statusQuery"> & {
   readonly desktopSyncManager?: Pick<DesktopSyncManager, "getState">;
   readonly desktopToolsPipeHandoff?: DesktopToolsPipeHandoff;
   readonly desktopCodexRuntimeFactory?: DesktopCodexRuntimeProvider;
+  /**
+   * Read-only Desktop interactive capability check. It reports the same reason the production
+   * Goal preflight blocks an interactive Desktop Goal with, so a blocked capability stays
+   * queryable instead of only appearing as a binary Goal failure.
+   */
+  readonly desktopInteractivePreflight?: () => DesktopInteractiveReadiness;
   readonly statusQuery?: HttpStatusQuery;
   readonly tunnel?: Pick<TunnelProvider, "status">;
 };
@@ -277,6 +285,48 @@ async function handleLauncherDesktopSyncRequest(
     state = undefined;
   }
   sendJson(response, 200, desktopSyncStatus(state), { "cache-control": "no-store" });
+}
+
+async function handleLauncherDesktopInteractivePreflightRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: HttpRuntimeContext,
+  authToken: string,
+): Promise<void> {
+  request.resume();
+  if (!isDirectLoopbackRequest(request)) {
+    sendJson(response, 404, { error: "not_found" });
+    return;
+  }
+  if (!isAuthenticated(request, authToken)) {
+    sendUnauthorized(response);
+    return;
+  }
+  if (request.method !== "GET") {
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+  const check = context.desktopInteractivePreflight;
+  if (check === undefined) {
+    sendJson(response, 503, {
+      ready: false,
+      reason: "desktop_tools_pipe_unavailable",
+      pipeSource: null,
+    }, { "cache-control": "no-store" });
+    return;
+  }
+  let readiness: DesktopInteractiveReadiness;
+  try {
+    readiness = check();
+  } catch {
+    readiness = { ready: false, reason: "desktop_tools_pipe_unavailable" };
+  }
+  // The pipe path itself is never returned; only the resolution source is observable.
+  sendJson(response, 200, {
+    ready: readiness.ready,
+    reason: readiness.reason ?? null,
+    pipeSource: readiness.pipeSource ?? null,
+  }, { "cache-control": "no-store" });
 }
 
 async function handleLauncherDesktopToolsPipeRequest(
@@ -944,6 +994,16 @@ export function createHttpServer(
 
       if (path === LAUNCHER_DESKTOP_TOOLS_PIPE_PROBE_PATH) {
         await handleLauncherDesktopToolsPipeProbeRequest(request, response, context, settings.auth.token);
+        return;
+      }
+
+      if (path === LAUNCHER_DESKTOP_INTERACTIVE_PREFLIGHT_PATH) {
+        await handleLauncherDesktopInteractivePreflightRequest(
+          request,
+          response,
+          context,
+          settings.auth.token,
+        );
         return;
       }
 

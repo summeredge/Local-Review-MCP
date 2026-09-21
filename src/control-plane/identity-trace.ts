@@ -25,7 +25,14 @@ export const IDENTITY_TRACE_FAILURE_REASONS = [
   "goal_start_failed",
 ] as const;
 
-const failureStageSchema = z.enum(["runtime", "workspace", "conversation", "connector", "extension"]);
+const failureStageSchema = z.enum([
+  "runtime",
+  "workspace",
+  "conversation",
+  "desktop",
+  "connector",
+  "extension",
+]);
 
 export const identityTraceEventNameSchema = z.enum(IDENTITY_TRACE_EVENTS);
 export const identityTraceFailureReasonSchema = z.enum(IDENTITY_TRACE_FAILURE_REASONS);

@@ -20,6 +20,11 @@ import type {
   ExtensionDeliveryReadiness,
   ExtensionDeliveryReadinessCheck,
 } from "./extension-delivery.js";
+import { executionModeSchema } from "./execution-service.js";
+import type {
+  DesktopInteractiveBlockReason,
+  DesktopInteractiveReadiness,
+} from "../desktop-codex/desktop-interactive-preflight.js";
 
 export const GOAL_PREFLIGHT_EXTENSION_READY_TIMEOUT_MS = 60_000;
 export const GOAL_PREFLIGHT_POLL_INTERVAL_MS = 250;
@@ -27,6 +32,11 @@ export const GOAL_PREFLIGHT_POLL_INTERVAL_MS = 250;
 export const goalPreflightInputSchema = z.object({
   workspace_id: workspaceIdSchema,
   conversation_id: conversationIdSchema,
+  /**
+   * The route the Goal will actually take. Only the interactive Desktop route has a backend
+   * capability precondition (a resolvable Desktop tools pipe), so batch Goals omit it.
+   */
+  execution_mode: executionModeSchema.optional(),
 }).strict();
 
 const readinessStateSchema = z.enum([
@@ -65,8 +75,21 @@ const goalPreflightResultSchemaBase = z.object({
     valid: z.boolean(),
     conversation_id: conversationIdSchema,
   }).strict(),
-  failure_stage: z.enum(["runtime", "workspace", "conversation", "connector", "extension"]).optional(),
+  failure_stage: z.enum(["runtime", "workspace", "conversation", "desktop", "connector", "extension"]).optional(),
   failure_reason: z.string().min(1).max(4000).optional(),
+  /**
+   * Desktop interactive route capability evidence. Present only for interactive Goals, because
+   * only that route needs a resolvable Desktop tools pipe before any Goal/Task/Execution exists.
+   */
+  desktop: z.object({
+    ready: z.boolean(),
+    reason: z.enum([
+      "desktop_disconnected",
+      "executor_identity_unavailable",
+      "desktop_tools_pipe_unavailable",
+    ]).optional(),
+    pipe_source: z.enum(["handoff", "current_environment"]).optional(),
+  }).strict().optional(),
 }).strict();
 
 export const goalPreflightResultSchema = goalPreflightResultSchemaBase.superRefine((result, context) => {
@@ -75,6 +98,18 @@ export const goalPreflightResultSchema = goalPreflightResultSchemaBase.superRefi
   }
   if (!result.ready && (result.failure_stage === undefined || result.failure_reason === undefined)) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: "failed preflight must identify its failure" });
+  }
+  if (result.desktop !== undefined) {
+    if (!result.desktop.ready && result.desktop.reason === undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "blocked Desktop preflight must state its reason" });
+    }
+    if (result.desktop.ready && result.desktop.reason !== undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "ready Desktop preflight must not have a reason" });
+    }
+  }
+  if (result.failure_stage === "desktop"
+    && (result.desktop === undefined || result.desktop.ready)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "desktop failure requires a blocked Desktop result" });
   }
 });
 
@@ -97,6 +132,11 @@ export interface GoalPreflightServiceOptions {
   readonly registry: GoalPreflightWorkspaceRegistry;
   readonly storageRoot?: string;
   readonly runtimeReady?: () => boolean | Promise<boolean>;
+  /**
+   * Desktop interactive route capability check. It is required for interactive Goals and is the
+   * only way this preflight can observe a blocked Desktop tools pipe capability.
+   */
+  readonly desktopReadiness?: () => DesktopInteractiveReadiness;
   readonly diagnoseConnector?: GoalPreflightConnectorCheck;
   readonly extensionReadiness?: ExtensionDeliveryReadinessCheck;
   readonly extensionStatus?: () => GoalPreflightExtensionStatus;
@@ -194,8 +234,25 @@ function extensionState(
   };
 }
 
+function desktopState(readiness: DesktopInteractiveReadiness): NonNullable<GoalPreflightResult["desktop"]> {
+  return {
+    ready: readiness.ready,
+    ...(readiness.reason === undefined ? {} : { reason: readiness.reason }),
+    ...(readiness.pipeSource === undefined ? {} : { pipe_source: readiness.pipeSource }),
+  };
+}
+
+const DESKTOP_FAILURE_REASONS: Record<DesktopInteractiveBlockReason, string> = {
+  desktop_disconnected: "desktop_disconnected: Desktop is not connected.",
+  executor_identity_unavailable:
+    "executor_identity_unavailable: Desktop executor conversation identity is unavailable.",
+  desktop_tools_pipe_unavailable:
+    "desktop_tools_pipe_unavailable: no verified handoff and no host CODEX_APP_TOOLS_PIPE_PATH.",
+};
+
 export class GoalPreflightService {
   private readonly runtimeReadyCheck: GoalPreflightServiceOptions["runtimeReady"];
+  private desktopReadinessCheck: GoalPreflightServiceOptions["desktopReadiness"];
   private readonly connectorCheck: GoalPreflightConnectorCheck;
   private readonly extensionCheck: ExtensionDeliveryReadinessCheck;
   private readonly extensionStatus: (() => GoalPreflightExtensionStatus) | undefined;
@@ -207,6 +264,7 @@ export class GoalPreflightService {
   public constructor(private readonly options: GoalPreflightServiceOptions) {
     const storageRoot = options.storageRoot ?? defaultTaskContextStorageRoot();
     this.runtimeReadyCheck = options.runtimeReady;
+    this.desktopReadinessCheck = options.desktopReadiness;
     this.connectorCheck = options.diagnoseConnector
       ?? ((settings) => diagnoseChatGPTConnector(settings, { storageRoot }));
     this.extensionCheck = options.extensionReadiness ?? extensionDeliveryReadiness;
@@ -220,6 +278,14 @@ export class GoalPreflightService {
 
   public setRuntimeReady(ready: boolean): void {
     this.runtimeReadyValue = ready;
+  }
+
+  /**
+   * Bind the Desktop interactive capability check once the Desktop tools-pipe handoff and IPC
+   * observer exist. This is a wiring seam, not a policy switch: it never relaxes the check.
+   */
+  public setDesktopReadiness(check: GoalPreflightServiceOptions["desktopReadiness"]): void {
+    this.desktopReadinessCheck = check;
   }
 
   public async checkGoalPreflight(input: GoalPreflightInput): Promise<GoalPreflightResult> {
@@ -265,6 +331,22 @@ export class GoalPreflightService {
     }
     result = goalPreflightResultSchema.parse({ ...result, runtime: { ready: runtimeReady } });
     if (!runtimeReady) return fail(result, "runtime", "Runtime is not ready");
+
+    // The interactive Desktop route needs a Desktop-owned pipe capability before any
+    // Goal/Task/Execution exists. Check it here so a blocked capability is a queryable preflight
+    // result instead of a failure that only appears after the Goal already started.
+    if (parsed.execution_mode === "interactive") {
+      const readiness = this.desktopReadinessCheck?.()
+        ?? { ready: false as const, reason: "desktop_tools_pipe_unavailable" as const };
+      result = goalPreflightResultSchema.parse({ ...result, desktop: desktopState(readiness) });
+      if (!readiness.ready) {
+        return fail(
+          result,
+          "desktop",
+          DESKTOP_FAILURE_REASONS[readiness.reason ?? "desktop_tools_pipe_unavailable"],
+        );
+      }
+    }
 
     let connector: ChatGPTConnectorDiagnostic;
     try {

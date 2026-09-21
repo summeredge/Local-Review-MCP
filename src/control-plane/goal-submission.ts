@@ -111,6 +111,8 @@ export class GoalSubmissionService {
     const preflight = await this.preflight.checkGoalPreflight({
       workspace_id: parsed.workspace_id,
       conversation_id: parsed.conversation_id,
+      // The interactive Desktop route has a backend capability precondition; batch does not.
+      ...(parsed.execution_mode === "interactive" ? { execution_mode: parsed.execution_mode } : {}),
     });
     if (!preflight.ready) throw new GoalPreflightError(preflight);
     const plan = buildPlan(parsed);

@@ -1,0 +1,41 @@
+{
+  "name": "read_thread",
+  "description": "Read recent status and turn summaries for one thread or chat without opening it. Use page cursors from earlier responses to read older turns.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "threadId": {
+        "type": "string",
+        "description": "Thread id to inspect."
+      },
+      "hostId": {
+        "type": "string",
+        "description": "Optional host id returned by create_thread or list_threads."
+      },
+      "cursor": {
+        "type": "string",
+        "description": "Optional cursor for older turns."
+      },
+      "turnLimit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10,
+        "description": "Maximum number of turns to return."
+      },
+      "includeOutputs": {
+        "type": "boolean",
+        "description": "Whether to include truncated tool or command outputs."
+      },
+      "maxOutputCharsPerItem": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 20000,
+        "description": "Maximum characters to keep for each included Codex output or chat message."
+      }
+    },
+    "required": [
+      "threadId"
+    ],
+    "additionalProperties": false
+  }
+}

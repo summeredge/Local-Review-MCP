@@ -1,0 +1,246 @@
+[
+  {
+    "name": "list_projects",
+    "arguments": {},
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "create_thread",
+    "arguments": {
+      "prompt": "Only return LRM_P530B_TURN_A_7b696fc3-3210-4f07-9c54-a0ec4b4cd926. Do not modify files. Do not create commits. Do not push.",
+      "target": {
+        "type": "project",
+        "projectId": "39eebb0b-7398-4548-8d0a-727a3139085b",
+        "environment": {
+          "type": "local"
+        }
+      }
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "send_message_to_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "prompt": "Only return LRM_P530B_TURN_B_7b696fc3-3210-4f07-9c54-a0ec4b4cd926. Do not modify files. Do not create commits. Do not push."
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "wait_threads",
+    "arguments": {
+      "targets": [
+        {
+          "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+          "hostId": "local"
+        }
+      ],
+      "timeoutMs": 30000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c1c7-90bc-7b61-856b-f21fc80bcf22",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": true,
+      "maxOutputCharsPerItem": 20000
+    },
+    "_meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  }
+]

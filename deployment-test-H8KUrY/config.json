@@ -1,0 +1,1 @@
+{"port":4999,"workspace":"C:\\Users\\shaoy\\Documents\\Local-Review-MCP\\deployment-test-H8KUrY","auth":{"token":"deployment-test-token"},"remote":{"enabled":false,"provider":"cloudflare","endpoint":""},"supervisor":{"enabled":false,"healthIntervalSeconds":30,"maxRestartAttempts":3}}

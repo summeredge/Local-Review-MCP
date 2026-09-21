@@ -8,6 +8,7 @@ import {
 } from "../../src/control-plane/goal-preflight.js";
 import type { ChatGPTConnectorDiagnostic } from "../../src/control-plane/chatgpt-connector.js";
 import type { ExtensionDeliveryReadinessCheck } from "../../src/control-plane/extension-delivery.js";
+import type { DesktopInteractiveReadiness } from "../../src/desktop-codex/desktop-interactive-preflight.js";
 
 const settings: ResolvedSettings = {
   host: "127.0.0.1",
@@ -84,18 +85,22 @@ function service(options: {
   readonly connector?: GoalPreflightConnectorCheck;
   readonly extension?: ExtensionDeliveryReadinessCheck;
   readonly extensionStatus?: () => GoalPreflightExtensionStatus;
+  readonly desktopReadiness?: () => DesktopInteractiveReadiness;
 } = {}): {
   readonly service: GoalPreflightService;
   readonly connector: GoalPreflightConnectorCheck;
   readonly extension: ExtensionDeliveryReadinessCheck;
+  readonly desktopReadiness: ReturnType<typeof vi.fn>;
 } {
   const connector = options.connector ?? vi.fn(async () => connectorDiagnostic());
   const extension = options.extension ?? vi.fn(async () => extensionReadiness(true));
+  const desktopReadiness = vi.fn(options.desktopReadiness ?? (() => ({ ready: true as const })));
   return {
     service: new GoalPreflightService({
       settings,
       registry: registry(),
       runtimeReady: options.runtimeReady ?? (() => true),
+      desktopReadiness,
       diagnoseConnector: connector,
       extensionReadiness: extension,
       extensionStatus: options.extensionStatus,
@@ -103,6 +108,7 @@ function service(options: {
     }),
     connector,
     extension,
+    desktopReadiness,
   };
 }
 
@@ -246,5 +252,52 @@ describe("GoalPreflightService", () => {
     });
     expect(f.connector).not.toHaveBeenCalled();
     expect(f.extension).not.toHaveBeenCalled();
+  });
+});
+
+describe("GoalPreflightService Desktop interactive route", () => {
+  it("blocks an interactive Goal before any connector or extension check", async () => {
+    const f = service({
+      desktopReadiness: () => ({ ready: false, reason: "desktop_tools_pipe_unavailable" }),
+    });
+    await expect(f.service.checkGoalPreflight({
+      workspace_id: "workspace-a",
+      conversation_id: "conversation-1",
+      execution_mode: "interactive",
+    })).resolves.toMatchObject({
+      ready: false,
+      failure_stage: "desktop",
+      failure_reason: expect.stringContaining("desktop_tools_pipe_unavailable"),
+      desktop: { ready: false, reason: "desktop_tools_pipe_unavailable" },
+    });
+    expect(f.desktopReadiness).toHaveBeenCalledTimes(1);
+    expect(f.connector).not.toHaveBeenCalled();
+    expect(f.extension).not.toHaveBeenCalled();
+  });
+
+  it("reports the handoff pipe source on a ready interactive preflight", async () => {
+    const f = service({ desktopReadiness: () => ({ ready: true, pipeSource: "handoff" }) });
+    await expect(f.service.checkGoalPreflight({
+      workspace_id: "workspace-a",
+      conversation_id: "conversation-1",
+      execution_mode: "interactive",
+    })).resolves.toMatchObject({
+      ready: true,
+      desktop: { ready: true, pipe_source: "handoff" },
+    });
+  });
+
+  it("never runs the Desktop check for a batch Goal", async () => {
+    const f = service();
+    await expect(f.service.checkGoalPreflight({
+      workspace_id: "workspace-a",
+      conversation_id: "conversation-1",
+    })).resolves.toMatchObject({ ready: true });
+    await expect(f.service.checkGoalPreflight({
+      workspace_id: "workspace-a",
+      conversation_id: "conversation-1",
+      execution_mode: "batch",
+    })).resolves.toMatchObject({ ready: true });
+    expect(f.desktopReadiness).not.toHaveBeenCalled();
   });
 });

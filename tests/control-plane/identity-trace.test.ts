@@ -265,4 +265,54 @@ describe("IdentityTraceService", () => {
     const contents = await readFile(trace.file, "utf8");
     expect(contents).not.toContain(failureReason);
   });
+
+  it("records a blocked Desktop pipe capability as a queryable desktop failure", async () => {
+    const root = await makeRoot("local-review-mcp-identity-trace-desktop-");
+    const trace = new IdentityTraceService(root);
+    const correlations = new ConversationCorrelationRegistry(root);
+    const failureReason =
+      "desktop_tools_pipe_unavailable: no verified handoff and no host CODEX_APP_TOOLS_PIPE_PATH.";
+    const pending = new PendingGoalSubmissionService(correlations, {
+      submitGoal: vi.fn(async () => {
+        throw new GoalPreflightError({
+          ready: false,
+          runtime: { ready: true },
+          connector: { ready: false },
+          extension: { ready: false },
+          workspace: { valid: true, workspace_id: "workspace-a" },
+          conversation: { valid: true, conversation_id: "conversation-a" },
+          desktop: { ready: false, reason: "desktop_tools_pipe_unavailable" },
+          failure_stage: "desktop",
+          failure_reason: failureReason,
+        });
+      }),
+    }, { storageRoot: root, identityTrace: trace });
+
+    await pending.accept(input());
+    await correlations.observe(evidence(KEY_A, "conversation-a"));
+    await waitFor(async () => (await pending.get(KEY_A))?.state === "failed");
+
+    await expect(trace.getIdentityTrace(KEY_A)).resolves.toMatchObject({
+      events: [
+        { event: "pending_created" },
+        { event: "evidence_match_success" },
+        {
+          event: "goal_start_failed",
+          reason: "goal_start_failed",
+          failure_stage: "desktop",
+          failure_reason_hash: identityHash(failureReason),
+        },
+      ],
+    });
+    // The blocked capability stays queryable on the durable pending submission too.
+    await expect(pending.get(KEY_A)).resolves.toMatchObject({
+      state: "failed",
+      preflight: {
+        failure_stage: "desktop",
+        desktop: { ready: false, reason: "desktop_tools_pipe_unavailable" },
+      },
+    });
+    const contents = await readFile(trace.file, "utf8");
+    expect(contents).not.toContain(failureReason);
+  });
 });

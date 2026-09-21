@@ -62,6 +62,7 @@ import { DesktopIPCObserver } from "./desktop-sync/desktop-ipc-observer.js";
 import { DesktopSyncManager } from "./desktop-sync/desktop-sync-manager.js";
 import { DesktopToolsPipeHandoff } from "./desktop-codex/desktop-tools-pipe-handoff.js";
 import { DesktopCodexRuntimeFactory } from "./desktop-codex/desktop-tools-pipe-probe.js";
+import { DesktopInteractivePreflight } from "./desktop-codex/desktop-interactive-preflight.js";
 import { DesktopCodexBackend } from "./desktop-codex/desktop-codex-backend.js";
 
 export interface AppContext extends McpRuntimeContext {
@@ -241,6 +242,13 @@ export async function startApp(
     desktopToolsPipeHandoff,
     () => desktopSyncObserver.getState(),
   );
+  // Goal preflight must observe the same Desktop evidence the interactive backend enforces, so
+  // a missing pipe capability blocks the Goal before any Session, Task, or Execution is created.
+  const desktopInteractivePreflight = new DesktopInteractivePreflight(
+    desktopToolsPipeHandoff,
+    () => desktopSyncObserver.getState(),
+  );
+  context.goalPreflight?.setDesktopReadiness(() => desktopInteractivePreflight.check());
   // The production interactive route is the Desktop codex_app backend. It must reuse the exact
   // Desktop tools-pipe handoff, observer state, and runtime factory owned by this host so the HTTP
   // handoff and the execution backend share one memory domain. Bind before HTTP/MCP accepts Goals.
@@ -278,6 +286,7 @@ export async function startApp(
       desktopSyncManager,
       desktopToolsPipeHandoff,
       desktopCodexRuntimeFactory,
+      desktopInteractivePreflight: () => desktopInteractivePreflight.check(),
     }, {
       oauthClientRegistryPath: options.oauthClientRegistryPath ?? workspaceOAuth?.clientRegistryPath,
       oauthTokenStorePath: options.oauthTokenStorePath

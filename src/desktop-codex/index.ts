@@ -10,3 +10,4 @@ export * from "./desktop-codex-backend.js";
 export * from "./desktop-tools-pipe-handoff.js";
 export * from "./desktop-tools-pipe-resolver.js";
 export * from "./desktop-tools-pipe-probe.js";
+export * from "./desktop-interactive-preflight.js";

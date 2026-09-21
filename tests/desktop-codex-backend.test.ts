@@ -451,13 +451,14 @@ describe("P5.4.1 route selection", () => {
 });
 
 describe("P5.4.1 Desktop preflight fail-closed", () => {
-  it("connects through the current environment pipe when no handoff capability exists", async () => {
+  it("connects through the host environment pipe when this process already holds it", async () => {
     const desktop = fakeDesktop();
     desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
     const seenPipePaths: string[] = [];
     const environmentPipe = "\\\\.\\pipe\\codex-env-pipe";
-    // No handoff capability is ever accepted here, so the runtime must resolve the pipe from the
-    // current environment instead of failing with desktop_tools_pipe_unavailable.
+    // No handoff capability is ever accepted here, but this process already inherits the pipe via
+    // CODEX_APP_TOOLS_PIPE_PATH, so the runtime resolves that compatibility source instead of
+    // failing with desktop_tools_pipe_unavailable. This is not a Launcher auto-acquisition path.
     const runtimeFactory = new DesktopCodexRuntimeFactory(
       new DesktopToolsPipeHandoff(),
       () => desktopState(),

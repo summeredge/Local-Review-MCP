@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"schemaVersion\":2,\"projects\":[{\"projectId\":\"9535b622-6a9c-4c50-aa13-eebb580516d3\",\"projectKind\":\"local\",\"label\":\"TimePrep\",\"path\":\"C:\\\\Users\\\\shaoy\\\\Documents\\\\TimePrep\",\"hostId\":\"local\",\"hostDisplayName\":null,\"isGitRepository\":true},{\"projectId\":\"1e2d7f88-2168-4847-8d02-ecf38b1bf0e4\",\"projectKind\":\"local\",\"label\":\"PI-Data-Viewer\",\"path\":\"C:\\\\Users\\\\shaoy\\\\Documents\\\\PI-Data-Viewer\",\"hostId\":\"local\",\"hostDisplayName\":null,\"isGitRepository\":true},{\"projectId\":\"39eebb0b-7398-4548-8d0a-727a3139085b\",\"projectKind\":\"local\",\"label\":\"Local-Review-MCP\",\"path\":\"C:\\\\Users\\\\shaoy\\\\Documents\\\\Local-Review-MCP\",\"hostId\":\"local\",\"hostDisplayName\":null,\"isGitRepository\":true},{\"projectId\":\"a74b4511-5b67-4c0f-9f07-0c9d7d832f65\",\"projectKind\":\"local\",\"label\":\"Tools\",\"path\":\"C:\\\\Users\\\\shaoy\\\\Documents\\\\Tools\",\"hostId\":\"local\",\"hostDisplayName\":null,\"isGitRepository\":true},{\"projectId\":\"871e01fe-a02f-4b1e-86ad-31548f3f55de\",\"projectKind\":\"local\",\"label\":\"PCA\",\"path\":\"C:\\\\Users\\\\shaoy\\\\Documents\\\\Process_Model_Builder\",\"hostId\":\"local\",\"hostDisplayName\":null,\"isGitRepository\":true},{\"projectId\":\"c835bb0c-b45e-4e16-8b3f-f46b54b633ff\",\"projectKind\":\"local\",\"label\":\"IMAGE\",\"path\":\"C:\\\\Users\\\\shaoy\\\\Documents\\\\IMAGE2\",\"hostId\":\"local\",\"hostDisplayName\":null,\"isGitRepository\":false},{\"projectId\":\"8c45fa88-9d8f-447a-ad64-ebfbdb53c3c0\",\"projectKind\":\"local\",\"label\":\"DataProject\",\"path\":\"C:\\\\Users\\\\shaoy\\\\Documents\\\\DataProject\",\"hostId\":\"local\",\"hostDisplayName\":null,\"isGitRepository\":true}]}"
+    }
+  ],
+  "isError": false
+}

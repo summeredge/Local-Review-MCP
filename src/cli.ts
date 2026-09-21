@@ -40,6 +40,7 @@ import {
   runDesktopThreadDurableSmoke,
 } from "./desktop-sync/desktop-thread-durable-smoke.js";
 import { runDesktopCompletionContractProbe } from "./desktop-sync/desktop-completion-contract-probe.js";
+import { runDesktopFirstTurnProbe } from "./desktop-sync/desktop-first-turn-probe.js";
 import {
   DesktopToolsPipeHandoffError,
   sendDesktopToolsPipeHandoff,
@@ -84,6 +85,10 @@ try {
     if (!diagnostic.ok) process.exitCode = 1;
   } else if (argv[0] === "diagnostic-p530b") {
     const diagnostic = await runDesktopCompletionContractProbe(argv.slice(1));
+    console.log(JSON.stringify(diagnostic, null, 2));
+    if (!diagnostic.ok) process.exitCode = 1;
+  } else if (argv[0] === "diagnostic-p541-first-turn") {
+    const diagnostic = await runDesktopFirstTurnProbe(argv.slice(1));
     console.log(JSON.stringify(diagnostic, null, 2));
     if (!diagnostic.ok) process.exitCode = 1;
   } else if (argv[0] === "handoff-desktop-tools-pipe") {

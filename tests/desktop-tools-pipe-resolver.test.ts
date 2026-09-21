@@ -80,7 +80,7 @@ describe("Desktop tools pipe resolver", () => {
     expect(resolver.resolve()).toEqual({ pipePath: HANDOFF_PIPE, source: "handoff" });
   });
 
-  it("uses the current environment when no handoff capability exists", () => {
+  it("uses the host environment only when this process already holds the pipe", () => {
     const resolver = new DesktopToolsPipeResolver(
       new DesktopToolsPipeHandoff(),
       () => connectedState(),
@@ -177,7 +177,7 @@ describe("Desktop runtime factory pipe resolution", () => {
     expect(probe.pipeSource).toBe("handoff");
   });
 
-  it("connects with the current environment pipe when the handoff is absent", async () => {
+  it("connects with the host environment pipe when this process already holds it", async () => {
     const seen: string[] = [];
     const factory = new DesktopCodexRuntimeFactory(
       new DesktopToolsPipeHandoff(),
