@@ -12,6 +12,9 @@ import type {
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_POLL_INTERVAL_MS = 50;
+/** Bounded grace for the very first observation of a freshly created target thread. */
+const DEFAULT_VISIBILITY_GRACE_MS = 15_000;
+const DEFAULT_VISIBILITY_POLL_INTERVAL_MS = 500;
 
 export type DesktopCompletionStatus = "completed" | "timed_out" | "unknown";
 
@@ -25,7 +28,8 @@ export type DesktopCompletionUnknownReason =
   | "turn_identity_unavailable"
   | "ambiguous_new_turn"
   | "status_unrecognized"
-  | "baseline_invalid";
+  | "baseline_invalid"
+  | "first_turn_visibility_unavailable";
 
 export interface DesktopCompletionContext {
   readonly executorThreadId: string;
@@ -53,12 +57,27 @@ export interface DesktopCompletionObserverOptions {
   readonly client: Pick<CodexAppMcpClient, "callTool">;
   readonly contracts: Pick<CodexAppToolContracts, "readThreadArguments" | "waitThreadsArguments">;
   readonly pollIntervalMs?: number;
+  /** Bound for retrying an unreadable (tool-error) first read of an empty-baseline target. */
+  readonly visibilityGraceMs?: number;
+  readonly visibilityPollIntervalMs?: number;
 }
 
 export class DesktopCompletionObserverError extends Error {
   public constructor(public readonly reason: DesktopCompletionUnknownReason, message?: string) {
     super(message ?? reason);
     this.name = "DesktopCompletionObserverError";
+  }
+}
+
+/**
+ * Raised only when a tool call returned CallToolResult.isError === true. It is kept distinct from
+ * other failures so the first-turn visibility grace can retry a not-yet-visible thread without ever
+ * retrying malformed payloads, identity mismatches, or turn-level errors.
+ */
+class ReadToolResultError extends Error {
+  public constructor() {
+    super("codex_app tool returned an error result.");
+    this.name = "ReadToolResultError";
   }
 }
 
@@ -135,7 +154,7 @@ function fail(reason: DesktopCompletionUnknownReason): never {
 }
 
 function embeddedJson(result: CallToolResult): JsonRecord {
-  if (result.isError === true) fail("tool_error");
+  if (result.isError === true) throw new ReadToolResultError();
   const content = (result as unknown as JsonRecord).content;
   if (!Array.isArray(content)) fail("malformed_response");
   const first = content[0];
@@ -269,6 +288,7 @@ function isAbort(error: unknown, signal: AbortSignal | undefined): boolean {
 
 function errorReason(error: unknown): DesktopCompletionUnknownReason {
   if (error instanceof DesktopCompletionObserverError) return error.reason;
+  if (error instanceof ReadToolResultError) return "tool_error";
   if (error instanceof CodexAppRuntimeError) {
     if (error.code === "tool_contract_incompatible") return "tool_contract_incompatible";
     return "tool_error";
@@ -300,11 +320,21 @@ export class DesktopCompletionObserver {
   private readonly readAvailable: boolean;
   private readonly waitAvailable: boolean;
   private readonly pollIntervalMs: number;
+  private readonly visibilityGraceMs: number;
+  private readonly visibilityPollIntervalMs: number;
 
   public constructor(private readonly options: DesktopCompletionObserverOptions) {
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     if (!Number.isSafeInteger(this.pollIntervalMs) || this.pollIntervalMs < 0) {
       throw new Error("pollIntervalMs must be a non-negative integer.");
+    }
+    this.visibilityGraceMs = options.visibilityGraceMs ?? DEFAULT_VISIBILITY_GRACE_MS;
+    if (!Number.isSafeInteger(this.visibilityGraceMs) || this.visibilityGraceMs < 0) {
+      throw new Error("visibilityGraceMs must be a non-negative integer.");
+    }
+    this.visibilityPollIntervalMs = options.visibilityPollIntervalMs ?? DEFAULT_VISIBILITY_POLL_INTERVAL_MS;
+    if (!Number.isSafeInteger(this.visibilityPollIntervalMs) || this.visibilityPollIntervalMs < 0) {
+      throw new Error("visibilityPollIntervalMs must be a non-negative integer.");
     }
     this.readAvailable = this.contractAvailable((contracts) => {
       contracts.readThreadArguments("observer-probe", "observer-probe");
@@ -402,6 +432,11 @@ export class DesktopCompletionObserver {
     }
 
     const deadline = Date.now() + timeoutFor(context);
+    // The first-turn visibility grace only ever applies to a freshly created target whose baseline
+    // is empty. It is a bounded, separate window and never consumes the full execution timeout.
+    const visibilityDeadline = this.visibilityGraceMs > 0 && context.baseline.turnIds.length === 0
+      ? Date.now() + this.visibilityGraceMs
+      : 0;
     let candidateTurnId: string | undefined;
     let afterCursor: string | undefined;
     while (true) {
@@ -417,6 +452,21 @@ export class DesktopCompletionObserver {
         );
       } catch (error: unknown) {
         if (isAbort(error, context.signal)) throw abortError();
+        if (error instanceof ReadToolResultError
+          && visibilityDeadline > 0
+          && candidateTurnId === undefined) {
+          const remainingGrace = Math.min(visibilityDeadline - Date.now(), deadline - Date.now());
+          if (remainingGrace > 0) {
+            try {
+              await sleep(Math.min(this.visibilityPollIntervalMs, remainingGrace), context.signal);
+            } catch (sleepError: unknown) {
+              if (isAbort(sleepError, context.signal)) throw abortError();
+              throw sleepError;
+            }
+            continue;
+          }
+          return resultFor(context, "unknown", { reason: "first_turn_visibility_unavailable" });
+        }
         if (timeoutError(error) || Date.now() >= deadline) return resultFor(context, "timed_out");
         return resultFor(context, "unknown", { reason: errorReason(error) });
       }
