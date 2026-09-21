@@ -11,3 +11,5 @@ export * from "./desktop-tools-pipe-handoff.js";
 export * from "./desktop-tools-pipe-resolver.js";
 export * from "./desktop-tools-pipe-probe.js";
 export * from "./desktop-interactive-preflight.js";
+export * from "./desktop-session-start-runner.js";
+export * from "./desktop-hook-installer.js";

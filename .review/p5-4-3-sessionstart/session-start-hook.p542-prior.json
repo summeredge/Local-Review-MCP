@@ -1,0 +1,29 @@
+{
+  "probe": "p5-4-2-session-start-hook",
+  "hook_event_name": "SessionStart",
+  "hook_source": "startup",
+  "session_id": "01a0c2c0-b214-7192-8c5b-06b6a73633b2",
+  "hook_cwd": "C:\\Users\\shaoy\\Documents\\Local-Review-MCP",
+  "hook_process_id": 43872,
+  "hook_process_ppid": 51616,
+  "hook_process_cwd": "C:\\Users\\shaoy\\Documents\\Local-Review-MCP",
+  "hook_process_env_presence": {
+    "CODEX_APP_TOOLS_PIPE_PATH": false,
+    "CODEX_MCP_NODE_PATH": true,
+    "CODEX_BROWSER_USE_NODE_PATH": false,
+    "CODEX_ELECTRON_RESOURCES_PATH": false,
+    "CODEX_CLI_PATH": false,
+    "CODEX_THREAD_ID": true,
+    "CODEX_SESSION_ID": true
+  },
+  "started_at": "2026-09-21T06:57:00.322Z",
+  "handoff_cli": {
+    "exit_code": 1,
+    "stdout_json": {
+      "ok": false,
+      "error": "desktop_tools_pipe_unavailable"
+    },
+    "stderr_present": false
+  },
+  "finished_at": "2026-09-21T06:57:00.771Z"
+}

@@ -1,0 +1,30 @@
+[
+  {
+    "index": 3,
+    "name": "read_thread",
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"schemaVersion\":1,\"thread\":{\"id\":\"01a0c208-231b-7a32-b458-8b8c2b04adb0\",\"kind\":\"codex\",\"hostId\":\"local\",\"title\":null,\"preview\":\"\",\"status\":{\"type\":\"active\",\"activeFlags\":[]},\"cwd\":\"C:\\\\Users\\\\shaoy\\\\Documents\\\\Local-Review-MCP\",\"createdAt\":1789961708,\"updatedAt\":1789961709},\"page\":{\"order\":\"newest_first\",\"limit\":10,\"nextCursor\":null,\"hasMore\":false},\"turns\":[{\"id\":\"01a0c208-2680-7df3-a4f3-fbc7946ca6b1\",\"status\":\"inProgress\",\"error\":null,\"startedAt\":1789961709,\"completedAt\":null,\"durationMs\":null,\"items\":[]}]}"
+        }
+      ],
+      "isError": false
+    },
+    "isError": false
+  },
+  {
+    "index": 5,
+    "name": "read_thread",
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"schemaVersion\":1,\"thread\":{\"id\":\"01a0c208-231b-7a32-b458-8b8c2b04adb0\",\"kind\":\"codex\",\"hostId\":\"local\",\"title\":\"Return LRM_P541 identifier\",\"preview\":\"\",\"status\":{\"type\":\"idle\"},\"cwd\":\"C:\\\\Users\\\\shaoy\\\\Documents\\\\Local-Review-MCP\",\"createdAt\":1789961708,\"updatedAt\":1789961714},\"page\":{\"order\":\"newest_first\",\"limit\":10,\"nextCursor\":null,\"hasMore\":false},\"turns\":[{\"id\":\"01a0c208-2680-7df3-a4f3-fbc7946ca6b1\",\"status\":\"completed\",\"error\":null,\"startedAt\":1789961709,\"completedAt\":1789961714,\"durationMs\":5349,\"items\":[{\"type\":\"functionCallOutput\",\"id\":\"fco_01a0c208-26ab-7603-90c1-435568f16674\",\"name\":\"create_thread\",\"namespace\":\"codex_app\"},{\"type\":\"reasoning\",\"id\":\"rs_877452024d4f4a03a7599a92ffcec4ed\",\"summary\":[]},{\"type\":\"agentMessage\",\"id\":\"msg_af3cdc1c728e4216b40efed8d2b888b0\",\"text\":\"LRM_P541_FIRST_TURN_844d3ef0-bae8-4687-9e07-d65d8fef9736\",\"phase\":\"final_answer\"}]}]}"
+        }
+      ],
+      "isError": false
+    },
+    "isError": false
+  }
+]

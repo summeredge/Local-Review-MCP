@@ -333,8 +333,9 @@ export class DesktopCompletionObserver {
       throw new Error("visibilityGraceMs must be a non-negative integer.");
     }
     this.visibilityPollIntervalMs = options.visibilityPollIntervalMs ?? DEFAULT_VISIBILITY_POLL_INTERVAL_MS;
-    if (!Number.isSafeInteger(this.visibilityPollIntervalMs) || this.visibilityPollIntervalMs < 0) {
-      throw new Error("visibilityPollIntervalMs must be a non-negative integer.");
+    // A zero interval would make the bounded visibility retry a busy-loop, so it is rejected.
+    if (!Number.isSafeInteger(this.visibilityPollIntervalMs) || this.visibilityPollIntervalMs < 1) {
+      throw new Error("visibilityPollIntervalMs must be a positive integer.");
     }
     this.readAvailable = this.contractAvailable((contracts) => {
       contracts.readThreadArguments("observer-probe", "observer-probe");
@@ -441,20 +442,34 @@ export class DesktopCompletionObserver {
     let afterCursor: string | undefined;
     while (true) {
       if (context.signal?.aborted) throw abortError();
-      const remainingBeforeRead = deadline - Date.now();
+      const now = Date.now();
+      const remainingBeforeRead = deadline - now;
       if (remainingBeforeRead <= 0) return resultFor(context, "timed_out");
+
+      // The visibility grace only bounds reads while the target is still unreadable and no turn has
+      // been locked yet. During that window a single read is bounded by both the remaining execution
+      // timeout and the remaining visibility window, so a hanging read can never consume the full
+      // execution timeout. No additional read/poll implementation is introduced here.
+      const visibilityActive = visibilityDeadline > 0 && candidateTurnId === undefined;
+      const visibilityRemaining = visibilityDeadline - now;
+      if (visibilityActive && visibilityRemaining <= 0) {
+        return Date.now() >= deadline
+          ? resultFor(context, "timed_out")
+          : resultFor(context, "unknown", { reason: "first_turn_visibility_unavailable" });
+      }
+      const readTimeoutMs = visibilityActive
+        ? Math.max(1, Math.min(remainingBeforeRead, visibilityRemaining))
+        : remainingBeforeRead;
 
       let snapshot: ReadSnapshot;
       try {
         snapshot = readSnapshot(
-          await this.read(context, remainingBeforeRead),
+          await this.read(context, readTimeoutMs),
           context,
         );
       } catch (error: unknown) {
         if (isAbort(error, context.signal)) throw abortError();
-        if (error instanceof ReadToolResultError
-          && visibilityDeadline > 0
-          && candidateTurnId === undefined) {
+        if (visibilityActive && error instanceof ReadToolResultError) {
           const remainingGrace = Math.min(visibilityDeadline - Date.now(), deadline - Date.now());
           if (remainingGrace > 0) {
             try {
@@ -465,6 +480,13 @@ export class DesktopCompletionObserver {
             }
             continue;
           }
+          return Date.now() >= deadline
+            ? resultFor(context, "timed_out")
+            : resultFor(context, "unknown", { reason: "first_turn_visibility_unavailable" });
+        }
+        // A read that timed out because the visibility window was exhausted is a visibility failure,
+        // not an execution timeout, as long as the execution deadline has not actually passed.
+        if (visibilityActive && timeoutError(error) && Date.now() < deadline) {
           return resultFor(context, "unknown", { reason: "first_turn_visibility_unavailable" });
         }
         if (timeoutError(error) || Date.now() >= deadline) return resultFor(context, "timed_out");

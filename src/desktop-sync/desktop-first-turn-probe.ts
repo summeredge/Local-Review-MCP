@@ -65,6 +65,14 @@ export interface DesktopFirstTurnProbeDependencies {
   ) => Promise<string>;
   /** Test seam overriding the resolved workspace root for artifact placement. */
   readonly workspacePath?: string;
+  /**
+   * Observer tuning seam. Production omits this and uses the Observer defaults, so the probe keeps
+   * reproducing the real first-turn visibility grace; tests may shorten it for speed.
+   */
+  readonly observerOptions?: {
+    readonly visibilityGraceMs?: number;
+    readonly visibilityPollIntervalMs?: number;
+  };
 }
 
 export type DesktopFirstTurnProbeFailure =
@@ -619,7 +627,16 @@ async function runProbe(
       hostId: state.hostId,
       turnIds: [],
     };
-    const observer = new DesktopCompletionObserver({ client, contracts });
+    const observer = new DesktopCompletionObserver({
+      client,
+      contracts,
+      ...(dependencies.observerOptions?.visibilityGraceMs === undefined
+        ? {}
+        : { visibilityGraceMs: dependencies.observerOptions.visibilityGraceMs }),
+      ...(dependencies.observerOptions?.visibilityPollIntervalMs === undefined
+        ? {}
+        : { visibilityPollIntervalMs: dependencies.observerOptions.visibilityPollIntervalMs }),
+    });
     try {
       state.observerResult = await observer.waitForCompletion({
         executorThreadId: state.executorThreadId,

@@ -176,6 +176,10 @@ async function withProbe(
   waits: readonly CallToolResult[],
   extraArgs: readonly string[] = [],
   create: () => Promise<CallToolResult> = async () => textResult({ threadId: TARGET_THREAD, hostId: HOST_ID }),
+  observerOptions: { readonly visibilityGraceMs?: number; readonly visibilityPollIntervalMs?: number } = {
+    visibilityGraceMs: 30,
+    visibilityPollIntervalMs: 1,
+  },
 ): Promise<{
   readonly result: Awaited<ReturnType<typeof runDesktopFirstTurnProbe>>;
   readonly calls: CallToolRequestParams[];
@@ -188,6 +192,7 @@ async function withProbe(
     workspacePath: workspace,
     connectRuntime: async () => fake.runtime,
     readExecutorThreadId: async () => EXECUTOR_THREAD,
+    observerOptions,
   });
   return {
     result,
@@ -268,7 +273,9 @@ describe("P5.4.1-D create_thread -> empty baseline -> waitForCompletion", () => 
   });
 
   it("writes every required artifact even when the observer fails", async () => {
-    const { result, artifactDir, cleanup } = await withProbe([errorResult()], []);
+    const { result, artifactDir, cleanup } = await withProbe([errorResult()], [], [], undefined, {
+      visibilityGraceMs: 0,
+    });
     try {
       expect(result.ok).toBe(true);
       for (const name of [
@@ -291,7 +298,10 @@ describe("P5.4.1-D create_thread -> empty baseline -> waitForCompletion", () => 
 
 describe("P5.4.1-D failure classification", () => {
   it("distinguishes a read_thread tool error", async () => {
-    const { result, artifactDir, cleanup } = await withProbe([errorResult()], []);
+    // With the visibility grace disabled the raw first read error fails closed as tool_error.
+    const { result, artifactDir, cleanup } = await withProbe([errorResult()], [], [], undefined, {
+      visibilityGraceMs: 0,
+    });
     try {
       expect(result.observer_status).toBe("unknown");
       expect(result.observer_reason).toBe("tool_error");

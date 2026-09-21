@@ -45,6 +45,10 @@ import {
   DesktopToolsPipeHandoffError,
   sendDesktopToolsPipeHandoff,
 } from "./desktop-codex/desktop-tools-pipe-handoff.js";
+import {
+  installLrmSessionStartHook,
+  uninstallLrmSessionStartHook,
+} from "./desktop-codex/desktop-hook-installer.js";
 
 function printErrorDetails(error: unknown, warning = false): void {
   const log = warning ? console.warn : console.error;
@@ -105,6 +109,14 @@ try {
       }, null, 2));
       process.exitCode = 1;
     }
+  } else if (argv[0] === "install-desktop-session-start-hook") {
+    const result = installLrmSessionStartHook();
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.ok) process.exitCode = 1;
+  } else if (argv[0] === "uninstall-desktop-session-start-hook") {
+    const result = uninstallLrmSessionStartHook();
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.ok) process.exitCode = 1;
   } else if (argv[0] === "diagnose-chatgpt-connector") {
     try {
       const settings = await loadSettings(argv.slice(1));

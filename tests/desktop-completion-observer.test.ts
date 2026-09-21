@@ -108,6 +108,10 @@ function textResult(text: string): CallToolResult {
   return { content: [{ type: "text", text }] };
 }
 
+function errorResult(): CallToolResult {
+  return { isError: true, content: [{ type: "text", text: "thread is not visible yet" }] };
+}
+
 interface ClientSetup {
   readonly observer: DesktopCompletionObserver;
   readonly calls: CallToolRequestParams[];
@@ -116,7 +120,13 @@ interface ClientSetup {
 function setup(
   reads: readonly CallToolResult[],
   waits: readonly CallToolResult[] = [],
-  options: { readonly read?: boolean; readonly wait?: boolean; readonly pollIntervalMs?: number } = {},
+  options: {
+    readonly read?: boolean;
+    readonly wait?: boolean;
+    readonly pollIntervalMs?: number;
+    readonly visibilityGraceMs?: number;
+    readonly visibilityPollIntervalMs?: number;
+  } = {},
 ): ClientSetup {
   const readQueue = [...reads];
   const waitQueue = [...waits];
@@ -149,6 +159,10 @@ function setup(
       client: { callTool },
       contracts,
       pollIntervalMs: options.pollIntervalMs ?? 0,
+      ...(options.visibilityGraceMs === undefined ? {} : { visibilityGraceMs: options.visibilityGraceMs }),
+      ...(options.visibilityPollIntervalMs === undefined
+        ? {}
+        : { visibilityPollIntervalMs: options.visibilityPollIntervalMs }),
     }),
   };
 }
@@ -436,5 +450,146 @@ describe("DesktopCompletionObserver", () => {
       baseline: { targetThreadId: "other-thread", hostId: HOST_ID, turnIds: [A] },
     })).resolves.toMatchObject({ status: "unknown", reason: "baseline_invalid" });
     expect(setupValue.calls).toHaveLength(0);
+  });
+
+  describe("first-turn visibility grace (empty baseline only)", () => {
+    const emptyBaseline = { targetThreadId: TARGET_THREAD, hostId: HOST_ID, turnIds: [] };
+
+    it("rejects a non-positive visibility poll interval", () => {
+      const contracts = createCodexAppToolContracts(appTools());
+      const client: Pick<CodexAppMcpClient, "callTool"> = { callTool: async () => readPayload([]) };
+
+      expect(() => new DesktopCompletionObserver({ client, contracts, visibilityPollIntervalMs: 0 }))
+        .toThrow(/visibilityPollIntervalMs/);
+      expect(() => new DesktopCompletionObserver({ client, contracts, visibilityPollIntervalMs: -1 }))
+        .toThrow(/visibilityPollIntervalMs/);
+      expect(() => new DesktopCompletionObserver({ client, contracts, visibilityPollIntervalMs: 1 }))
+        .not.toThrow();
+    });
+
+    it("allows visibilityGraceMs = 0 to explicitly disable the grace", () => {
+      const contracts = createCodexAppToolContracts(appTools());
+      const client: Pick<CodexAppMcpClient, "callTool"> = { callTool: async () => readPayload([]) };
+
+      expect(() => new DesktopCompletionObserver({ client, contracts, visibilityGraceMs: 0 }))
+        .not.toThrow();
+    });
+
+    it("recovers when the first read is a tool error and the second read completes", async () => {
+      const setupValue = setup(
+        [errorResult(), readPayload([turn(B, "completed")])],
+        [],
+        { visibilityGraceMs: 5_000, visibilityPollIntervalMs: 1 },
+      );
+
+      await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: emptyBaseline }))
+        .resolves.toMatchObject({ status: "completed", turnId: B });
+      expect(setupValue.calls.map((call) => call.name)).toEqual(["read_thread", "read_thread"]);
+    });
+
+    it("keeps retrying bounded tool errors until a turn appears, then waits", async () => {
+      const setupValue = setup(
+        [
+          errorResult(),
+          errorResult(),
+          readPayload([turn(B, "inProgress")]),
+          readPayload([turn(B, "completed")]),
+        ],
+        [waitPayload()],
+        { visibilityGraceMs: 5_000, visibilityPollIntervalMs: 1 },
+      );
+
+      await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: emptyBaseline }))
+        .resolves.toMatchObject({ status: "completed", turnId: B });
+      expect(setupValue.calls.map((call) => call.name)).toEqual([
+        "read_thread",
+        "read_thread",
+        "read_thread",
+        "wait_threads",
+        "read_thread",
+      ]);
+    });
+
+    it("fails closed with a dedicated reason once the visibility grace expires", async () => {
+      const setupValue = setup(
+        [errorResult()],
+        [],
+        { visibilityGraceMs: 20, visibilityPollIntervalMs: 1 },
+      );
+
+      await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: emptyBaseline }))
+        .resolves.toMatchObject({ status: "unknown", reason: "first_turn_visibility_unavailable" });
+      expect(setupValue.calls.length).toBeGreaterThan(1);
+    });
+
+    it("bounds a hanging first read by the visibility grace instead of the execution timeout", async () => {
+      const hanging = new Promise<CallToolResult>(() => undefined) as unknown as CallToolResult;
+      const setupValue = setup(
+        [hanging],
+        [],
+        { visibilityGraceMs: 50, visibilityPollIntervalMs: 1 },
+      );
+      const startedAt = Date.now();
+
+      await expect(setupValue.observer.waitForCompletion({ ...context(60_000), baseline: emptyBaseline }))
+        .resolves.toMatchObject({ status: "unknown", reason: "first_turn_visibility_unavailable" });
+      // The read was bounded by the visibility window, never the 60s execution timeout.
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+    });
+
+    it("still reports timed_out when the execution deadline itself has passed", async () => {
+      const setupValue = setup(
+        [errorResult()],
+        [],
+        { visibilityGraceMs: 5_000, visibilityPollIntervalMs: 1 },
+      );
+
+      await expect(setupValue.observer.waitForCompletion({
+        ...context(1),
+        baseline: emptyBaseline,
+      })).resolves.toMatchObject({ status: "timed_out" });
+    });
+
+    it("does not retry a tool error on a non-empty baseline", async () => {
+      const setupValue = setup(
+        [errorResult()],
+        [],
+        { visibilityGraceMs: 5_000, visibilityPollIntervalMs: 1 },
+      );
+
+      await expect(setupValue.observer.waitForCompletion({
+        ...context(),
+        baseline: { targetThreadId: TARGET_THREAD, hostId: HOST_ID, turnIds: [A] },
+      })).resolves.toMatchObject({ status: "unknown", reason: "tool_error" });
+      expect(setupValue.calls).toHaveLength(1);
+    });
+
+    it("does not treat a turn error as a visibility error", async () => {
+      const setupValue = setup(
+        [readPayload([turn(B, "completed", { error: { code: "failed" } })])],
+        [],
+        { visibilityGraceMs: 5_000, visibilityPollIntervalMs: 1 },
+      );
+
+      await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: emptyBaseline }))
+        .resolves.toMatchObject({ status: "unknown", reason: "tool_error" });
+      expect(setupValue.calls).toHaveLength(1);
+    });
+
+    it.each([
+      ["malformed response", textResult("{not-json"), "malformed_response"],
+      ["thread identity mismatch", readPayload([turn(B, "completed")], "other-thread", HOST_ID), "thread_identity_mismatch"],
+      ["host identity mismatch", readPayload([turn(B, "completed")], TARGET_THREAD, "other-host"), "host_identity_mismatch"],
+    ])("does not retry %s on an empty baseline", async (_label, payload, reason) => {
+      const setupValue = setup(
+        [payload as CallToolResult],
+        [],
+        { visibilityGraceMs: 5_000, visibilityPollIntervalMs: 1 },
+      );
+
+      await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: emptyBaseline }))
+        .resolves.toMatchObject({ status: "unknown", reason });
+      expect(setupValue.calls).toHaveLength(1);
+    });
   });
 });

@@ -19,6 +19,8 @@
     "diagnostic:p530b": "npm run build && node dist/src/cli.js diagnostic-p530b",
     "diagnostic:p541-first-turn": "npm run build && node dist/src/cli.js diagnostic-p541-first-turn",
     "handoff:desktop-tools-pipe": "npm run build && node dist/src/cli.js handoff-desktop-tools-pipe",
+    "install:desktop-session-start-hook": "node dist/src/cli.js install-desktop-session-start-hook",
+    "uninstall:desktop-session-start-hook": "node dist/src/cli.js uninstall-desktop-session-start-hook",
     "confirm:chatgpt-connector": "npm run build && node dist/src/cli.js confirm-chatgpt-connector",
     "diagnose:conversation-routing": "npm run build && node dist/src/cli.js diagnose-conversation-routing",
     "diagnose:review-delivery": "npm run build && node dist/src/cli.js diagnose-review-delivery",

@@ -1,0 +1,13 @@
+{
+  "port": 1,
+  "workspace": "C:\\Users\\shaoy\\Documents\\Local-Review-MCP",
+  "auth": {
+    "token": "p543-unreachable-host-probe"
+  },
+  "remote": {
+    "enabled": false
+  },
+  "supervisor": {
+    "enabled": false
+  }
+}

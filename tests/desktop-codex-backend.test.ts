@@ -148,6 +148,8 @@ interface FakeDesktop {
   setListTools(tools: readonly Tool[]): void;
   setProjectPath(path: string): void;
   failConnect(error: Error): void;
+  /** Make the next N read_thread calls return CallToolResult.isError === true. */
+  setReadErrors(count: number): void;
 }
 
 interface Turn {
@@ -174,6 +176,7 @@ function fakeDesktop(options: {
   let projectPath = options.projectPath ?? OTHER_WORKSPACE_PATH;
   let connectError: Error | undefined;
   let runtimeCloses = 0;
+  let readErrors = 0;
 
   const client = {
     callTool: async (params: CallToolRequestParams): Promise<CallToolResult> => {
@@ -193,6 +196,10 @@ function fakeDesktop(options: {
         case "send_message_to_thread":
           return jsonResult({ ok: true });
         case "read_thread":
+          if (readErrors > 0) {
+            readErrors -= 1;
+            return { isError: true, content: [{ type: "text", text: "thread is not visible yet" }] };
+          }
           return jsonResult({
             thread: { id: threadId, hostId, status: { type: "idle" } },
             turns: turns.map((turn) => ({
@@ -239,6 +246,7 @@ function fakeDesktop(options: {
     setListTools: (value) => { tools = value; },
     failConnect: (error) => { connectError = error; },
     setProjectPath: (value) => { projectPath = value; },
+    setReadErrors: (count) => { readErrors = count; },
   };
 }
 
@@ -639,6 +647,23 @@ describe("P5.4.1 first turn on a newly created Desktop target", () => {
     expect(execution?.status).toBe("failed");
     expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
     expect(value.terminals).toHaveLength(1);
+  });
+
+  it("recovers the first turn when the target is not yet visible on the first read", async () => {
+    const value = await fixture();
+    value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 42 }]);
+    // The freshly created target is momentarily unreadable; the first-turn visibility grace retries.
+    value.desktop.setReadErrors(1);
+    await authorizeAndActuate(value);
+
+    const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
+    expect(execution).toMatchObject({ status: "passed" });
+    expect(value.desktop.createThreadCount()).toBe(1);
+    const reads = value.desktop.calls.filter((call) => call.name === "read_thread");
+    expect(reads.length).toBeGreaterThan(1);
+    const session = (await value.sessions.listSessions())[0]!;
+    const events = await value.events.listEvents(session.session_id);
+    expect(events.map((event) => event.event_type)).toContain("turn_completed");
   });
 });
 

@@ -1,0 +1,16 @@
+[
+  {
+    "index": 4,
+    "name": "wait_threads",
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"timedOut\":false,\"wake\":{\"reason\":\"turnCompleted\",\"turnId\":\"01a0c208-2680-7df3-a4f3-fbc7946ca6b1\",\"threadId\":\"01a0c208-231b-7a32-b458-8b8c2b04adb0\",\"hostId\":\"local\"},\"polls\":[{\"schemaVersion\":1,\"cursor\":\"bd87bd1e-df2a-4b91-b9d0-5a4529be32c3:2\",\"revision\":2,\"changed\":true,\"thread\":{\"id\":\"01a0c208-231b-7a32-b458-8b8c2b04adb0\",\"hostId\":\"local\",\"status\":{\"type\":\"idle\"}},\"latestTurn\":{\"id\":\"01a0c208-2680-7df3-a4f3-fbc7946ca6b1\",\"status\":\"completed\",\"error\":null,\"startedAt\":1789961709,\"completedAt\":1789961714,\"durationMs\":5349},\"latestAssistantMessageId\":\"msg_af3cdc1c728e4216b40efed8d2b888b0\",\"latestAssistantMessage\":{\"id\":\"msg_af3cdc1c728e4216b40efed8d2b888b0\",\"turnId\":\"01a0c208-2680-7df3-a4f3-fbc7946ca6b1\",\"phase\":\"final_answer\",\"text\":\"LRM_P541_FIRST_TURN_844d3ef0-bae8-4687-9e07-d65d8fef9736\"},\"latestToolMarkerId\":null,\"latestToolMarker\":null}]}"
+        }
+      ],
+      "isError": false
+    },
+    "isError": false
+  }
+]

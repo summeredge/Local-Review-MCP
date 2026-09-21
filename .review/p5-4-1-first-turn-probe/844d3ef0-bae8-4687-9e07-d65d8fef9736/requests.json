@@ -1,0 +1,69 @@
+[
+  {
+    "index": 1,
+    "name": "list_projects",
+    "arguments": {},
+    "meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "index": 2,
+    "name": "create_thread",
+    "arguments": {
+      "prompt": "Only return LRM_P541_FIRST_TURN_844d3ef0-bae8-4687-9e07-d65d8fef9736. Do not modify files. Do not create commits. Do not push.",
+      "target": {
+        "type": "project",
+        "projectId": "39eebb0b-7398-4548-8d0a-727a3139085b",
+        "environment": {
+          "type": "local"
+        }
+      }
+    },
+    "meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "index": 3,
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c208-231b-7a32-b458-8b8c2b04adb0",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": false
+    },
+    "meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "index": 4,
+    "name": "wait_threads",
+    "arguments": {
+      "targets": [
+        {
+          "threadId": "01a0c208-231b-7a32-b458-8b8c2b04adb0",
+          "hostId": "local"
+        }
+      ],
+      "timeoutMs": 119972
+    },
+    "meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  },
+  {
+    "index": 5,
+    "name": "read_thread",
+    "arguments": {
+      "threadId": "01a0c208-231b-7a32-b458-8b8c2b04adb0",
+      "hostId": "local",
+      "turnLimit": 10,
+      "includeOutputs": false
+    },
+    "meta": {
+      "openai/threadId": "01a0c169-2d53-70b1-ae5a-9fec15cba62b"
+    }
+  }
+]
