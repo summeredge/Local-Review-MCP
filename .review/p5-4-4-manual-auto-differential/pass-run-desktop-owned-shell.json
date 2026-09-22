@@ -1,0 +1,65 @@
+{
+  "probe": "p5-4-4-differential",
+  "role": "manual-pass-desktop-owned-shell",
+  "timestamp": "2026-09-21T13:49:45.053Z",
+  "pid": 15336,
+  "ppid": 2876,
+  "executable": "node.exe",
+  "cwd": "C:\\Users\\shaoy\\Documents\\Local-Review-MCP",
+  "env_presence": {
+    "CODEX_APP_TOOLS_PIPE_PATH": true,
+    "CODEX_THREAD_ID": true,
+    "CODEX_SESSION_ID": true
+  },
+  "host_before": {
+    "desktop_connected": true,
+    "ownerClientId_present": true,
+    "ready": false,
+    "reason": "desktop_tools_pipe_unavailable",
+    "pipeSource": null
+  },
+  "chain": [
+    {
+      "pid": 15336,
+      "ppid": 2876,
+      "exe": "node.exe"
+    },
+    {
+      "pid": 2876,
+      "ppid": 50868,
+      "exe": "pwsh.exe"
+    },
+    {
+      "pid": 50868,
+      "ppid": 51064,
+      "exe": "codex.exe"
+    },
+    {
+      "pid": 51064,
+      "ppid": 13768,
+      "exe": "ChatGPT.exe"
+    },
+    {
+      "pid": 13768,
+      "ppid": 13636,
+      "exe": "explorer.exe"
+    }
+  ],
+  "sender": {
+    "exit_code": 0,
+    "stdout": {
+      "ok": true,
+      "accepted": true,
+      "source": "desktop_environment",
+      "received_at": "2026-09-21T13:49:51.373Z",
+      "desktop_owner_bound": true
+    }
+  },
+  "host_after": {
+    "desktop_connected": true,
+    "ownerClientId_present": true,
+    "ready": true,
+    "reason": null,
+    "pipeSource": "handoff"
+  }
+}

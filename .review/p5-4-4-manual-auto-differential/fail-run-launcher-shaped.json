@@ -1,0 +1,82 @@
+{
+  "probe": "p5-4-4-differential",
+  "role": "launcher-shaped-plain-user-session",
+  "timestamp": "2026-09-21T13:57:44.013Z",
+  "pid": 60244,
+  "ppid": 19392,
+  "executable": "node.exe",
+  "cwd": "C:\\Users\\shaoy\\Documents\\Local-Review-MCP",
+  "env_presence": {
+    "CODEX_APP_TOOLS_PIPE_PATH": false,
+    "CODEX_THREAD_ID": false,
+    "CODEX_SESSION_ID": false
+  },
+  "host_before": {
+    "desktop_connected": true,
+    "ownerClientId_present": true,
+    "ready": true,
+    "reason": null,
+    "pipeSource": "handoff"
+  },
+  "chain": [
+    {
+      "pid": 60244,
+      "ppid": 19392,
+      "exe": "node.exe"
+    },
+    {
+      "pid": 19392,
+      "ppid": 47256,
+      "exe": "powershell.exe"
+    },
+    {
+      "pid": 47256,
+      "ppid": 22368,
+      "exe": "pythonw.exe"
+    },
+    {
+      "pid": 22368,
+      "ppid": 42540,
+      "exe": "pythonw.exe"
+    },
+    {
+      "pid": 42540,
+      "ppid": 59000,
+      "exe": "cmd.exe"
+    },
+    {
+      "pid": 59000,
+      "ppid": 1812,
+      "exe": "explorer.exe"
+    },
+    {
+      "pid": 1812,
+      "ppid": 1576,
+      "exe": "svchost.exe"
+    },
+    {
+      "pid": 1576,
+      "ppid": 1496,
+      "exe": "services.exe"
+    },
+    {
+      "pid": 1496,
+      "ppid": 1168,
+      "exe": "wininit.exe"
+    }
+  ],
+  "sender": {
+    "exit_code": 1,
+    "stdout": {
+      "ok": false,
+      "error": "desktop_tools_pipe_unavailable"
+    }
+  },
+  "host_after": {
+    "desktop_connected": true,
+    "ownerClientId_present": true,
+    "ready": true,
+    "reason": null,
+    "pipeSource": "handoff"
+  }
+}
