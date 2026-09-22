@@ -1,0 +1,20 @@
+{
+  "name": "lrm-local",
+  "interface": {
+    "displayName": "LRM Local"
+  },
+  "plugins": [
+    {
+      "name": "lrm-desktop-session-start",
+      "source": {
+        "source": "local",
+        "path": "./plugins/lrm-desktop-session-start"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "at": "2026-09-22T14:05:13.635Z",
+  "desktopInteractiveStatus": 200,
+  "ready": true,
+  "reason": null,
+  "pipeSource": "handoff",
+  "desktopConnected": true,
+  "desktopOwnerClientId": "4caf2394-d524-419e-be49-99c394cf238d",
+  "currentConversationId": "01a0c92f-44e6-79b2-8483-03aac4c96647"
+}

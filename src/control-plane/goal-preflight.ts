@@ -28,6 +28,13 @@ import type {
 
 export const GOAL_PREFLIGHT_EXTENSION_READY_TIMEOUT_MS = 60_000;
 export const GOAL_PREFLIGHT_POLL_INTERVAL_MS = 250;
+/**
+ * P5.7.2 Desktop capability readiness synchronization. The Desktop tools pipe capability is
+ * delivered by the SessionStart hook handoff, which can land after `submit_goal` was already
+ * accepted, so the Desktop check waits for it for a bounded window.
+ */
+export const GOAL_PREFLIGHT_DESKTOP_READY_TIMEOUT_MS = 30_000;
+export const GOAL_PREFLIGHT_DESKTOP_POLL_INTERVAL_MS = 1_000;
 
 export const goalPreflightInputSchema = z.object({
   workspace_id: workspaceIdSchema,
@@ -137,6 +144,12 @@ export interface GoalPreflightServiceOptions {
    * only way this preflight can observe a blocked Desktop tools pipe capability.
    */
   readonly desktopReadiness?: () => DesktopInteractiveReadiness;
+  /**
+   * Bounded wait window for a Desktop capability that is still being handed off. It only applies
+   * to `desktop_tools_pipe_unavailable`; every other reason keeps failing immediately.
+   */
+  readonly desktopReadyTimeoutMs?: number;
+  readonly onDesktopWait?: (observation: DesktopWaitObservation) => void;
   readonly diagnoseConnector?: GoalPreflightConnectorCheck;
   readonly extensionReadiness?: ExtensionDeliveryReadinessCheck;
   readonly extensionStatus?: () => GoalPreflightExtensionStatus;
@@ -181,6 +194,81 @@ export async function waitForExtensionReady(
     await sleep(GOAL_PREFLIGHT_POLL_INTERVAL_MS);
     latest = normalizeReadiness(await readiness(conversationId));
   }
+  return latest;
+}
+
+/**
+ * P5.7.2 wait diagnostics. Deliberately limited to counts, elapsed time, and reason/source codes so
+ * a blocked or slow Desktop capability never leaks a pipe path, an environment value, or a token.
+ */
+export interface DesktopWaitObservation {
+  readonly state: "waiting" | "ready" | "blocked" | "timeout";
+  readonly reason?: DesktopInteractiveBlockReason;
+  readonly retry: number;
+  readonly elapsed_ms: number;
+  readonly pipe_source?: DesktopInteractiveReadiness["pipeSource"];
+}
+
+/**
+ * P5.7.2 Desktop capability bounded wait.
+ *
+ * The Desktop tools pipe capability arrives through the SessionStart hook handoff, so it can appear
+ * shortly after `submit_goal` was already accepted. Only the "no capability yet" reason waits, and
+ * only for a bounded window: a disconnected Desktop or an unavailable executor identity still fails
+ * immediately, and a timeout keeps the original fail-closed `desktop_tools_pipe_unavailable` result.
+ */
+export async function waitForDesktopReady(
+  check: () => DesktopInteractiveReadiness,
+  options: {
+    readonly timeoutMs?: number;
+    readonly now?: () => number;
+    readonly wait?: (milliseconds: number) => Promise<void>;
+    readonly observe?: (observation: DesktopWaitObservation) => void;
+  } = {},
+): Promise<DesktopInteractiveReadiness> {
+  const now = options.now ?? Date.now;
+  const sleep = options.wait ?? (async (milliseconds: number): Promise<void> => {
+    await wait(milliseconds);
+  });
+  const observe = (observation: DesktopWaitObservation): void => {
+    try {
+      options.observe?.(observation);
+    } catch {
+      // Waiting diagnostics are observational and must never change the preflight decision.
+    }
+  };
+
+  let latest = check();
+  if (latest.ready || latest.reason !== "desktop_tools_pipe_unavailable") return latest;
+
+  // The retry budget bounds the loop independently of the injected clock, so a wait seam that never
+  // advances time still cannot wait forever.
+  const timeoutMs = options.timeoutMs ?? GOAL_PREFLIGHT_DESKTOP_READY_TIMEOUT_MS;
+  const maxRetries = Math.max(0, Math.ceil(timeoutMs / GOAL_PREFLIGHT_DESKTOP_POLL_INTERVAL_MS));
+  const startedAt = now();
+  let retry = 0;
+  observe({ state: "waiting", reason: latest.reason, retry, elapsed_ms: 0 });
+  while (retry < maxRetries) {
+    await sleep(GOAL_PREFLIGHT_DESKTOP_POLL_INTERVAL_MS);
+    retry += 1;
+    latest = check();
+    const elapsed_ms = now() - startedAt;
+    if (latest.ready) {
+      observe({
+        state: "ready",
+        retry,
+        elapsed_ms,
+        ...(latest.pipeSource === undefined ? {} : { pipe_source: latest.pipeSource }),
+      });
+      return latest;
+    }
+    if (latest.reason !== "desktop_tools_pipe_unavailable") {
+      observe({ state: "blocked", reason: latest.reason, retry, elapsed_ms });
+      return latest;
+    }
+    observe({ state: "waiting", reason: latest.reason, retry, elapsed_ms });
+  }
+  observe({ state: "timeout", reason: latest.reason, retry, elapsed_ms: now() - startedAt });
   return latest;
 }
 
@@ -253,6 +341,8 @@ const DESKTOP_FAILURE_REASONS: Record<DesktopInteractiveBlockReason, string> = {
 export class GoalPreflightService {
   private readonly runtimeReadyCheck: GoalPreflightServiceOptions["runtimeReady"];
   private desktopReadinessCheck: GoalPreflightServiceOptions["desktopReadiness"];
+  private readonly desktopReadyTimeoutMs: number | undefined;
+  private desktopWaitReporter: GoalPreflightServiceOptions["onDesktopWait"];
   private readonly connectorCheck: GoalPreflightConnectorCheck;
   private readonly extensionCheck: ExtensionDeliveryReadinessCheck;
   private readonly extensionStatus: (() => GoalPreflightExtensionStatus) | undefined;
@@ -265,6 +355,8 @@ export class GoalPreflightService {
     const storageRoot = options.storageRoot ?? defaultTaskContextStorageRoot();
     this.runtimeReadyCheck = options.runtimeReady;
     this.desktopReadinessCheck = options.desktopReadiness;
+    this.desktopReadyTimeoutMs = options.desktopReadyTimeoutMs;
+    this.desktopWaitReporter = options.onDesktopWait;
     this.connectorCheck = options.diagnoseConnector
       ?? ((settings) => diagnoseChatGPTConnector(settings, { storageRoot }));
     this.extensionCheck = options.extensionReadiness ?? extensionDeliveryReadiness;
@@ -286,6 +378,14 @@ export class GoalPreflightService {
    */
   public setDesktopReadiness(check: GoalPreflightServiceOptions["desktopReadiness"]): void {
     this.desktopReadinessCheck = check;
+  }
+
+  /**
+   * Bind the Desktop capability wait diagnostics once the runtime diagnostic log exists. This is a
+   * wiring seam, not a policy switch: it never changes the wait window or the preflight outcome.
+   */
+  public setDesktopWaitReporter(reporter: GoalPreflightServiceOptions["onDesktopWait"]): void {
+    this.desktopWaitReporter = reporter;
   }
 
   public async checkGoalPreflight(input: GoalPreflightInput): Promise<GoalPreflightResult> {
@@ -336,8 +436,16 @@ export class GoalPreflightService {
     // Goal/Task/Execution exists. Check it here so a blocked capability is a queryable preflight
     // result instead of a failure that only appears after the Goal already started.
     if (parsed.execution_mode === "interactive") {
-      const readiness = this.desktopReadinessCheck?.()
-        ?? { ready: false as const, reason: "desktop_tools_pipe_unavailable" as const };
+      const check = this.desktopReadinessCheck;
+      // An unbound check can never become ready, so it keeps failing closed without waiting.
+      const readiness = check === undefined
+        ? { ready: false as const, reason: "desktop_tools_pipe_unavailable" as const }
+        : await waitForDesktopReady(check, {
+          timeoutMs: this.desktopReadyTimeoutMs,
+          now: this.now,
+          wait: this.sleep,
+          ...(this.desktopWaitReporter === undefined ? {} : { observe: this.desktopWaitReporter }),
+        });
       result = goalPreflightResultSchema.parse({ ...result, desktop: desktopState(readiness) });
       if (!readiness.ready) {
         return fail(

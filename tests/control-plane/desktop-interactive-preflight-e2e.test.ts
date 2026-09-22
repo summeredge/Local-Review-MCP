@@ -117,6 +117,10 @@ function readyConnector(): ChatGPTConnectorDiagnostic {
 
 function preflightService(
   interactivePreflight: DesktopInteractivePreflight,
+  options: {
+    readonly desktopReadyTimeoutMs?: number;
+    readonly wait?: (milliseconds: number) => Promise<void>;
+  } = {},
 ): GoalPreflightService {
   return new GoalPreflightService({
     settings: settings("C:\\workspace"),
@@ -131,6 +135,10 @@ function preflightService(
       readiness_state: "ready" as const,
     }),
     extensionReadyTimeoutMs: 0,
+    // The bounded Desktop capability wait is exercised in the goal-preflight unit tests; these
+    // production-path tests assert the immediate fail-closed result.
+    desktopReadyTimeoutMs: options.desktopReadyTimeoutMs ?? 0,
+    wait: options.wait,
   });
 }
 
@@ -144,16 +152,26 @@ interface ProductionFixture {
 function productionFixture(options: {
   readonly state: () => DesktopSyncState;
   readonly environment: NodeJS.ProcessEnv;
+  readonly handoff?: DesktopToolsPipeHandoff;
+  readonly desktopReadyTimeoutMs?: number;
+  readonly desktopWait?: (milliseconds: number) => Promise<void>;
 }): ProductionFixture {
-  const handoff = new DesktopToolsPipeHandoff();
+  const handoff = options.handoff ?? new DesktopToolsPipeHandoff();
   const interactivePreflight = new DesktopInteractivePreflight(
     handoff,
     options.state,
     { environment: options.environment },
   );
-  const preflight = preflightService(interactivePreflight);
+  const preflight = preflightService(interactivePreflight, {
+    desktopReadyTimeoutMs: options.desktopReadyTimeoutMs,
+    wait: options.desktopWait,
+  });
   const createGoal = vi.fn(async () => ({ goal_id: "goal-1" }));
-  const startGoal = vi.fn(async () => ({ goal_id: "goal-1", status: "running" }));
+  const startGoal = vi.fn(async () => ({
+    goal_id: "goal-1",
+    status: "running",
+    execution_id: "execution-1",
+  }));
   const submission = new GoalSubmissionService(
     { createGoal, startGoal } as never,
     preflight,
@@ -189,6 +207,30 @@ describe("production interactive Desktop preflight", () => {
     // No Goal, Task, Session, or Execution may exist for a blocked capability.
     expect(fixture.createGoal).not.toHaveBeenCalled();
     expect(fixture.startGoal).not.toHaveBeenCalled();
+  });
+
+  it("waits for a SessionStart handoff that arrives after submit_goal and starts the Goal", async () => {
+    const handoff = new DesktopToolsPipeHandoff();
+    let ticks = 0;
+    const fixture = productionFixture({
+      state: () => connectedState(),
+      environment: {},
+      handoff,
+      desktopReadyTimeoutMs: 30_000,
+      // The capability is handed off while the preflight is already waiting for it.
+      desktopWait: async () => {
+        ticks += 1;
+        if (ticks === 2) handoff.accept(HANDOFF_PIPE, OWNER);
+      },
+    });
+
+    await expect(fixture.submission.submitGoal(interactiveRequest())).resolves.toMatchObject({
+      goal_id: "goal-1",
+      execution_id: "execution-1",
+    });
+    expect(ticks).toBeGreaterThan(1);
+    expect(fixture.createGoal).toHaveBeenCalledTimes(1);
+    expect(fixture.startGoal).toHaveBeenCalledTimes(1);
   });
 
   it("reports the host environment source when the LRM process already holds the pipe", async () => {

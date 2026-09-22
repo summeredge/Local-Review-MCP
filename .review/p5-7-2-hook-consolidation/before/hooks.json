@@ -1,0 +1,43 @@
+{
+  "description": "Minimal local probe for UserPromptSubmit and Stop.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"%USERPROFILE%\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe\" \"%USERPROFILE%\\.codex\\hook_probe.py\"",
+            "commandWindows": "\"%USERPROFILE%\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe\" \"%USERPROFILE%\\.codex\\hook_probe.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"%USERPROFILE%\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe\" \"%USERPROFILE%\\.codex\\hook_probe.py\"",
+            "commandWindows": "\"%USERPROFILE%\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe\" \"%USERPROFILE%\\.codex\\hook_probe.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"node\" \"C:\\Users\\shaoy\\Documents\\Local-Review-MCP\\scripts\\desktop-session-start-handoff.mjs\" --config \"C:\\Users\\shaoy\\Documents\\Local-Review-MCP\\config.production.json\"",
+            "commandWindows": "\"node\" \"C:\\Users\\shaoy\\Documents\\Local-Review-MCP\\scripts\\desktop-session-start-handoff.mjs\" --config \"C:\\Users\\shaoy\\Documents\\Local-Review-MCP\\config.production.json\"",
+            "timeout": 10,
+            "statusMessage": "LRM Desktop session-start handoff"
+          }
+        ]
+      }
+    ]
+  }
+}

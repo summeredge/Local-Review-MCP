@@ -1,0 +1,10 @@
+{
+  "name": "lrm-desktop-session-start",
+  "version": "0.1.0",
+  "description": "Local Review MCP Desktop SessionStart handoff plugin.",
+  "author": {
+    "name": "Local Review MCP"
+  },
+  "license": "UNLICENSED",
+  "hooks": "./hooks/hooks.json"
+}

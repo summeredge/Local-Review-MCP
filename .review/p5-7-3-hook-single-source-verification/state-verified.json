@@ -1,0 +1,41 @@
+{
+  "at": "2026-09-22T14:05:23.229Z",
+  "userHooksFile": {
+    "path": "C:\\Users\\shaoy\\.codex\\hooks.json",
+    "events": [
+      "UserPromptSubmit",
+      "Stop"
+    ],
+    "sessionStartEntries": 0,
+    "lrmOwnedSessionStartEntries": 0,
+    "otherHooksPreserved": [
+      {
+        "event": "UserPromptSubmit",
+        "command": "\"%USERPROFILE%\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe\" \"%USERPROFILE%\\.codex\\hook_probe.py\""
+      },
+      {
+        "event": "Stop",
+        "command": "\"%USERPROFILE%\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe\" \"%USERPROFILE%\\.codex\\hook_probe.py\""
+      }
+    ]
+  },
+  "trustState": {
+    "path": "C:\\Users\\shaoy\\.codex\\config.toml",
+    "lines": 345,
+    "userSessionStartKeys": [],
+    "userOtherKeys": [
+      "[hooks.state.'C:\\Users\\shaoy\\.codex\\hooks.json:user_prompt_submit:0:0']",
+      "[hooks.state.'C:\\Users\\shaoy\\.codex\\hooks.json:stop:0:0']"
+    ],
+    "pluginKeys": [
+      "[hooks.state.\"lrm-desktop-session-start@lrm-local:hooks/hooks.json:session_start:0:0\"]"
+    ]
+  },
+  "pluginHook": {
+    "path": "C:\\Users\\shaoy\\Documents\\Local-Review-MCP\\plugin\\plugins\\lrm-desktop-session-start\\hooks\\hooks.json",
+    "sessionStartEntries": 1,
+    "handoffEntries": 1,
+    "matcher": "startup|resume|clear|compact",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/lrm-session-start-handoff.mjs\" \"C:\\Users\\shaoy\\Documents\\Local-Review-MCP\""
+  }
+}

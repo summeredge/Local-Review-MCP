@@ -249,6 +249,16 @@ export async function startApp(
     () => desktopSyncObserver.getState(),
   );
   context.goalPreflight?.setDesktopReadiness(() => desktopInteractivePreflight.check());
+  // A capability handed off a moment after submit_goal is waited for, so the wait is observable in
+  // the runtime diagnostic log without ever recording the pipe path or an environment value.
+  context.goalPreflight?.setDesktopWaitReporter((observation) => writeRuntimeDiagnostic(
+    runtimeDiagnosticLogger,
+    {
+      event: "desktop_preflight_wait",
+      timestamp: new Date().toISOString(),
+      ...observation,
+    },
+  ));
   // The production interactive route is the Desktop codex_app backend. It must reuse the exact
   // Desktop tools-pipe handoff, observer state, and runtime factory owned by this host so the HTTP
   // handoff and the execution backend share one memory domain. Bind before HTTP/MCP accepts Goals.

@@ -1,0 +1,10 @@
+{
+  "name": "lrm-desktop-session-start-probe",
+  "version": "0.1.1",
+  "description": "P5.7.0 probe plugin: on SessionStart it calls the existing Local Review MCP session-start handoff runner.",
+  "author": {
+    "name": "Local Review MCP"
+  },
+  "license": "UNLICENSED",
+  "hooks": "./hooks/hooks.json"
+}

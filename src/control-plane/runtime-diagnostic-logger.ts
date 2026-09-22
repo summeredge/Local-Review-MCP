@@ -2,13 +2,29 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { defaultLogDirectory } from "../supervisor/logger.js";
 
-export interface RuntimeDiagnosticEvent {
+export interface BridgeStartedDiagnosticEvent {
   readonly event: "bridge_started";
   readonly timestamp: string;
   readonly host: string;
   readonly port: number;
   readonly protocol: number;
 }
+
+/**
+ * P5.7.2 Desktop capability wait observability. It carries counts, elapsed time, and reason/source
+ * codes only: never a pipe path, an environment value, or a credential.
+ */
+export interface DesktopWaitDiagnosticEvent {
+  readonly event: "desktop_preflight_wait";
+  readonly timestamp: string;
+  readonly state: "waiting" | "ready" | "blocked" | "timeout";
+  readonly retry: number;
+  readonly elapsed_ms: number;
+  readonly reason?: string;
+  readonly pipe_source?: "handoff" | "current_environment";
+}
+
+export type RuntimeDiagnosticEvent = BridgeStartedDiagnosticEvent | DesktopWaitDiagnosticEvent;
 
 export interface RuntimeDiagnosticLogger {
   write(event: RuntimeDiagnosticEvent): void;

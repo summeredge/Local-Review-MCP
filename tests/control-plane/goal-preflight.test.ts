@@ -2,9 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import type { ResolvedSettings } from "../../src/config/settings.js";
 import {
   GoalPreflightService,
+  waitForDesktopReady,
   type GoalPreflightConnectorCheck,
   type GoalPreflightExtensionStatus,
   type GoalPreflightWorkspaceRegistry,
+  type DesktopWaitObservation,
 } from "../../src/control-plane/goal-preflight.js";
 import type { ChatGPTConnectorDiagnostic } from "../../src/control-plane/chatgpt-connector.js";
 import type { ExtensionDeliveryReadinessCheck } from "../../src/control-plane/extension-delivery.js";
@@ -80,12 +82,30 @@ function extensionReadiness(ready: boolean, paired = ready): ReturnType<Extensio
   };
 }
 
+/**
+ * P5.7.2 Desktop capability bounded wait. The clock is injected so a wait window is exercised
+ * without real sleeping; every other test keeps the window closed at 0.
+ */
+function desktopClock(): {
+  readonly now: () => number;
+  readonly wait: (milliseconds: number) => Promise<void>;
+} {
+  let current = 1_000_000;
+  return {
+    now: () => current,
+    wait: async (milliseconds: number) => { current += milliseconds; },
+  };
+}
+
 function service(options: {
   readonly runtimeReady?: () => boolean | Promise<boolean>;
   readonly connector?: GoalPreflightConnectorCheck;
   readonly extension?: ExtensionDeliveryReadinessCheck;
   readonly extensionStatus?: () => GoalPreflightExtensionStatus;
   readonly desktopReadiness?: () => DesktopInteractiveReadiness;
+  readonly desktopReadyTimeoutMs?: number;
+  readonly desktopClock?: ReturnType<typeof desktopClock>;
+  readonly onDesktopWait?: (observation: DesktopWaitObservation) => void;
 } = {}): {
   readonly service: GoalPreflightService;
   readonly connector: GoalPreflightConnectorCheck;
@@ -105,6 +125,10 @@ function service(options: {
       extensionReadiness: extension,
       extensionStatus: options.extensionStatus,
       extensionReadyTimeoutMs: 0,
+      desktopReadyTimeoutMs: options.desktopReadyTimeoutMs ?? 0,
+      now: options.desktopClock?.now,
+      wait: options.desktopClock?.wait,
+      onDesktopWait: options.onDesktopWait,
     }),
     connector,
     extension,
@@ -299,5 +323,154 @@ describe("GoalPreflightService Desktop interactive route", () => {
       execution_mode: "batch",
     })).resolves.toMatchObject({ ready: true });
     expect(f.desktopReadiness).not.toHaveBeenCalled();
+  });
+});
+
+describe("GoalPreflightService Desktop capability bounded wait (P5.7.2)", () => {
+  const interactive = {
+    workspace_id: "workspace-a",
+    conversation_id: "conversation-1",
+    execution_mode: "interactive" as const,
+  };
+
+  it("waits 30 seconds by default and never longer", async () => {
+    const clock = desktopClock();
+    let checks = 0;
+    const readiness = await waitForDesktopReady(
+      () => {
+        checks += 1;
+        return { ready: false, reason: "desktop_tools_pipe_unavailable" };
+      },
+      { now: clock.now, wait: clock.wait },
+    );
+
+    expect(readiness).toEqual({ ready: false, reason: "desktop_tools_pipe_unavailable" });
+    // One initial check plus one per second for the bounded 30 second window.
+    expect(checks).toBe(31);
+    expect(clock.now()).toBe(1_000_000 + 30_000);
+  });
+
+  it("waits for a handoff that arrives after submit_goal and then continues", async () => {
+    const clock = desktopClock();
+    const observations: DesktopWaitObservation[] = [];
+    let calls = 0;
+    const f = service({
+      desktopReadyTimeoutMs: 30_000,
+      desktopClock: clock,
+      onDesktopWait: (observation) => observations.push(observation),
+      desktopReadiness: () => {
+        calls += 1;
+        return calls < 3
+          ? { ready: false, reason: "desktop_tools_pipe_unavailable" }
+          : { ready: true, pipeSource: "handoff" };
+      },
+    });
+
+    await expect(f.service.checkGoalPreflight(interactive)).resolves.toMatchObject({
+      ready: true,
+      desktop: { ready: true, pipe_source: "handoff" },
+    });
+    expect(f.desktopReadiness).toHaveBeenCalledTimes(3);
+    // Field-for-field equality: the diagnostics carry counts, elapsed time, and codes only.
+    expect(observations).toEqual([
+      { state: "waiting", reason: "desktop_tools_pipe_unavailable", retry: 0, elapsed_ms: 0 },
+      { state: "waiting", reason: "desktop_tools_pipe_unavailable", retry: 1, elapsed_ms: 1_000 },
+      { state: "ready", retry: 2, elapsed_ms: 2_000, pipe_source: "handoff" },
+    ]);
+  });
+
+  it("keeps fail closed after the bounded window and records the timeout", async () => {
+    const clock = desktopClock();
+    const observations: DesktopWaitObservation[] = [];
+    const f = service({
+      desktopReadyTimeoutMs: 3_000,
+      desktopClock: clock,
+      onDesktopWait: (observation) => observations.push(observation),
+      desktopReadiness: () => ({ ready: false, reason: "desktop_tools_pipe_unavailable" }),
+    });
+
+    await expect(f.service.checkGoalPreflight(interactive)).resolves.toMatchObject({
+      ready: false,
+      failure_stage: "desktop",
+      failure_reason: expect.stringContaining("desktop_tools_pipe_unavailable"),
+      desktop: { ready: false, reason: "desktop_tools_pipe_unavailable" },
+    });
+    expect(f.desktopReadiness).toHaveBeenCalledTimes(4);
+    expect(observations).toEqual([
+      { state: "waiting", reason: "desktop_tools_pipe_unavailable", retry: 0, elapsed_ms: 0 },
+      { state: "waiting", reason: "desktop_tools_pipe_unavailable", retry: 1, elapsed_ms: 1_000 },
+      { state: "waiting", reason: "desktop_tools_pipe_unavailable", retry: 2, elapsed_ms: 2_000 },
+      { state: "waiting", reason: "desktop_tools_pipe_unavailable", retry: 3, elapsed_ms: 3_000 },
+      { state: "timeout", reason: "desktop_tools_pipe_unavailable", retry: 3, elapsed_ms: 3_000 },
+    ]);
+  });
+
+  it("does not wait when the capability is already resolved", async () => {
+    const clock = desktopClock();
+    const observations: DesktopWaitObservation[] = [];
+    const f = service({
+      desktopReadyTimeoutMs: 30_000,
+      desktopClock: clock,
+      onDesktopWait: (observation) => observations.push(observation),
+      desktopReadiness: () => ({ ready: true, pipeSource: "current_environment" }),
+    });
+
+    await expect(f.service.checkGoalPreflight(interactive)).resolves.toMatchObject({
+      ready: true,
+      desktop: { ready: true, pipe_source: "current_environment" },
+    });
+    expect(f.desktopReadiness).toHaveBeenCalledTimes(1);
+    expect(observations).toEqual([]);
+  });
+
+  it("fails immediately for a disconnected Desktop or an unavailable executor identity", async () => {
+    for (const reason of ["desktop_disconnected", "executor_identity_unavailable"] as const) {
+      const clock = desktopClock();
+      const observations: DesktopWaitObservation[] = [];
+      const f = service({
+        desktopReadyTimeoutMs: 30_000,
+        desktopClock: clock,
+        onDesktopWait: (observation) => observations.push(observation),
+        desktopReadiness: () => ({ ready: false, reason }),
+      });
+
+      await expect(f.service.checkGoalPreflight(interactive)).resolves.toMatchObject({
+        ready: false,
+        failure_stage: "desktop",
+        failure_reason: expect.stringContaining(reason),
+        desktop: { ready: false, reason },
+      });
+      expect(f.desktopReadiness).toHaveBeenCalledTimes(1);
+      expect(observations).toEqual([]);
+    }
+  });
+
+  it("stops waiting as soon as the reason is no longer the missing capability", async () => {
+    const clock = desktopClock();
+    const observations: DesktopWaitObservation[] = [];
+    let calls = 0;
+    const f = service({
+      desktopReadyTimeoutMs: 30_000,
+      desktopClock: clock,
+      onDesktopWait: (observation) => observations.push(observation),
+      desktopReadiness: () => {
+        calls += 1;
+        return calls < 2
+          ? { ready: false, reason: "desktop_tools_pipe_unavailable" }
+          : { ready: false, reason: "desktop_disconnected" };
+      },
+    });
+
+    await expect(f.service.checkGoalPreflight(interactive)).resolves.toMatchObject({
+      ready: false,
+      failure_stage: "desktop",
+      failure_reason: expect.stringContaining("desktop_disconnected"),
+      desktop: { ready: false, reason: "desktop_disconnected" },
+    });
+    expect(f.desktopReadiness).toHaveBeenCalledTimes(2);
+    expect(observations).toEqual([
+      { state: "waiting", reason: "desktop_tools_pipe_unavailable", retry: 0, elapsed_ms: 0 },
+      { state: "blocked", reason: "desktop_disconnected", retry: 1, elapsed_ms: 1_000 },
+    ]);
   });
 });

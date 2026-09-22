@@ -1,0 +1,43 @@
+{
+  "note": "RECONSTRUCTED, not raw: the pre-trust hooks/list census. The original run's raw output was overwritten by the post-trust run before it was archived, so this file restates only the fields observed in that pre-trust run (source/pluginId/enabled/trustStatus/currentHash plus the probe command). The post-trust raw census is hooks-list-census.trusted.json.",
+  "data": [
+    {
+      "group": {
+        "cwd": "C:\\Users\\shaoy\\Documents\\Local-Review-MCP"
+      },
+      "hooks": [
+        {
+          "key": "C:\\Users\\shaoy\\.codex\\hooks.json:session_start:0:0",
+          "eventName": "sessionStart",
+          "source": "user",
+          "pluginId": null,
+          "enabled": true,
+          "trustStatus": "trusted",
+          "currentHash": "sha256:66dc7e90f75fc0445bf75057be1a4c67726f1e78ae422ea880c35158062f6b2d"
+        },
+        {
+          "key": "lrm-desktop-session-start-probe@lrm-probe:hooks/hooks.json:session_start:0:0",
+          "eventName": "sessionStart",
+          "source": "plugin",
+          "pluginId": "lrm-desktop-session-start-probe@lrm-probe",
+          "enabled": true,
+          "trustStatus": "untrusted",
+          "currentHash": "sha256:799e115279f96037ff237a2b709ed9529bbecd0a88d1872d002f9554b09dcb6c",
+          "command": "node \"C:\\Users\\shaoy\\.codex\\plugins\\cache\\lrm-probe\\lrm-desktop-session-start-probe\\0.1.1/hooks/lrm-session-start-handoff.mjs\" \"C:\\Users\\shaoy\\Documents\\Local-Review-MCP\"",
+          "matcher": "startup|resume|clear|compact",
+          "timeoutSec": 10,
+          "statusMessage": "LRM Desktop session-start capability probe"
+        },
+        {
+          "key": "ponytail@ponytail:hooks/claude-codex-hooks.json:session_start:0:0",
+          "eventName": "sessionStart",
+          "source": "plugin",
+          "pluginId": "ponytail@ponytail",
+          "enabled": true,
+          "trustStatus": "trusted",
+          "currentHash": "sha256:5f81d38f47448a1581c08ec877e044d9e04dd6f814dce3f2671f7a8edadd719b"
+        }
+      ]
+    }
+  ]
+}

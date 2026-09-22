@@ -1,0 +1,10 @@
+{
+  "at": "2026-09-22T04:41:57.7551004Z",
+  "runtimePid": 54036,
+  "runtimeStartedAt": "2026-09-22T12:38:51.3467950+08:00",
+  "handoffEndpointProbe": "HTTP 409  { \"connected\": false, \"error\": \"desktop_tools_pipe_unavailable\" }",
+  "interactiveEndpoint": "{\"ready\":false,\"reason\":\"desktop_tools_pipe_unavailable\",\"pipeSource\":null}",
+  "desktopConnected": true,
+  "resolverReason": "state.connected=true, so the only remaining fail-closed cause is: no accepted handoff capability AND no current_environment pipe value",
+  "conclusion": "no handoff capability held and no environment pipe inherited -> the Host was not pre-warmed"
+}

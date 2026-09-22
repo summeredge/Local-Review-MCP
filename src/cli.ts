@@ -47,6 +47,7 @@ import {
 } from "./desktop-codex/desktop-tools-pipe-handoff.js";
 import {
   installLrmSessionStartHook,
+  migrateLrmSessionStartHookRegistration,
   uninstallLrmSessionStartHook,
 } from "./desktop-codex/desktop-hook-installer.js";
 
@@ -109,12 +110,17 @@ try {
       }, null, 2));
       process.exitCode = 1;
     }
-  } else if (argv[0] === "install-desktop-session-start-hook") {
+  } else if (argv[0] === "desktop-session-start-hook-status"
+    || argv[0] === "install-desktop-session-start-hook") {
     const result = installLrmSessionStartHook();
     console.log(JSON.stringify(result, null, 2));
     if (!result.ok) process.exitCode = 1;
   } else if (argv[0] === "uninstall-desktop-session-start-hook") {
     const result = uninstallLrmSessionStartHook();
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.ok) process.exitCode = 1;
+  } else if (argv[0] === "migrate-desktop-session-start-hook") {
+    const result = migrateLrmSessionStartHookRegistration();
     console.log(JSON.stringify(result, null, 2));
     if (!result.ok) process.exitCode = 1;
   } else if (argv[0] === "diagnose-chatgpt-connector") {
