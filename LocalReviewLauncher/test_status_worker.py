@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, Mock, patch
 from PySide6.QtCore import QCoreApplication, QThreadPool
 from status_checker import (
     BrowserReadiness,
+    DesktopCapabilityStatus,
     DesktopSyncStatus,
     StatusQueryError,
     OAuthClientStatus,
@@ -84,6 +85,36 @@ class StatusCheckWorkerTests(unittest.TestCase):
         offline_worker.run()
         offline_probe.assert_not_called()
         self.assertEqual(offline_results[-1].desktop_sync, DesktopSyncStatus())
+
+    def test_worker_includes_desktop_capability_only_when_mcp_is_running(self) -> None:
+        capability = DesktopCapabilityStatus(ready=True, pipe_source="handoff")
+        probe = Mock(return_value=capability)
+        checker = SimpleNamespace(
+            check=lambda: LauncherStatus(True, True, True),
+            desktop_capability_status=probe,
+        )
+        results: list[LauncherStatus] = []
+        worker = StatusCheckWorker(checker)  # type: ignore[arg-type]
+        worker.signals.finished.connect(lambda _generation, status: results.append(status))
+
+        worker.run()
+        self.assertEqual(results[-1].desktop_capability, capability)
+
+        probe.side_effect = TimeoutError()
+        worker.run()
+        self.assertEqual(results[-1].desktop_capability, DesktopCapabilityStatus())
+
+        offline_probe = Mock()
+        offline_checker = SimpleNamespace(
+            check=lambda: LauncherStatus(False, False, False),
+            desktop_capability_status=offline_probe,
+        )
+        offline_results: list[LauncherStatus] = []
+        offline_worker = StatusCheckWorker(offline_checker)  # type: ignore[arg-type]
+        offline_worker.signals.finished.connect(lambda _generation, status: offline_results.append(status))
+        offline_worker.run()
+        offline_probe.assert_not_called()
+        self.assertEqual(offline_results[-1].desktop_capability, DesktopCapabilityStatus())
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -284,6 +315,56 @@ class StatusCheckerTests(unittest.TestCase):
             self.assertEqual(checker.desktop_sync_status(), DesktopSyncStatus())
         with patch.object(checker, "_request_json", return_value=invalid[-1]):
             self.assertEqual(checker.desktop_sync_status(), DesktopSyncStatus())
+
+    def test_desktop_capability_status_reports_ready_source_with_bearer_auth(self) -> None:
+        response = MagicMock()
+        response.read.return_value = json.dumps({
+            "ready": True,
+            "reason": None,
+            "pipeSource": "handoff",
+        }).encode()
+        response.headers.get.return_value = "application/json"
+        response.__enter__.return_value = response
+        with patch("status_checker.urlopen", return_value=response) as open_url:
+            status = StatusChecker(auth_token="secret").desktop_capability_status()
+
+        self.assertEqual(status, DesktopCapabilityStatus(ready=True, pipe_source="handoff"))
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:12080/launcher/desktop-interactive")
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+
+    def test_desktop_capability_status_keeps_the_environment_source_distinct(self) -> None:
+        checker = StatusChecker()
+        with patch.object(checker, "_request_json", return_value={
+            "ready": True,
+            "reason": None,
+            "pipeSource": "current_environment",
+        }):
+            self.assertEqual(
+                checker.desktop_capability_status(),
+                DesktopCapabilityStatus(ready=True, pipe_source="current_environment"),
+            )
+
+    def test_desktop_capability_status_fails_closed_on_inconsistent_response(self) -> None:
+        unavailable = {"ready": False, "reason": "desktop_tools_pipe_unavailable", "pipeSource": None}
+        checker = StatusChecker()
+        with patch.object(checker, "_request_json", return_value=unavailable):
+            self.assertEqual(checker.desktop_capability_status(), DesktopCapabilityStatus())
+
+        invalid = [
+            None,
+            {},
+            {**unavailable, "ready": "true"},
+            {**unavailable, "pipeSource": "handoff"},
+            {"ready": True, "reason": None, "pipeSource": None},
+            {"ready": True, "reason": None, "pipeSource": "guessed_pipe_name"},
+        ]
+        for payload in invalid:
+            with self.subTest(payload=payload), patch.object(checker, "_request_json", return_value=payload):
+                self.assertEqual(checker.desktop_capability_status(), DesktopCapabilityStatus())
+        with patch.object(checker, "_request_json", side_effect=StatusQueryError("unreachable")):
+            self.assertEqual(checker.desktop_capability_status(), DesktopCapabilityStatus())
 
     def test_legacy_p2_status_maps_to_a_consistent_fail_closed_source(self) -> None:
         disconnected = {

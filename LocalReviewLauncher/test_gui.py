@@ -27,6 +27,7 @@ from config_manager import LauncherConfig
 from gui import LauncherState, LauncherWindow
 from status_checker import (
     BrowserReadiness,
+    DesktopCapabilityStatus,
     DesktopSyncStatus,
     LauncherStatus,
     OAuthClientStatus,
@@ -81,12 +82,22 @@ class LauncherLogTests(unittest.TestCase):
                 fallback_reason=None,
             )
             state_before = window.state
-            window._render_status(LauncherStatus(True, True, True, desktop_sync=connected_desktop))
+            window._render_status(LauncherStatus(
+                True, True, True,
+                desktop_sync=connected_desktop,
+                desktop_capability=DesktopCapabilityStatus(ready=True, pipe_source="handoff"),
+            ))
             self.assertIn("Connected", window.desktop_sync_status.text())
             self.assertIn("Mode: Auto", window.desktop_sync_status.text())
             self.assertIn("Source: Desktop IPC", window.desktop_sync_status.text())
             self.assertIn("Conversation: conversation-1", window.desktop_sync_status.text())
             self.assertIn("Following: Yes", window.desktop_sync_status.text())
+            self.assertIn("Desktop Capability: Ready", window.desktop_sync_status.text())
+            self.assertIn("Source: handoff", window.desktop_sync_status.text())
+
+            window._render_status(LauncherStatus(True, True, True, desktop_sync=connected_desktop))
+            self.assertIn("Desktop Capability: Unavailable", window.desktop_sync_status.text())
+            self.assertIn("Source: none", window.desktop_sync_status.text())
 
             unmatched = replace(connected_desktop, association_status="unmatched")
             window._render_status(LauncherStatus(True, True, True, desktop_sync=unmatched))
@@ -105,7 +116,9 @@ class LauncherLogTests(unittest.TestCase):
             )
             window._render_status(LauncherStatus(True, True, True, desktop_sync=fallback))
             self.assertEqual(window.desktop_sync_status.text(),
-                             "Unavailable\nMode: Auto\nSource: Legacy app-server\nReason: Desktop unavailable")
+                             "Unavailable\nMode: Auto\nSource: Legacy app-server\n"
+                             "Reason: Desktop unavailable\n\n"
+                             "Desktop Capability: Unavailable\nSource: none")
 
             evidence_unavailable = replace(
                 fallback,
@@ -120,7 +133,9 @@ class LauncherLogTests(unittest.TestCase):
             self.assertTrue(window._last_status.mcp_running)
             window._render_status(LauncherStatus(True, True, True, desktop_sync=DesktopSyncStatus()))
             self.assertEqual(window.desktop_sync_status.text(),
-                             "Unavailable\nMode: Auto\nSource: Legacy app-server\nReason: Desktop unavailable")
+                             "Unavailable\nMode: Auto\nSource: Legacy app-server\n"
+                             "Reason: Desktop unavailable\n\n"
+                             "Desktop Capability: Unavailable\nSource: none")
             for state, reason in (("extension_not_paired", "Extension is not paired."),
                                   ("extension_not_present", "Extension is not connected.")):
                 browser = BrowserReadiness(False, state, True, state == "extension_not_present", False,

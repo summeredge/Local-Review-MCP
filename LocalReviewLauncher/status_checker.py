@@ -20,6 +20,7 @@ LOCAL_MCP_URL = "http://127.0.0.1:12080/mcp"
 LOCAL_SESSION_CATALOG_URL = "http://127.0.0.1:12080/launcher/sessions"
 LOCAL_BROWSER_READINESS_URL = "http://127.0.0.1:12080/launcher/readiness"
 LOCAL_DESKTOP_SYNC_URL = "http://127.0.0.1:12080/launcher/desktop-sync"
+LOCAL_DESKTOP_INTERACTIVE_URL = "http://127.0.0.1:12080/launcher/desktop-interactive"
 REMOTE_STATUS_URL = "https://review.syqiu.kdns.fr/.well-known/oauth-protected-resource"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 MAX_STATUS_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -160,6 +161,19 @@ class DesktopSyncStatus:
 
 
 @dataclass(frozen=True)
+class DesktopCapabilityStatus:
+    """Read-only Desktop codex_app capability, read from /launcher/desktop-interactive.
+
+    This is not the Desktop IPC connection: an observer can be connected while no tools pipe has
+    ever been handed to the runtime, and only a ready capability can execute desktop_codex_app.
+    Fail-closed defaults describe a capability that was not established.
+    """
+
+    ready: bool = False
+    pipe_source: str | None = None
+
+
+@dataclass(frozen=True)
 class LauncherStatus:
     mcp_running: bool
     tunnel_connected: bool
@@ -169,6 +183,7 @@ class LauncherStatus:
     sessions: tuple[SessionViewModel, ...] = ()
     browser: BrowserReadiness = BrowserReadiness()
     desktop_sync: DesktopSyncStatus = DesktopSyncStatus()
+    desktop_capability: DesktopCapabilityStatus = DesktopCapabilityStatus()
 
 
 def _object(value: object, label: str) -> dict[str, object]:
@@ -410,6 +425,7 @@ class StatusChecker:
         workspace_id: str | None = None,
         browser_readiness_url: str = LOCAL_BROWSER_READINESS_URL,
         desktop_sync_url: str = LOCAL_DESKTOP_SYNC_URL,
+        desktop_capability_url: str = LOCAL_DESKTOP_INTERACTIVE_URL,
     ) -> None:
         self.auth_token = auth_token
         self.oauth_clients_url = oauth_clients_url
@@ -418,6 +434,7 @@ class StatusChecker:
         self.workspace_id = workspace_id
         self.browser_readiness_url = browser_readiness_url
         self.desktop_sync_url = desktop_sync_url
+        self.desktop_capability_url = desktop_capability_url
 
     def browser_readiness(self) -> BrowserReadiness:
         try:
@@ -586,6 +603,32 @@ class StatusChecker:
             )
         except StatusQueryError:
             return DesktopSyncStatus()
+
+    def desktop_capability_status(self) -> DesktopCapabilityStatus:
+        """The capability only reports what the preflight reports; it never acquires one."""
+
+        try:
+            document = _object(self._request_json(self.desktop_capability_url), "Desktop capability")
+            if not {"ready", "pipeSource"}.issubset(document):
+                raise StatusQueryError("Desktop capability fields are incomplete")
+            ready = document["ready"]
+            if type(ready) is not bool:
+                raise StatusQueryError("ready must be a boolean")
+            source_value = document["pipeSource"]
+            if not ready:
+                if source_value is not None:
+                    raise StatusQueryError("Unavailable Desktop capability has a pipe source")
+                return DesktopCapabilityStatus()
+            return DesktopCapabilityStatus(
+                ready=True,
+                pipe_source=_status(
+                    source_value,
+                    "pipeSource",
+                    frozenset({"handoff", "current_environment"}),
+                ),
+            )
+        except StatusQueryError:
+            return DesktopCapabilityStatus()
 
     def check(self) -> LauncherStatus:
         mcp_running = self._reachable(LOCAL_HEALTH_URL)

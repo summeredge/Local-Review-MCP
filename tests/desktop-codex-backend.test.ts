@@ -8,12 +8,14 @@ import {
   CliExecutionBackend,
   ExecutionBackendRouter,
   ExecutionService,
+  type ExecutionBackend,
   type ExecutionBackendStartRequest,
   type ExecutionStartResult,
 } from "../src/control-plane/execution-service.js";
 import {
   ActuationAuthorizationStore,
   ControlledActuationService,
+  type ActuationAuthorizationInput,
 } from "../src/control-plane/controlled-actuation.js";
 import { ExecutionContextService } from "../src/context/execution-service.js";
 import { SessionStore } from "../src/context/session-store.js";
@@ -387,7 +389,10 @@ async function seedTask(value: Fixture): Promise<void> {
   });
 }
 
-async function authorizeAndActuate(value: Fixture): Promise<void> {
+async function authorizeAndActuate(
+  value: Fixture,
+  overrides: Partial<ActuationAuthorizationInput> = {},
+): Promise<void> {
   await seedTask(value);
   const authorization = await value.controlled.authorize({
     actuation_id: ACTUATION_ID,
@@ -397,6 +402,7 @@ async function authorizeAndActuate(value: Fixture): Promise<void> {
     execution_id: EXECUTION_ID,
     instruction: INSTRUCTION,
     execution_mode: "interactive",
+    ...overrides,
   });
   await value.controlled.actuate({
     actuation_id: ACTUATION_ID,
@@ -553,23 +559,82 @@ describe("P5.4.1 Desktop preflight fail-closed", () => {
     expect(value.desktop.createThreadCount()).toBe(0);
     expect(value.appServerStart).not.toHaveBeenCalled();
   });
+});
 
-  it("fails closed for an explicit model before any effectful dispatch", async () => {
+describe("P5.4.1 Desktop route ignores provider model and reasoning_effort", () => {
+  it("dispatches create_thread for an interactive Goal that carries model and reasoning_effort", async () => {
     const value = await fixture();
-    await seedTask(value);
-    await expect(value.service.start(interactiveRequest({ model: "gpt-5" }))).rejects.toBeDefined();
-    expect(value.desktop.createThreadCount()).toBe(0);
-    expect(value.desktop.sendCount()).toBe(0);
-    expect(value.appServerStart).not.toHaveBeenCalled();
+    value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+
+    await authorizeAndActuate(value, { model: "gpt-5.6-luna", reasoning_effort: "max" });
+
+    expect(value.desktop.createThreadCount()).toBe(1);
+    const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
+    expect(execution?.status).toBe("passed");
+
+    // The Desktop keeps its own model selection: neither value reaches codex_app MCP.
+    const createThread = value.desktop.calls.find((call) => call.name === "create_thread")!;
+    expect(Object.keys(createThread.arguments ?? {}).sort()).toEqual(["prompt", "target"]);
+    expect(JSON.stringify(value.desktop.calls.map((call) => call.arguments)))
+      .not.toContain("gpt-5.6-luna");
+
+    // Nor are they projected onto the Desktop Session, which needs no provider model.
+    const session = (await value.sessions.listSessions())[0]!;
+    expect(session.model).toBeUndefined();
+    expect(session.reasoning_effort).toBeUndefined();
   });
 
-  it("fails closed for an explicit reasoning_effort before any effectful dispatch", async () => {
+  it("keeps the Desktop route unchanged when no provider model is given", async () => {
+    const value = await fixture();
+    value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+
+    await authorizeAndActuate(value);
+
+    expect(value.desktop.createThreadCount()).toBe(1);
+    const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
+    expect(execution?.status).toBe("passed");
+  });
+
+  it("still delivers model and reasoning_effort to a non-Desktop interactive backend", async () => {
+    const seen: ExecutionBackendStartRequest[] = [];
+    const capture: ExecutionBackend = {
+      start: async (request) => {
+        seen.push(request);
+        throw new Error("captured before any provider start");
+      },
+    };
+    const value = await fixture();
+    const service = new ExecutionService(new ExecutionBackendRouter({
+      batch: new CliExecutionBackend({ start: value.cliStart }),
+      interactive: capture,
+    }));
+
+    await seedTask(value);
+    await expect(service.start(interactiveRequest({
+      model: "gpt-5.6-luna",
+      reasoning_effort: "max",
+    }))).rejects.toBeDefined();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ model: "gpt-5.6-luna", reasoning_effort: "max" });
+  });
+
+  it("leaves the batch route on the CLI backend when model and reasoning_effort are given", async () => {
     const value = await fixture();
     await seedTask(value);
-    await expect(value.service.start(interactiveRequest({ reasoning_effort: "high" }))).rejects.toBeDefined();
+
+    const started = await value.service.start({
+      workspace_id: "workspace-a",
+      task_id: TASK_ID,
+      execution_id: "execution-batch",
+      instruction: INSTRUCTION,
+      model: "gpt-5.6-luna",
+      reasoning_effort: "max",
+    });
+
+    expect(started.process_id).toBe(9_002);
+    expect(value.cliStart).toHaveBeenCalledTimes(1);
     expect(value.desktop.createThreadCount()).toBe(0);
-    expect(value.desktop.sendCount()).toBe(0);
-    expect(value.appServerStart).not.toHaveBeenCalled();
   });
 });
 

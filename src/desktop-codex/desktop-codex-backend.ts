@@ -44,7 +44,6 @@ export type DesktopExecutionErrorCode =
   | "desktop_tools_pipe_unavailable"
   | "runtime_connect_failed"
   | "tools_contract_incompatible"
-  | "unsupported_execution_option"
   | "execution_not_recoverable"
   | "desktop_target_conflict";
 
@@ -144,12 +143,9 @@ export class DesktopCodexBackend implements ExecutionBackend {
     if (parsed.goal_id === undefined) {
       throw new DesktopExecutionError("desktop_goal_required", "Interactive execution requires goal_id.");
     }
-    if (parsed.model !== undefined || parsed.reasoning_effort !== undefined) {
-      throw new DesktopExecutionError(
-        "unsupported_execution_option",
-        "Desktop codex_app does not accept an explicit model or reasoning_effort.",
-      );
-    }
+    // A Goal may carry provider model/reasoning_effort for the batch route. The Desktop codex_app
+    // create_thread contract has no such argument and keeps its own model selection, so both fields
+    // are ignored here instead of failing an interactive Goal that was already accepted.
     if (this.closing) {
       throw new DesktopExecutionError("desktop_backend_closed", "Desktop codex_app backend is closed.");
     }

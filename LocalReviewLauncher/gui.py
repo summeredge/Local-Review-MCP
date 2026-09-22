@@ -39,7 +39,14 @@ from config_manager import (
     LauncherConfigError,
 )
 from process_manager import ProductionProcessManager
-from status_checker import DesktopSyncStatus, LauncherStatus, OAuthRegistryStatus, SessionViewModel, StatusChecker
+from status_checker import (
+    DesktopCapabilityStatus,
+    DesktopSyncStatus,
+    LauncherStatus,
+    OAuthRegistryStatus,
+    SessionViewModel,
+    StatusChecker,
+)
 from status_worker import StatusCheckScheduler, StatusCheckWorker
 
 
@@ -402,20 +409,29 @@ class LauncherWindow(QMainWindow):
             if display_state == "READY" and not browser.ready else ""
         )
         desktop_sync = getattr(status, "desktop_sync", DesktopSyncStatus())
+        desktop_capability = getattr(status, "desktop_capability", DesktopCapabilityStatus())
+        # A connected Desktop IPC observer says nothing about the Desktop codex_app capability, so
+        # the handoff state is always rendered separately instead of being read as the same thing.
+        capability_lines = [
+            "",
+            "Desktop Capability: Ready" if desktop_capability.ready else "Desktop Capability: Unavailable",
+            f"Source: {desktop_capability.pipe_source or 'none'}",
+        ]
         if desktop_sync.active_source == "legacy_app_server":
             reason = {
                 "desktop_disconnected": "Desktop unavailable",
                 "desktop_evidence_unavailable": "Desktop evidence unavailable",
             }.get(desktop_sync.fallback_reason, "Desktop Sync unavailable")
-            self.desktop_sync_status.setText("\n".join((
+            self.desktop_sync_status.setText("\n".join([
                 "Unavailable",
                 "Mode: Auto",
                 "Source: Legacy app-server",
                 f"Reason: {reason}",
-            )))
+                *capability_lines,
+            ]))
             self.desktop_sync_status.setStyleSheet("color: #666666")
         elif not desktop_sync.connected:
-            self.desktop_sync_status.setText("Unavailable")
+            self.desktop_sync_status.setText("\n".join(["Unavailable", *capability_lines]))
             self.desktop_sync_status.setStyleSheet("color: #666666")
         else:
             lines = [
@@ -429,6 +445,7 @@ class LauncherWindow(QMainWindow):
             ]
             if desktop_sync.association_status != "matched":
                 lines.append(f"Association: {desktop_sync.association_status.title()}")
+            lines.extend(capability_lines)
             self.desktop_sync_status.setText("\n".join(lines))
             self.desktop_sync_status.setStyleSheet(
                 "color: #946200" if desktop_sync.association_status in {"conflict", "unavailable"}

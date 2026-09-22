@@ -52,6 +52,23 @@ Multiple exact Session matches are `Association: Conflict`; neither case is
 silently converted into fallback. The Manager is read-only and keeps its
 derived state in memory.
 
+## Desktop Capability status
+
+The same overview block shows the Desktop codex_app capability separately, read
+from the runtime's existing `/launcher/desktop-interactive` preflight:
+
+```text
+Desktop Capability: Ready       |  Desktop Capability: Unavailable
+Source: handoff                 |  Source: none
+```
+
+It is not the Desktop IPC connection: the observer can be connected while no
+tools pipe has ever been handed to the runtime, and only a ready capability
+(`handoff`, or the runtime's own `current_environment` fallback) satisfies the
+preflight that `desktop_codex_app` execution needs. The block refreshes with the
+same five-second status worker as Desktop Sync and is read-only: the launcher
+never acquires a capability, posts a handoff, or reads the named pipe.
+
 ## Dashboard
 
 The Task Dashboard shows interactive (`codex_app_server`) Sessions with:
