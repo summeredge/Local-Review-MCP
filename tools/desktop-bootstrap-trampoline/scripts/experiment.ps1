@@ -197,7 +197,18 @@ if ($Phase -eq 'B') {
   }
   $state.boot_launch = $boot
   $state.handoff = $handoff
-  try { $state.desktop_interactive = Invoke-Launcher '/launcher/desktop-interactive' $settings } catch { $state.desktop_interactive = @{ error = $_.Exception.Message } }
+  # The handoff can be accepted a moment before LRM reports it as ready; poll briefly instead of
+  # recording a single racy reading.
+  $readings = @()
+  $readyDeadline = (Get-Date).AddSeconds(30)
+  while ((Get-Date) -lt $readyDeadline) {
+    try { $reading = Invoke-Launcher '/launcher/desktop-interactive' $settings } catch { $reading = @{ error = $_.Exception.Message } }
+    $readings += $reading
+    if ($reading.ready -eq $true -and $reading.pipeSource -eq 'handoff') { break }
+    Start-Sleep -Seconds 3
+  }
+  $state.desktop_interactive_readings = $readings
+  $state.desktop_interactive = $readings[$readings.Count - 1]
   try { $state.desktop_sync = Invoke-Launcher '/launcher/desktop-sync' $settings } catch { $state.desktop_sync = @{ error = $_.Exception.Message } }
   $state.completed_utc = (Get-Date).ToUniversalTime().ToString('o')
   $state.pass = ($null -ne $boot) -and ($handoff.event -eq 'handoff_accepted') -and ($state.desktop_interactive.ready -eq $true) -and ($state.desktop_interactive.pipeSource -eq 'handoff')
