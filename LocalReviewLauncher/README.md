@@ -42,11 +42,11 @@ The endpoint does not guess a current Session when no unambiguous context is
 available.
 The launcher does not read the named pipe or control Desktop. Codex execution
 negotiates the Desktop capability first and uses the existing standalone
-app-server provider after a retry/standalone choice or bounded fallback timeout.
+app-server provider after a recheck/standalone choice or bounded fallback timeout.
 Unmatched or
 conflicting Desktop identities remain visible as Desktop IPC association
 states and are not disguised as fallback.
 
-The overview also reads `/launcher/capability` and exposes the current source,
-state, and the retry/standalone actions. These actions select the execution
+The overview also reads `/launcher/capability?execution_id=current` and exposes
+the current execution, source, state, and the recheck/standalone actions. These actions select the execution
 provider; they do not acquire a pipe or change the Desktop protocols.

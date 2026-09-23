@@ -86,6 +86,7 @@ class StatusCheckWorkerTests(unittest.TestCase):
         offline_worker.run()
         offline_probe.assert_not_called()
         self.assertEqual(offline_results[-1].desktop_sync, DesktopSyncStatus())
+        self.assertEqual(offline_results[-1].capability, CapabilityStatus())
 
     def test_worker_includes_desktop_capability_only_when_mcp_is_running(self) -> None:
         capability = DesktopCapabilityStatus(ready=True, pipe_source="handoff", pipe_state="active")
@@ -383,10 +384,13 @@ class StatusCheckerTests(unittest.TestCase):
     def test_capability_status_parses_state_source_and_actions(self) -> None:
         checker = StatusChecker()
         with patch.object(checker, "_request_json", return_value={
+            "execution_id": "execution-1",
+            "task_id": "task-1",
+            "actuation_id": "actuation-1",
             "state": "desktop_failed",
             "source": "desktop",
             "reason": "desktop_tools_pipe_unavailable",
-            "actions": ["retry", "standalone"],
+            "actions": ["recheck", "standalone"],
             "updatedAt": "2026-09-23T00:00:00.000Z",
         }):
             self.assertEqual(
@@ -395,22 +399,31 @@ class StatusCheckerTests(unittest.TestCase):
                     state="desktop_failed",
                     source="desktop",
                     reason="desktop_tools_pipe_unavailable",
-                    actions=("retry", "standalone"),
+                    actions=("recheck", "standalone"),
+                    execution_id="execution-1",
+                    task_id="task-1",
+                    actuation_id="actuation-1",
                 ),
             )
 
     def test_capability_status_fails_closed_and_actions_use_the_authenticated_endpoint(self) -> None:
         checker = StatusChecker(auth_token="secret")
         with patch.object(checker, "_request_json", return_value={
+            "execution_id": "execution-1",
+            "task_id": "task-1",
+            "actuation_id": None,
             "state": "fallback_running",
             "source": "standalone",
             "reason": None,
             "actions": [],
         }):
             self.assertEqual(checker.capability_status(), CapabilityStatus(
-                state="fallback_running", source="standalone", actions=(),
+                state="fallback_running", source="standalone", actions=(), execution_id="execution-1",
+                task_id="task-1",
             ))
         with patch.object(checker, "_request_json", return_value={
+            "execution_id": "execution-1",
+            "task_id": "task-1",
             "state": "desktop_failed",
             "source": "standalone",
             "reason": None,
@@ -418,13 +431,14 @@ class StatusCheckerTests(unittest.TestCase):
         }):
             self.assertEqual(checker.capability_status(), CapabilityStatus())
         with patch.object(checker, "_request_json", return_value={"state": "fallback_ready"}) as request:
-            self.assertTrue(checker.capability_action("standalone"))
+            self.assertTrue(checker.capability_action("standalone", "execution-1"))
             request.assert_called_once_with(
-                checker.capability_url,
+                f"{checker.capability_url}?execution_id=execution-1",
                 method="POST",
-                body={"action": "standalone"},
+                body={"action": "standalone", "execution_id": "execution-1"},
             )
         self.assertFalse(checker.capability_action("unknown"))
+        self.assertFalse(checker.capability_action("standalone"))
 
     def test_legacy_p2_status_maps_to_a_consistent_fail_closed_source(self) -> None:
         disconnected = {

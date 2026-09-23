@@ -84,7 +84,7 @@ class StatusCheckWorker(QRunnable):
         capability_status = getattr(self.status_checker, "capability_status", None)
         if status.mcp_running and callable(capability_status):
             try:
-                candidate = capability_status()
+                candidate = capability_status("current")
                 capability = candidate if isinstance(candidate, CapabilityStatus) else CapabilityStatus()
             except Exception:
                 capability = CapabilityStatus()

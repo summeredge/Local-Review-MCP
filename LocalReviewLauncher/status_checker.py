@@ -177,10 +177,13 @@ class DesktopCapabilityStatus:
 
 @dataclass(frozen=True)
 class CapabilityStatus:
-    state: str = "initializing"
+    state: str = "unavailable"
     source: str | None = None
     reason: str | None = None
     actions: tuple[str, ...] = ()
+    execution_id: str | None = None
+    task_id: str | None = None
+    actuation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -656,9 +659,17 @@ class StatusChecker:
         except StatusQueryError:
             return DesktopCapabilityStatus()
 
-    def capability_status(self) -> CapabilityStatus:
+    def capability_status(self, execution_id: str | None = None) -> CapabilityStatus:
         try:
-            document = _object(self._request_json(self.capability_url), "Capability status")
+            selected_execution_id = execution_id or "current"
+            capability_url = (
+                f"{self.capability_url}?execution_id={quote(selected_execution_id, safe='')}"
+            )
+            document = _object(self._request_json(capability_url), "Capability status")
+            parsed_execution_id = _identifier(document.get("execution_id"), "execution_id")
+            parsed_task_id = _identifier(document.get("task_id"), "task_id")
+            actuation_value = document.get("actuation_id")
+            parsed_actuation_id = None if actuation_value is None else _identifier(actuation_value, "actuation_id")
             state = _status(document.get("state"), "state", frozenset({
                 "initializing", "desktop_pending", "desktop_ready", "desktop_failed",
                 "fallback_ready", "fallback_running",
@@ -680,21 +691,36 @@ class StatusChecker:
             actions_value = document.get("actions")
             if not isinstance(actions_value, list):
                 raise StatusQueryError("actions must be an array")
-            actions = tuple(_status(action, "actions[]", frozenset({"retry", "standalone"}))
+            actions = tuple(_status(action, "actions[]", frozenset({"recheck", "standalone"}))
                             for action in actions_value)
             if state.startswith("desktop_") and source not in (None, "desktop"):
                 raise StatusQueryError("Desktop capability state has an invalid source")
             if state.startswith("fallback_") and source != "standalone":
                 raise StatusQueryError("Fallback capability state requires standalone source")
-            return CapabilityStatus(state, source, reason, actions)
+            return CapabilityStatus(
+                state,
+                source,
+                reason,
+                actions,
+                parsed_execution_id,
+                parsed_task_id,
+                parsed_actuation_id,
+            )
         except StatusQueryError:
             return CapabilityStatus()
 
-    def capability_action(self, action: str) -> bool:
-        if action not in {"retry", "standalone"}:
+    def capability_action(self, action: str, execution_id: str | None = None) -> bool:
+        if action not in {"recheck", "standalone"} or execution_id is None:
             return False
         try:
-            response = self._request_json(self.capability_url, method="POST", body={"action": action})
+            capability_url = (
+                f"{self.capability_url}?execution_id={quote(execution_id, safe='')}"
+            )
+            response = self._request_json(
+                capability_url,
+                method="POST",
+                body={"action": action, "execution_id": execution_id},
+            )
         except StatusQueryError:
             return False
         return isinstance(response, Mapping) and isinstance(response.get("state"), str)

@@ -102,7 +102,7 @@ class LauncherWindow(QMainWindow):
         self.desktop_sync_status = QLabel("Unavailable")
         self.desktop_sync_status.setWordWrap(True)
         self.desktop_sync_status.setTextFormat(Qt.TextFormat.PlainText)
-        self.capability_status = QLabel("Initializing")
+        self.capability_status = QLabel("Unavailable")
         self.capability_status.setWordWrap(True)
         self.capability_status.setTextFormat(Qt.TextFormat.PlainText)
         self.oauth_status_label = QLabel("Unavailable")
@@ -168,9 +168,9 @@ class LauncherWindow(QMainWindow):
         self.start_button = QPushButton("启动 MCP")
         self.stop_button = QPushButton("停止 MCP")
         self.refresh_button = QPushButton("刷新状态")
-        self.retry_desktop_button = QPushButton("重试 Desktop")
+        self.recheck_desktop_button = QPushButton("重新检查 Desktop")
         self.standalone_button = QPushButton("使用 Standalone")
-        self.retry_desktop_button.setEnabled(False)
+        self.recheck_desktop_button.setEnabled(False)
         self.standalone_button.setEnabled(False)
         self.refresh_oauth_button = QPushButton("Refresh OAuth Status")
         self.reset_oauth_button = QPushButton("Reset OAuth Clients")
@@ -194,7 +194,7 @@ class LauncherWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_mcp)
         self.stop_button.clicked.connect(self.stop_mcp)
         self.refresh_button.clicked.connect(self.refresh_status)
-        self.retry_desktop_button.clicked.connect(self.retry_desktop_capability)
+        self.recheck_desktop_button.clicked.connect(self.recheck_desktop_capability)
         self.standalone_button.clicked.connect(self.select_standalone_capability)
         self.refresh_oauth_button.clicked.connect(self.refresh_oauth_status)
         self.reset_oauth_button.clicked.connect(self.reset_oauth_clients)
@@ -228,7 +228,7 @@ class LauncherWindow(QMainWindow):
         overview_layout.addWidget(self._row("Desktop Sync:", self.desktop_sync_status))
         overview_layout.addWidget(self._row("Execution Capability:", self.capability_status))
         capability_buttons = QHBoxLayout()
-        capability_buttons.addWidget(self.retry_desktop_button)
+        capability_buttons.addWidget(self.recheck_desktop_button)
         capability_buttons.addWidget(self.standalone_button)
         capability_buttons.addStretch()
         overview_layout.addLayout(capability_buttons)
@@ -431,9 +431,20 @@ class LauncherWindow(QMainWindow):
             "desktop": "Desktop",
             "standalone": "Standalone",
         }.get(capability.source or "", "—")
+        capability_hint = {
+            "unavailable": "MCP capability unavailable.",
+            "initializing": "Waiting for the current execution capability.",
+            "desktop_pending": "Checking Desktop capability.",
+            "desktop_ready": "Desktop capability is ready.",
+            "desktop_failed": "Desktop capability unavailable; recheck or choose Standalone.",
+            "fallback_ready": "Standalone fallback selected.",
+            "fallback_running": "Standalone backend is running.",
+        }.get(capability.state, "Capability state unavailable.")
         capability_lines = [
+            f"Execution: {capability.execution_id or '—'}",
             f"Source: {capability_source}",
             f"State: {capability.state}",
+            f"Hint: {capability_hint}",
         ]
         if capability.reason:
             capability_lines.append(f"Reason: {capability.reason}")
@@ -830,18 +841,20 @@ class LauncherWindow(QMainWindow):
             LauncherState.STARTING,
             LauncherState.STOPPING,
         )
-        self.retry_desktop_button.setEnabled(capability_available and "retry" in capability_actions)
+        self.recheck_desktop_button.setEnabled(capability_available and "recheck" in capability_actions)
         self.standalone_button.setEnabled(capability_available and "standalone" in capability_actions)
 
-    def retry_desktop_capability(self) -> None:
-        if self.status_checker.capability_action("retry"):
-            self.message_label.setText("Desktop capability retry requested.")
+    def recheck_desktop_capability(self) -> None:
+        execution_id = getattr(self._last_status.capability, "execution_id", None)
+        if self.status_checker.capability_action("recheck", execution_id):
+            self.message_label.setText("Desktop capability recheck requested.")
             self.refresh_status()
         else:
-            self._show_error("无法请求 Desktop capability 重试。")
+            self._show_error("无法请求 Desktop capability 重新检查。")
 
     def select_standalone_capability(self) -> None:
-        if self.status_checker.capability_action("standalone"):
+        execution_id = getattr(self._last_status.capability, "execution_id", None)
+        if self.status_checker.capability_action("standalone", execution_id):
             self.message_label.setText("Standalone fallback selected.")
             self.refresh_status()
         else:

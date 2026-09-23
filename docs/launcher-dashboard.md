@@ -74,7 +74,9 @@ fallback) satisfies the preflight that `desktop_codex_app` execution needs. The
 block refreshes with the same five-second status worker as Desktop Sync and is
 read-only with respect to the Desktop pipe: the launcher never reads the named
 pipe or posts a handoff. When the capability state is `desktop_failed`, the
-launcher can request `retry` or select the standalone app-server fallback.
+launcher can request `recheck` for that execution or select the standalone
+app-server fallback. Recheck only reads the existing Desktop capability again;
+it never posts a new handoff or triggers SessionStart.
 
 ## Dashboard
 

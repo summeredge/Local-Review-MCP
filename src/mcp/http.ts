@@ -43,6 +43,7 @@ import {
   type ResolvedSettings,
 } from "../config/settings.js";
 import type { TunnelProvider, TunnelStatus } from "../tunnel/types.js";
+import { executionIdSchema } from "../context/schema.js";
 import { requestIdFromHeader, withInboundRequestOrigin } from "./inbound.js";
 import { createMcpServer, registeredMcpToolsMessage, type McpRuntimeContext } from "./server.js";
 
@@ -75,7 +76,10 @@ type HttpRuntimeContext = Omit<McpRuntimeContext, "statusQuery"> & {
    * queryable instead of only appearing as a binary Goal failure.
    */
   readonly desktopInteractivePreflight?: () => DesktopInteractiveReadiness;
-  readonly capabilityNegotiator?: Pick<CapabilityNegotiator, "snapshot" | "retryDesktop" | "selectStandalone">;
+  readonly capabilityNegotiator?: Pick<
+    CapabilityNegotiator,
+    "snapshot" | "currentSnapshot" | "recheckDesktop" | "selectStandalone"
+  >;
   readonly statusQuery?: HttpStatusQuery;
   readonly tunnel?: Pick<TunnelProvider, "status">;
 };
@@ -124,6 +128,14 @@ async function parseBody(request: IncomingMessage): Promise<unknown> {
 async function parseFormBody(request: IncomingMessage): Promise<URLSearchParams> {
   const body = await readBody(request);
   return new URLSearchParams(body?.toString("utf8") ?? "");
+}
+
+function requestSearchParams(request: IncomingMessage): URLSearchParams {
+  try {
+    return new URL(request.url ?? "/", "http://127.0.0.1").searchParams;
+  } catch {
+    return new URLSearchParams();
+  }
 }
 
 function sendJson(
@@ -371,7 +383,17 @@ async function handleLauncherCapabilityRequest(
   }
   if (request.method === "GET") {
     request.resume();
-    sendJson(response, 200, negotiator.snapshot(), { "cache-control": "no-store" });
+    const requestedExecutionId = requestSearchParams(request).get("execution_id");
+    const snapshot = requestedExecutionId === null || requestedExecutionId === "current"
+      ? negotiator.currentSnapshot()
+      : executionIdSchema.safeParse(requestedExecutionId).success
+        ? negotiator.snapshot(requestedExecutionId)
+        : null;
+    if (snapshot === null) {
+      sendJson(response, 404, { error: "capability_execution_unavailable" });
+      return;
+    }
+    sendJson(response, 200, snapshot, { "cache-control": "no-store" });
     return;
   }
   if (request.method !== "POST") {
@@ -392,14 +414,49 @@ async function handleLauncherCapabilityRequest(
   const action = typeof body === "object" && body !== null && !Array.isArray(body)
     ? (body as { action?: unknown }).action
     : undefined;
+  const bodyExecutionId = typeof body === "object" && body !== null && !Array.isArray(body)
+    ? (body as { execution_id?: unknown }).execution_id
+    : undefined;
   const parsed = capabilityActionSchema.safeParse(action);
   if (!parsed.success) {
     sendJson(response, 400, { error: "capability_action_invalid" });
     return;
   }
-  const snapshot = parsed.data === "retry"
-    ? negotiator.retryDesktop()
-    : negotiator.selectStandalone();
+  const requestedExecutionId = requestSearchParams(request).get("execution_id");
+  const parsedBodyExecutionId = bodyExecutionId === undefined
+    ? undefined
+    : executionIdSchema.safeParse(bodyExecutionId);
+  if (parsedBodyExecutionId !== undefined && !parsedBodyExecutionId.success) {
+    sendJson(response, 400, { error: "capability_execution_invalid" });
+    return;
+  }
+  const queryExecutionId = requestedExecutionId === null || requestedExecutionId === "current"
+    ? undefined
+    : requestedExecutionId;
+  if (queryExecutionId !== undefined && !executionIdSchema.safeParse(queryExecutionId).success) {
+    sendJson(response, 400, { error: "capability_execution_invalid" });
+    return;
+  }
+  const bodyExecutionValue = parsedBodyExecutionId?.success ? parsedBodyExecutionId.data : undefined;
+  if (queryExecutionId !== undefined
+    && bodyExecutionValue !== undefined
+    && queryExecutionId !== bodyExecutionValue) {
+    sendJson(response, 400, { error: "capability_execution_mismatch" });
+    return;
+  }
+  const executionId = queryExecutionId ?? bodyExecutionValue
+    ?? negotiator.currentSnapshot()?.execution_id;
+  if (executionId === undefined) {
+    sendJson(response, 400, { error: "capability_execution_required" });
+    return;
+  }
+  const snapshot = parsed.data === "recheck"
+    ? negotiator.recheckDesktop(executionId)
+    : negotiator.selectStandalone(executionId);
+  if (snapshot === null) {
+    sendJson(response, 404, { error: "capability_execution_unavailable" });
+    return;
+  }
   sendJson(response, 200, snapshot, { "cache-control": "no-store" });
 }
 

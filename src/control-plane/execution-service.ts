@@ -24,6 +24,7 @@ const executionReasoningEffortSchema = z.string().min(1).max(64);
 
 export const executionBackendStartRequestSchema = z.object({
   goal_id: goalIdSchema.optional(),
+  actuation_id: z.string().min(1).max(128).optional(),
   workspace_id: workspaceIdSchema,
   task_id: taskIdSchema,
   execution_id: executionIdSchema,
@@ -103,7 +104,8 @@ export class ExecutionBackendRouter implements ExecutionBackend {
    * One-time interactive backend binding. The Desktop backend needs the shared Desktop tools-pipe
    * handoff, observer, and runtime factory, which only exist once the HTTP host is constructed.
    * This is a wiring seam, not a runtime backend switch: nothing selects a backend per Execution
-   * beyond the fixed execution_mode route, and there is no automatic fallback.
+   * beyond the fixed execution_mode route. Interactive capability selection is handled by the
+   * bound CapabilityNegotiator.
    */
   public bindInteractive(backend: ExecutionBackend, options: { readonly replace?: boolean } = {}): void {
     if (options.replace !== true && this.boundInteractive) {

@@ -21,7 +21,7 @@ export type CapabilityState = z.infer<typeof capabilityStateSchema>;
 export const capabilitySourceSchema = z.enum(["desktop", "standalone"]);
 export type CapabilitySource = z.infer<typeof capabilitySourceSchema>;
 
-export const capabilityActionSchema = z.enum(["retry", "standalone"]);
+export const capabilityActionSchema = z.enum(["recheck", "standalone"]);
 export type CapabilityAction = z.infer<typeof capabilityActionSchema>;
 
 export type CapabilityFailureReason =
@@ -32,11 +32,28 @@ export type CapabilityFailureReason =
   | "desktop_execution_failed"
   | "standalone_execution_failed";
 
-export interface CapabilitySnapshot {
+export interface CapabilityNegotiationTimestamps {
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly desktopDeadlineAt: string | null;
+  readonly fallbackDeadlineAt: string | null;
+}
+
+export interface CapabilityNegotiationContext {
+  readonly execution_id: string;
+  readonly task_id: string;
+  readonly actuation_id: string | null;
   readonly state: CapabilityState;
+  readonly requestedAction: CapabilityAction | null;
   readonly source: CapabilitySource | null;
   readonly reason: CapabilityFailureReason | null;
   readonly actions: readonly CapabilityAction[];
+  readonly timestamps: CapabilityNegotiationTimestamps;
+}
+
+export interface CapabilitySnapshot extends CapabilityNegotiationContext {
+  readonly error_code: string | null;
+  /** Compatibility alias for existing status consumers. */
   readonly updatedAt: string;
 }
 
@@ -48,16 +65,11 @@ export interface CapabilityPreparation {
 export interface CapabilityProvider extends ExecutionBackend {
   readonly source: CapabilitySource;
   prepare(): Promise<CapabilityPreparation>;
-  reset?(): void | Promise<void>;
 }
 
 export interface DesktopCapabilityProviderOptions {
   readonly backend: ExecutionBackend;
   readonly readiness: () => DesktopInteractiveReadiness;
-  /** Existing DesktopBootstrapTrampoline handoff seam. */
-  readonly trampolineHandoff?: () => void | Promise<void>;
-  /** Existing SessionStart handoff seam used when the trampoline did not establish capability. */
-  readonly sessionStartHandoff?: () => void | Promise<void>;
 }
 
 function readinessReason(readiness: DesktopInteractiveReadiness): CapabilityFailureReason {
@@ -66,60 +78,18 @@ function readinessReason(readiness: DesktopInteractiveReadiness): CapabilityFail
 
 export class DesktopCapabilityProvider implements CapabilityProvider {
   public readonly source = "desktop" as const;
-  private handoffAttempted = false;
 
   public constructor(private readonly options: DesktopCapabilityProviderOptions) {}
 
   public async prepare(): Promise<CapabilityPreparation> {
-    let first: DesktopInteractiveReadiness;
     try {
-      first = this.options.readiness();
+      const readiness = this.options.readiness();
+      return readiness.ready
+        ? { ready: true }
+        : { ready: false, reason: readinessReason(readiness) };
     } catch {
       return { ready: false, reason: "desktop_handoff_failed" };
     }
-    if (first.ready) return { ready: true };
-    if (first.reason !== "desktop_tools_pipe_unavailable") {
-      return { ready: false, reason: readinessReason(first) };
-    }
-
-    if (!this.handoffAttempted) {
-      this.handoffAttempted = true;
-      let handoffFailed = false;
-      for (const handoff of [this.options.trampolineHandoff, this.options.sessionStartHandoff]) {
-        if (handoff === undefined) continue;
-        try {
-          await handoff();
-        } catch {
-          handoffFailed = true;
-        }
-        let afterHandoff: DesktopInteractiveReadiness;
-        try {
-          afterHandoff = this.options.readiness();
-        } catch {
-          handoffFailed = true;
-          continue;
-        }
-        if (afterHandoff.ready) return { ready: true };
-        if (afterHandoff.reason !== "desktop_tools_pipe_unavailable") {
-          return { ready: false, reason: readinessReason(afterHandoff) };
-        }
-      }
-      if (handoffFailed) return { ready: false, reason: "desktop_handoff_failed" };
-    }
-
-    let latest: DesktopInteractiveReadiness;
-    try {
-      latest = this.options.readiness();
-    } catch {
-      return { ready: false, reason: "desktop_handoff_failed" };
-    }
-    return latest.ready
-      ? { ready: true }
-      : { ready: false, reason: readinessReason(latest) };
-  }
-
-  public reset(): void {
-    this.handoffAttempted = false;
   }
 
   public start(request: ExecutionBackendStartRequest): Promise<ExecutionStartResult> {
@@ -157,6 +127,26 @@ export class StandaloneCapabilityProvider implements CapabilityProvider {
   }
 }
 
+export class CapabilityExecutionError extends Error {
+  public readonly provider: CapabilitySource;
+  public readonly code: string | undefined;
+
+  public constructor(provider: CapabilitySource, cause: unknown) {
+    const message = cause instanceof Error && cause.message !== ""
+      ? cause.message
+      : `${provider} execution failed.`;
+    super(message, { cause });
+    this.name = "CapabilityExecutionError";
+    this.provider = provider;
+    this.code = typeof cause === "object"
+      && cause !== null
+      && "code" in cause
+      && typeof cause.code === "string"
+      ? cause.code
+      : undefined;
+  }
+}
+
 export interface CapabilityNegotiatorOptions {
   readonly desktop: CapabilityProvider;
   readonly standalone: CapabilityProvider;
@@ -170,9 +160,22 @@ export interface CapabilityNegotiatorOptions {
 
 type DesktopWaitResult =
   | { readonly action: "ready" }
-  | { readonly action: "retry" }
+  | { readonly action: "recheck" }
   | { readonly action: "standalone" }
   | { readonly action: "failed"; readonly reason: CapabilityFailureReason };
+
+interface StoredCapabilityNegotiationContext {
+  execution_id: string;
+  task_id: string;
+  actuation_id: string | null;
+  state: CapabilityState;
+  requestedAction: CapabilityAction | null;
+  source: CapabilitySource | null;
+  reason: CapabilityFailureReason | null;
+  actions: readonly CapabilityAction[];
+  timestamps: CapabilityNegotiationTimestamps;
+  lastError: unknown;
+}
 
 function requestKey(request: ExecutionBackendStartRequest): string {
   return `${request.workspace_id}\0${request.task_id}\0${request.execution_id}`;
@@ -180,6 +183,15 @@ function requestKey(request: ExecutionBackendStartRequest): string {
 
 function errorReason(source: CapabilitySource): CapabilityFailureReason {
   return source === "desktop" ? "desktop_execution_failed" : "standalone_execution_failed";
+}
+
+function errorCode(error: unknown): string | null {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && typeof error.code === "string"
+    ? error.code
+    : null;
 }
 
 export class CapabilityNegotiator implements ExecutionBackend {
@@ -192,8 +204,7 @@ export class CapabilityNegotiator implements ExecutionBackend {
   private readonly wait: (milliseconds: number) => Promise<void>;
   private readonly onStateChanged: ((snapshot: CapabilitySnapshot) => void) | undefined;
   private readonly inFlight = new Map<string, Promise<ExecutionStartResult>>();
-  private requestedAction: CapabilityAction | undefined;
-  private snapshotValue: CapabilitySnapshot;
+  private readonly contexts = new Map<string, StoredCapabilityNegotiationContext>();
 
   public constructor(options: CapabilityNegotiatorOptions) {
     this.desktop = options.desktop;
@@ -204,29 +215,42 @@ export class CapabilityNegotiator implements ExecutionBackend {
     this.now = options.now ?? Date.now;
     this.wait = options.wait ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
     this.onStateChanged = options.onStateChanged;
-    this.snapshotValue = {
-      state: "initializing",
-      source: null,
-      reason: null,
-      actions: ["retry", "standalone"],
-      updatedAt: new Date(this.now()).toISOString(),
-    };
   }
 
-  public snapshot(): CapabilitySnapshot {
-    return this.snapshotValue;
+  public snapshot(executionId?: string): CapabilitySnapshot | null {
+    const context = executionId === undefined || executionId === "current"
+      ? this.currentContext()
+      : this.contexts.get(executionId);
+    return context === undefined ? null : this.snapshotOf(context);
   }
 
-  public retryDesktop(): CapabilitySnapshot {
-    this.requestedAction = "retry";
-    this.setState("initializing", null, null, ["retry", "standalone"]);
-    return this.snapshotValue;
+  public currentSnapshot(): CapabilitySnapshot | null {
+    return this.snapshot("current");
   }
 
-  public selectStandalone(): CapabilitySnapshot {
-    this.requestedAction = "standalone";
-    this.setState("fallback_ready", "standalone", null, ["retry"]);
-    return this.snapshotValue;
+  public context(executionId: string): CapabilityNegotiationContext | null {
+    const context = this.contexts.get(executionId);
+    return context === undefined ? null : this.publicContext(context);
+  }
+
+  public recheckDesktop(executionId: string): CapabilitySnapshot | null {
+    const context = this.contexts.get(executionId);
+    if (context === undefined || !context.actions.includes("recheck")) {
+      return context === undefined ? null : this.snapshotOf(context);
+    }
+    context.requestedAction = "recheck";
+    this.setState(context, "initializing", null, null, ["recheck", "standalone"]);
+    return this.snapshotOf(context);
+  }
+
+  public selectStandalone(executionId: string): CapabilitySnapshot | null {
+    const context = this.contexts.get(executionId);
+    if (context === undefined || !context.actions.includes("standalone")) {
+      return context === undefined ? null : this.snapshotOf(context);
+    }
+    context.requestedAction = "standalone";
+    this.setState(context, "fallback_ready", "standalone", null, ["recheck"]);
+    return this.snapshotOf(context);
   }
 
   public start(request: ExecutionBackendStartRequest): Promise<ExecutionStartResult> {
@@ -235,7 +259,8 @@ export class CapabilityNegotiator implements ExecutionBackend {
     const pending = this.inFlight.get(key);
     if (pending !== undefined) return pending.then((result) => ({ ...result, accepted: "existing" as const }));
 
-    const operation = this.startOnce(parsed);
+    const context = this.ensureContext(parsed);
+    const operation = this.startOnce(parsed, context);
     this.inFlight.set(key, operation);
     void operation.finally(() => {
       if (this.inFlight.get(key) === operation) this.inFlight.delete(key);
@@ -255,37 +280,74 @@ export class CapabilityNegotiator implements ExecutionBackend {
     ]);
   }
 
-  private async startOnce(request: ExecutionBackendStartRequest): Promise<ExecutionStartResult> {
-    if (this.consumeAction("standalone") === true) return this.startStandalone(request);
+  private ensureContext(request: ExecutionBackendStartRequest): StoredCapabilityNegotiationContext {
+    const existing = this.contexts.get(request.execution_id);
+    if (existing !== undefined) {
+      if (existing.task_id !== request.task_id
+        || existing.actuation_id !== (request.actuation_id ?? null)) {
+        throw new Error(`Execution "${request.execution_id}" is already bound to another capability context.`);
+      }
+      return existing;
+    }
+
+    const timestamp = this.timestamp(this.now());
+    const context: StoredCapabilityNegotiationContext = {
+      execution_id: request.execution_id,
+      task_id: request.task_id,
+      actuation_id: request.actuation_id ?? null,
+      state: "initializing",
+      requestedAction: null,
+      source: null,
+      reason: null,
+      actions: ["recheck", "standalone"],
+      timestamps: {
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        desktopDeadlineAt: null,
+        fallbackDeadlineAt: null,
+      },
+      lastError: undefined,
+    };
+    this.contexts.set(context.execution_id, context);
+    this.emit(context);
+    return context;
+  }
+
+  private async startOnce(
+    request: ExecutionBackendStartRequest,
+    context: StoredCapabilityNegotiationContext,
+  ): Promise<ExecutionStartResult> {
+    if (this.consumeAction(context, "standalone")) return this.startStandalone(request, context);
 
     while (true) {
-      await this.desktop.reset?.();
-      const result = await this.waitForDesktop();
-      if (result.action === "standalone") return this.startStandalone(request);
-      if (result.action === "retry") continue;
+      const result = await this.waitForDesktop(context);
+      if (result.action === "standalone") return this.startStandalone(request, context);
+      if (result.action === "recheck") continue;
       if (result.action === "failed") {
-        this.setState("desktop_failed", "desktop", result.reason, ["retry", "standalone"]);
-        const choice = await this.waitForFallbackChoice();
-        if (choice === "retry") continue;
-        return this.startStandalone(request);
+        this.setState(context, "desktop_failed", "desktop", result.reason, ["recheck", "standalone"]);
+        const choice = await this.waitForFallbackChoice(context);
+        if (choice === "recheck") continue;
+        return this.startStandalone(request, context);
       }
 
-      this.setState("desktop_ready", "desktop", null, []);
+      this.setState(context, "desktop_ready", "desktop", null, []);
       try {
         return await this.desktop.start(request);
-      } catch {
-        this.setState("desktop_failed", "desktop", errorReason("desktop"), ["retry", "standalone"]);
-        throw new Error("Desktop execution failed.");
+      } catch (error: unknown) {
+        const wrapped = new CapabilityExecutionError("desktop", error);
+        this.setState(context, "desktop_failed", "desktop", errorReason("desktop"), ["recheck", "standalone"], wrapped);
+        throw wrapped;
       }
     }
   }
 
-  private async waitForDesktop(): Promise<DesktopWaitResult> {
-    this.setState("desktop_pending", "desktop", null, ["retry", "standalone"]);
+  private async waitForDesktop(context: StoredCapabilityNegotiationContext): Promise<DesktopWaitResult> {
     const deadline = this.now() + this.desktopTimeoutMs;
+    this.setDeadline(context, "desktopDeadlineAt", deadline);
+    this.setState(context, "desktop_pending", "desktop", null, ["recheck", "standalone"]);
     while (true) {
-      if (this.consumeAction("standalone") === true) return { action: "standalone" };
-      if (this.consumeAction("retry") === true) return { action: "retry" };
+      if (this.consumeAction(context, "standalone")) return { action: "standalone" };
+      if (this.consumeAction(context, "recheck")) return { action: "recheck" };
 
       let preparation: CapabilityPreparation;
       try {
@@ -297,60 +359,134 @@ export class CapabilityNegotiator implements ExecutionBackend {
       if (preparation.reason !== "desktop_tools_pipe_unavailable") {
         return { action: "failed", reason: preparation.reason ?? "desktop_handoff_failed" };
       }
-      if (this.consumeAction("standalone") === true) return { action: "standalone" };
-      if (this.consumeAction("retry") === true) return { action: "retry" };
+      if (this.consumeAction(context, "standalone")) return { action: "standalone" };
+      if (this.consumeAction(context, "recheck")) return { action: "recheck" };
       const remaining = deadline - this.now();
       if (remaining <= 0) return { action: "failed", reason: "desktop_tools_pipe_unavailable" };
       await this.wait(Math.min(this.pollIntervalMs, remaining));
     }
   }
 
-  private async waitForFallbackChoice(): Promise<"retry" | "standalone"> {
+  private async waitForFallbackChoice(context: StoredCapabilityNegotiationContext): Promise<"recheck" | "standalone"> {
     const deadline = this.now() + this.fallbackTimeoutMs;
+    this.setDeadline(context, "fallbackDeadlineAt", deadline);
     while (true) {
-      if (this.consumeAction("retry") === true) return "retry";
-      if (this.consumeAction("standalone") === true) return "standalone";
+      if (this.consumeAction(context, "recheck")) return "recheck";
+      if (this.consumeAction(context, "standalone")) return "standalone";
       const remaining = deadline - this.now();
       if (remaining <= 0) return "standalone";
       await this.wait(Math.min(this.pollIntervalMs, remaining));
     }
   }
 
-  private async startStandalone(request: ExecutionBackendStartRequest): Promise<ExecutionStartResult> {
-    this.requestedAction = undefined;
-    this.setState("fallback_ready", "standalone", null, ["retry"]);
-    this.setState("fallback_running", "standalone", null, []);
+  private async startStandalone(
+    request: ExecutionBackendStartRequest,
+    context: StoredCapabilityNegotiationContext,
+  ): Promise<ExecutionStartResult> {
+    context.requestedAction = null;
+    this.setState(context, "fallback_ready", "standalone", null, ["recheck"]);
     try {
-      return await this.standalone.start(request);
-    } catch {
-      this.setState("fallback_ready", "standalone", errorReason("standalone"), ["retry", "standalone"]);
-      throw new Error("Standalone execution failed.");
+      const preparation = await this.standalone.prepare();
+      if (!preparation.ready) {
+        const cause = new Error(preparation.reason ?? "Standalone capability is unavailable.");
+        const wrapped = new CapabilityExecutionError("standalone", cause);
+        this.setState(context, "fallback_ready", "standalone", "standalone_execution_failed", ["recheck", "standalone"], wrapped);
+        throw wrapped;
+      }
+      const result = await this.standalone.start(request);
+      this.setState(context, "fallback_running", "standalone", null, []);
+      return result;
+    } catch (error: unknown) {
+      if (error instanceof CapabilityExecutionError) throw error;
+      const wrapped = new CapabilityExecutionError("standalone", error);
+      this.setState(context, "fallback_ready", "standalone", errorReason("standalone"), ["recheck", "standalone"], wrapped);
+      throw wrapped;
     }
   }
 
-  private consumeAction(action: CapabilityAction): boolean {
-    if (this.requestedAction !== action) return false;
-    this.requestedAction = undefined;
+  private consumeAction(context: StoredCapabilityNegotiationContext, action: CapabilityAction): boolean {
+    if (context.requestedAction !== action) return false;
+    context.requestedAction = null;
     return true;
   }
 
+  private setDeadline(
+    context: StoredCapabilityNegotiationContext,
+    field: "desktopDeadlineAt" | "fallbackDeadlineAt",
+    deadline: number,
+  ): void {
+    const timestamp = this.timestamp(this.now());
+    context.timestamps = {
+      ...context.timestamps,
+      updatedAt: timestamp,
+      [field]: this.timestamp(deadline),
+    };
+    this.emit(context);
+  }
+
   private setState(
+    context: StoredCapabilityNegotiationContext,
     state: CapabilityState,
     source: CapabilitySource | null,
     reason: CapabilityFailureReason | null,
     actions: readonly CapabilityAction[],
+    lastError?: unknown,
   ): void {
-    this.snapshotValue = {
-      state,
-      source,
-      reason,
-      actions,
-      updatedAt: new Date(this.now()).toISOString(),
+    context.state = state;
+    context.source = source;
+    context.reason = reason;
+    context.actions = actions;
+    context.lastError = lastError;
+    context.timestamps = {
+      ...context.timestamps,
+      updatedAt: this.timestamp(this.now()),
+      ...(state !== "desktop_pending" ? { desktopDeadlineAt: null } : {}),
+      ...(state !== "desktop_failed" ? { fallbackDeadlineAt: null } : {}),
     };
+    this.emit(context);
+  }
+
+  private emit(context: StoredCapabilityNegotiationContext): void {
     try {
-      this.onStateChanged?.(this.snapshotValue);
+      this.onStateChanged?.(this.snapshotOf(context));
     } catch {
       // Status reporting must never change provider selection.
     }
+  }
+
+  private snapshotOf(context: StoredCapabilityNegotiationContext): CapabilitySnapshot {
+    return {
+      ...this.publicContext(context),
+      error_code: errorCode(context.lastError),
+      updatedAt: context.timestamps.updatedAt,
+    };
+  }
+
+  private publicContext(context: StoredCapabilityNegotiationContext): CapabilityNegotiationContext {
+    return {
+      execution_id: context.execution_id,
+      task_id: context.task_id,
+      actuation_id: context.actuation_id,
+      state: context.state,
+      requestedAction: context.requestedAction,
+      source: context.source,
+      reason: context.reason,
+      actions: context.actions,
+      timestamps: context.timestamps,
+    };
+  }
+
+  private currentContext(): StoredCapabilityNegotiationContext | undefined {
+    let current: StoredCapabilityNegotiationContext | undefined;
+    for (const candidate of this.contexts.values()) {
+      if (current === undefined || candidate.timestamps.updatedAt >= current.timestamps.updatedAt) {
+        current = candidate;
+      }
+    }
+    return current;
+  }
+
+  private timestamp(value: number): string {
+    return new Date(value).toISOString();
   }
 }

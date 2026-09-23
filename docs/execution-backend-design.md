@@ -342,7 +342,7 @@ submit_goal(execution_mode="interactive")
         -> EventStore (turn_completed)
         -> terminal listener -> ExecutionRoutingService
 
-On handoff failure, the same negotiator waits for a retry/standalone action or
+On capability failure, the same negotiator waits for a recheck/standalone action or
 starts `StandaloneCapabilityProvider` with the existing private app-server.
 ```
 
