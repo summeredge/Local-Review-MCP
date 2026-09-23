@@ -100,7 +100,8 @@ try {
     try {
       const settings = await loadSettings(argv.slice(1));
       const result = await sendDesktopToolsPipeHandoff(settings);
-      console.log(JSON.stringify({ ok: true, ...result }, null, 2));
+      console.log(JSON.stringify({ ok: result.accepted, ...result }, null, 2));
+      if (!result.accepted) process.exitCode = 1;
     } catch (error: unknown) {
       console.log(JSON.stringify({
         ok: false,

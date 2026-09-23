@@ -440,7 +440,7 @@ is durable and queryable rather than a binary `failed`:
 - the reason is hashed into the identity trace with `failure_stage = "desktop"` on
   `goal_start_failed`, and the preflight result is persisted on the pending Goal submission;
 - the read-only loopback endpoint `/launcher/desktop-interactive` reports
-  `{ ready, reason, pipeSource }` for the current evidence without ever returning a pipe path.
+  `{ ready, reason, pipeSource, pipeState }` for the current evidence without ever returning a pipe path.
 
 Current live status is **P5.4.1 BLOCKED_DESKTOP_PIPE_CAPABILITY**: there is no real production pipe
 capability source for an independently started LRM Host yet, so P5.4.1 is not claimed as PASS.

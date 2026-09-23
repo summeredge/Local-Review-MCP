@@ -7,6 +7,7 @@ import {
 
 export type DesktopSessionStartHandoffStatus =
   | "handoff_accepted"
+  | "handoff_pending"
   | "pipe_env_unavailable"
   | "host_unavailable"
   | "handoff_rejected"
@@ -62,11 +63,15 @@ export async function runDesktopSessionStartHandoff(
   };
 
   try {
-    await sendDesktopToolsPipeHandoff(settings, {
+    const handoff = await sendDesktopToolsPipeHandoff(settings, {
       environment: env,
       fetch: boundedFetch,
     });
     clearTimeout(timer);
+    if (handoff.accepted === false) {
+      log("handoff_pending");
+      return "handoff_pending";
+    }
     log("handoff_accepted");
     return "handoff_accepted";
   } catch (error: unknown) {

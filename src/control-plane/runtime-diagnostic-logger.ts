@@ -24,7 +24,21 @@ export interface DesktopWaitDiagnosticEvent {
   readonly pipe_source?: "handoff" | "current_environment";
 }
 
-export type RuntimeDiagnosticEvent = BridgeStartedDiagnosticEvent | DesktopWaitDiagnosticEvent;
+export interface DesktopToolsPipeLifecycleDiagnosticEvent {
+  readonly event: "desktop_tools_pipe_lifecycle";
+  readonly timestamp: string;
+  readonly state: "pending_registered" | "owner_bound" | "promoted" | "discarded";
+  readonly pending_registered_at?: string;
+  readonly owner_binding_at?: string;
+  readonly promotion_at?: string;
+  readonly expires_at?: string;
+  readonly discard_reason?: "expired" | "disconnected" | "owner_mismatch";
+}
+
+export type RuntimeDiagnosticEvent =
+  | BridgeStartedDiagnosticEvent
+  | DesktopWaitDiagnosticEvent
+  | DesktopToolsPipeLifecycleDiagnosticEvent;
 
 export interface RuntimeDiagnosticLogger {
   write(event: RuntimeDiagnosticEvent): void;

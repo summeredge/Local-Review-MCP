@@ -87,7 +87,7 @@ class StatusCheckWorkerTests(unittest.TestCase):
         self.assertEqual(offline_results[-1].desktop_sync, DesktopSyncStatus())
 
     def test_worker_includes_desktop_capability_only_when_mcp_is_running(self) -> None:
-        capability = DesktopCapabilityStatus(ready=True, pipe_source="handoff")
+        capability = DesktopCapabilityStatus(ready=True, pipe_source="handoff", pipe_state="active")
         probe = Mock(return_value=capability)
         checker = SimpleNamespace(
             check=lambda: LauncherStatus(True, True, True),
@@ -328,7 +328,7 @@ class StatusCheckerTests(unittest.TestCase):
         with patch("status_checker.urlopen", return_value=response) as open_url:
             status = StatusChecker(auth_token="secret").desktop_capability_status()
 
-        self.assertEqual(status, DesktopCapabilityStatus(ready=True, pipe_source="handoff"))
+        self.assertEqual(status, DesktopCapabilityStatus(ready=True, pipe_source="handoff", pipe_state="active"))
         request = open_url.call_args.args[0]
         self.assertEqual(request.full_url, "http://127.0.0.1:12080/launcher/desktop-interactive")
         self.assertEqual(request.get_method(), "GET")
@@ -343,7 +343,20 @@ class StatusCheckerTests(unittest.TestCase):
         }):
             self.assertEqual(
                 checker.desktop_capability_status(),
-                DesktopCapabilityStatus(ready=True, pipe_source="current_environment"),
+                DesktopCapabilityStatus(ready=True, pipe_source="current_environment", pipe_state="active"),
+            )
+
+    def test_desktop_capability_status_reports_pending_without_a_source(self) -> None:
+        checker = StatusChecker()
+        with patch.object(checker, "_request_json", return_value={
+            "ready": False,
+            "reason": "executor_identity_unavailable",
+            "pipeSource": None,
+            "pipeState": "pending",
+        }):
+            self.assertEqual(
+                checker.desktop_capability_status(),
+                DesktopCapabilityStatus(pipe_state="pending"),
             )
 
     def test_desktop_capability_status_fails_closed_on_inconsistent_response(self) -> None:

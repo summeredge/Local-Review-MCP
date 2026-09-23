@@ -1,7 +1,7 @@
 # P5.8.0 Desktop bootstrap trampoline experiment driver.
 #
 #   -Phase A  standalone trampoline (no Desktop restart)
-#   -Phase B  cold start with CODEX_CLI_PATH set, then read LRM desktop-interactive
+#   -Phase B  cold start with CODEX_CLI_PATH set, then wait for one existing-conversation activation
 #   -Phase C  transparency checks against the running boot
 #   -Phase D  rollback: remove CODEX_CLI_PATH and verify Desktop starts its own core
 #   -Phase status  read-only snapshot
@@ -137,8 +137,14 @@ if ($Phase -eq 'A') {
   $before = (Read-Entries).Count
   $versionOutput = & $trampoline --version 2>&1 | Out-String
   $versionExit = $LASTEXITCODE
-  $unknownOutput = & $trampoline --p58-unknown-flag 2>&1 | Out-String
-  $unknownExit = $LASTEXITCODE
+  $previousErrorAction = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $unknownOutput = & $trampoline --p58-unknown-flag 2>&1 | Out-String
+    $unknownExit = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousErrorAction
+  }
   Start-Sleep -Seconds 3
   $entries = Read-Entries | Select-Object -Skip $before
   $launch = $entries | Where-Object { $_.event -eq 'launch' } | Select-Object -First 1
@@ -186,16 +192,26 @@ if ($Phase -eq 'B') {
   Write-Host "CODEX_CLI_PATH(user) = '$trampoline'; starting Desktop"
   $state.desktop_started = Start-Desktop
   $deadline = (Get-Date).AddSeconds($WaitSeconds)
+  $initialHandoff = $null
   $handoff = $null
   $boot = $null
   while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 3
     $entries = Read-Entries | Select-Object -Skip $before
     $boot = $entries | Where-Object { $_.event -eq 'launch' -and $_.command_line -like '*app-server*' } | Select-Object -First 1
-    $handoff = $entries | Where-Object { $_.event -in @('handoff_accepted','handoff_rejected','handoff_giving_up') } | Select-Object -First 1
+    if ($null -eq $initialHandoff) {
+      $initialHandoff = $entries | Where-Object {
+        $_.event -eq 'handoff_retry' -and $_.http_status -eq 202 -and $_.response_body -match '"pending":true'
+      } | Select-Object -First 1
+      if ($boot -and $initialHandoff) {
+        Write-Host 'handoff pending; switch one existing Desktop conversation, then leave this process running'
+      }
+    }
+    $handoff = $entries | Where-Object { $_.event -eq 'handoff_accepted' } | Select-Object -First 1
     if ($boot -and $handoff) { break }
   }
   $state.boot_launch = $boot
+  $state.initial_handoff = $initialHandoff
   $state.handoff = $handoff
   # The handoff can be accepted a moment before LRM reports it as ready; poll briefly instead of
   # recording a single racy reading.
@@ -211,7 +227,9 @@ if ($Phase -eq 'B') {
   $state.desktop_interactive = $readings[$readings.Count - 1]
   try { $state.desktop_sync = Invoke-Launcher '/launcher/desktop-sync' $settings } catch { $state.desktop_sync = @{ error = $_.Exception.Message } }
   $state.completed_utc = (Get-Date).ToUniversalTime().ToString('o')
-  $state.pass = ($null -ne $boot) -and ($handoff.event -eq 'handoff_accepted') -and ($state.desktop_interactive.ready -eq $true) -and ($state.desktop_interactive.pipeSource -eq 'handoff')
+  $state.pass = ($null -ne $boot) -and ($null -ne $initialHandoff) -and ($handoff.event -eq 'handoff_accepted') -and
+    ($state.desktop_interactive.ready -eq $true) -and ($state.desktop_interactive.pipeSource -eq 'handoff') -and
+    ($state.desktop_sync.connected -eq $true) -and ($null -ne $state.desktop_sync.ownerClientId)
   Write-Evidence 'test-b.json' $state
   $state | ConvertTo-Json -Depth 8 | Write-Host
   if (-not $state.pass) { exit 1 }

@@ -412,10 +412,29 @@ class LauncherWindow(QMainWindow):
         desktop_capability = getattr(status, "desktop_capability", DesktopCapabilityStatus())
         # A connected Desktop IPC observer says nothing about the Desktop codex_app capability, so
         # the handoff state is always rendered separately instead of being read as the same thing.
+        identity_state = (
+            "Unavailable" if not desktop_sync.connected
+            else "Ready" if desktop_sync.owner_client_id
+            else "Waiting for activation"
+        )
+        pipe_state = {
+            "active": "Active",
+            "pending": "Pending",
+            "unavailable": "Unavailable",
+        }.get(desktop_capability.pipe_state, "Unavailable")
+        capability_state = (
+            f"pipeSource={desktop_capability.pipe_source}"
+            if desktop_capability.ready and desktop_capability.pipe_source
+            else "Waiting for Desktop activation"
+            if desktop_capability.pipe_state == "pending"
+            else "Unavailable"
+        )
         capability_lines = [
             "",
-            "Desktop Capability: Ready" if desktop_capability.ready else "Desktop Capability: Unavailable",
-            f"Source: {desktop_capability.pipe_source or 'none'}",
+            f"Desktop IPC: {'Connected' if desktop_sync.connected else 'Disconnected'}",
+            f"Desktop Identity: {identity_state}",
+            f"Tools Pipe: {pipe_state}",
+            f"Capability: {capability_state}",
         ]
         if desktop_sync.active_source == "legacy_app_server":
             reason = {

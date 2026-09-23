@@ -1,16 +1,20 @@
-# Desktop bootstrap trampoline (P5.8.0 experiment)
+# Desktop Capability Activation Bootstrap (P5.8)
 
-Experiment branch `feature/p5.8-desktop-bootstrap-trampoline` only. Nothing here is wired into the
-production execution path; the existing bootstrap stays:
+Branch `feature/p5.8-desktop-bootstrap-trampoline` only. The supported flow is:
 
 ```text
-SessionStart hook -> DesktopToolsPipeHandoff -> LRM
+Desktop cold start
+  -> CODEX_CLI_PATH trampoline captures CODEX_APP_TOOLS_PIPE_PATH
+  -> pending handoff
+  -> user switches one existing conversation
+  -> Desktop IPC owner binding
+  -> pending promotion
+  -> pipeSource=handoff
 ```
 
-Hypothesis under test: a native trampoline launched by Desktop through `CODEX_CLI_PATH` can
-capture `CODEX_APP_TOOLS_PIPE_PATH` at Desktop startup, hand it to the local LRM launcher with the
-existing `POST /launcher/desktop-tools-pipe` contract, and then exec the real bundled `codex.exe`
-transparently - making the SessionStart hook unnecessary as the capability bootstrap.
+The trampoline is only the capability capture/forwarding path. It does not create Desktop identity,
+change the Desktop IPC protocol, or authorize a pipe from its name. Without a user activation that
+provides Desktop owner identity, the handoff remains pending and the capability stays fail-closed.
 
 ## Layout
 
@@ -44,7 +48,8 @@ pwsh -File tools/desktop-bootstrap-trampoline/scripts/build.ps1
 # A: standalone trampoline (exe runs, argv + exit code forwarded, handoff attempted)
 pwsh -File tools/desktop-bootstrap-trampoline/scripts/experiment.ps1 -Phase A
 
-# B: cold Desktop start with CODEX_CLI_PATH set (restarts Desktop - run outside the Codex app)
+# B: cold Desktop start; switch one existing conversation when the script reports pending
+#    (restarts Desktop - run outside the Codex app)
 pwsh -File tools/desktop-bootstrap-trampoline/scripts/experiment.ps1 -Phase B
 
 # C: transparency checks against the running boot
@@ -66,4 +71,3 @@ Evidence is written under `.review/p5.8-bootstrap/` (`test-a.json` ... `test-d.j
   The trampoline retries on a bounded schedule for `handoffDeadlineSeconds`.
 - Desktop tears down the app-server process tree on exit, so the trampoline may be killed before it can
   observe the child exit code (verified in P5.7).
-

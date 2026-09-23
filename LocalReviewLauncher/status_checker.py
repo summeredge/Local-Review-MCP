@@ -171,6 +171,7 @@ class DesktopCapabilityStatus:
 
     ready: bool = False
     pipe_source: str | None = None
+    pipe_state: str = "unavailable"
 
 
 @dataclass(frozen=True)
@@ -615,10 +616,22 @@ class StatusChecker:
             if type(ready) is not bool:
                 raise StatusQueryError("ready must be a boolean")
             source_value = document["pipeSource"]
+            pipe_state_value = document.get("pipeState")
+            pipe_state = (
+                ("active" if ready else "unavailable")
+                if pipe_state_value is None
+                else _status(
+                    pipe_state_value,
+                    "pipeState",
+                    frozenset({"active", "pending", "unavailable"}),
+                )
+            )
             if not ready:
                 if source_value is not None:
                     raise StatusQueryError("Unavailable Desktop capability has a pipe source")
-                return DesktopCapabilityStatus()
+                return DesktopCapabilityStatus(pipe_state=pipe_state)
+            if pipe_state != "active":
+                raise StatusQueryError("Ready Desktop capability must have an active pipe")
             return DesktopCapabilityStatus(
                 ready=True,
                 pipe_source=_status(
@@ -626,6 +639,7 @@ class StatusChecker:
                     "pipeSource",
                     frozenset({"handoff", "current_environment"}),
                 ),
+                pipe_state=pipe_state,
             )
         except StatusQueryError:
             return DesktopCapabilityStatus()

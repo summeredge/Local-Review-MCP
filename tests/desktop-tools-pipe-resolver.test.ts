@@ -80,6 +80,17 @@ describe("Desktop tools pipe resolver", () => {
     expect(resolver.resolve()).toEqual({ pipePath: HANDOFF_PIPE, source: "handoff" });
   });
 
+  it("never resolves a pending capability before owner binding", () => {
+    const handoff = new DesktopToolsPipeHandoff();
+    const ownerlessState: DesktopSyncState = { connected: true, followingThreads: new Set() };
+    handoff.observeDesktopState(ownerlessState);
+    handoff.stagePending(HANDOFF_PIPE);
+    const resolver = new DesktopToolsPipeResolver(handoff, () => ownerlessState, { environment: {} });
+
+    expect(() => resolver.resolve())
+      .toThrowError(expect.objectContaining({ code: "desktop_tools_pipe_unavailable" }));
+  });
+
   it("uses the host environment only when this process already holds the pipe", () => {
     const resolver = new DesktopToolsPipeResolver(
       new DesktopToolsPipeHandoff(),
