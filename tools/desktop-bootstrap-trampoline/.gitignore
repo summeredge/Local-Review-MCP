@@ -1,0 +1,5 @@
+# Build output and the generated local config (it carries the launcher token).
+DesktopBootstrapTrampoline.exe
+trampoline.config.ini
+logs/
+
