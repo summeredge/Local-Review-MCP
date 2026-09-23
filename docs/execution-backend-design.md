@@ -333,18 +333,22 @@ The production interactive route is now the Desktop codex_app backend:
 submit_goal(execution_mode="interactive")
         -> Goal / Task / ControlledActuation
         -> ExecutionService (ExecutionBackendRouter)
-        -> DesktopCodexBackend
+        -> CapabilityNegotiator (Desktop first)
+        -> DesktopCapabilityProvider
         -> DesktopThreadCoordinator (DesktopThreadBindingStore)
         -> DesktopCodexThreadCommands -> create_thread
         -> DesktopCompletionObserver
         -> Session / Execution terminal projection
         -> EventStore (turn_completed)
         -> terminal listener -> ExecutionRoutingService
+
+On handoff failure, the same negotiator waits for a retry/standalone action or
+starts `StandaloneCapabilityProvider` with the existing private app-server.
 ```
 
 `CodexAppServerBackend` is retained but is no longer selected for the normal production
-interactive route. There is no automatic fallback: a Desktop failure fails closed and never
-silently routes the same Execution to the private app-server backend.
+interactive route. P5.9 keeps Desktop as the first provider and negotiates the existing private
+app-server backend as a bounded, user-selectable or automatic fallback.
 
 ### Backend identity
 

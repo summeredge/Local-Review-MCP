@@ -31,6 +31,10 @@ import {
 } from "../desktop-codex/desktop-tools-pipe-probe.js";
 import type { DesktopInteractiveReadiness } from "../desktop-codex/desktop-interactive-preflight.js";
 import {
+  capabilityActionSchema,
+  type CapabilityNegotiator,
+} from "../control-plane/capability-negotiation.js";
+import {
   APP_VERSION,
   DEFAULT_HOST,
   HEALTH_PATH,
@@ -47,6 +51,7 @@ export const OAUTH_CLIENTS_PATH = "/oauth/clients";
 export const LAUNCHER_SESSION_CATALOG_PATH = "/launcher/sessions";
 export const LAUNCHER_DESKTOP_SYNC_PATH = "/launcher/desktop-sync";
 export const LAUNCHER_DESKTOP_INTERACTIVE_PREFLIGHT_PATH = "/launcher/desktop-interactive";
+export const LAUNCHER_CAPABILITY_PATH = "/launcher/capability";
 const SAFE_OAUTH_STORAGE_PATH = "oauth/clients.json";
 
 type HttpStatusQuery = NonNullable<McpRuntimeContext["statusQuery"]> & {
@@ -70,6 +75,7 @@ type HttpRuntimeContext = Omit<McpRuntimeContext, "statusQuery"> & {
    * queryable instead of only appearing as a binary Goal failure.
    */
   readonly desktopInteractivePreflight?: () => DesktopInteractiveReadiness;
+  readonly capabilityNegotiator?: Pick<CapabilityNegotiator, "snapshot" | "retryDesktop" | "selectStandalone">;
   readonly statusQuery?: HttpStatusQuery;
   readonly tunnel?: Pick<TunnelProvider, "status">;
 };
@@ -339,6 +345,62 @@ async function handleLauncherDesktopInteractivePreflightRequest(
     pipeSource: readiness.pipeSource ?? null,
     pipeState,
   }, { "cache-control": "no-store" });
+}
+
+async function handleLauncherCapabilityRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: HttpRuntimeContext,
+  authToken: string,
+): Promise<void> {
+  if (!isDirectLoopbackRequest(request)) {
+    request.resume();
+    sendJson(response, 404, { error: "not_found" });
+    return;
+  }
+  if (!isAuthenticated(request, authToken)) {
+    request.resume();
+    sendUnauthorized(response);
+    return;
+  }
+  const negotiator = context.capabilityNegotiator;
+  if (negotiator === undefined) {
+    request.resume();
+    sendJson(response, 503, { error: "capability_negotiation_unavailable" });
+    return;
+  }
+  if (request.method === "GET") {
+    request.resume();
+    sendJson(response, 200, negotiator.snapshot(), { "cache-control": "no-store" });
+    return;
+  }
+  if (request.method !== "POST") {
+    request.resume();
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+
+  let body: unknown;
+  try {
+    body = await parseBody(request);
+  } catch (error: unknown) {
+    sendJson(response, error instanceof RequestBodyTooLargeError ? 413 : 400, {
+      error: error instanceof RequestBodyTooLargeError ? "payload_too_large" : "invalid_json_body",
+    });
+    return;
+  }
+  const action = typeof body === "object" && body !== null && !Array.isArray(body)
+    ? (body as { action?: unknown }).action
+    : undefined;
+  const parsed = capabilityActionSchema.safeParse(action);
+  if (!parsed.success) {
+    sendJson(response, 400, { error: "capability_action_invalid" });
+    return;
+  }
+  const snapshot = parsed.data === "retry"
+    ? negotiator.retryDesktop()
+    : negotiator.selectStandalone();
+  sendJson(response, 200, snapshot, { "cache-control": "no-store" });
 }
 
 async function handleLauncherDesktopToolsPipeRequest(
@@ -1024,6 +1086,11 @@ export function createHttpServer(
           context,
           settings.auth.token,
         );
+        return;
+      }
+
+      if (path === LAUNCHER_CAPABILITY_PATH) {
+        await handleLauncherCapabilityRequest(request, response, context, settings.auth.token);
         return;
       }
 

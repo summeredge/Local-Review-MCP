@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, Mock, patch
 from PySide6.QtCore import QCoreApplication, QThreadPool
 from status_checker import (
     BrowserReadiness,
+    CapabilityStatus,
     DesktopCapabilityStatus,
     DesktopSyncStatus,
     StatusQueryError,
@@ -378,6 +379,52 @@ class StatusCheckerTests(unittest.TestCase):
                 self.assertEqual(checker.desktop_capability_status(), DesktopCapabilityStatus())
         with patch.object(checker, "_request_json", side_effect=StatusQueryError("unreachable")):
             self.assertEqual(checker.desktop_capability_status(), DesktopCapabilityStatus())
+
+    def test_capability_status_parses_state_source_and_actions(self) -> None:
+        checker = StatusChecker()
+        with patch.object(checker, "_request_json", return_value={
+            "state": "desktop_failed",
+            "source": "desktop",
+            "reason": "desktop_tools_pipe_unavailable",
+            "actions": ["retry", "standalone"],
+            "updatedAt": "2026-09-23T00:00:00.000Z",
+        }):
+            self.assertEqual(
+                checker.capability_status(),
+                CapabilityStatus(
+                    state="desktop_failed",
+                    source="desktop",
+                    reason="desktop_tools_pipe_unavailable",
+                    actions=("retry", "standalone"),
+                ),
+            )
+
+    def test_capability_status_fails_closed_and_actions_use_the_authenticated_endpoint(self) -> None:
+        checker = StatusChecker(auth_token="secret")
+        with patch.object(checker, "_request_json", return_value={
+            "state": "fallback_running",
+            "source": "standalone",
+            "reason": None,
+            "actions": [],
+        }):
+            self.assertEqual(checker.capability_status(), CapabilityStatus(
+                state="fallback_running", source="standalone", actions=(),
+            ))
+        with patch.object(checker, "_request_json", return_value={
+            "state": "desktop_failed",
+            "source": "standalone",
+            "reason": None,
+            "actions": [],
+        }):
+            self.assertEqual(checker.capability_status(), CapabilityStatus())
+        with patch.object(checker, "_request_json", return_value={"state": "fallback_ready"}) as request:
+            self.assertTrue(checker.capability_action("standalone"))
+            request.assert_called_once_with(
+                checker.capability_url,
+                method="POST",
+                body={"action": "standalone"},
+            )
+        self.assertFalse(checker.capability_action("unknown"))
 
     def test_legacy_p2_status_maps_to_a_consistent_fail_closed_source(self) -> None:
         disconnected = {

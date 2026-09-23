@@ -280,6 +280,23 @@ describe("GoalPreflightService", () => {
 });
 
 describe("GoalPreflightService Desktop interactive route", () => {
+  it("keeps the Goal preflight ready when the negotiator can use standalone", async () => {
+    const f = service({
+      desktopReadiness: () => ({ ready: false, reason: "desktop_tools_pipe_unavailable" }),
+    });
+    f.service.setDesktopFallbackAvailable(() => true);
+
+    await expect(f.service.checkGoalPreflight({
+      workspace_id: "workspace-a",
+      conversation_id: "conversation-1",
+      execution_mode: "interactive",
+    })).resolves.toMatchObject({
+      ready: true,
+      desktop: { ready: false, reason: "desktop_tools_pipe_unavailable" },
+    });
+    expect(f.connector).toHaveBeenCalledOnce();
+  });
+
   it("blocks an interactive Goal before any connector or extension check", async () => {
     const f = service({
       desktopReadiness: () => ({ ready: false, reason: "desktop_tools_pipe_unavailable" }),

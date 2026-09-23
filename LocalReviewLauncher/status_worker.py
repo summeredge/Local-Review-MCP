@@ -6,6 +6,7 @@ from PySide6.QtCore import QObject, QRunnable, Signal
 
 from status_checker import (
     BrowserReadiness,
+    CapabilityStatus,
     DesktopCapabilityStatus,
     DesktopSyncStatus,
     LauncherStatus,
@@ -79,6 +80,14 @@ class StatusCheckWorker(QRunnable):
                 )
             except Exception:
                 desktop_capability = DesktopCapabilityStatus()
+        capability = CapabilityStatus()
+        capability_status = getattr(self.status_checker, "capability_status", None)
+        if status.mcp_running and callable(capability_status):
+            try:
+                candidate = capability_status()
+                capability = candidate if isinstance(candidate, CapabilityStatus) else CapabilityStatus()
+            except Exception:
+                capability = CapabilityStatus()
         oauth_status = getattr(self.status_checker, "oauth_status", None)
         if status.mcp_running and callable(oauth_status):
             try:
@@ -102,5 +111,6 @@ class StatusCheckWorker(QRunnable):
             browser=browser,
             desktop_sync=desktop_sync,
             desktop_capability=desktop_capability,
+            capability=capability,
         )
         self.signals.finished.emit(self.generation, status)

@@ -64,6 +64,11 @@ import { DesktopToolsPipeHandoff } from "./desktop-codex/desktop-tools-pipe-hand
 import { DesktopCodexRuntimeFactory } from "./desktop-codex/desktop-tools-pipe-probe.js";
 import { DesktopInteractivePreflight } from "./desktop-codex/desktop-interactive-preflight.js";
 import { DesktopCodexBackend } from "./desktop-codex/desktop-codex-backend.js";
+import {
+  CapabilityNegotiator,
+  DesktopCapabilityProvider,
+  StandaloneCapabilityProvider,
+} from "./control-plane/capability-negotiation.js";
 
 export interface AppContext extends McpRuntimeContext {
   readonly storageRoot?: string;
@@ -88,6 +93,7 @@ export interface AppContext extends McpRuntimeContext {
   readonly identityTrace?: IdentityTraceService;
   readonly evidenceTransportTrace?: EvidenceTransportTraceService;
   readonly executionRouter?: ExecutionRoutingService;
+  capabilityNegotiator?: CapabilityNegotiator;
 }
 
 export interface AppStartOptions extends HttpServerOptions {
@@ -253,8 +259,8 @@ export async function startApp(
     desktopToolsPipeHandoff,
     () => desktopSyncObserver.getState(),
   );
-  // Goal preflight must observe the same Desktop evidence the interactive backend enforces, so
-  // a missing pipe capability blocks the Goal before any Session, Task, or Execution is created.
+  // Goal preflight observes the same Desktop evidence the interactive provider enforces. The
+  // negotiator may continue with standalone when Desktop cannot establish that capability.
   const desktopInteractivePreflight = new DesktopInteractivePreflight(
     desktopToolsPipeHandoff,
     () => desktopSyncObserver.getState(),
@@ -270,16 +276,28 @@ export async function startApp(
       ...observation,
     },
   ));
-  // The production interactive route is the Desktop codex_app backend. It must reuse the exact
-  // Desktop tools-pipe handoff, observer state, and runtime factory owned by this host so the HTTP
-  // handoff and the execution backend share one memory domain. Bind before HTTP/MCP accepts Goals.
-  if (context.executionService !== undefined && context.storageRoot !== undefined) {
-    context.executionService.bindInteractive(new DesktopCodexBackend(context.registry, {
-      storageRoot: context.storageRoot,
-      eventStore: context.eventStore,
-      runtimeFactory: desktopCodexRuntimeFactory,
-      desktopState: () => desktopSyncObserver.getState(),
-    }));
+  // The interactive route prefers the Desktop codex_app provider, then uses the existing private
+  // app-server provider after an explicit choice or bounded fallback timeout. Bind before HTTP/MCP
+  // accepts Goals so both providers share this host's durable execution services.
+  if (context.executionService !== undefined
+    && context.storageRoot !== undefined
+    && context.codexAppServerBackend !== undefined) {
+    const desktopProvider = new DesktopCapabilityProvider({
+      backend: new DesktopCodexBackend(context.registry, {
+        storageRoot: context.storageRoot,
+        eventStore: context.eventStore,
+        runtimeFactory: desktopCodexRuntimeFactory,
+        desktopState: () => desktopSyncObserver.getState(),
+      }),
+      readiness: () => desktopInteractivePreflight.check(),
+    });
+    const capabilityNegotiator = new CapabilityNegotiator({
+      desktop: desktopProvider,
+      standalone: new StandaloneCapabilityProvider(context.codexAppServerBackend),
+    });
+    context.capabilityNegotiator = capabilityNegotiator;
+    context.goalPreflight?.setDesktopFallbackAvailable(() => true);
+    context.executionService.bindInteractive(capabilityNegotiator);
     // The terminal listener was registered on the previous interactive backend; rebind it so the
     // Desktop route still reaches durable Review routing.
     context.executionService.setTerminalListener(
