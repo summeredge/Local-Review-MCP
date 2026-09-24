@@ -7,6 +7,7 @@ from PySide6.QtCore import QObject, QRunnable, Signal
 from status_checker import (
     BrowserReadiness,
     CapabilityStatus,
+    DoctorStatus,
     DesktopCapabilityStatus,
     DesktopSyncStatus,
     LauncherStatus,
@@ -32,6 +33,52 @@ class StatusCheckScheduler:
         source = self._source
         self._source = None
         return source
+
+
+class DoctorCheckSignals(QObject):
+    finished = Signal(int, object)
+
+
+class DoctorCheckWorker(QRunnable):
+    def __init__(self, status_checker: StatusChecker, generation: int = 0):
+        super().__init__()
+        self.status_checker = status_checker
+        self.generation = generation
+        self.signals = DoctorCheckSignals()
+
+    def run(self) -> None:
+        try:
+            report = self.status_checker.doctor_report()
+        except Exception:
+            report = DoctorStatus()
+        self.signals.finished.emit(self.generation, report if isinstance(report, DoctorStatus) else DoctorStatus())
+
+
+class CapabilityTimelineCheckSignals(QObject):
+    finished = Signal(int, object)
+
+
+class CapabilityTimelineCheckWorker(QRunnable):
+    def __init__(
+        self,
+        status_checker: StatusChecker,
+        execution_id: str | None = None,
+        limit: int = 100,
+        generation: int = 0,
+    ):
+        super().__init__()
+        self.status_checker = status_checker
+        self.execution_id = execution_id
+        self.limit = limit
+        self.generation = generation
+        self.signals = CapabilityTimelineCheckSignals()
+
+    def run(self) -> None:
+        try:
+            events = self.status_checker.capability_timeline(self.execution_id, self.limit)
+        except Exception:
+            events = ()
+        self.signals.finished.emit(self.generation, events if isinstance(events, tuple) else ())
 
 
 class StatusCheckSignals(QObject):

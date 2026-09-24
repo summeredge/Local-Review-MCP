@@ -1,4 +1,4 @@
-import { loadSettings, parseCliArgs } from "./config/settings.js";
+import { loadSettings, localOrigin, parseCliArgs } from "./config/settings.js";
 import { createAppContext, startApp, startupMessage } from "./app.js";
 import { generateConversationRoutingExample } from "./context/conversation-routing-diagnostic.js";
 import { generateReviewDeliveryExample } from "./context/review-delivery-diagnostic.js";
@@ -50,6 +50,12 @@ import {
   migrateLrmSessionStartHookRegistration,
   uninstallLrmSessionStartHook,
 } from "./desktop-codex/desktop-hook-installer.js";
+import {
+  formatDoctorReport,
+  offlineDoctorReport,
+  type DoctorReport,
+} from "./diagnostic/doctor.js";
+import { LAUNCHER_DOCTOR_PATH } from "./mcp/http.js";
 
 function printErrorDetails(error: unknown, warning = false): void {
   const log = warning ? console.warn : console.error;
@@ -70,9 +76,29 @@ function connectorCommandError(error: unknown): void {
   process.exitCode = 1;
 }
 
+async function runDoctorCommand(argv: readonly string[]): Promise<void> {
+  const json = argv.includes("--json");
+  const settingsArgs = argv.filter((argument) => argument !== "--json");
+  const settings = await loadSettings(settingsArgs);
+  let report: DoctorReport;
+  try {
+    const response = await fetch(`${localOrigin(settings)}${LAUNCHER_DOCTOR_PATH}`, {
+      headers: { authorization: `Bearer ${settings.auth.token}` },
+    });
+    if (!response.ok) throw new Error(`Doctor endpoint returned HTTP ${response.status}.`);
+    report = await response.json() as DoctorReport;
+  } catch {
+    report = offlineDoctorReport();
+  }
+  console.log(json ? JSON.stringify(report, null, 2) : formatDoctorReport(report));
+  if (report.status === "FAILED") process.exitCode = 1;
+}
+
 try {
   const argv = process.argv.slice(2);
-  if (argv[0] === "diagnose-desktop-ipc") {
+  if (argv[0] === "doctor") {
+    await runDoctorCommand(argv.slice(1));
+  } else if (argv[0] === "diagnose-desktop-ipc") {
     await runDesktopIPCDiagnostic(argv.slice(1));
   } else if (argv[0] === "diagnose-desktop-thread-visibility") {
     await runDesktopThreadVisibilityDiagnostic(argv.slice(1));

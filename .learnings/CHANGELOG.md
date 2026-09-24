@@ -39,4 +39,5 @@
 {"ts":"2026-09-15T19:00:00+08:00","action":"add","type":"error","id":"ERR-20260915-002","summary":"Identity Trace MCP 上下文初始遗漏内部 record 能力，typecheck 暴露后修正"}
 {"ts":"2026-09-17T09:51:00+08:00","action":"add","type":"error","id":"ERR-20260917-001","summary":"MAIN-world Fiber identity 三项测试稳定返回空 evidence，与 Launcher 改动无关"}
 {"ts":"2026-09-23T22:00:00+08:00","action":"add","type":"learning","id":"LRN-20260923-001","summary":"全局 Skill 写入 CODEX_HOME/skills，避免误放到项目目录"}
+{"ts":"2026-09-24T10:07:07+08:00","action":"add","type":"learning","id":"LRN-20260924-001","summary":"只读诊断探针隔离执行环境并复用单轮结果"}
 ```

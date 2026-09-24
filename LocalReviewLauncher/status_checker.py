@@ -22,6 +22,8 @@ LOCAL_BROWSER_READINESS_URL = "http://127.0.0.1:12080/launcher/readiness"
 LOCAL_DESKTOP_SYNC_URL = "http://127.0.0.1:12080/launcher/desktop-sync"
 LOCAL_DESKTOP_INTERACTIVE_URL = "http://127.0.0.1:12080/launcher/desktop-interactive"
 LOCAL_CAPABILITY_URL = "http://127.0.0.1:12080/launcher/capability"
+LOCAL_CAPABILITY_TIMELINE_URL = "http://127.0.0.1:12080/launcher/capability/timeline"
+LOCAL_DOCTOR_URL = "http://127.0.0.1:12080/launcher/doctor"
 REMOTE_STATUS_URL = "https://review.syqiu.kdns.fr/.well-known/oauth-protected-resource"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 MAX_STATUS_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -184,6 +186,35 @@ class CapabilityStatus:
     execution_id: str | None = None
     task_id: str | None = None
     actuation_id: str | None = None
+    error_code: str | None = None
+    desktop_deadline_at: str | None = None
+    fallback_deadline_at: str | None = None
+
+
+@dataclass(frozen=True)
+class CapabilityTimelineEvent:
+    timestamp: str
+    previous_state: str | None
+    current_state: str
+    source: str | None
+    reason: str | None
+    error_code: str | None
+    event: str | None = None
+
+
+@dataclass(frozen=True)
+class DoctorCheckStatus:
+    component: str
+    status: str
+    reason: str | None = None
+    timestamp: str | None = None
+
+
+@dataclass(frozen=True)
+class DoctorStatus:
+    status: str = "FAILED"
+    generated_at: str | None = None
+    checks: tuple[DoctorCheckStatus, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -198,6 +229,7 @@ class LauncherStatus:
     desktop_sync: DesktopSyncStatus = DesktopSyncStatus()
     desktop_capability: DesktopCapabilityStatus = DesktopCapabilityStatus()
     capability: CapabilityStatus = CapabilityStatus()
+    doctor: DoctorStatus = DoctorStatus()
 
 
 def _object(value: object, label: str) -> dict[str, object]:
@@ -243,6 +275,12 @@ def _rfc3339_timestamp(value: object, label: str) -> str:
     if "T" not in text or parsed.tzinfo is None:
         raise StatusQueryError(f"{label} must be an RFC3339 timestamp")
     return text
+
+
+def _optional_rfc3339_timestamp(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    return _rfc3339_timestamp(value, label)
 
 
 def _status(value: object, label: str, allowed: frozenset[str]) -> str:
@@ -441,6 +479,8 @@ class StatusChecker:
         desktop_sync_url: str = LOCAL_DESKTOP_SYNC_URL,
         desktop_capability_url: str = LOCAL_DESKTOP_INTERACTIVE_URL,
         capability_url: str = LOCAL_CAPABILITY_URL,
+        capability_timeline_url: str = LOCAL_CAPABILITY_TIMELINE_URL,
+        doctor_url: str = LOCAL_DOCTOR_URL,
     ) -> None:
         self.auth_token = auth_token
         self.oauth_clients_url = oauth_clients_url
@@ -451,6 +491,8 @@ class StatusChecker:
         self.desktop_sync_url = desktop_sync_url
         self.desktop_capability_url = desktop_capability_url
         self.capability_url = capability_url
+        self.capability_timeline_url = capability_timeline_url
+        self.doctor_url = doctor_url
 
     def browser_readiness(self) -> BrowserReadiness:
         try:
@@ -684,7 +726,8 @@ class StatusChecker:
                 "reason",
                 frozenset({
                     "desktop_disconnected", "executor_identity_unavailable",
-                    "desktop_tools_pipe_unavailable", "desktop_handoff_failed",
+                    "desktop_tools_pipe_unavailable", "desktop_handoff_failed", "desktop_handoff_timeout",
+                    "desktop_binding_recovered",
                     "desktop_execution_failed", "standalone_execution_failed",
                 }),
             )
@@ -697,17 +740,124 @@ class StatusChecker:
                 raise StatusQueryError("Desktop capability state has an invalid source")
             if state.startswith("fallback_") and source != "standalone":
                 raise StatusQueryError("Fallback capability state requires standalone source")
+            timestamps_value = document.get("timestamps")
+            desktop_deadline_at = None
+            fallback_deadline_at = None
+            if timestamps_value is not None:
+                timestamps = _object(timestamps_value, "timestamps")
+                desktop_deadline_at = _optional_rfc3339_timestamp(
+                    timestamps.get("desktopDeadlineAt"), "timestamps.desktopDeadlineAt"
+                )
+                fallback_deadline_at = _optional_rfc3339_timestamp(
+                    timestamps.get("fallbackDeadlineAt"), "timestamps.fallbackDeadlineAt"
+                )
             return CapabilityStatus(
-                state,
-                source,
-                reason,
-                actions,
-                parsed_execution_id,
-                parsed_task_id,
-                parsed_actuation_id,
+                state=state,
+                source=source,
+                reason=reason,
+                actions=actions,
+                execution_id=parsed_execution_id,
+                task_id=parsed_task_id,
+                actuation_id=parsed_actuation_id,
+                error_code=_optional_text(document.get("error_code"), "error_code"),
+                desktop_deadline_at=desktop_deadline_at,
+                fallback_deadline_at=fallback_deadline_at,
             )
         except StatusQueryError:
             return CapabilityStatus()
+
+    def capability_timeline(
+        self,
+        execution_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[CapabilityTimelineEvent, ...]:
+        try:
+            if type(limit) is not int or not 1 <= limit <= 1_000:
+                raise StatusQueryError("Capability timeline limit is invalid")
+            if execution_id is not None:
+                execution_id = _identifier(execution_id, "execution_id")
+            query = [f"limit={limit}"]
+            if execution_id is not None:
+                query.insert(0, f"execution_id={quote(execution_id, safe='')}")
+            document = _object(
+                self._request_json(f"{self.capability_timeline_url}?{'&'.join(query)}"),
+                "Capability timeline",
+            )
+            values = document.get("events")
+            if not isinstance(values, list):
+                raise StatusQueryError("Capability timeline events must be an array")
+
+            states = frozenset({
+                "initializing", "desktop_pending", "desktop_ready", "desktop_failed",
+                "fallback_ready", "fallback_running",
+            })
+            event_names = states | frozenset({
+                "fallback_waiting", "fallback_selected", "desktop_capability_restored",
+            })
+            sources = frozenset({"desktop", "standalone"})
+            reasons = frozenset({
+                "desktop_disconnected", "executor_identity_unavailable",
+                "desktop_tools_pipe_unavailable", "desktop_handoff_failed", "desktop_handoff_timeout",
+                "desktop_binding_recovered",
+                "desktop_execution_failed", "standalone_execution_failed",
+            })
+            events: list[CapabilityTimelineEvent] = []
+            for value in values:
+                event = _object(value, "Capability timeline event")
+                if not {
+                    "timestamp", "execution_id", "task_id", "previous_state", "current_state",
+                    "source", "reason", "error_code",
+                }.issubset(event):
+                    raise StatusQueryError("Capability timeline event fields are incomplete")
+                event_execution_id = _identifier(event["execution_id"], "execution_id")
+                _identifier(event["task_id"], "task_id")
+                if execution_id is not None and execution_id != "current" and event_execution_id != execution_id:
+                    raise StatusQueryError("Capability timeline execution does not match")
+                previous_value = event["previous_state"]
+                previous_state = None if previous_value is None else _status(
+                    previous_value, "previous_state", states
+                )
+                current_state = _status(event["current_state"], "current_state", states)
+                event_value = event.get("event")
+                event_name = None if event_value is None else _status(event_value, "event", event_names)
+                source_value = event["source"]
+                source = None if source_value is None else _status(source_value, "source", sources)
+                reason_value = event["reason"]
+                reason = None if reason_value is None else _status(reason_value, "reason", reasons)
+                error_code = _optional_text(event["error_code"], "error_code", 256)
+                events.append(CapabilityTimelineEvent(
+                    timestamp=_rfc3339_timestamp(event["timestamp"], "timestamp"),
+                    previous_state=previous_state,
+                    current_state=current_state,
+                    source=source,
+                    reason=reason,
+                    error_code=error_code,
+                    event=event_name,
+                ))
+            return tuple(events)
+        except StatusQueryError:
+            return ()
+
+    def doctor_report(self) -> DoctorStatus:
+        try:
+            document = _object(self._request_json(self.doctor_url, timeout=15), "Doctor report")
+            status = _status(document.get("status"), "status", frozenset({"READY", "DEGRADED", "FAILED"}))
+            generated_at = _rfc3339_timestamp(document.get("generatedAt"), "generatedAt")
+            values = document.get("checks")
+            if not isinstance(values, list):
+                raise StatusQueryError("Doctor checks must be an array")
+            checks = []
+            for value in values:
+                check = _object(value, "Doctor check")
+                checks.append(DoctorCheckStatus(
+                    component=_text(check.get("component"), "component"),
+                    status=_status(check.get("status"), "check status", frozenset({"PASS", "WARN", "FAIL"})),
+                    reason=_optional_text(check.get("reason"), "reason", 1000),
+                    timestamp=_rfc3339_timestamp(check.get("timestamp"), "timestamp"),
+                ))
+            return DoctorStatus(status, generated_at, tuple(checks))
+        except StatusQueryError:
+            return DoctorStatus()
 
     def capability_action(self, action: str, execution_id: str | None = None) -> bool:
         if action not in {"recheck", "standalone"} or execution_id is None:
@@ -893,6 +1043,7 @@ class StatusChecker:
         method: str = "GET",
         body: Mapping[str, object] | None = None,
         mcp: bool = False,
+        timeout: float = 3,
     ) -> object:
         data = None if body is None else json.dumps(body).encode("utf-8")
         headers = self._auth_headers()
@@ -903,7 +1054,7 @@ class StatusChecker:
             })
         request = Request(url, data=data, method=method, headers=headers)
         try:
-            with urlopen(request, timeout=3) as response:
+            with urlopen(request, timeout=timeout) as response:
                 raw = response.read(MAX_STATUS_RESPONSE_BYTES + 1)
                 if len(raw) > MAX_STATUS_RESPONSE_BYTES:
                     raise StatusQueryError("Status Query response is too large")

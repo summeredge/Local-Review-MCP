@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bridgePort, extensionDeliveryReadiness, EXTENSION_PRESENCE_TIMEOUT_MS, startBridge, stopBridge } from "../src/control-plane/bridge.js";
 import { startApp } from "../src/app.js";
-import { createHttpServer } from "../src/mcp/http.js";
+import { createHttpServer, LAUNCHER_DOCTOR_PATH } from "../src/mcp/http.js";
 import { inboundRequestId } from "../src/mcp/inbound.js";
 import { StatusQueryService } from "../src/control-plane/status-query.js";
 import type { DesktopSyncState } from "../src/desktop-sync/desktop-sync-state.js";
@@ -58,6 +58,36 @@ function structuredJson(result: unknown): Record<string, unknown> {
 }
 
 describe("MCP HTTP runtime", () => {
+  it("serves the authenticated read-only Doctor report", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-launcher-doctor-"));
+    temporaryDirectories.push(workspace);
+    const registry = new WorkspaceRegistry([{ id: "doctor-http", name: "Doctor HTTP", path: workspace }]);
+    const report = {
+      status: "READY" as const,
+      checks: [{ component: "MCP Runtime", status: "PASS" as const, timestamp: "2026-09-24T00:00:00.000Z" }],
+      generatedAt: "2026-09-24T00:00:00.000Z",
+    };
+    const server = createHttpServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
+    }, { registry, doctorRunner: { run: vi.fn(async () => report) } });
+    runningServers.push(server);
+    const port = await listen(server);
+    const url = `http://127.0.0.1:${port}${LAUNCHER_DOCTOR_PATH}`;
+    const headers = { authorization: "Bearer test-token" };
+    expect((await fetch(url)).status).toBe(401);
+    expect((await fetch(url, { method: "POST", headers })).status).toBe(405);
+    expect((await fetch(url, { headers: { ...headers, "x-forwarded-for": "127.0.0.1" } })).status).toBe(404);
+    const response = await fetch(url, { headers });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.json()).resolves.toEqual(report);
+  });
+
   it("serves the authenticated loopback launcher Session catalog without adding an MCP tool", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-launcher-catalog-"));
     temporaryDirectories.push(workspace);

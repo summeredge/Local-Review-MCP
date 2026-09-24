@@ -207,6 +207,21 @@ Run the standard startup entry point:
 .\scripts\start-production.ps1 -Config ".\config.production.json"
 ```
 
+With the runtime already running, use the read-only capability doctor:
+
+```powershell
+npm run build
+node .\dist\src\cli.js doctor --config .\config.production.json
+node .\dist\src\cli.js doctor --config .\config.production.json --json
+```
+
+The `lrm doctor` command (and the existing `local-review-mcp doctor` alias)
+calls the authenticated loopback `/launcher/doctor` endpoint. It reports MCP
+Runtime, Desktop IPC, Desktop Handoff, Desktop Trampoline, Standalone Backend,
+and Codex App Server checks. It does not create an Execution, alter the
+`CapabilityNegotiator` snapshot, acquire a handoff, send a Goal, or select a
+fallback provider.
+
 The entry point reads the configuration, runs `preflight-check.ps1`, then
 starts the existing Local Review MCP runtime. The runtime starts the Windows
 Supervisor when `supervisor.enabled` is `true` and starts the Cloudflare Tunnel

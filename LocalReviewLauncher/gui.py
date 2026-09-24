@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import datetime
 from enum import Enum
 from itertools import groupby
+from math import ceil
 from pathlib import Path
 from time import monotonic
 
@@ -41,6 +42,8 @@ from config_manager import (
 from process_manager import ProductionProcessManager
 from status_checker import (
     CapabilityStatus,
+    CapabilityTimelineEvent,
+    DoctorStatus,
     DesktopCapabilityStatus,
     DesktopSyncStatus,
     LauncherStatus,
@@ -48,7 +51,12 @@ from status_checker import (
     SessionViewModel,
     StatusChecker,
 )
-from status_worker import StatusCheckScheduler, StatusCheckWorker
+from status_worker import (
+    CapabilityTimelineCheckWorker,
+    DoctorCheckWorker,
+    StatusCheckScheduler,
+    StatusCheckWorker,
+)
 
 
 STARTUP_TIMEOUT_SECONDS = 60
@@ -56,6 +64,7 @@ STARTUP_POLL_INTERVAL_MS = 2_000
 BROWSER_PRESENCE_GRACE_SECONDS = 15
 MAX_EVENT_STREAM_ROWS = 500
 MAX_DASHBOARD_ROWS = 5
+CAPABILITY_TIMELINE_LIMIT = 100
 EVENT_STREAM_MIN_HEIGHT = 270
 CLEARED_TERMINAL_SESSION_STATUSES = frozenset({"completed", "failed", "terminated"})
 
@@ -105,6 +114,40 @@ class LauncherWindow(QMainWindow):
         self.capability_status = QLabel("Unavailable")
         self.capability_status.setWordWrap(True)
         self.capability_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.doctor_status = QLabel("Not run")
+        self.doctor_status.setWordWrap(True)
+        self.doctor_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.capability_timeline_toggle = QToolButton()
+        self.capability_timeline_toggle.setText("Capability Timeline")
+        self.capability_timeline_toggle.setCheckable(True)
+        self.capability_timeline_refresh_button = QPushButton("刷新 Timeline")
+        self.capability_timeline_table = QTableWidget(0, 7)
+        self.capability_timeline_table.setHorizontalHeaderLabels([
+            "Timestamp",
+            "Previous State",
+            "Current State",
+            "Source",
+            "Reason",
+            "Error Code",
+            "Event",
+        ])
+        self.capability_timeline_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.capability_timeline_table.horizontalHeader().setStretchLastSection(True)
+        self.capability_timeline_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.capability_timeline_table.setMinimumHeight(160)
+        self.capability_timeline_table.setMaximumHeight(280)
+        self.capability_timeline_empty_label = QLabel("No recent capability timeline events.")
+        self.capability_timeline_empty_label.setWordWrap(True)
+        self.capability_timeline_content = QWidget()
+        timeline_layout = QVBoxLayout(self.capability_timeline_content)
+        timeline_layout.setContentsMargins(0, 0, 0, 0)
+        timeline_toolbar = QHBoxLayout()
+        timeline_toolbar.addWidget(self.capability_timeline_refresh_button)
+        timeline_toolbar.addStretch()
+        timeline_layout.addLayout(timeline_toolbar)
+        timeline_layout.addWidget(self.capability_timeline_table)
+        timeline_layout.addWidget(self.capability_timeline_empty_label)
+        self._capability_timeline_loading = False
         self.oauth_status_label = QLabel("Unavailable")
         self.oauth_status_label.setWordWrap(True)
         self.workspace_label = QLabel()
@@ -168,10 +211,14 @@ class LauncherWindow(QMainWindow):
         self.start_button = QPushButton("启动 MCP")
         self.stop_button = QPushButton("停止 MCP")
         self.refresh_button = QPushButton("刷新状态")
-        self.recheck_desktop_button = QPushButton("重新检查 Desktop")
-        self.standalone_button = QPushButton("使用 Standalone")
+        self.recheck_desktop_button = QPushButton("Retry Desktop")
+        self.standalone_button = QPushButton("Use Standalone")
+        self.run_doctor_button = QPushButton("Run Doctor")
+        self.capability_timeline_toggle.setEnabled(False)
+        self.capability_timeline_refresh_button.setEnabled(False)
         self.recheck_desktop_button.setEnabled(False)
         self.standalone_button.setEnabled(False)
+        self.run_doctor_button.setEnabled(False)
         self.refresh_oauth_button = QPushButton("Refresh OAuth Status")
         self.reset_oauth_button = QPushButton("Reset OAuth Clients")
         self.delete_oauth_button = QPushButton("删除 OAuth Client")
@@ -196,6 +243,9 @@ class LauncherWindow(QMainWindow):
         self.refresh_button.clicked.connect(self.refresh_status)
         self.recheck_desktop_button.clicked.connect(self.recheck_desktop_capability)
         self.standalone_button.clicked.connect(self.select_standalone_capability)
+        self.run_doctor_button.clicked.connect(self.run_doctor)
+        self.capability_timeline_toggle.toggled.connect(self._set_capability_timeline_expanded)
+        self.capability_timeline_refresh_button.clicked.connect(self.refresh_capability_timeline)
         self.refresh_oauth_button.clicked.connect(self.refresh_oauth_status)
         self.reset_oauth_button.clicked.connect(self.reset_oauth_clients)
         self.delete_oauth_button.clicked.connect(self.delete_oauth_client)
@@ -227,11 +277,15 @@ class LauncherWindow(QMainWindow):
         overview_layout.addWidget(self._row("Browser:", self.browser_status))
         overview_layout.addWidget(self._row("Desktop Sync:", self.desktop_sync_status))
         overview_layout.addWidget(self._row("Execution Capability:", self.capability_status))
+        overview_layout.addWidget(self._row("Capability Doctor:", self.doctor_status))
         capability_buttons = QHBoxLayout()
+        capability_buttons.addWidget(self.run_doctor_button)
+        capability_buttons.addWidget(self.capability_timeline_toggle)
         capability_buttons.addWidget(self.recheck_desktop_button)
         capability_buttons.addWidget(self.standalone_button)
         capability_buttons.addStretch()
         overview_layout.addLayout(capability_buttons)
+        overview_layout.addWidget(self.capability_timeline_content)
         overview_layout.addWidget(self._row("OAuth Status:", self.oauth_status_label))
         overview_layout.addWidget(self._row("Workspace:", self.workspace_label))
         top_actions = QWidget()
@@ -307,6 +361,7 @@ class LauncherWindow(QMainWindow):
         task_layout.addWidget(QLabel("Event Stream"))
         task_layout.addWidget(self.event_table)
         self._set_session_viewer_expanded(False)
+        self._set_capability_timeline_expanded(False)
 
         startup_container = QWidget()
         startup_container.setLayout(startup_layout)
@@ -329,6 +384,10 @@ class LauncherWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._refresh_status_automatically)
         self.timer.start(5_000)
+        self.capability_countdown_timer = QTimer(self)
+        self.capability_countdown_timer.setInterval(1_000)
+        self.capability_countdown_timer.timeout.connect(self._refresh_capability_countdown)
+        self.capability_countdown_timer.start()
         self.startup_timer = QTimer(self)
         self.startup_timer.setInterval(STARTUP_POLL_INTERVAL_MS)
         self.startup_timer.timeout.connect(self._poll_startup)
@@ -427,33 +486,7 @@ class LauncherWindow(QMainWindow):
         desktop_sync = getattr(status, "desktop_sync", DesktopSyncStatus())
         desktop_capability = getattr(status, "desktop_capability", DesktopCapabilityStatus())
         capability = getattr(status, "capability", CapabilityStatus())
-        capability_source = {
-            "desktop": "Desktop",
-            "standalone": "Standalone",
-        }.get(capability.source or "", "—")
-        capability_hint = {
-            "unavailable": "MCP capability unavailable.",
-            "initializing": "Waiting for the current execution capability.",
-            "desktop_pending": "Checking Desktop capability.",
-            "desktop_ready": "Desktop capability is ready.",
-            "desktop_failed": "Desktop capability unavailable; recheck or choose Standalone.",
-            "fallback_ready": "Standalone fallback selected.",
-            "fallback_running": "Standalone backend is running.",
-        }.get(capability.state, "Capability state unavailable.")
-        capability_lines = [
-            f"Execution: {capability.execution_id or '—'}",
-            f"Source: {capability_source}",
-            f"State: {capability.state}",
-            f"Hint: {capability_hint}",
-        ]
-        if capability.reason:
-            capability_lines.append(f"Reason: {capability.reason}")
-        self.capability_status.setText("\n".join(capability_lines))
-        self.capability_status.setStyleSheet(
-            "color: #16803c" if capability.state in {"desktop_ready", "fallback_running"}
-            else "color: #946200" if capability.state in {"initializing", "desktop_pending", "fallback_ready"}
-            else "color: #9b1c1c"
-        )
+        self._render_capability_status(capability)
         # A connected Desktop IPC observer says nothing about the Desktop codex_app capability, so
         # the handoff state is always rendered separately instead of being read as the same thing.
         identity_state = (
@@ -518,6 +551,146 @@ class LauncherWindow(QMainWindow):
         self._render_session_dashboard(sessions)
         self.workspace_label.setText(self._current_workspace_text())
         self.cloudflared_version_label.setText(getattr(status, "cloudflared_version", "unavailable"))
+
+    @staticmethod
+    def _capability_reason_text(reason: str | None) -> str:
+        labels = {
+            "desktop_disconnected": "Desktop disconnected",
+            "executor_identity_unavailable": "Desktop owner binding unavailable",
+            "desktop_tools_pipe_unavailable": "Desktop tools pipe unavailable",
+            "desktop_handoff_failed": "Desktop handoff failed",
+            "desktop_handoff_timeout": "Desktop handoff timeout",
+            "desktop_binding_recovered": "Desktop binding recovered",
+            "desktop_execution_failed": "Desktop execution failed",
+            "standalone_execution_failed": "Standalone execution failed",
+            "user_selected_standalone": "User selected Standalone",
+        }
+        return labels.get(reason or "", reason or "—")
+
+    @staticmethod
+    def _capability_reason_line(reason: str | None) -> str:
+        if reason is None:
+            return "Reason: —"
+        label = LauncherWindow._capability_reason_text(reason)
+        return f"Reason: {label} ({reason})" if label != reason else f"Reason: {label}"
+
+    @staticmethod
+    def _seconds_until(timestamp: str | None) -> int | None:
+        if timestamp is None:
+            return None
+        try:
+            deadline = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if deadline.tzinfo is None:
+                return None
+            return max(0, int(ceil((deadline - datetime.now(deadline.tzinfo)).total_seconds())))
+        except ValueError:
+            return None
+
+    def _render_capability_status(self, capability: CapabilityStatus) -> None:
+        capability_source = {
+            "desktop": "Desktop",
+            "standalone": "Standalone",
+        }.get(capability.source or "", "—")
+        capability_hint = {
+            "unavailable": "MCP capability unavailable.",
+            "initializing": "Waiting for the current execution capability.",
+            "desktop_pending": "Waiting for Desktop handoff.",
+            "desktop_ready": "Desktop capability is ready.",
+            "desktop_failed": "Desktop handoff failed; retry Desktop or use Standalone.",
+            "fallback_ready": "Standalone fallback selected.",
+            "fallback_running": "Standalone backend is running.",
+        }.get(capability.state, "Capability state unavailable.")
+        capability_lines = [
+            f"Execution: {capability.execution_id or '—'}",
+            f"Source: {capability_source}",
+            f"State: {capability.state}",
+            f"Hint: {capability_hint}",
+        ]
+        if capability.state == "desktop_pending":
+            capability_lines.extend(["Desktop: Pending", "Waiting for handoff"])
+        elif capability.state == "desktop_ready":
+            capability_lines.append("Desktop: Ready")
+            if capability.reason:
+                capability_lines.append(self._capability_reason_line(capability.reason))
+        elif capability.state == "desktop_failed":
+            capability_lines.append("Desktop: Failed")
+            capability_lines.append(self._capability_reason_line(capability.reason))
+            if capability.error_code:
+                capability_lines.append(f"Error code: {capability.error_code}")
+            remaining = self._seconds_until(capability.fallback_deadline_at)
+            if remaining is not None:
+                capability_lines.extend([
+                    "",
+                    "Waiting for user decision",
+                    f"Automatic fallback in: {remaining} seconds",
+                ])
+        elif capability.state == "fallback_running":
+            capability_lines.extend([
+                "",
+                "Fallback activated",
+                "Provider: Standalone",
+                self._capability_reason_line(capability.reason if capability.reason else "user_selected_standalone"),
+            ])
+            if capability.error_code:
+                capability_lines.append(f"Error code: {capability.error_code}")
+        elif capability.reason:
+            capability_lines.append(self._capability_reason_line(capability.reason))
+            if capability.error_code:
+                capability_lines.append(f"Error code: {capability.error_code}")
+        self.capability_status.setText("\n".join(capability_lines))
+        self.capability_status.setStyleSheet(
+            "color: #16803c" if capability.state in {"desktop_ready", "fallback_running"}
+            else "color: #946200" if capability.state in {"initializing", "desktop_pending", "fallback_ready"}
+            else "color: #9b1c1c"
+        )
+
+    def _refresh_capability_countdown(self) -> None:
+        if self._closing:
+            return
+        capability = getattr(self._last_status, "capability", CapabilityStatus())
+        if capability.state == "desktop_failed" and capability.fallback_deadline_at:
+            self._render_capability_status(capability)
+
+    def _render_doctor(self, report: DoctorStatus) -> None:
+        lines = [f"Status: {report.status}", f"Last run: {self._format_timestamp(report.generated_at)}"]
+        if report.checks:
+            for check in report.checks:
+                line = f"[{check.status}] {check.component}"
+                if check.reason:
+                    line += f" — {check.reason}"
+                lines.append(line)
+        else:
+            lines.append("[FAIL] Doctor — doctor_unavailable")
+        self.doctor_status.setText("\n".join(lines))
+        self.doctor_status.setStyleSheet({
+            "READY": "color: #16803c",
+            "DEGRADED": "color: #946200",
+            "FAILED": "color: #9b1c1c",
+        }.get(report.status, "color: #666666"))
+
+    def _render_capability_timeline(self, events: tuple[CapabilityTimelineEvent, ...]) -> None:
+        self.capability_timeline_table.setRowCount(0)
+        for event in events:
+            row = self.capability_timeline_table.rowCount()
+            self.capability_timeline_table.insertRow(row)
+            values = (
+                self._format_timestamp(event.timestamp),
+                event.previous_state or "—",
+                event.current_state,
+                event.source or "—",
+                event.reason or "—",
+                event.error_code or "—",
+                event.event or event.current_state,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                self.capability_timeline_table.setItem(row, column, item)
+        self.capability_timeline_table.resizeColumnsToContents()
+        self.capability_timeline_empty_label.setText(
+            "No recent capability timeline events." if not events else ""
+        )
+        self.capability_timeline_empty_label.setVisible(not events)
 
     def _render_oauth_status(self, status: OAuthRegistryStatus | None) -> None:
         if status is None:
@@ -841,6 +1014,11 @@ class LauncherWindow(QMainWindow):
             LauncherState.STARTING,
             LauncherState.STOPPING,
         )
+        self.run_doctor_button.setEnabled(capability_available)
+        self.capability_timeline_toggle.setEnabled(capability_available)
+        self.capability_timeline_refresh_button.setEnabled(
+            capability_available and not self._capability_timeline_loading
+        )
         self.recheck_desktop_button.setEnabled(capability_available and "recheck" in capability_actions)
         self.standalone_button.setEnabled(capability_available and "standalone" in capability_actions)
 
@@ -859,6 +1037,62 @@ class LauncherWindow(QMainWindow):
             self.refresh_status()
         else:
             self._show_error("无法选择 Standalone fallback。")
+
+    def run_doctor(self) -> None:
+        if not self._last_status.mcp_running or self._closing:
+            return
+        self.run_doctor_button.setEnabled(False)
+        self.message_label.setText("Running read-only LRM Doctor checks...")
+        generation = self._status_check_generation
+        worker = DoctorCheckWorker(self.status_checker, generation)
+        worker.signals.finished.connect(self._doctor_check_finished)
+        self._status_thread_pool.start(worker)
+
+    @Slot(int, object)
+    def _doctor_check_finished(self, generation: int, report: DoctorStatus) -> None:
+        if self._closing or generation != self._status_check_generation:
+            return
+        self._render_doctor(report)
+        self.message_label.setText(f"LRM Doctor completed: {report.status}.")
+        self._apply_controls(self._last_status)
+
+    def _set_capability_timeline_expanded(self, expanded: bool) -> None:
+        self.capability_timeline_content.setVisible(expanded)
+        if expanded and self._last_status.mcp_running and not self._capability_timeline_loading:
+            self.refresh_capability_timeline()
+
+    def refresh_capability_timeline(self) -> None:
+        if self._closing or not self._last_status.mcp_running or self._capability_timeline_loading:
+            return
+        self._capability_timeline_loading = True
+        self.capability_timeline_refresh_button.setEnabled(False)
+        self.capability_timeline_empty_label.setText("Loading capability timeline...")
+        self.capability_timeline_empty_label.setVisible(True)
+        execution_id = getattr(self._last_status.capability, "execution_id", None)
+        worker = CapabilityTimelineCheckWorker(
+            self.status_checker,
+            execution_id,
+            CAPABILITY_TIMELINE_LIMIT,
+            self._status_check_generation,
+        )
+        worker.signals.finished.connect(self._capability_timeline_check_finished)
+        self._status_thread_pool.start(worker)
+
+    @Slot(int, object)
+    def _capability_timeline_check_finished(
+        self,
+        generation: int,
+        events: tuple[CapabilityTimelineEvent, ...],
+    ) -> None:
+        self._capability_timeline_loading = False
+        if self._closing:
+            return
+        if generation != self._status_check_generation:
+            self._apply_controls(self._last_status)
+            return
+        self._render_capability_timeline(events)
+        self.message_label.setText(f"Capability Timeline loaded: {len(events)} event(s).")
+        self._apply_controls(self._last_status)
 
     def _set_state(self, state: LauncherState) -> None:
         self.state = state
@@ -1164,6 +1398,7 @@ class LauncherWindow(QMainWindow):
         self._closing = True
         self._status_check_generation += 1
         self.timer.stop()
+        self.capability_countdown_timer.stop()
         self.startup_timer.stop()
         if self.process_manager.has_started:
             try:

@@ -77,6 +77,25 @@ pipe or posts a handoff. When the capability state is `desktop_failed`, the
 launcher can request `recheck` for that execution or select the standalone
 app-server fallback. Recheck only reads the existing Desktop capability again;
 it never posts a new handoff or triggers SessionStart.
+During `desktop_pending` it shows `Desktop: Pending / Waiting for handoff`.
+After a failure it shows the failure reason and `error_code`, keeps **Retry
+Desktop** and **Use Standalone** available, and displays the remaining
+automatic-fallback countdown. An automatic selection is shown as
+`Fallback activated`, `Provider: Standalone`, with `Desktop handoff timeout`
+as its reason. The expandable Capability Timeline shows the same decision path,
+including `fallback_waiting` and `fallback_selected`.
+
+## Capability Doctor
+
+The same overview exposes **Run Doctor**, which calls the authenticated,
+loopback-only `/launcher/doctor` endpoint. The report is intentionally an
+observation layer: it reads the current MCP runtime, Desktop observer, handoff
+lifecycle, trampoline configuration, standalone backend configuration, and
+Codex app-server protocol health without creating an Execution or changing the
+capability snapshot. The Codex app-server probe performs only `initialize` and
+`model/list`, then closes its diagnostic client; it never starts a Thread or a
+Turn. The most recent report is shown in memory with its total status, check
+items, and preserved failure reasons.
 
 ## Dashboard
 

@@ -267,3 +267,27 @@ owner 完全匹配时作为已接收处理并记录 `ack_time`，保持已保存
 - See Also: none
 
 ---
+
+## [LRN-20260924-001] 只读诊断探针要隔离执行环境并复用结果
+
+**Priority**: medium
+**Status**: resolved
+**Area**: infra
+
+### 内容
+
+诊断 app-server 时若继承 `CODEX_CLI_PATH` 或 Desktop pipe 环境，可能误触发 trampoline
+或 handoff；同一轮诊断中重复探测还会重复启动 provider 进程。只读探针应清除这些
+执行环境，并让同一轮的 backend 与 protocol 检查共享一个 Promise。
+
+### 建议修复
+
+在诊断边界显式覆盖执行环境，并只调用 provider 的 initialize/protocol 方法；不要调用
+thread/turn 或执行路由。对一次 report 的重复依赖检查复用同一个短生命周期探针。
+
+### 元数据
+
+- Source: task_review
+- See Also: LRN-20260923-001
+
+---

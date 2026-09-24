@@ -28,7 +28,10 @@ from gui import LauncherState, LauncherWindow
 from status_checker import (
     BrowserReadiness,
     CapabilityStatus,
+    CapabilityTimelineEvent,
     DesktopCapabilityStatus,
+    DoctorCheckStatus,
+    DoctorStatus,
     DesktopSyncStatus,
     LauncherStatus,
     OAuthClientStatus,
@@ -95,8 +98,20 @@ class LauncherLogTests(unittest.TestCase):
                     execution_id="execution-1",
                     task_id="task-1",
                     actuation_id="actuation-1",
+                    error_code="owner_binding_timeout",
+                    fallback_deadline_at="2999-09-24T01:00:00.000Z",
                 ),
             ))
+            window._render_doctor(DoctorStatus(
+                "DEGRADED",
+                "2026-09-24T01:00:00.000Z",
+                (DoctorCheckStatus("Desktop Handoff", "WARN", "desktop_tools_pipe_unavailable", "2026-09-24T01:00:00.000Z"),),
+            ))
+            self.assertIn("Status: DEGRADED", window.doctor_status.text())
+            self.assertIn("[WARN] Desktop Handoff", window.doctor_status.text())
+            self.assertIn("desktop_tools_pipe_unavailable", window.doctor_status.text())
+            window._render_doctor(DoctorStatus())
+            self.assertIn("[FAIL] Doctor — doctor_unavailable", window.doctor_status.text())
             window._apply_controls(window._last_status)
             self.assertIn("Connected", window.desktop_sync_status.text())
             self.assertIn("Mode: Auto", window.desktop_sync_status.text())
@@ -110,9 +125,54 @@ class LauncherLogTests(unittest.TestCase):
             self.assertIn("Execution: execution-1", window.capability_status.text())
             self.assertIn("Source: Desktop", window.capability_status.text())
             self.assertIn("State: desktop_failed", window.capability_status.text())
-            self.assertIn("recheck or choose Standalone", window.capability_status.text())
+            self.assertIn("Desktop: Failed", window.capability_status.text())
+            self.assertIn("Error code: owner_binding_timeout", window.capability_status.text())
+            self.assertIn("Waiting for user decision", window.capability_status.text())
+            self.assertIn("Automatic fallback in:", window.capability_status.text())
             self.assertTrue(window.recheck_desktop_button.isEnabled())
             self.assertTrue(window.standalone_button.isEnabled())
+
+            window._render_status(LauncherStatus(
+                True,
+                True,
+                True,
+                desktop_sync=connected_desktop,
+                capability=CapabilityStatus(state="desktop_pending", source="desktop"),
+            ))
+            self.assertIn("Desktop: Pending", window.capability_status.text())
+            self.assertIn("Waiting for handoff", window.capability_status.text())
+
+            window._render_status(LauncherStatus(
+                True,
+                True,
+                True,
+                desktop_sync=connected_desktop,
+                capability=CapabilityStatus(
+                    state="fallback_running",
+                    source="standalone",
+                    reason="desktop_handoff_timeout",
+                    error_code="desktop_handoff_timeout",
+                ),
+            ))
+            self.assertIn("Fallback activated", window.capability_status.text())
+            self.assertIn("Provider: Standalone", window.capability_status.text())
+            self.assertIn("Desktop handoff timeout", window.capability_status.text())
+
+            window._render_status(LauncherStatus(
+                True,
+                True,
+                True,
+                desktop_sync=connected_desktop,
+                capability=CapabilityStatus(
+                    state="desktop_ready",
+                    source="desktop",
+                    reason="desktop_binding_recovered",
+                    execution_id="execution-1",
+                ),
+            ))
+            self.assertIn("Desktop: Ready", window.capability_status.text())
+            self.assertIn("Source: Desktop", window.capability_status.text())
+            self.assertIn("desktop_binding_recovered", window.capability_status.text())
 
             offline_status = LauncherStatus(False, False, False)
             window._render_status(offline_status)
@@ -219,6 +279,40 @@ class LauncherLogTests(unittest.TestCase):
                 self.assertEqual(upper.x(), lower.x())
                 self.assertEqual(upper.width(), lower.width())
                 self.assertGreater(lower.y(), upper.geometry().bottom())
+
+    def test_capability_timeline_renders_state_and_failure_fields(self) -> None:
+        manager = Mock()
+        manager.load.return_value = LauncherConfig("", "config.production.json", False)
+        with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
+            LauncherWindow, "refresh_status"
+        ), patch.object(LauncherWindow, "_render_runtime_info"):
+            process.return_value.has_started = False
+            window = LauncherWindow(Path.cwd(), manager)
+            self.addCleanup(window.close)
+
+        self.assertFalse(window.capability_timeline_toggle.isChecked())
+        self.assertTrue(window.capability_timeline_content.isHidden())
+        window._render_capability_timeline((CapabilityTimelineEvent(
+            "2026-09-24T01:00:00.000Z",
+            "desktop_pending",
+            "desktop_failed",
+            "desktop",
+            "desktop_handoff_failed",
+            "handoff_failed",
+            "fallback_waiting",
+        ),))
+
+        self.assertEqual(window.capability_timeline_table.rowCount(), 1)
+        expected_time = datetime.fromisoformat("2026-09-24T01:00:00.000Z".replace("Z", "+00:00")) \
+            .astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(
+            [window.capability_timeline_table.item(0, column).text() for column in range(7)],
+            [expected_time, "desktop_pending", "desktop_failed", "desktop",
+             "desktop_handoff_failed", "handoff_failed", "fallback_waiting"],
+        )
+        window._render_capability_timeline(())
+        self.assertEqual(window.capability_timeline_table.rowCount(), 0)
+        self.assertEqual(window.capability_timeline_empty_label.text(), "No recent capability timeline events.")
 
     def test_save_log_writes_utf8(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

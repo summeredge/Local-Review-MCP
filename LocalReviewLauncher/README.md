@@ -50,3 +50,9 @@ states and are not disguised as fallback.
 The overview also reads `/launcher/capability?execution_id=current` and exposes
 the current execution, source, state, and the recheck/standalone actions. These actions select the execution
 provider; they do not acquire a pipe or change the Desktop protocols.
+
+The capability panel also provides **Run Doctor**. It reads the authenticated
+`/launcher/doctor` observation report and displays the latest total status,
+timestamp, each check, and any failure reason. Doctor does not submit a Goal,
+create an Execution or Codex Thread, send a message, change the capability
+snapshot, or select a fallback provider.

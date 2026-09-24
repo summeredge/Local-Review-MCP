@@ -14,6 +14,9 @@ from PySide6.QtCore import QCoreApplication, QThreadPool
 from status_checker import (
     BrowserReadiness,
     CapabilityStatus,
+    CapabilityTimelineEvent,
+    DoctorCheckStatus,
+    DoctorStatus,
     DesktopCapabilityStatus,
     DesktopSyncStatus,
     StatusQueryError,
@@ -23,7 +26,7 @@ from status_checker import (
     SessionViewModel,
     StatusChecker,
 )
-from status_worker import StatusCheckScheduler, StatusCheckWorker
+from status_worker import CapabilityTimelineCheckWorker, StatusCheckScheduler, StatusCheckWorker
 
 
 class StatusCheckSchedulerTests(unittest.TestCase):
@@ -37,6 +40,25 @@ class StatusCheckSchedulerTests(unittest.TestCase):
 
 
 class StatusCheckWorkerTests(unittest.TestCase):
+    def test_capability_timeline_worker_reads_events_and_fails_closed(self) -> None:
+        events = (CapabilityTimelineEvent(
+            "2026-09-24T01:00:00.000Z", "desktop_pending", "desktop_failed", "desktop",
+            "desktop_handoff_failed", "handoff_failed",
+        ),)
+        probe = Mock(return_value=events)
+        checker = SimpleNamespace(capability_timeline=probe)
+        results = []
+        worker = CapabilityTimelineCheckWorker(checker, "execution-1", 10, 3)  # type: ignore[arg-type]
+        worker.signals.finished.connect(lambda generation, value: results.append((generation, value)))
+
+        worker.run()
+
+        self.assertEqual(results, [(3, events)])
+        probe.assert_called_once_with("execution-1", 10)
+        probe.side_effect = TimeoutError()
+        worker.run()
+        self.assertEqual(results[-1], (3, ()))
+
     def test_worker_includes_browser_readiness_and_fails_closed_on_probe_error(self) -> None:
         browser = BrowserReadiness(True, "ready", True, True, True, 123, "", "")
         probe = Mock(return_value=browser)
@@ -222,6 +244,103 @@ class StatusCheckWorkerTests(unittest.TestCase):
 
 
 class StatusCheckerTests(unittest.TestCase):
+    def test_capability_timeline_parses_recent_events_and_uses_authenticated_endpoint(self) -> None:
+        checker = StatusChecker(auth_token="secret")
+        payload = {
+            "events": [{
+                "timestamp": "2026-09-24T01:00:00.000Z",
+                "execution_id": "execution-1",
+                "task_id": "task-1",
+                "previous_state": None,
+                "current_state": "initializing",
+                "source": None,
+                "reason": None,
+                "error_code": None,
+            }, {
+                "timestamp": "2026-09-24T01:00:01.000Z",
+                "execution_id": "execution-1",
+                "task_id": "task-1",
+                "previous_state": "desktop_pending",
+                "current_state": "desktop_failed",
+                "source": "desktop",
+                "reason": "desktop_handoff_failed",
+                "error_code": "handoff_failed",
+                "event": "fallback_waiting",
+            }, {
+                "timestamp": "2026-09-24T01:00:02.000Z",
+                "execution_id": "execution-1",
+                "task_id": "task-1",
+                "previous_state": "desktop_pending",
+                "current_state": "desktop_ready",
+                "source": "desktop",
+                "reason": "desktop_binding_recovered",
+                "error_code": None,
+                "event": "desktop_capability_restored",
+            }],
+        }
+        with patch.object(checker, "_request_json", return_value=payload) as request:
+            self.assertEqual(
+                checker.capability_timeline("execution-1", 10),
+                (
+                    CapabilityTimelineEvent(
+                        "2026-09-24T01:00:00.000Z", None, "initializing", None, None, None,
+                    ),
+                    CapabilityTimelineEvent(
+                        "2026-09-24T01:00:01.000Z", "desktop_pending", "desktop_failed", "desktop",
+                        "desktop_handoff_failed", "handoff_failed", "fallback_waiting",
+                    ),
+                    CapabilityTimelineEvent(
+                        "2026-09-24T01:00:02.000Z", "desktop_pending", "desktop_ready", "desktop",
+                        "desktop_binding_recovered", None, "desktop_capability_restored",
+                    ),
+                ),
+            )
+        request.assert_called_once_with(
+            f"{checker.capability_timeline_url}?execution_id=execution-1&limit=10"
+        )
+
+    def test_capability_timeline_fails_closed_on_invalid_event(self) -> None:
+        checker = StatusChecker()
+        valid = {
+            "timestamp": "2026-09-24T01:00:00.000Z",
+            "execution_id": "execution-1",
+            "task_id": "task-1",
+            "previous_state": None,
+            "current_state": "initializing",
+            "source": None,
+            "reason": None,
+            "error_code": None,
+        }
+        for event in ({**valid, "current_state": "unknown"}, {**valid, "execution_id": "other"}):
+            with self.subTest(event=event), patch.object(checker, "_request_json", return_value={"events": [event]}):
+                self.assertEqual(checker.capability_timeline("execution-1"), ())
+
+    def test_doctor_report_parses_checks_and_reason(self) -> None:
+        checker = StatusChecker()
+        with patch.object(checker, "_request_json", return_value={
+            "status": "DEGRADED",
+            "generatedAt": "2026-09-24T01:00:00.000Z",
+            "checks": [{
+                "component": "Desktop Handoff",
+                "status": "WARN",
+                "reason": "desktop_tools_pipe_unavailable",
+                "timestamp": "2026-09-24T01:00:00.000Z",
+            }],
+        }):
+            self.assertEqual(
+                checker.doctor_report(),
+                DoctorStatus(
+                    "DEGRADED",
+                    "2026-09-24T01:00:00.000Z",
+                    (DoctorCheckStatus("Desktop Handoff", "WARN", "desktop_tools_pipe_unavailable", "2026-09-24T01:00:00.000Z"),),
+                ),
+            )
+
+    def test_doctor_report_fails_closed_on_unusable_response(self) -> None:
+        checker = StatusChecker()
+        with patch.object(checker, "_request_json", return_value={"status": "READY"}):
+            self.assertEqual(checker.doctor_report(), DoctorStatus())
+
     def test_browser_readiness_uses_authenticated_endpoint_for_all_states(self) -> None:
         for state, available, paired, present, reason, action in (
             ("bridge_unavailable", False, False, False, "Bridge is not ready.", "Start the runtime."),
@@ -390,7 +509,12 @@ class StatusCheckerTests(unittest.TestCase):
             "state": "desktop_failed",
             "source": "desktop",
             "reason": "desktop_tools_pipe_unavailable",
+            "error_code": "owner_binding_timeout",
             "actions": ["recheck", "standalone"],
+            "timestamps": {
+                "desktopDeadlineAt": None,
+                "fallbackDeadlineAt": "2026-09-24T01:00:30.000Z",
+            },
             "updatedAt": "2026-09-23T00:00:00.000Z",
         }):
             self.assertEqual(
@@ -403,6 +527,30 @@ class StatusCheckerTests(unittest.TestCase):
                     execution_id="execution-1",
                     task_id="task-1",
                     actuation_id="actuation-1",
+                    error_code="owner_binding_timeout",
+                    fallback_deadline_at="2026-09-24T01:00:30.000Z",
+                ),
+            )
+
+    def test_capability_status_accepts_desktop_binding_recovery(self) -> None:
+        checker = StatusChecker()
+        with patch.object(checker, "_request_json", return_value={
+            "execution_id": "execution-1",
+            "task_id": "task-1",
+            "state": "desktop_ready",
+            "source": "desktop",
+            "reason": "desktop_binding_recovered",
+            "actions": [],
+        }):
+            self.assertEqual(
+                checker.capability_status(),
+                CapabilityStatus(
+                    state="desktop_ready",
+                    source="desktop",
+                    reason="desktop_binding_recovered",
+                    actions=(),
+                    execution_id="execution-1",
+                    task_id="task-1",
                 ),
             )
 

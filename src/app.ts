@@ -61,6 +61,7 @@ import { EvidenceTransportTraceService } from "./control-plane/evidence-transpor
 import { DesktopIPCObserver } from "./desktop-sync/desktop-ipc-observer.js";
 import { DesktopSyncManager } from "./desktop-sync/desktop-sync-manager.js";
 import { DesktopToolsPipeHandoff } from "./desktop-codex/desktop-tools-pipe-handoff.js";
+import { DesktopToolsPipeResolver } from "./desktop-codex/desktop-tools-pipe-resolver.js";
 import { DesktopCodexRuntimeFactory } from "./desktop-codex/desktop-tools-pipe-probe.js";
 import { DesktopInteractivePreflight } from "./desktop-codex/desktop-interactive-preflight.js";
 import { DesktopCodexBackend } from "./desktop-codex/desktop-codex-backend.js";
@@ -69,6 +70,8 @@ import {
   DesktopCapabilityProvider,
   StandaloneCapabilityProvider,
 } from "./control-plane/capability-negotiation.js";
+import { CapabilityTimeline } from "./control-plane/capability-timeline.js";
+import { DoctorRunner } from "./diagnostic/doctor.js";
 
 export interface AppContext extends McpRuntimeContext {
   readonly storageRoot?: string;
@@ -94,6 +97,7 @@ export interface AppContext extends McpRuntimeContext {
   readonly evidenceTransportTrace?: EvidenceTransportTraceService;
   readonly executionRouter?: ExecutionRoutingService;
   capabilityNegotiator?: CapabilityNegotiator;
+  capabilityTimeline?: CapabilityTimeline;
 }
 
 export interface AppStartOptions extends HttpServerOptions {
@@ -255,6 +259,10 @@ export async function startApp(
       ...(event.discardReason === undefined ? {} : { discard_reason: event.discardReason }),
     });
   });
+  const desktopToolsPipeResolver = new DesktopToolsPipeResolver(
+    desktopToolsPipeHandoff,
+    () => desktopSyncObserver.getState(),
+  );
   const desktopCodexRuntimeFactory = new DesktopCodexRuntimeFactory(
     desktopToolsPipeHandoff,
     () => desktopSyncObserver.getState(),
@@ -265,6 +273,7 @@ export async function startApp(
     desktopToolsPipeHandoff,
     () => desktopSyncObserver.getState(),
   );
+  let doctorRunner: DoctorRunner | undefined;
   context.goalPreflight?.setDesktopReadiness(() => desktopInteractivePreflight.check());
   // A capability handed off a moment after submit_goal is waited for, so the wait is observable in
   // the runtime diagnostic log without ever recording the pipe path or an environment value.
@@ -291,11 +300,32 @@ export async function startApp(
       }),
       readiness: () => desktopInteractivePreflight.check(),
     });
+    const capabilityTimeline = new CapabilityTimeline();
     const capabilityNegotiator = new CapabilityNegotiator({
       desktop: desktopProvider,
       standalone: new StandaloneCapabilityProvider(context.codexAppServerBackend),
+      timeline: capabilityTimeline,
+      desktopState: () => desktopSyncObserver.getState(),
+      desktopPipeResolver: desktopToolsPipeResolver,
+      workspaceId: context.registry.active.id,
+    });
+    doctorRunner = new DoctorRunner({
+      settings,
+      workspace: context.registry.active,
+      desktopState: () => desktopSyncObserver.getState(),
+      handoff: desktopToolsPipeHandoff,
+      pipeResolver: desktopToolsPipeResolver,
+      capabilitySnapshot: () => capabilityNegotiator.snapshot(),
+      standaloneBackend: context.codexAppServerBackend,
+      runtimeRunning: true,
+      runtimeCheck: () => ({
+        running: true,
+        workspaceId: context.registry.active.id,
+        configurationLoaded: true,
+      }),
     });
     context.capabilityNegotiator = capabilityNegotiator;
+    context.capabilityTimeline = capabilityTimeline;
     context.goalPreflight?.setDesktopFallbackAvailable(() => true);
     context.executionService.bindInteractive(capabilityNegotiator);
     // The terminal listener was registered on the previous interactive backend; rebind it so the
@@ -326,6 +356,7 @@ export async function startApp(
       desktopToolsPipeHandoff,
       desktopCodexRuntimeFactory,
       desktopInteractivePreflight: () => desktopInteractivePreflight.check(),
+      doctorRunner,
     }, {
       oauthClientRegistryPath: options.oauthClientRegistryPath ?? workspaceOAuth?.clientRegistryPath,
       oauthTokenStorePath: options.oauthTokenStorePath
@@ -336,6 +367,7 @@ export async function startApp(
     });
     removeDesktopToolsPipeStateListener = desktopSyncObserver.onStateChanged?.((state) => {
       desktopToolsPipeHandoff.observeDesktopState(state);
+      context.capabilityNegotiator?.reconcileDesktopCapability(undefined, state);
     });
     try {
       const extensionDeliveries = context.extensionDeliveries;

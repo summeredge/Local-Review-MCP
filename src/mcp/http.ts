@@ -34,6 +34,7 @@ import {
   capabilityActionSchema,
   type CapabilityNegotiator,
 } from "../control-plane/capability-negotiation.js";
+import type { DoctorRunner } from "../diagnostic/doctor.js";
 import {
   APP_VERSION,
   DEFAULT_HOST,
@@ -53,6 +54,8 @@ export const LAUNCHER_SESSION_CATALOG_PATH = "/launcher/sessions";
 export const LAUNCHER_DESKTOP_SYNC_PATH = "/launcher/desktop-sync";
 export const LAUNCHER_DESKTOP_INTERACTIVE_PREFLIGHT_PATH = "/launcher/desktop-interactive";
 export const LAUNCHER_CAPABILITY_PATH = "/launcher/capability";
+export const LAUNCHER_CAPABILITY_TIMELINE_PATH = "/launcher/capability/timeline";
+export const LAUNCHER_DOCTOR_PATH = "/launcher/doctor";
 const SAFE_OAUTH_STORAGE_PATH = "oauth/clients.json";
 
 type HttpStatusQuery = NonNullable<McpRuntimeContext["statusQuery"]> & {
@@ -78,8 +81,9 @@ type HttpRuntimeContext = Omit<McpRuntimeContext, "statusQuery"> & {
   readonly desktopInteractivePreflight?: () => DesktopInteractiveReadiness;
   readonly capabilityNegotiator?: Pick<
     CapabilityNegotiator,
-    "snapshot" | "currentSnapshot" | "recheckDesktop" | "selectStandalone"
+    "snapshot" | "currentSnapshot" | "recheckDesktop" | "selectStandalone" | "timeline"
   >;
+  readonly doctorRunner?: Pick<DoctorRunner, "run">;
   readonly statusQuery?: HttpStatusQuery;
   readonly tunnel?: Pick<TunnelProvider, "status">;
 };
@@ -458,6 +462,96 @@ async function handleLauncherCapabilityRequest(
     return;
   }
   sendJson(response, 200, snapshot, { "cache-control": "no-store" });
+}
+
+async function handleLauncherCapabilityTimelineRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: HttpRuntimeContext,
+  authToken: string,
+): Promise<void> {
+  if (!isDirectLoopbackRequest(request)) {
+    request.resume();
+    sendJson(response, 404, { error: "not_found" });
+    return;
+  }
+  if (!isAuthenticated(request, authToken)) {
+    request.resume();
+    sendUnauthorized(response);
+    return;
+  }
+  const negotiator = context.capabilityNegotiator;
+  if (negotiator === undefined) {
+    request.resume();
+    sendJson(response, 503, { error: "capability_negotiation_unavailable" });
+    return;
+  }
+  if (request.method !== "GET") {
+    request.resume();
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+  const params = requestSearchParams(request);
+  const requestedExecutionId = params.get("execution_id");
+  const executionId = requestedExecutionId === null
+    ? undefined
+    : requestedExecutionId === "current"
+      ? negotiator.currentSnapshot()?.execution_id
+      : requestedExecutionId;
+  if (requestedExecutionId === "current" && executionId === undefined) {
+    request.resume();
+    sendJson(response, 404, { error: "capability_execution_unavailable" });
+    return;
+  }
+  if (executionId !== undefined && !executionIdSchema.safeParse(executionId).success) {
+    request.resume();
+    sendJson(response, 400, { error: "capability_execution_invalid" });
+    return;
+  }
+  if (executionId !== undefined && negotiator.snapshot(executionId) === null) {
+    request.resume();
+    sendJson(response, 404, { error: "capability_execution_unavailable" });
+    return;
+  }
+  const rawLimit = params.get("limit");
+  const limit = rawLimit === null ? undefined : Number(rawLimit);
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000)) {
+    request.resume();
+    sendJson(response, 400, { error: "capability_timeline_limit_invalid" });
+    return;
+  }
+  request.resume();
+  sendJson(response, 200, { events: negotiator.timeline(executionId, limit) }, { "cache-control": "no-store" });
+}
+
+async function handleLauncherDoctorRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: HttpRuntimeContext,
+  authToken: string,
+): Promise<void> {
+  request.resume();
+  if (!isDirectLoopbackRequest(request)) {
+    sendJson(response, 404, { error: "not_found" });
+    return;
+  }
+  if (!isAuthenticated(request, authToken)) {
+    sendUnauthorized(response);
+    return;
+  }
+  if (request.method !== "GET") {
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+  if (context.doctorRunner === undefined) {
+    sendJson(response, 503, { error: "doctor_unavailable" });
+    return;
+  }
+  try {
+    sendJson(response, 200, await context.doctorRunner.run(), { "cache-control": "no-store" });
+  } catch {
+    sendJson(response, 500, { error: "doctor_failed" });
+  }
 }
 
 async function handleLauncherDesktopToolsPipeRequest(
@@ -1148,6 +1242,16 @@ export function createHttpServer(
 
       if (path === LAUNCHER_CAPABILITY_PATH) {
         await handleLauncherCapabilityRequest(request, response, context, settings.auth.token);
+        return;
+      }
+
+      if (path === LAUNCHER_CAPABILITY_TIMELINE_PATH) {
+        await handleLauncherCapabilityTimelineRequest(request, response, context, settings.auth.token);
+        return;
+      }
+
+      if (path === LAUNCHER_DOCTOR_PATH) {
+        await handleLauncherDoctorRequest(request, response, context, settings.auth.token);
         return;
       }
 

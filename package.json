@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "bin": {
+    "lrm": "dist/src/cli.js",
     "local-review-mcp": "dist/src/cli.js"
   },
   "scripts": {
