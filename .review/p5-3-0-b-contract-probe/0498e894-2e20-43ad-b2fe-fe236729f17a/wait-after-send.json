@@ -1,9 +1,0 @@
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "{\"timedOut\":false,\"wake\":{\"reason\":\"turnCompleted\",\"turnId\":\"01a0bd38-a0e0-73d1-a85e-a23590bc2196\",\"threadId\":\"01a0bd38-8001-78d1-95ab-eeb145798bb4\",\"hostId\":\"local\"},\"polls\":[{\"schemaVersion\":1,\"cursor\":\"21895e23-2a20-45b8-9ae4-45afa3b08deb:2\",\"revision\":2,\"changed\":true,\"thread\":{\"id\":\"01a0bd38-8001-78d1-95ab-eeb145798bb4\",\"hostId\":\"local\",\"status\":{\"type\":\"idle\"}},\"latestTurn\":{\"id\":\"01a0bd38-a0e0-73d1-a85e-a23590bc2196\",\"status\":\"completed\",\"error\":null,\"startedAt\":1789881000,\"completedAt\":1789881004,\"durationMs\":4356},\"latestAssistantMessageId\":\"msg_0c3861581740b532016aaf6aac13e887d09913aa60385ef99c\",\"latestAssistantMessage\":{\"id\":\"msg_0c3861581740b532016aaf6aac13e887d09913aa60385ef99c\",\"turnId\":\"01a0bd38-a0e0-73d1-a85e-a23590bc2196\",\"phase\":\"final_answer\",\"text\":\"LRM_P530B_TURN_B_0498e894-2e20-43ad-b2fe-fe236729f17a\"},\"latestToolMarkerId\":null,\"latestToolMarker\":null}]}"
-    }
-  ],
-  "isError": false
-}

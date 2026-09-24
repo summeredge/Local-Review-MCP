@@ -1,2 +1,0 @@
-{"timestamp":"2026-09-22T01:32:45.057Z","phase":"hook_started","pid":46728,"ppid":44412,"pipe_env_present":true}
-{"timestamp":"2026-09-22T01:32:45.275Z","phase":"hook_finished","pid":46728,"ppid":44412,"pipe_env_present":true,"handoff_status":"handoff_accepted","exit_status":0}

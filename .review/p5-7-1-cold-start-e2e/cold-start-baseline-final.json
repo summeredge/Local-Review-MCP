@@ -1,8 +1,0 @@
-{
-  "at": "2026-09-22T04:41:34.3301093Z",
-  "phase": "cold-start-baseline-final",
-  "interactive": "{\"ready\":false,\"reason\":\"desktop_tools_pipe_unavailable\",\"pipeSource\":null}",
-  "sync": "{\"mode\":\"auto\",\"activeSource\":\"desktop_ipc\",\"connected\":true,\"currentConversationId\":\"01a0c718-a783-7bb0-a4da-f1fc340d4346\",\"following\":true,\"followingThreads\":[\"01a0c718-a783-7bb0-a4da-f1fc340d4346\"],\"ownerClientId\":\"a2f73fe0-164d-4ea7-95c4-cfb9bfa1313b\",\"lastEventTime\":\"2026-09-22T04:38:56.218Z\",\"fallbackReason\":null,\"associationStatus\":\"unmatched\",\"associationReason\":null,\"sessionId\":null,\"goalId\":null,\"taskId\":null,\"executionId\":null,\"threadId\":null}",
-  "probe": "HTTP 409 \r\n{\r\n  \"connected\": false,\r\n  \"error\": \"desktop_tools_pipe_unavailable\"\r\n}",
-  "runtimePid": 54036
-}

@@ -7,7 +7,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
-// P5.8.0 Desktop bootstrap trampoline (experiment branch only, see tools/desktop-bootstrap-trampoline).
+// P5.8 Desktop bootstrap trampoline (see tools/desktop-bootstrap-trampoline and docs/p5.8-desktop-capability-activation-bootstrap.md).
 //
 // Launched by the Codex Desktop backend through CODEX_CLI_PATH. It captures the inherited
 // CODEX_APP_TOOLS_PIPE_PATH, optionally hands that capability to the local LRM launcher, then

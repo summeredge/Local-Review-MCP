@@ -1,9 +1,0 @@
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "{\"timedOut\":false,\"wake\":{\"reason\":\"turnCompleted\",\"turnId\":\"01a0c1c7-924a-7bb0-ad97-17cd5f9cfb9a\",\"threadId\":\"01a0c1c7-90bc-7b61-856b-f21fc80bcf22\",\"hostId\":\"local\"},\"polls\":[{\"schemaVersion\":1,\"cursor\":\"58943834-d55b-460d-8360-985fb6b6806e:2\",\"revision\":2,\"changed\":true,\"thread\":{\"id\":\"01a0c1c7-90bc-7b61-856b-f21fc80bcf22\",\"hostId\":\"local\",\"status\":{\"type\":\"idle\"}},\"latestTurn\":{\"id\":\"01a0c1c7-924a-7bb0-ad97-17cd5f9cfb9a\",\"status\":\"completed\",\"error\":null,\"startedAt\":1789957476,\"completedAt\":1789957486,\"durationMs\":9346},\"latestAssistantMessageId\":\"msg_2ddb6086fcc14266b8a57bbdf7ab57d1\",\"latestAssistantMessage\":{\"id\":\"msg_2ddb6086fcc14266b8a57bbdf7ab57d1\",\"turnId\":\"01a0c1c7-924a-7bb0-ad97-17cd5f9cfb9a\",\"phase\":\"final_answer\",\"text\":\"LRM_P530B_TURN_B_7b696fc3-3210-4f07-9c54-a0ec4b4cd926\"},\"latestToolMarkerId\":null,\"latestToolMarker\":null}]}"
-    }
-  ],
-  "isError": false
-}
