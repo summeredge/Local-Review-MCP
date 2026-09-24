@@ -237,7 +237,18 @@ export async function startApp(
         },
     workspaceId: context.registry.active.id,
   });
-  const desktopToolsPipeHandoff = new DesktopToolsPipeHandoff();
+  const desktopToolsPipeHandoff = new DesktopToolsPipeHandoff(undefined, (event) => {
+    writeRuntimeDiagnostic(runtimeDiagnosticLogger, {
+      event: "desktop_tools_pipe_lifecycle",
+      timestamp: event.timestamp,
+      state: event.state,
+      ...(event.pendingRegisteredAt === undefined ? {} : { pending_registered_at: event.pendingRegisteredAt }),
+      ...(event.ownerBindingAt === undefined ? {} : { owner_binding_at: event.ownerBindingAt }),
+      ...(event.promotionAt === undefined ? {} : { promotion_at: event.promotionAt }),
+      ...(event.expiresAt === undefined ? {} : { expires_at: event.expiresAt }),
+      ...(event.discardReason === undefined ? {} : { discard_reason: event.discardReason }),
+    });
+  });
   const desktopCodexRuntimeFactory = new DesktopCodexRuntimeFactory(
     desktopToolsPipeHandoff,
     () => desktopSyncObserver.getState(),

@@ -85,19 +85,28 @@ class LauncherLogTests(unittest.TestCase):
             window._render_status(LauncherStatus(
                 True, True, True,
                 desktop_sync=connected_desktop,
-                desktop_capability=DesktopCapabilityStatus(ready=True, pipe_source="handoff"),
+                desktop_capability=DesktopCapabilityStatus(ready=True, pipe_source="handoff", pipe_state="active"),
             ))
             self.assertIn("Connected", window.desktop_sync_status.text())
             self.assertIn("Mode: Auto", window.desktop_sync_status.text())
             self.assertIn("Source: Desktop IPC", window.desktop_sync_status.text())
             self.assertIn("Conversation: conversation-1", window.desktop_sync_status.text())
             self.assertIn("Following: Yes", window.desktop_sync_status.text())
-            self.assertIn("Desktop Capability: Ready", window.desktop_sync_status.text())
-            self.assertIn("Source: handoff", window.desktop_sync_status.text())
+            self.assertIn("Desktop IPC: Connected", window.desktop_sync_status.text())
+            self.assertIn("Desktop Identity: Ready", window.desktop_sync_status.text())
+            self.assertIn("Tools Pipe: Active", window.desktop_sync_status.text())
+            self.assertIn("Capability: pipeSource=handoff", window.desktop_sync_status.text())
 
-            window._render_status(LauncherStatus(True, True, True, desktop_sync=connected_desktop))
-            self.assertIn("Desktop Capability: Unavailable", window.desktop_sync_status.text())
-            self.assertIn("Source: none", window.desktop_sync_status.text())
+            window._render_status(LauncherStatus(
+                True,
+                True,
+                True,
+                desktop_sync=replace(connected_desktop, owner_client_id=None),
+                desktop_capability=DesktopCapabilityStatus(pipe_state="pending"),
+            ))
+            self.assertIn("Desktop Identity: Waiting for activation", window.desktop_sync_status.text())
+            self.assertIn("Tools Pipe: Pending", window.desktop_sync_status.text())
+            self.assertIn("Capability: Waiting for Desktop activation", window.desktop_sync_status.text())
 
             unmatched = replace(connected_desktop, association_status="unmatched")
             window._render_status(LauncherStatus(True, True, True, desktop_sync=unmatched))
@@ -118,7 +127,10 @@ class LauncherLogTests(unittest.TestCase):
             self.assertEqual(window.desktop_sync_status.text(),
                              "Unavailable\nMode: Auto\nSource: Legacy app-server\n"
                              "Reason: Desktop unavailable\n\n"
-                             "Desktop Capability: Unavailable\nSource: none")
+                             "Desktop IPC: Disconnected\n"
+                             "Desktop Identity: Unavailable\n"
+                             "Tools Pipe: Unavailable\n"
+                             "Capability: Unavailable")
 
             evidence_unavailable = replace(
                 fallback,
@@ -135,7 +147,10 @@ class LauncherLogTests(unittest.TestCase):
             self.assertEqual(window.desktop_sync_status.text(),
                              "Unavailable\nMode: Auto\nSource: Legacy app-server\n"
                              "Reason: Desktop unavailable\n\n"
-                             "Desktop Capability: Unavailable\nSource: none")
+                             "Desktop IPC: Disconnected\n"
+                             "Desktop Identity: Unavailable\n"
+                             "Tools Pipe: Unavailable\n"
+                             "Capability: Unavailable")
             for state, reason in (("extension_not_paired", "Extension is not paired."),
                                   ("extension_not_present", "Extension is not connected.")):
                 browser = BrowserReadiness(False, state, True, state == "extension_not_present", False,

@@ -52,6 +52,28 @@ describe("Desktop SessionStart Runner", () => {
     expect(logged).toEqual(["handoff_accepted"]);
   });
 
+  it("reports handoff_pending when the host stores the pipe before owner binding", async () => {
+    const logged: DesktopSessionStartHandoffStatus[] = [];
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: async () => ({
+        accepted: false,
+        pending: true,
+        source: "desktop_environment",
+        received_at: "2026-09-21T01:00:00.000Z",
+        desktop_owner_bound: false,
+      }),
+    });
+    const status = await runDesktopSessionStartHandoff(["--config", "config.production.json"], {
+      environment: { CODEX_APP_TOOLS_PIPE_PATH: VALID_PIPE },
+      fetch: fetchMock,
+      logStatus: (s) => logged.push(s),
+    });
+    expect(status).toBe("handoff_pending");
+    expect(logged).toEqual(["handoff_pending"]);
+  });
+
   it("exits with handoff_rejected when host responds with non-ok error", async () => {
     const logged: DesktopSessionStartHandoffStatus[] = [];
     const fetchMock = vi.fn().mockResolvedValue({

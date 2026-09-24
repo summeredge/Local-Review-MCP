@@ -54,20 +54,25 @@ derived state in memory.
 
 ## Desktop Capability status
 
-The same overview block shows the Desktop codex_app capability separately, read
-from the runtime's existing `/launcher/desktop-interactive` preflight:
+The same overview block shows the Desktop IPC transport, Desktop identity, and
+codex_app tools pipe separately. They are read from the runtime's existing
+authenticated status endpoints:
 
 ```text
-Desktop Capability: Ready       |  Desktop Capability: Unavailable
-Source: handoff                 |  Source: none
+Desktop IPC: Connected          |  Desktop IPC: Disconnected
+Desktop Identity: Ready         |  Desktop Identity: Waiting for activation
+Tools Pipe: Active              |  Tools Pipe: Pending / Unavailable
+Capability: pipeSource=handoff  |  Capability: Waiting for Desktop activation
 ```
 
-It is not the Desktop IPC connection: the observer can be connected while no
-tools pipe has ever been handed to the runtime, and only a ready capability
-(`handoff`, or the runtime's own `current_environment` fallback) satisfies the
-preflight that `desktop_codex_app` execution needs. The block refreshes with the
-same five-second status worker as Desktop Sync and is read-only: the launcher
-never acquires a capability, posts a handoff, or reads the named pipe.
+Desktop IPC is the loopback socket transport. Desktop Identity is ready only
+when the observer has a non-empty `ownerClientId`. Tools Pipe is the handoff
+lifecycle (`Active`, `Pending`, or `Unavailable`), without exposing a pipe path.
+Only a ready capability (`handoff`, or the runtime's own `current_environment`
+fallback) satisfies the preflight that `desktop_codex_app` execution needs. The
+block refreshes with the same five-second status worker as Desktop Sync and is
+read-only: the launcher never acquires a capability, posts a handoff, or reads
+the named pipe.
 
 ## Dashboard
 

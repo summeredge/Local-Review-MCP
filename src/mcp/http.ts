@@ -23,6 +23,7 @@ import {
   DesktopToolsPipeHandoffError,
   LAUNCHER_DESKTOP_TOOLS_PIPE_PATH,
   LAUNCHER_DESKTOP_TOOLS_PIPE_PROBE_PATH,
+  type DesktopToolsPipeHandoffState,
 } from "../desktop-codex/desktop-tools-pipe-handoff.js";
 import {
   probeDesktopToolsPipe,
@@ -312,6 +313,7 @@ async function handleLauncherDesktopInteractivePreflightRequest(
       ready: false,
       reason: "desktop_tools_pipe_unavailable",
       pipeSource: null,
+      pipeState: "unavailable" satisfies DesktopToolsPipeHandoffState,
     }, { "cache-control": "no-store" });
     return;
   }
@@ -321,11 +323,21 @@ async function handleLauncherDesktopInteractivePreflightRequest(
   } catch {
     readiness = { ready: false, reason: "desktop_tools_pipe_unavailable" };
   }
+  let pipeState: DesktopToolsPipeHandoffState = readiness.ready ? "active" : "unavailable";
+  if (!readiness.ready && context.desktopToolsPipeHandoff !== undefined) {
+    try {
+      const state = context.desktopSyncObserver?.getState();
+      if (state !== undefined) pipeState = context.desktopToolsPipeHandoff.stateFor(state);
+    } catch {
+      pipeState = "unavailable";
+    }
+  }
   // The pipe path itself is never returned; only the resolution source is observable.
   sendJson(response, 200, {
     ready: readiness.ready,
     reason: readiness.reason ?? null,
     pipeSource: readiness.pipeSource ?? null,
+    pipeState,
   }, { "cache-control": "no-store" });
 }
 
@@ -373,15 +385,23 @@ async function handleLauncherDesktopToolsPipeRequest(
     state = undefined;
   }
   const ownerClientId = state?.connected ? state.ownerClientId : undefined;
-  if (context.desktopToolsPipeHandoff === undefined
-    || state?.connected !== true
-    || typeof ownerClientId !== "string"
-    || ownerClientId.trim() === "") {
+  if (context.desktopToolsPipeHandoff === undefined || state?.connected !== true) {
     sendJson(response, 409, { error: "desktop_tools_pipe_unavailable" });
     return;
   }
 
   try {
+    if (typeof ownerClientId !== "string" || ownerClientId.trim() === "") {
+      const pending = context.desktopToolsPipeHandoff.stagePending((body as { pipePath: string }).pipePath);
+      sendJson(response, 202, {
+        accepted: false,
+        pending: true,
+        source: "desktop_environment",
+        received_at: pending.receivedAt,
+        desktop_owner_bound: false,
+      }, { "cache-control": "no-store" });
+      return;
+    }
     const capability = context.desktopToolsPipeHandoff.accept(
       (body as { pipePath: string }).pipePath,
       ownerClientId,

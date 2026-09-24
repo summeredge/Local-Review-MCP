@@ -9,6 +9,7 @@ import type { ResolvedSettings } from "../src/config/settings.js";
 import {
   DesktopToolsPipeHandoff,
   DesktopToolsPipeHandoffError,
+  type DesktopToolsPipeHandoffLifecycleEvent,
   MAX_DESKTOP_TOOLS_PIPE_PATH_LENGTH,
   sendDesktopToolsPipeHandoff,
   validateDesktopToolsPipePath,
@@ -128,6 +129,80 @@ describe("Desktop tools pipe handoff", () => {
     expect(new DesktopToolsPipeHandoff().pipePathFor(connectedState())).toBeUndefined();
   });
 
+  it("keeps a cold-start handoff pending until Desktop IPC supplies an owner", () => {
+    let now = "2026-09-20T01:00:00.000Z";
+    const lifecycle: DesktopToolsPipeHandoffLifecycleEvent[] = [];
+    const handoff = new DesktopToolsPipeHandoff(() => now, (event) => lifecycle.push(event));
+    const ownerlessState: DesktopSyncState = { connected: true, followingThreads: new Set() };
+
+    handoff.observeDesktopState(ownerlessState);
+    const pending = handoff.stagePending(PIPE);
+    expect(pending).toMatchObject({
+      pipePath: PIPE,
+      receivedAt: now,
+      provenance: "authenticated_loopback",
+      expiresAt: "2026-09-20T01:00:45.000Z",
+    });
+    expect(handoff.pipePathFor(ownerlessState)).toBeUndefined();
+    expect(handoff.stateFor(ownerlessState)).toBe("pending");
+    expect(handoff.hasAcceptedCapability()).toBe(false);
+
+    now = "2026-09-20T01:00:01.000Z";
+    handoff.observeDesktopState(connectedState());
+    expect(handoff.pipePathFor(connectedState())).toBe(PIPE);
+    expect(handoff.stateFor(connectedState())).toBe("active");
+    expect(handoff.hasAcceptedCapability()).toBe(true);
+    expect(lifecycle).toEqual([
+      {
+        state: "pending_registered",
+        timestamp: "2026-09-20T01:00:00.000Z",
+        pendingRegisteredAt: "2026-09-20T01:00:00.000Z",
+        expiresAt: "2026-09-20T01:00:45.000Z",
+      },
+      {
+        state: "owner_bound",
+        timestamp: "2026-09-20T01:00:01.000Z",
+        pendingRegisteredAt: "2026-09-20T01:00:00.000Z",
+        ownerBindingAt: "2026-09-20T01:00:01.000Z",
+      },
+      {
+        state: "promoted",
+        timestamp: "2026-09-20T01:00:01.000Z",
+        pendingRegisteredAt: "2026-09-20T01:00:00.000Z",
+        ownerBindingAt: "2026-09-20T01:00:01.000Z",
+        promotionAt: "2026-09-20T01:00:01.000Z",
+      },
+    ]);
+  });
+
+  it("discards a pending handoff after its TTL or a Desktop disconnect", () => {
+    let now = "2026-09-20T01:00:00.000Z";
+    const handoff = new DesktopToolsPipeHandoff(() => now);
+    const ownerlessState: DesktopSyncState = { connected: true, followingThreads: new Set() };
+
+    handoff.observeDesktopState(ownerlessState);
+    handoff.stagePending(PIPE);
+    now = "2026-09-20T01:00:45.000Z";
+    handoff.observeDesktopState(connectedState());
+    expect(handoff.pipePathFor(connectedState())).toBeUndefined();
+    expect(handoff.stateFor(connectedState())).toBe("unavailable");
+    expect(handoff.hasAcceptedCapability()).toBe(false);
+
+    handoff.stagePending(PIPE);
+    handoff.observeDesktopState({ connected: false, followingThreads: new Set() });
+    handoff.observeDesktopState(connectedState());
+    expect(handoff.pipePathFor(connectedState())).toBeUndefined();
+  });
+
+  it("does not promote pending evidence across an observed owner change", () => {
+    const handoff = new DesktopToolsPipeHandoff();
+    handoff.observeDesktopState(connectedState("desktop-instance-1"));
+    handoff.stagePending(PIPE);
+    handoff.observeDesktopState(connectedState("desktop-instance-2"));
+    expect(handoff.pipePathFor(connectedState("desktop-instance-2"))).toBeUndefined();
+    expect(handoff.hasAcceptedCapability()).toBe(false);
+  });
+
   it("permanently invalidates a capability after disconnect and owner changes", () => {
     const handoff = new DesktopToolsPipeHandoff();
     handoff.accept(PIPE, OWNER);
@@ -239,9 +314,77 @@ describe("Desktop tools pipe handoff", () => {
     });
     expect(JSON.stringify(result)).not.toContain(PIPE);
   });
+
+  it("recognizes a pending sender response without treating it as owner-bound", async () => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({
+      accepted: false,
+      pending: true,
+      source: "desktop_environment",
+      received_at: "2026-09-20T01:00:00.000Z",
+      desktop_owner_bound: false,
+      pipePath: PIPE,
+    }), { status: 202 }));
+    const result = await sendDesktopToolsPipeHandoff(settings("C:\\workspace"), {
+      environment: { CODEX_APP_TOOLS_PIPE_PATH: PIPE },
+      fetch,
+    });
+    expect(result).toEqual({
+      accepted: false,
+      pending: true,
+      source: "desktop_environment",
+      received_at: "2026-09-20T01:00:00.000Z",
+      desktop_owner_bound: false,
+    });
+    expect(JSON.stringify(result)).not.toContain(PIPE);
+  });
 });
 
 describe("Desktop tools pipe launcher endpoints", () => {
+  it("registers a cold-start pipe as pending and promotes it after owner binding", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-tools-pipe-pending-"));
+    temporaryDirectories.push(workspace);
+    let state: DesktopSyncState = { connected: true, followingThreads: new Set() };
+    const handoff = new DesktopToolsPipeHandoff(() => "2026-09-20T01:00:00.000Z");
+    const calls: string[] = [];
+    const server = createHttpServer(settings(workspace), {
+      registry: new WorkspaceRegistry([{ id: "tools-pipe-pending", name: "Tools Pipe Pending", path: workspace }]),
+      desktopSyncObserver: { getState: () => state },
+      desktopToolsPipeHandoff: handoff,
+      desktopCodexRuntimeFactory: new DesktopCodexRuntimeFactory(
+        handoff,
+        () => state,
+        async () => fakeRuntime(calls),
+      ),
+    });
+    runningServers.push(server);
+    const port = await listen(server);
+    const handoffUrl = `http://127.0.0.1:${port}${LAUNCHER_DESKTOP_TOOLS_PIPE_PATH}`;
+    const probeUrl = `http://127.0.0.1:${port}${LAUNCHER_DESKTOP_TOOLS_PIPE_PROBE_PATH}`;
+    const headers = { authorization: "Bearer test-token", "content-type": "application/json" };
+
+    const pending = await fetch(handoffUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ pipePath: PIPE }),
+    });
+    expect(pending.status).toBe(202);
+    await expect(pending.json()).resolves.toEqual({
+      accepted: false,
+      pending: true,
+      source: "desktop_environment",
+      received_at: "2026-09-20T01:00:00.000Z",
+      desktop_owner_bound: false,
+    });
+    expect(handoff.pipePathFor(state)).toBeUndefined();
+
+    state = connectedState();
+    handoff.observeDesktopState(state);
+    const probe = await fetch(probeUrl, { method: "POST", headers });
+    expect(probe.status).toBe(200);
+    await expect(probe.json()).resolves.toMatchObject({ connected: true, pipeSource: "handoff" });
+    expect(calls).toEqual(["tools/list"]);
+  });
+
   it("requires loopback, static auth, POST, and never returns the pipe", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-tools-pipe-http-"));
     temporaryDirectories.push(workspace);

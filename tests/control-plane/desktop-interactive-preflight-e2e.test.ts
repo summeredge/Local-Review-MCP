@@ -309,6 +309,7 @@ describe("production interactive Desktop preflight", () => {
       ready: false,
       reason: "desktop_tools_pipe_unavailable",
       pipeSource: null,
+      pipeState: "unavailable",
     });
     expect(JSON.stringify(body)).not.toContain(PIPE_PREFIX);
 
@@ -331,6 +332,7 @@ describe("production interactive Desktop preflight", () => {
       ready: true,
       reason: null,
       pipeSource: "handoff",
+      pipeState: "active",
     });
   });
 });
