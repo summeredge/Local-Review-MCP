@@ -144,6 +144,8 @@ export interface GoalPreflightServiceOptions {
    * only way this preflight can observe a blocked Desktop tools pipe capability.
    */
   readonly desktopReadiness?: () => DesktopInteractiveReadiness;
+  /** Interactive Goals may continue while the negotiator waits for Desktop or selects standalone. */
+  readonly desktopFallbackAvailable?: () => boolean;
   /**
    * Bounded wait window for a Desktop capability that is still being handed off. It only applies
    * to `desktop_tools_pipe_unavailable`; every other reason keeps failing immediately.
@@ -341,6 +343,7 @@ const DESKTOP_FAILURE_REASONS: Record<DesktopInteractiveBlockReason, string> = {
 export class GoalPreflightService {
   private readonly runtimeReadyCheck: GoalPreflightServiceOptions["runtimeReady"];
   private desktopReadinessCheck: GoalPreflightServiceOptions["desktopReadiness"];
+  private desktopFallbackAvailable: GoalPreflightServiceOptions["desktopFallbackAvailable"];
   private readonly desktopReadyTimeoutMs: number | undefined;
   private desktopWaitReporter: GoalPreflightServiceOptions["onDesktopWait"];
   private readonly connectorCheck: GoalPreflightConnectorCheck;
@@ -355,6 +358,7 @@ export class GoalPreflightService {
     const storageRoot = options.storageRoot ?? defaultTaskContextStorageRoot();
     this.runtimeReadyCheck = options.runtimeReady;
     this.desktopReadinessCheck = options.desktopReadiness;
+    this.desktopFallbackAvailable = options.desktopFallbackAvailable;
     this.desktopReadyTimeoutMs = options.desktopReadyTimeoutMs;
     this.desktopWaitReporter = options.onDesktopWait;
     this.connectorCheck = options.diagnoseConnector
@@ -378,6 +382,12 @@ export class GoalPreflightService {
    */
   public setDesktopReadiness(check: GoalPreflightServiceOptions["desktopReadiness"]): void {
     this.desktopReadinessCheck = check;
+  }
+
+  public setDesktopFallbackAvailable(
+    check: GoalPreflightServiceOptions["desktopFallbackAvailable"],
+  ): void {
+    this.desktopFallbackAvailable = check;
   }
 
   /**
@@ -432,22 +442,25 @@ export class GoalPreflightService {
     result = goalPreflightResultSchema.parse({ ...result, runtime: { ready: runtimeReady } });
     if (!runtimeReady) return fail(result, "runtime", "Runtime is not ready");
 
-    // The interactive Desktop route needs a Desktop-owned pipe capability before any
-    // Goal/Task/Execution exists. Check it here so a blocked capability is a queryable preflight
-    // result instead of a failure that only appears after the Goal already started.
+    // Observe the interactive Desktop route before Goal creation. Without a fallback provider a
+    // blocked capability remains a fail-closed preflight result; the P5.9 negotiator may instead
+    // carry the same evidence into its bounded Desktop/standalone selection.
     if (parsed.execution_mode === "interactive") {
       const check = this.desktopReadinessCheck;
+      const fallbackAvailable = this.desktopFallbackAvailable?.() === true;
       // An unbound check can never become ready, so it keeps failing closed without waiting.
       const readiness = check === undefined
         ? { ready: false as const, reason: "desktop_tools_pipe_unavailable" as const }
-        : await waitForDesktopReady(check, {
-          timeoutMs: this.desktopReadyTimeoutMs,
-          now: this.now,
-          wait: this.sleep,
-          ...(this.desktopWaitReporter === undefined ? {} : { observe: this.desktopWaitReporter }),
-        });
+        : fallbackAvailable
+          ? check()
+          : await waitForDesktopReady(check, {
+              timeoutMs: this.desktopReadyTimeoutMs,
+              now: this.now,
+              wait: this.sleep,
+              ...(this.desktopWaitReporter === undefined ? {} : { observe: this.desktopWaitReporter }),
+            });
       result = goalPreflightResultSchema.parse({ ...result, desktop: desktopState(readiness) });
-      if (!readiness.ready) {
+      if (!readiness.ready && !fallbackAvailable) {
         return fail(
           result,
           "desktop",

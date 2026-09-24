@@ -43,7 +43,7 @@ Legacy app-server Fallback
   → exposes no guessed Desktop identity; existing LRM Session.thread_id remains authoritative
 
 Codex execution
-  always uses Codex app-server
+  uses the Desktop capability first, then the standalone app-server fallback
 ```
 
 A connected Desktop conversation whose exact `conversationId` matches no LRM
@@ -56,7 +56,8 @@ derived state in memory.
 
 The same overview block shows the Desktop IPC transport, Desktop identity, and
 codex_app tools pipe separately. They are read from the runtime's existing
-authenticated status endpoints:
+authenticated status endpoints. P5.9 also exposes the negotiated execution
+capability and user actions:
 
 ```text
 Desktop IPC: Connected          |  Desktop IPC: Disconnected
@@ -71,8 +72,11 @@ lifecycle (`Active`, `Pending`, or `Unavailable`), without exposing a pipe path.
 Only a ready capability (`handoff`, or the runtime's own `current_environment`
 fallback) satisfies the preflight that `desktop_codex_app` execution needs. The
 block refreshes with the same five-second status worker as Desktop Sync and is
-read-only: the launcher never acquires a capability, posts a handoff, or reads
-the named pipe.
+read-only with respect to the Desktop pipe: the launcher never reads the named
+pipe or posts a handoff. When the capability state is `desktop_failed`, the
+launcher can request `recheck` for that execution or select the standalone
+app-server fallback. Recheck only reads the existing Desktop capability again;
+it never posts a new handoff or triggers SessionStart.
 
 ## Dashboard
 

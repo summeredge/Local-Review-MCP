@@ -27,6 +27,7 @@ from config_manager import LauncherConfig
 from gui import LauncherState, LauncherWindow
 from status_checker import (
     BrowserReadiness,
+    CapabilityStatus,
     DesktopCapabilityStatus,
     DesktopSyncStatus,
     LauncherStatus,
@@ -86,7 +87,17 @@ class LauncherLogTests(unittest.TestCase):
                 True, True, True,
                 desktop_sync=connected_desktop,
                 desktop_capability=DesktopCapabilityStatus(ready=True, pipe_source="handoff", pipe_state="active"),
+                capability=CapabilityStatus(
+                    state="desktop_failed",
+                    source="desktop",
+                    reason="desktop_tools_pipe_unavailable",
+                    actions=("recheck", "standalone"),
+                    execution_id="execution-1",
+                    task_id="task-1",
+                    actuation_id="actuation-1",
+                ),
             ))
+            window._apply_controls(window._last_status)
             self.assertIn("Connected", window.desktop_sync_status.text())
             self.assertIn("Mode: Auto", window.desktop_sync_status.text())
             self.assertIn("Source: Desktop IPC", window.desktop_sync_status.text())
@@ -96,6 +107,20 @@ class LauncherLogTests(unittest.TestCase):
             self.assertIn("Desktop Identity: Ready", window.desktop_sync_status.text())
             self.assertIn("Tools Pipe: Active", window.desktop_sync_status.text())
             self.assertIn("Capability: pipeSource=handoff", window.desktop_sync_status.text())
+            self.assertIn("Execution: execution-1", window.capability_status.text())
+            self.assertIn("Source: Desktop", window.capability_status.text())
+            self.assertIn("State: desktop_failed", window.capability_status.text())
+            self.assertIn("recheck or choose Standalone", window.capability_status.text())
+            self.assertTrue(window.recheck_desktop_button.isEnabled())
+            self.assertTrue(window.standalone_button.isEnabled())
+
+            offline_status = LauncherStatus(False, False, False)
+            window._render_status(offline_status)
+            window._apply_controls(offline_status)
+            self.assertIn("State: unavailable", window.capability_status.text())
+            self.assertIn("MCP capability unavailable", window.capability_status.text())
+            self.assertFalse(window.recheck_desktop_button.isEnabled())
+            self.assertFalse(window.standalone_button.isEnabled())
 
             window._render_status(LauncherStatus(
                 True,

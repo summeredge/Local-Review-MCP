@@ -563,6 +563,9 @@ export class ControlledActuationService {
     try {
       const request: ExecutionBackendStartRequest = {
         ...(authorization.goal_id === undefined ? {} : { goal_id: authorization.goal_id }),
+        ...(authorization.execution_mode === "interactive"
+          ? { actuation_id: authorization.actuation_id }
+          : {}),
         workspace_id: authorization.workspace_id,
         task_id: authorization.task_id,
         execution_id: authorization.execution_id,

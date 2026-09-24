@@ -40,6 +40,7 @@ from config_manager import (
 )
 from process_manager import ProductionProcessManager
 from status_checker import (
+    CapabilityStatus,
     DesktopCapabilityStatus,
     DesktopSyncStatus,
     LauncherStatus,
@@ -101,6 +102,9 @@ class LauncherWindow(QMainWindow):
         self.desktop_sync_status = QLabel("Unavailable")
         self.desktop_sync_status.setWordWrap(True)
         self.desktop_sync_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.capability_status = QLabel("Unavailable")
+        self.capability_status.setWordWrap(True)
+        self.capability_status.setTextFormat(Qt.TextFormat.PlainText)
         self.oauth_status_label = QLabel("Unavailable")
         self.oauth_status_label.setWordWrap(True)
         self.workspace_label = QLabel()
@@ -164,6 +168,10 @@ class LauncherWindow(QMainWindow):
         self.start_button = QPushButton("启动 MCP")
         self.stop_button = QPushButton("停止 MCP")
         self.refresh_button = QPushButton("刷新状态")
+        self.recheck_desktop_button = QPushButton("重新检查 Desktop")
+        self.standalone_button = QPushButton("使用 Standalone")
+        self.recheck_desktop_button.setEnabled(False)
+        self.standalone_button.setEnabled(False)
         self.refresh_oauth_button = QPushButton("Refresh OAuth Status")
         self.reset_oauth_button = QPushButton("Reset OAuth Clients")
         self.delete_oauth_button = QPushButton("删除 OAuth Client")
@@ -186,6 +194,8 @@ class LauncherWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_mcp)
         self.stop_button.clicked.connect(self.stop_mcp)
         self.refresh_button.clicked.connect(self.refresh_status)
+        self.recheck_desktop_button.clicked.connect(self.recheck_desktop_capability)
+        self.standalone_button.clicked.connect(self.select_standalone_capability)
         self.refresh_oauth_button.clicked.connect(self.refresh_oauth_status)
         self.reset_oauth_button.clicked.connect(self.reset_oauth_clients)
         self.delete_oauth_button.clicked.connect(self.delete_oauth_client)
@@ -216,6 +226,12 @@ class LauncherWindow(QMainWindow):
         overview_layout.addWidget(self._row("Remote Endpoint:", self.remote_status))
         overview_layout.addWidget(self._row("Browser:", self.browser_status))
         overview_layout.addWidget(self._row("Desktop Sync:", self.desktop_sync_status))
+        overview_layout.addWidget(self._row("Execution Capability:", self.capability_status))
+        capability_buttons = QHBoxLayout()
+        capability_buttons.addWidget(self.recheck_desktop_button)
+        capability_buttons.addWidget(self.standalone_button)
+        capability_buttons.addStretch()
+        overview_layout.addLayout(capability_buttons)
         overview_layout.addWidget(self._row("OAuth Status:", self.oauth_status_label))
         overview_layout.addWidget(self._row("Workspace:", self.workspace_label))
         top_actions = QWidget()
@@ -410,6 +426,34 @@ class LauncherWindow(QMainWindow):
         )
         desktop_sync = getattr(status, "desktop_sync", DesktopSyncStatus())
         desktop_capability = getattr(status, "desktop_capability", DesktopCapabilityStatus())
+        capability = getattr(status, "capability", CapabilityStatus())
+        capability_source = {
+            "desktop": "Desktop",
+            "standalone": "Standalone",
+        }.get(capability.source or "", "—")
+        capability_hint = {
+            "unavailable": "MCP capability unavailable.",
+            "initializing": "Waiting for the current execution capability.",
+            "desktop_pending": "Checking Desktop capability.",
+            "desktop_ready": "Desktop capability is ready.",
+            "desktop_failed": "Desktop capability unavailable; recheck or choose Standalone.",
+            "fallback_ready": "Standalone fallback selected.",
+            "fallback_running": "Standalone backend is running.",
+        }.get(capability.state, "Capability state unavailable.")
+        capability_lines = [
+            f"Execution: {capability.execution_id or '—'}",
+            f"Source: {capability_source}",
+            f"State: {capability.state}",
+            f"Hint: {capability_hint}",
+        ]
+        if capability.reason:
+            capability_lines.append(f"Reason: {capability.reason}")
+        self.capability_status.setText("\n".join(capability_lines))
+        self.capability_status.setStyleSheet(
+            "color: #16803c" if capability.state in {"desktop_ready", "fallback_running"}
+            else "color: #946200" if capability.state in {"initializing", "desktop_pending", "fallback_ready"}
+            else "color: #9b1c1c"
+        )
         # A connected Desktop IPC observer says nothing about the Desktop codex_app capability, so
         # the handoff state is always rendered separately instead of being read as the same thing.
         identity_state = (
@@ -791,6 +835,30 @@ class LauncherWindow(QMainWindow):
             and status.oauth_registry.client_count > 0
             and bool(status.oauth_registry.clients)
         )
+        capability = getattr(status, "capability", CapabilityStatus())
+        capability_actions = set(capability.actions)
+        capability_available = status.mcp_running and self.state not in (
+            LauncherState.STARTING,
+            LauncherState.STOPPING,
+        )
+        self.recheck_desktop_button.setEnabled(capability_available and "recheck" in capability_actions)
+        self.standalone_button.setEnabled(capability_available and "standalone" in capability_actions)
+
+    def recheck_desktop_capability(self) -> None:
+        execution_id = getattr(self._last_status.capability, "execution_id", None)
+        if self.status_checker.capability_action("recheck", execution_id):
+            self.message_label.setText("Desktop capability recheck requested.")
+            self.refresh_status()
+        else:
+            self._show_error("无法请求 Desktop capability 重新检查。")
+
+    def select_standalone_capability(self) -> None:
+        execution_id = getattr(self._last_status.capability, "execution_id", None)
+        if self.status_checker.capability_action("standalone", execution_id):
+            self.message_label.setText("Standalone fallback selected.")
+            self.refresh_status()
+        else:
+            self._show_error("无法选择 Standalone fallback。")
 
     def _set_state(self, state: LauncherState) -> None:
         self.state = state

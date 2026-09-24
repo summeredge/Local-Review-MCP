@@ -244,3 +244,26 @@ owner 完全匹配时作为已接收处理并记录 `ack_time`，保持已保存
 - Pattern-Key: browser-delivery-time-budget
 
 ---
+
+## [LRN-20260923-001] 全局 Skill 应安装到 CODEX_HOME 而不是项目目录
+
+**Priority**: medium
+**Status**: resolved
+**Area**: tools
+
+### 内容
+
+用户要求创建全局 Skill 时，目标应是 `C:\Users\shaoy\.codex\skills\<skill>`；
+项目工作区中的同名目录会把全局能力误分配为项目内容。
+
+### 建议修复
+
+创建 Skill 前先确认作用域：全局任务写入 `CODEX_HOME/skills`，项目专属能力才写入
+当前仓库；若作用域被更正，清理仓库中的占位目录后再继续。
+
+### 元数据
+
+- Source: correction
+- See Also: none
+
+---

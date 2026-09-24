@@ -21,6 +21,7 @@ LOCAL_SESSION_CATALOG_URL = "http://127.0.0.1:12080/launcher/sessions"
 LOCAL_BROWSER_READINESS_URL = "http://127.0.0.1:12080/launcher/readiness"
 LOCAL_DESKTOP_SYNC_URL = "http://127.0.0.1:12080/launcher/desktop-sync"
 LOCAL_DESKTOP_INTERACTIVE_URL = "http://127.0.0.1:12080/launcher/desktop-interactive"
+LOCAL_CAPABILITY_URL = "http://127.0.0.1:12080/launcher/capability"
 REMOTE_STATUS_URL = "https://review.syqiu.kdns.fr/.well-known/oauth-protected-resource"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 MAX_STATUS_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -175,6 +176,17 @@ class DesktopCapabilityStatus:
 
 
 @dataclass(frozen=True)
+class CapabilityStatus:
+    state: str = "unavailable"
+    source: str | None = None
+    reason: str | None = None
+    actions: tuple[str, ...] = ()
+    execution_id: str | None = None
+    task_id: str | None = None
+    actuation_id: str | None = None
+
+
+@dataclass(frozen=True)
 class LauncherStatus:
     mcp_running: bool
     tunnel_connected: bool
@@ -185,6 +197,7 @@ class LauncherStatus:
     browser: BrowserReadiness = BrowserReadiness()
     desktop_sync: DesktopSyncStatus = DesktopSyncStatus()
     desktop_capability: DesktopCapabilityStatus = DesktopCapabilityStatus()
+    capability: CapabilityStatus = CapabilityStatus()
 
 
 def _object(value: object, label: str) -> dict[str, object]:
@@ -427,6 +440,7 @@ class StatusChecker:
         browser_readiness_url: str = LOCAL_BROWSER_READINESS_URL,
         desktop_sync_url: str = LOCAL_DESKTOP_SYNC_URL,
         desktop_capability_url: str = LOCAL_DESKTOP_INTERACTIVE_URL,
+        capability_url: str = LOCAL_CAPABILITY_URL,
     ) -> None:
         self.auth_token = auth_token
         self.oauth_clients_url = oauth_clients_url
@@ -436,6 +450,7 @@ class StatusChecker:
         self.browser_readiness_url = browser_readiness_url
         self.desktop_sync_url = desktop_sync_url
         self.desktop_capability_url = desktop_capability_url
+        self.capability_url = capability_url
 
     def browser_readiness(self) -> BrowserReadiness:
         try:
@@ -643,6 +658,72 @@ class StatusChecker:
             )
         except StatusQueryError:
             return DesktopCapabilityStatus()
+
+    def capability_status(self, execution_id: str | None = None) -> CapabilityStatus:
+        try:
+            selected_execution_id = execution_id or "current"
+            capability_url = (
+                f"{self.capability_url}?execution_id={quote(selected_execution_id, safe='')}"
+            )
+            document = _object(self._request_json(capability_url), "Capability status")
+            parsed_execution_id = _identifier(document.get("execution_id"), "execution_id")
+            parsed_task_id = _identifier(document.get("task_id"), "task_id")
+            actuation_value = document.get("actuation_id")
+            parsed_actuation_id = None if actuation_value is None else _identifier(actuation_value, "actuation_id")
+            state = _status(document.get("state"), "state", frozenset({
+                "initializing", "desktop_pending", "desktop_ready", "desktop_failed",
+                "fallback_ready", "fallback_running",
+            }))
+            source_value = document.get("source")
+            source = None if source_value is None else _status(
+                source_value, "source", frozenset({"desktop", "standalone"})
+            )
+            reason_value = document.get("reason")
+            reason = None if reason_value is None else _status(
+                reason_value,
+                "reason",
+                frozenset({
+                    "desktop_disconnected", "executor_identity_unavailable",
+                    "desktop_tools_pipe_unavailable", "desktop_handoff_failed",
+                    "desktop_execution_failed", "standalone_execution_failed",
+                }),
+            )
+            actions_value = document.get("actions")
+            if not isinstance(actions_value, list):
+                raise StatusQueryError("actions must be an array")
+            actions = tuple(_status(action, "actions[]", frozenset({"recheck", "standalone"}))
+                            for action in actions_value)
+            if state.startswith("desktop_") and source not in (None, "desktop"):
+                raise StatusQueryError("Desktop capability state has an invalid source")
+            if state.startswith("fallback_") and source != "standalone":
+                raise StatusQueryError("Fallback capability state requires standalone source")
+            return CapabilityStatus(
+                state,
+                source,
+                reason,
+                actions,
+                parsed_execution_id,
+                parsed_task_id,
+                parsed_actuation_id,
+            )
+        except StatusQueryError:
+            return CapabilityStatus()
+
+    def capability_action(self, action: str, execution_id: str | None = None) -> bool:
+        if action not in {"recheck", "standalone"} or execution_id is None:
+            return False
+        try:
+            capability_url = (
+                f"{self.capability_url}?execution_id={quote(execution_id, safe='')}"
+            )
+            response = self._request_json(
+                capability_url,
+                method="POST",
+                body={"action": action, "execution_id": execution_id},
+            )
+        except StatusQueryError:
+            return False
+        return isinstance(response, Mapping) and isinstance(response.get("state"), str)
 
     def check(self) -> LauncherStatus:
         mcp_running = self._reachable(LOCAL_HEALTH_URL)
