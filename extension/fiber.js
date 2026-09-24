@@ -563,13 +563,43 @@
     const currentTurn = turns[turns.length - 1];
     if (currentTurn) {
       try {
-        const fiber = fiberOf(currentTurn.sections[0]);
-        fiberRootDetected = Boolean(fiber);
-        conversation = fiber ? conversationEvidenceDetailsOf(fiber) : null;
-        currentTurnConversationId = conversation && !conversation.conflict && !conversation.unreadable
-          ? conversation.conversationId : null;
-        messages = fiber ? turnMessagesOf(fiber) : null;
-        currentTool = currentToolCorrelationOf(messages);
+        const conversationIds = new Set();
+        let conversationConflict = false;
+        let conversationUnreadable = false;
+        const mergedMessages = [];
+        const seenMessageIds = new Set();
+        let messagesFound = false;
+        for (const section of currentTurn.sections) {
+          const fiber = fiberOf(section);
+          if (!fiber) continue;
+          fiberRootDetected = true;
+          const candidateConversation = conversationEvidenceDetailsOf(fiber);
+          const candidateMessages = turnMessagesOf(fiber);
+          if (candidateConversation?.conflict) conversationConflict = true;
+          if (candidateConversation?.unreadable) conversationUnreadable = true;
+          if (candidateConversation?.conversationId) {
+            conversationIds.add(candidateConversation.conversationId);
+          }
+          if (!Array.isArray(candidateMessages)) continue;
+          messagesFound = true;
+          for (const message of candidateMessages) {
+            const messageId = messageIdOf(message);
+            if (messageId) {
+              if (seenMessageIds.has(messageId)) continue;
+              seenMessageIds.add(messageId);
+            }
+            mergedMessages.push(message);
+          }
+        }
+
+        if (conversationIds.size > 1) conversationConflict = true;
+        currentTurnConversationId = !conversationConflict && !conversationUnreadable
+          && conversationIds.size === 1 ? [...conversationIds][0] : null;
+        conversation = fiberRootDetected
+          ? { conversationId: currentTurnConversationId, conflict: conversationConflict, unreadable: conversationUnreadable }
+          : null;
+        messages = messagesFound ? mergedMessages : null;
+        currentTool = currentToolCorrelationOf(mergedMessages);
       } catch {
         // An unreadable current turn must not turn into guessed identity evidence.
       }

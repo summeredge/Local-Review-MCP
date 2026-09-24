@@ -89,10 +89,13 @@ function currentConnectorRequest(
 function fiberSection(
   messages: unknown[],
   turnId = "turn-1",
-  conversationId = CONVERSATION,
+  conversationId: string | undefined = CONVERSATION,
 ): Record<string, unknown> {
   let model: Record<string, unknown> = {
-    memoizedProps: { conversation: { id: conversationId }, turn: { id: turnId, messages } },
+    memoizedProps: {
+      ...(conversationId === undefined ? {} : { conversation: { id: conversationId } }),
+      turn: { id: turnId, messages },
+    },
     return: null,
   };
   for (let depth = 0; depth < 30; depth += 1) {
@@ -293,6 +296,56 @@ describe("Extension submit_goal correlation evidence", () => {
     ]);
     expect(reply.evidence).toEqual([]);
     expect(reply.diagnostic).toEqual({ source: "none", matched: false });
+  });
+
+  it("keeps a valid current split-section key when one section has no conversation identity", () => {
+    const reply = scanFiberSections([
+      fiberSection([{ author: { role: "user" }, content: { content_type: "text", text: "current" } }], "turn-split", CONVERSATION),
+      fiberSection([currentConnectorRequest("current", "submit_goal", KEY_A)], "turn-split", undefined),
+    ]);
+    expect(reply.evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+  });
+
+  it("deduplicates the same stable message across current sections", () => {
+    const message = currentConnectorRequest("repeated", "submit_goal", KEY_A);
+    const reply = scanFiberSections([
+      fiberSection([message], "turn-repeat"),
+      fiberSection([message], "turn-repeat"),
+    ]);
+    expect(reply.evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+    expect(reply.scan_diagnostic.assistant_tool_calls_found).toBe(1);
+  });
+
+  it("uses the later valid submit_goal after an earlier unrelated tool", () => {
+    const reply = scanFiberSections([
+      fiberSection([currentConnectorRequest("unrelated", "workspace_info")], "turn-order"),
+      fiberSection([currentConnectorRequest("current", "submit_goal", KEY_A)], "turn-order"),
+    ]);
+    expect(reply.evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+  });
+
+  it("does not fall back to an earlier submit_goal after a later unrelated tool", () => {
+    const reply = scanFiberSections([
+      fiberSection([currentConnectorRequest("current", "submit_goal", KEY_A)], "turn-order"),
+      fiberSection([currentConnectorRequest("unrelated", "workspace_info")], "turn-order"),
+    ]);
+    expect(reply.evidence).toEqual([]);
+  });
+
+  it("fails closed when current sections expose different conversation identities", () => {
+    const reply = scanFiberSections([
+      fiberSection([currentConnectorRequest("conversation-a", "submit_goal", KEY_A)], "turn-conflict", CONVERSATION),
+      fiberSection([currentConnectorRequest("conversation-b", "submit_goal", KEY_A)], "turn-conflict", CONVERSATION_B),
+    ]);
+    expect(reply.evidence).toEqual([]);
+  });
+
+  it("does not fall back to an earlier key when the latest submit_goal is malformed", () => {
+    const reply = scanFiberSections([
+      fiberSection([currentConnectorRequest("current", "submit_goal", KEY_A)], "turn-malformed"),
+      fiberSection([currentConnectorRequest("latest", "submit_goal")], "turn-malformed"),
+    ]);
+    expect(reply.evidence).toEqual([]);
   });
 
   it("extracts a valid key from the current direct Connector request shape", () => {

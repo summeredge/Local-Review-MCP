@@ -19,8 +19,10 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
 )
 
 from config_manager import LauncherConfig
@@ -313,6 +315,37 @@ class LauncherLogTests(unittest.TestCase):
         window._render_capability_timeline(())
         self.assertEqual(window.capability_timeline_table.rowCount(), 0)
         self.assertEqual(window.capability_timeline_empty_label.text(), "No recent capability timeline events.")
+
+    def test_capability_doctor_has_own_tab_between_startup_and_tasks(self) -> None:
+        manager = Mock()
+        manager.load.return_value = LauncherConfig("", "config.production.json", False)
+        with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
+            LauncherWindow, "refresh_status"
+        ), patch.object(LauncherWindow, "_render_runtime_info"):
+            process.return_value.has_started = False
+            window = LauncherWindow(Path.cwd(), manager)
+            self.addCleanup(window.close)
+
+        tabs = window.findChild(QTabWidget)
+        self.assertIsNotNone(tabs)
+        assert tabs is not None
+        self.assertEqual([tabs.tabText(index) for index in range(tabs.count())], [
+            "启动信息", "能力诊断", "任务信息",
+        ])
+        startup = tabs.widget(0)
+        capability = tabs.widget(1)
+        self.assertIsInstance(capability, QScrollArea)
+        self.assertIs(window.capability_scroll_area, capability)
+        self.assertNotIn(window.doctor_status, startup.findChildren(QLabel))
+        self.assertIn(window.doctor_status, capability.findChildren(QLabel))
+        for widget in (
+            window.run_doctor_button,
+            window.capability_timeline_toggle,
+            window.recheck_desktop_button,
+            window.standalone_button,
+            window.capability_timeline_content,
+        ):
+            self.assertIn(widget, capability.findChildren(type(widget)))
 
     def test_save_log_writes_utf8(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

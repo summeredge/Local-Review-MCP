@@ -157,7 +157,7 @@ interface FakeDesktop {
 interface Turn {
   readonly id: string;
   readonly status: string;
-  readonly error?: null;
+  readonly error?: unknown;
   readonly startedAt?: number;
   readonly completedAt: number | null;
   readonly durationMs?: number | null;
@@ -392,6 +392,7 @@ async function seedTask(value: Fixture): Promise<void> {
 async function authorizeAndActuate(
   value: Fixture,
   overrides: Partial<ActuationAuthorizationInput> = {},
+  waitForTerminal = true,
 ): Promise<void> {
   await seedTask(value);
   const authorization = await value.controlled.authorize({
@@ -408,9 +409,11 @@ async function authorizeAndActuate(
     actuation_id: ACTUATION_ID,
     authorization_id: authorization.authorization_id,
   });
-  // The Desktop turn completes asynchronously through the completion observer. Wait for the
-  // durable Execution terminal state so assertions observe the committed result, not a snapshot.
-  await waitForTerminalExecution(value);
+  if (waitForTerminal) {
+    // The Desktop turn completes asynchronously through the completion observer. Wait for the
+    // durable Execution terminal state so assertions observe the committed result, not a snapshot.
+    await waitForTerminalExecution(value);
+  }
 }
 
 async function waitForTerminalExecution(value: Fixture): Promise<void> {
@@ -703,15 +706,43 @@ describe("P5.4.1 first turn on a newly created Desktop target", () => {
     expect(value.terminals).toHaveLength(1);
   });
 
-  it("fails the Execution when the Desktop turn times out", async () => {
+  it("keeps the Execution running while the Desktop turn is in progress", async () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
+    await authorizeAndActuate(value, {}, false);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
+    expect(execution?.status).toBe("running");
+    expect((await value.sessions.listSessions())[0]!.status).toBe("active");
+    expect(value.terminals).toHaveLength(0);
+
+    await value.backend.close();
+    await value.backend.whenIdle();
+  });
+
+  it("recovers from a transient observer wait error and completes", async () => {
+    const value = await fixture();
+    value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
+    const original = value.desktop.runtime.mcpClient.callTool;
+    let transient = true;
+    value.desktop.runtime.mcpClient.callTool = async (params: CallToolRequestParams) => {
+      if (params.name === "wait_threads" && transient) {
+        transient = false;
+        value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+        return { isError: true, content: [{ type: "text", text: "temporary wait failure" }] };
+      }
+      return original(params);
+    };
+
     await authorizeAndActuate(value);
 
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
-    expect(execution?.status).toBe("failed");
-    expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
-    expect(value.terminals).toHaveLength(1);
+    expect(execution?.status).toBe("passed");
+    expect((await value.sessions.listSessions())[0]!.status).toBe("completed");
+    const events = await value.events.listEvents((await value.sessions.listSessions())[0]!.session_id);
+    expect(events.map((event) => event.event_type)).toContain("turn_completed");
+    expect(events.map((event) => event.event_type)).not.toContain("execution_failed");
   });
 
   it("recovers the first turn when the target is not yet visible on the first read", async () => {
@@ -924,9 +955,14 @@ describe("P5.4.1 FIX executor identity is captured exactly once", () => {
 });
 
 describe("P5.4.1 FIX failure terminal projection", () => {
-  it("persists Execution, Session, and execution_failed before the listener for a timeout", async () => {
+  it("persists Execution, Session, and execution_failed before the listener for an authoritative turn failure", async () => {
     const value = await fixture();
-    value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
+    value.desktop.setTurns([{
+      id: "turn-1",
+      status: "completed",
+      error: { code: "failed" },
+      completedAt: 1,
+    }]);
     const observed: Array<{
       readonly execution: string;
       readonly session: string;
@@ -958,7 +994,7 @@ describe("P5.4.1 FIX failure terminal projection", () => {
       session: "failed",
       event: "execution_failed",
     });
-    // A timed-out turn has no verifiable turn identity, so it must not be fabricated.
+    // A failed turn has no completion event, so it must not be fabricated.
     expect(observed[0]?.turnId).toBe("absent");
   });
 
@@ -1138,21 +1174,22 @@ describe("P5.4.1 FIX Desktop runtime ownership", () => {
     expect((await value.sessions.listSessions())[0]!.status).toBe("completed");
   });
 
-  it("closes the runtime exactly once when the Desktop turn times out", async () => {
+  it("keeps the runtime open while the Desktop turn runs and closes it once on shutdown", async () => {
     const value = await fixture();
-    // No completed turn ever appears, so the observer reports timed_out.
-    value.desktop.setTurns([]);
+    value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
 
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, false);
+    expect(value.desktop.runtimeCloseCount()).toBe(0);
 
+    await value.backend.close();
+    await value.backend.whenIdle();
     expect(value.desktop.runtimeCloseCount()).toBe(1);
     const execution = await value.executions.getExecutionContext(
       "workspace-a",
       TASK_ID,
       EXECUTION_ID,
     );
-    expect(execution?.status).toBe("failed");
-    expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
+    expect(execution?.status).toBe("running");
   });
 
   it("closes a runtime held in the active map when the backend is shut down", async () => {
@@ -1164,7 +1201,7 @@ describe("P5.4.1 FIX Desktop runtime ownership", () => {
     const started = value.service.start(interactiveRequest());
     // Wait until the runtime has been registered as active before shutting the backend down.
     const deadline = Date.now() + 5_000;
-    while (value.desktop.runtimeCloseCount() === 0 && Date.now() < deadline) {
+    while (!value.desktop.calls.some((call) => call.name === "read_thread") && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 

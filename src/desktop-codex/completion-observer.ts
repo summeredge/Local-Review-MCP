@@ -10,7 +10,10 @@ import type {
   WaitThreadsArguments,
 } from "./codex-app-contracts.js";
 
-const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
+const DEFAULT_WAIT_INTERVAL_MS = 20_000;
+const WAIT_TIMEOUT_MARGIN_MS = 5_000;
+const DEFAULT_TRANSIENT_RETRY_BACKOFF_MS = 250;
 const DEFAULT_POLL_INTERVAL_MS = 50;
 /** Bounded grace for the very first observation of a freshly created target thread. */
 const DEFAULT_VISIBILITY_GRACE_MS = 15_000;
@@ -103,7 +106,11 @@ interface WaitObservation {
 type Evaluation =
   | { readonly kind: "pending"; readonly candidateTurnId?: string }
   | { readonly kind: "completed"; readonly turnId: string }
-  | { readonly kind: "unknown"; readonly reason: DesktopCompletionUnknownReason };
+  | {
+    readonly kind: "unknown";
+    readonly reason: DesktopCompletionUnknownReason;
+    readonly turnId?: string;
+  };
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -132,7 +139,7 @@ function assertContext(context: DesktopCompletionContext): void {
 }
 
 function timeoutFor(context: DesktopCompletionContext): number {
-  return context.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  return context.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
 }
 
 function resultFor(
@@ -270,7 +277,9 @@ function evaluate(
 
   const turn = snapshot.turns.find((value) => value.id === candidate);
   if (turn === undefined) return { kind: "unknown", reason: "turn_identity_unavailable" };
-  if (turn.error !== null && turn.error !== undefined) return { kind: "unknown", reason: "tool_error" };
+  if (turn.error !== null && turn.error !== undefined) {
+    return { kind: "unknown", reason: "tool_error", turnId: candidate };
+  }
   if (turn.status === "completed") {
     if (turn.error === null && turn.completedAt !== null && turn.completedAt !== undefined) {
       return { kind: "completed", turnId: candidate };
@@ -296,8 +305,13 @@ function errorReason(error: unknown): DesktopCompletionUnknownReason {
   return "tool_error";
 }
 
-function timeoutError(error: unknown): boolean {
-  return error instanceof CodexAppRuntimeError && error.code === "tool_call_timeout";
+function transientObservationError(error: unknown): boolean {
+  if (error instanceof ReadToolResultError) return true;
+  return error instanceof CodexAppRuntimeError
+    && (error.code === "tool_call_timeout"
+      || error.code === "tool_call_failed"
+      || error.code === "transport_failed"
+      || error.code === "runtime_unavailable");
 }
 
 function sleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
@@ -390,9 +404,15 @@ export class DesktopCompletionObserver {
       tool: "wait_threads",
       arguments: arguments_,
       executorThreadId: context.executorThreadId,
-      timeoutMs,
+      timeoutMs: timeoutMs + (context.timeoutMs === undefined
+        ? WAIT_TIMEOUT_MARGIN_MS
+        : Math.min(WAIT_TIMEOUT_MARGIN_MS, 250)),
       ...(context.signal === undefined ? {} : { signal: context.signal }),
     });
+  }
+
+  private async retryTransient(signal: AbortSignal | undefined): Promise<void> {
+    await sleep(DEFAULT_TRANSIENT_RETRY_BACKOFF_MS, signal);
   }
 
   /** Capture immediately before the caller dispatches the corresponding turn. */
@@ -432,7 +452,9 @@ export class DesktopCompletionObserver {
       return resultFor(context, "unknown", { reason: "capability_unavailable" });
     }
 
-    const deadline = Date.now() + timeoutFor(context);
+    // An explicit timeout remains available to bounded diagnostic callers. The Desktop backend
+    // intentionally omits it so a normal in-progress turn is not an execution-timeout failure.
+    const deadline = context.timeoutMs === undefined ? undefined : Date.now() + timeoutFor(context);
     // The first-turn visibility grace only ever applies to a freshly created target whose baseline
     // is empty. It is a bounded, separate window and never consumes the full execution timeout.
     const visibilityDeadline = this.visibilityGraceMs > 0 && context.baseline.turnIds.length === 0
@@ -443,8 +465,10 @@ export class DesktopCompletionObserver {
     while (true) {
       if (context.signal?.aborted) throw abortError();
       const now = Date.now();
-      const remainingBeforeRead = deadline - now;
-      if (remainingBeforeRead <= 0) return resultFor(context, "timed_out");
+      const remainingBeforeRead = deadline === undefined ? undefined : deadline - now;
+      if (remainingBeforeRead !== undefined && remainingBeforeRead <= 0) {
+        return resultFor(context, "timed_out");
+      }
 
       // The visibility grace only bounds reads while the target is still unreadable and no turn has
       // been locked yet. During that window a single read is bounded by both the remaining execution
@@ -453,13 +477,14 @@ export class DesktopCompletionObserver {
       const visibilityActive = visibilityDeadline > 0 && candidateTurnId === undefined;
       const visibilityRemaining = visibilityDeadline - now;
       if (visibilityActive && visibilityRemaining <= 0) {
-        return Date.now() >= deadline
+        return deadline !== undefined && Date.now() >= deadline
           ? resultFor(context, "timed_out")
           : resultFor(context, "unknown", { reason: "first_turn_visibility_unavailable" });
       }
       const readTimeoutMs = visibilityActive
-        ? Math.max(1, Math.min(remainingBeforeRead, visibilityRemaining))
-        : remainingBeforeRead;
+        ? Math.max(1, Math.min(remainingBeforeRead ?? visibilityRemaining, visibilityRemaining))
+        : Math.max(1, Math.min(remainingBeforeRead ?? (DEFAULT_WAIT_INTERVAL_MS + WAIT_TIMEOUT_MARGIN_MS),
+          DEFAULT_WAIT_INTERVAL_MS + WAIT_TIMEOUT_MARGIN_MS));
 
       let snapshot: ReadSnapshot;
       try {
@@ -469,8 +494,11 @@ export class DesktopCompletionObserver {
         );
       } catch (error: unknown) {
         if (isAbort(error, context.signal)) throw abortError();
-        if (visibilityActive && error instanceof ReadToolResultError) {
-          const remainingGrace = Math.min(visibilityDeadline - Date.now(), deadline - Date.now());
+        if (visibilityActive && transientObservationError(error)) {
+          const remainingGrace = Math.min(
+            visibilityDeadline - Date.now(),
+            deadline === undefined ? Number.MAX_SAFE_INTEGER : deadline - Date.now(),
+          );
           if (remainingGrace > 0) {
             try {
               await sleep(Math.min(this.visibilityPollIntervalMs, remainingGrace), context.signal);
@@ -480,16 +508,26 @@ export class DesktopCompletionObserver {
             }
             continue;
           }
-          return Date.now() >= deadline
+          return deadline !== undefined && Date.now() >= deadline
             ? resultFor(context, "timed_out")
             : resultFor(context, "unknown", { reason: "first_turn_visibility_unavailable" });
         }
-        // A read that timed out because the visibility window was exhausted is a visibility failure,
-        // not an execution timeout, as long as the execution deadline has not actually passed.
-        if (visibilityActive && timeoutError(error) && Date.now() < deadline) {
-          return resultFor(context, "unknown", { reason: "first_turn_visibility_unavailable" });
+        if (transientObservationError(error)) {
+          if (this.visibilityGraceMs === 0 && context.baseline.turnIds.length === 0) {
+            return resultFor(context, "unknown", { reason: "tool_error" });
+          }
+          if (deadline !== undefined && Date.now() >= deadline) {
+            return resultFor(context, "timed_out");
+          }
+          try {
+            await this.retryTransient(context.signal);
+          } catch (retryError: unknown) {
+            if (isAbort(retryError, context.signal)) throw abortError();
+            throw retryError;
+          }
+          continue;
         }
-        if (timeoutError(error) || Date.now() >= deadline) return resultFor(context, "timed_out");
+        if (deadline !== undefined && Date.now() >= deadline) return resultFor(context, "timed_out");
         return resultFor(context, "unknown", { reason: errorReason(error) });
       }
 
@@ -498,31 +536,58 @@ export class DesktopCompletionObserver {
         return resultFor(context, "completed", { turnId: evaluation.turnId });
       }
       if (evaluation.kind === "unknown") {
-        return resultFor(context, "unknown", { reason: evaluation.reason });
+        return resultFor(context, "unknown", {
+          reason: evaluation.reason,
+          ...(evaluation.turnId === undefined ? {} : { turnId: evaluation.turnId }),
+        });
       }
       candidateTurnId = evaluation.candidateTurnId ?? candidateTurnId;
 
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) return resultFor(context, "timed_out");
+      const remaining = deadline === undefined ? undefined : deadline - Date.now();
+      if (remaining !== undefined && remaining <= 0) return resultFor(context, "timed_out");
       if (this.waitAvailable) {
         let observation: WaitObservation;
         try {
           observation = waitObservation(
-            await this.wait(context, remaining, afterCursor),
+            await this.wait(
+              context,
+              remaining === undefined ? DEFAULT_WAIT_INTERVAL_MS : Math.min(DEFAULT_WAIT_INTERVAL_MS, remaining),
+              afterCursor,
+            ),
             context,
             candidateTurnId,
           );
         } catch (error: unknown) {
           if (isAbort(error, context.signal)) throw abortError();
-          if (timeoutError(error) || Date.now() >= deadline) return resultFor(context, "timed_out");
+          if (transientObservationError(error)) {
+            if (deadline !== undefined && Date.now() >= deadline) return resultFor(context, "timed_out");
+            if (visibilityDeadline > 0 && Date.now() >= visibilityDeadline) {
+              return resultFor(context, "unknown", { reason: "tool_error" });
+            }
+            // wait_threads is only a wake-up hint; the next read_thread is authoritative.
+            try {
+              await this.retryTransient(context.signal);
+            } catch (retryError: unknown) {
+              if (isAbort(retryError, context.signal)) throw abortError();
+              throw retryError;
+            }
+            continue;
+          }
+          if (deadline !== undefined && Date.now() >= deadline) return resultFor(context, "timed_out");
           return resultFor(context, "unknown", { reason: errorReason(error) });
         }
         afterCursor = observation.afterCursor ?? afterCursor;
+        // A fake or unhealthy provider may resolve immediately; yield once so an endless
+        // observation loop cannot starve shutdown or other application work.
+        await sleep(0, context.signal);
         continue;
       }
 
       try {
-        await sleep(Math.min(this.pollIntervalMs, remaining), context.signal);
+        await sleep(
+          Math.min(this.pollIntervalMs, remaining ?? this.pollIntervalMs),
+          context.signal,
+        );
       } catch (error: unknown) {
         if (isAbort(error, context.signal)) throw abortError();
         throw error;

@@ -4,6 +4,7 @@ import {
   createCodexAppToolContracts,
   type CodexAppMcpClient,
 } from "../src/desktop-codex/index.js";
+import { CodexAppRuntimeError } from "../src/desktop-codex/codex-app-runtime.js";
 import {
   DesktopCompletionObserver,
   type DesktopCompletionBaseline,
@@ -117,9 +118,11 @@ interface ClientSetup {
   readonly calls: CallToolRequestParams[];
 }
 
+type ToolOutcome = CallToolResult | Error;
+
 function setup(
-  reads: readonly CallToolResult[],
-  waits: readonly CallToolResult[] = [],
+  reads: readonly ToolOutcome[],
+  waits: readonly ToolOutcome[] = [],
   options: {
     readonly read?: boolean;
     readonly wait?: boolean;
@@ -138,12 +141,14 @@ function setup(
     if (params.name === "read_thread") {
       const next = readQueue.shift() ?? lastRead;
       if (next === undefined) throw new Error("unexpected read_thread call");
+      if (next instanceof Error) throw next;
       lastRead = next;
       return next;
     }
     if (params.name === "wait_threads") {
       const next = waitQueue.shift() ?? lastWait;
       if (next === undefined) throw new Error("unexpected wait_threads call");
+      if (next instanceof Error) throw next;
       lastWait = next;
       return next;
     }
@@ -225,6 +230,63 @@ describe("DesktopCompletionObserver", () => {
     await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: captured }))
       .resolves.toMatchObject({ status: "completed", turnId: B });
     expect(setupValue.calls.map((call) => call.name)).toEqual([
+      "read_thread",
+      "read_thread",
+      "wait_threads",
+      "read_thread",
+    ]);
+  });
+
+  it("recovers after a transient wait_threads tool error", async () => {
+    const setupValue = setup([
+      readPayload([turn(A, "completed")]),
+      readPayload([turn(B, "inProgress")]),
+      readPayload([turn(B, "inProgress")]),
+      readPayload([turn(B, "completed")]),
+    ], [errorResult(), waitPayload()]);
+    const captured = await setupValue.observer.captureBaseline(context());
+
+    await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: captured }))
+      .resolves.toMatchObject({ status: "completed", turnId: B });
+    expect(setupValue.calls.map((call) => call.name)).toEqual([
+      "read_thread",
+      "read_thread",
+      "wait_threads",
+      "read_thread",
+      "wait_threads",
+      "read_thread",
+    ]);
+  });
+
+  it("recovers after a transient wait_threads timeout", async () => {
+    const setupValue = setup([
+      readPayload([turn(A, "completed")]),
+      readPayload([turn(B, "inProgress")]),
+      readPayload([turn(B, "inProgress")]),
+      readPayload([turn(B, "completed")]),
+    ], [
+      new CodexAppRuntimeError("tool_call_timeout", "wait timed out"),
+      waitPayload(),
+    ]);
+    const captured = await setupValue.observer.captureBaseline(context());
+
+    await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: captured }))
+      .resolves.toMatchObject({ status: "completed", turnId: B });
+  });
+
+  it("recovers after a transient read_thread tool error", async () => {
+    const setupValue = setup([
+      readPayload([turn(A, "completed")]),
+      errorResult(),
+      readPayload([turn(B, "inProgress")]),
+      readPayload([turn(B, "completed")]),
+    ], [waitPayload()]);
+    const captured = await setupValue.observer.captureBaseline(context());
+
+    await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: captured }))
+      .resolves.toMatchObject({ status: "completed", turnId: B });
+    expect(setupValue.calls.map((call) => call.name)).toEqual([
+      "read_thread",
       "read_thread",
       "read_thread",
       "wait_threads",
@@ -550,7 +612,7 @@ describe("DesktopCompletionObserver", () => {
       })).resolves.toMatchObject({ status: "timed_out" });
     });
 
-    it("does not retry a tool error on a non-empty baseline", async () => {
+    it("keeps retrying transient read errors until an explicit observer deadline", async () => {
       const setupValue = setup(
         [errorResult()],
         [],
@@ -558,10 +620,10 @@ describe("DesktopCompletionObserver", () => {
       );
 
       await expect(setupValue.observer.waitForCompletion({
-        ...context(),
+        ...context(500),
         baseline: { targetThreadId: TARGET_THREAD, hostId: HOST_ID, turnIds: [A] },
-      })).resolves.toMatchObject({ status: "unknown", reason: "tool_error" });
-      expect(setupValue.calls).toHaveLength(1);
+      })).resolves.toMatchObject({ status: "timed_out" });
+      expect(setupValue.calls.length).toBeGreaterThan(1);
     });
 
     it("does not treat a turn error as a visibility error", async () => {
@@ -572,7 +634,7 @@ describe("DesktopCompletionObserver", () => {
       );
 
       await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: emptyBaseline }))
-        .resolves.toMatchObject({ status: "unknown", reason: "tool_error" });
+        .resolves.toMatchObject({ status: "unknown", reason: "tool_error", turnId: B });
       expect(setupValue.calls).toHaveLength(1);
     });
 

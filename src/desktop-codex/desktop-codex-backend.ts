@@ -33,7 +33,7 @@ export const DESKTOP_EXECUTION_COMMAND = "desktop codex_app";
 export const DESKTOP_EXECUTION_BACKEND_IDENTITY = "desktop_codex_app" as const;
 
 const SUMMARY_MAX_LENGTH = 4_000;
-const DEFAULT_COMPLETION_TIMEOUT_MS = 120_000;
+const DEFAULT_TOOL_CALL_TIMEOUT_MS = 120_000;
 
 export type DesktopExecutionErrorCode =
   | "desktop_backend_closed"
@@ -78,6 +78,7 @@ interface WatchContext {
   readonly baseline: DesktopCompletionBaseline;
   readonly threadId: string;
   readonly hostId: string;
+  readonly signal: AbortSignal;
   /** Set once the observer has produced a verifiable turn id for this Execution. */
   resolvedTurnId?: string;
 }
@@ -112,6 +113,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
   private readonly now: () => string;
   private readonly inFlight = new Map<string, Promise<ExecutionStartResult>>();
   private readonly runtimes = new Map<string, DesktopRuntime>();
+  private readonly watchAbortControllers = new Map<string, AbortController>();
   private readonly completions = new Map<string, Promise<void>>();
   private terminalListener: ExecutionTerminalListener | undefined;
   private closing = false;
@@ -127,7 +129,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
     this.events = options.eventStore ?? new EventStore(this.storageRoot);
     this.runtimeFactory = options.runtimeFactory;
     this.desktopState = options.desktopState;
-    this.completionTimeoutMs = options.completionTimeoutMs ?? DEFAULT_COMPLETION_TIMEOUT_MS;
+    this.completionTimeoutMs = options.completionTimeoutMs ?? DEFAULT_TOOL_CALL_TIMEOUT_MS;
     this.pollIntervalMs = options.pollIntervalMs;
     this.now = options.now ?? (() => new Date().toISOString());
   }
@@ -176,9 +178,15 @@ export class DesktopCodexBackend implements ExecutionBackend {
 
   public async close(): Promise<void> {
     this.closing = true;
-    const runtimes = [...this.runtimes.values()];
+    for (const controller of this.watchAbortControllers.values()) controller.abort();
+    const completions = [...this.completions.values()];
+    const runtimes = [...this.runtimes.entries()];
     this.runtimes.clear();
-    await Promise.all(runtimes.map((runtime) => runtime.close().catch(() => undefined)));
+    await Promise.all(runtimes.map(([sessionId, runtime]) =>
+      this.watchAbortControllers.has(sessionId)
+        ? Promise.resolve()
+        : runtime.close().catch(() => undefined)));
+    await Promise.all(completions);
   }
 
   private executorIdentity(): string {
@@ -269,6 +277,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
 
       const threadId = created.binding.target_thread_id;
       const hostId = created.binding.host_id;
+      const abortController = new AbortController();
       session = await this.sessions.updateSession(session.session_id, {
         status: "active",
         thread_id: threadId,
@@ -292,7 +301,9 @@ export class DesktopCodexBackend implements ExecutionBackend {
         baseline: { targetThreadId: threadId, hostId, turnIds: [] },
         threadId,
         hostId,
+        signal: abortController.signal,
       };
+      this.watchAbortControllers.set(sessionId, abortController);
       const completion = this.watch(watch, client, contracts).catch(() => undefined);
       this.completions.set(sessionId, completion);
       void completion.finally(() => {
@@ -445,29 +456,42 @@ export class DesktopCodexBackend implements ExecutionBackend {
         contracts,
         ...(this.pollIntervalMs === undefined ? {} : { pollIntervalMs: this.pollIntervalMs }),
       });
-      const completion = await observer.waitForCompletion({
-        executorThreadId: watch.executorThreadId,
-        targetThreadId: watch.threadId,
-        hostId: watch.hostId,
-        timeoutMs: this.completionTimeoutMs,
-        baseline: watch.baseline,
-      });
-      if (completion.status === "completed") {
-        await this.complete(watch, completion);
+      while (!this.closing) {
+        const completion = await observer.waitForCompletion({
+          executorThreadId: watch.executorThreadId,
+          targetThreadId: watch.threadId,
+          hostId: watch.hostId,
+          signal: watch.signal,
+          baseline: watch.baseline,
+        });
+        if (completion.status === "completed") {
+          await this.complete(watch, completion);
+          return;
+        }
+        if (completion.reason === "first_turn_visibility_unavailable"
+          || (completion.reason === "tool_error" && completion.turnId === undefined)) {
+          // This is an observer availability result, not evidence that the Desktop turn failed.
+          continue;
+        }
+        // Only a verifiable observer turn id is carried into failure projection; never synthesize one.
+        if (completion.turnId !== undefined && completion.reason !== "tool_error") {
+          watch.resolvedTurnId = completion.turnId;
+        }
+        await this.fail(
+          watch,
+          completion.reason === "tool_error" && completion.turnId !== undefined
+            ? "Desktop turn failed."
+            : completion.status === "timed_out"
+              ? "Desktop turn timed out."
+              : "Desktop turn completion was unverifiable (" + (completion.reason ?? "unknown") + ").",
+        );
         return;
       }
-      // Only a verifiable observer turn id is carried into failure projection; never synthesize one.
-      if (completion.turnId !== undefined) watch.resolvedTurnId = completion.turnId;
-      await this.fail(
-        watch,
-        completion.status === "timed_out"
-          ? "Desktop turn timed out."
-          : "Desktop turn completion was unverifiable (" + (completion.reason ?? "unknown") + ").",
-      );
     } catch (error: unknown) {
       if (this.closing) return;
       await this.fail(watch, "Desktop turn failed: " + errorMessage(error));
     } finally {
+      this.watchAbortControllers.delete(watch.sessionId);
       this.runtimes.delete(watch.sessionId);
       await watch.runtime.close().catch(() => undefined);
     }
