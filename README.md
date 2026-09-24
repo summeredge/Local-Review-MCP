@@ -443,6 +443,34 @@ npm test
 npm run build
 ```
 
+### Current validation baseline
+
+Validation baseline recorded on 2026-09-24:
+
+```text
+Command                         Result
+npm run typecheck               PASS
+npm run build                   PASS
+npm test                        PARTIAL FAILURE
+```
+
+`npm test` result: 1,088 passed, 1 skipped, and 3 failed. The known failures
+are isolated to `tests/extension-identity.test.ts`:
+
+- `allowlists metadata.request_id and the matching Fiber conversation`
+- `preserves an opaque UUID request id from Fiber through content evidence`
+- `follows the real section-to-turn Fiber traversal and groups split sections`
+
+Expected: Fiber conversation evidence. Actual: `[]`.
+
+This baseline failure is independent of Capability Doctor, Capability Timeline,
+the Launcher Timeline Viewer, and the Desktop Handoff Fallback UX. The
+Capability/Fallback main-path tests pass, and both TypeScript typechecking and
+the production build pass. Do not modify the failing tests, Extension identity
+logic, Fiber traversal, Evidence transport, or CI thresholds as part of
+unrelated work; treat these three failures as a known baseline until their
+separate follow-up task is addressed.
+
 The Browser Worker review-submission diagnostic drives the complete local
 Review Delivery chain with a mock Page and does not require a ChatGPT login:
 
