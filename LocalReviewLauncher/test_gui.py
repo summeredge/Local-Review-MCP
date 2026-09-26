@@ -190,8 +190,12 @@ class LauncherLogTests(unittest.TestCase):
             offline_status = LauncherStatus(False, False, False)
             window._render_status(offline_status)
             window._apply_controls(offline_status)
-            self.assertIn("状态：不可用（unavailable）", window.capability_status.text())
-            self.assertIn("MCP 能力不可用", window.capability_status.text())
+            self.assertEqual(window.capability_status.text(), "\n".join([
+                "执行：—",
+                "来源：—",
+                "状态：MCP 已停止",
+                "说明：MCP 未运行，无法读取执行能力状态。",
+            ]))
             self.assertFalse(window.recheck_desktop_button.isEnabled())
             self.assertFalse(window.standalone_button.isEnabled())
 
@@ -312,6 +316,50 @@ class LauncherLogTests(unittest.TestCase):
             self.application.processEvents()
             for button, x in initial_x.items():
                 self.assertEqual(button.mapTo(window, button.rect().topLeft()).x(), x)
+
+    def test_capability_status_distinguishes_idle_from_a_stopped_runtime(self) -> None:
+        manager = Mock()
+        manager.load.return_value = LauncherConfig("", "config.production.json", False)
+        with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
+            LauncherWindow, "refresh_status"
+        ), patch.object(LauncherWindow, "_render_runtime_info"):
+            process.return_value.has_started = False
+            window = LauncherWindow(Path.cwd(), manager)
+            self.addCleanup(window.close)
+
+        window._render_status(LauncherStatus(True, True, True))
+        idle = window.capability_status.text()
+        self.assertEqual(idle, "\n".join([
+            "执行：—",
+            "来源：—",
+            "状态：当前空闲",
+            "说明：当前没有活动的执行任务。",
+        ]))
+        self.assertNotIn("unavailable", idle)
+
+        window._render_status(LauncherStatus(False, False, False))
+        stopped = window.capability_status.text()
+        self.assertNotEqual(stopped, idle)
+        self.assertIn("状态：MCP 已停止", stopped)
+        self.assertNotIn("当前空闲", stopped)
+
+        window._render_status(LauncherStatus(
+            True,
+            True,
+            True,
+            capability=CapabilityStatus(state="initializing"),
+        ))
+        self.assertIn("状态：初始化中（initializing）", window.capability_status.text())
+        window._render_status(LauncherStatus(
+            True,
+            True,
+            True,
+            capability=CapabilityStatus(
+                state="desktop_ready", source="desktop", execution_id="execution-1",
+            ),
+        ))
+        self.assertIn("执行：execution-1", window.capability_status.text())
+        self.assertIn("状态：Desktop 已就绪（desktop_ready）", window.capability_status.text())
 
     def test_capability_timeline_renders_state_and_failure_fields(self) -> None:
         manager = Mock()

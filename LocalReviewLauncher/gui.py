@@ -75,6 +75,18 @@ BUTTON_SPACING = 6
 CONTENT_MARGIN = 16
 CONTENT_SPACING = 10
 ROW_LABEL_WIDTH = 132
+IDLE_CAPABILITY_TEXT = "\n".join([
+    "执行：—",
+    "来源：—",
+    "状态：当前空闲",
+    "说明：当前没有活动的执行任务。",
+])
+STOPPED_CAPABILITY_TEXT = "\n".join([
+    "执行：—",
+    "来源：—",
+    "状态：MCP 已停止",
+    "说明：MCP 未运行，无法读取执行能力状态。",
+])
 
 
 class LauncherState(str, Enum):
@@ -122,7 +134,7 @@ class LauncherWindow(QMainWindow):
         self.desktop_sync_status = QLabel("不可用")
         self.desktop_sync_status.setWordWrap(True)
         self.desktop_sync_status.setTextFormat(Qt.TextFormat.PlainText)
-        self.capability_status = QLabel("不可用")
+        self.capability_status = QLabel(IDLE_CAPABILITY_TEXT)
         self.capability_status.setWordWrap(True)
         self.capability_status.setTextFormat(Qt.TextFormat.PlainText)
         self.doctor_status = QLabel("未运行")
@@ -573,7 +585,7 @@ class LauncherWindow(QMainWindow):
         desktop_sync = getattr(status, "desktop_sync", DesktopSyncStatus())
         desktop_capability = getattr(status, "desktop_capability", DesktopCapabilityStatus())
         capability = getattr(status, "capability", CapabilityStatus())
-        self._render_capability_status(capability)
+        self._render_capability_status(capability, status.mcp_running)
         # A connected Desktop IPC observer says nothing about the Desktop codex_app capability, so
         # the handoff state is always rendered separately instead of being read as the same thing.
         identity_state = (
@@ -694,7 +706,18 @@ class LauncherWindow(QMainWindow):
         except ValueError:
             return None
 
-    def _render_capability_status(self, capability: CapabilityStatus) -> None:
+    def _render_capability_status(
+        self,
+        capability: CapabilityStatus,
+        mcp_running: bool = True,
+    ) -> None:
+        # The fail-closed default is also what the status query returns when no execution is
+        # active, so it is rendered as idle instead of a capability failure. A stopped runtime is
+        # reported separately because it cannot be read at all.
+        if capability == CapabilityStatus():
+            self.capability_status.setText(IDLE_CAPABILITY_TEXT if mcp_running else STOPPED_CAPABILITY_TEXT)
+            self.capability_status.setStyleSheet("color: #666666")
+            return
         capability_source = {
             "desktop": "Desktop",
             "standalone": "Standalone",
