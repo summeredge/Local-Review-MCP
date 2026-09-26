@@ -92,6 +92,8 @@ export const autoIterationSchema = z.object({
   actuation_id: actuationIdSchema.optional(),
   authorization_id: z.string().uuid().optional(),
   pending_iteration: pendingIterationSchema.optional(),
+  retry_at: timestampSchema.optional(),
+  completion_attempt_count: z.number().int().nonnegative().optional(),
   stage: autoIterationStageSchema,
   terminal_decision: autoIterationTerminalDecisionSchema.optional(),
   terminal_reason: z.string().min(1).max(4000).optional(),
@@ -338,7 +340,7 @@ export interface AutoIterationServiceOptions {
   readonly routingService?: ConversationRoutingService;
   readonly reviewDeliveryService?: ReviewDeliveryService;
   readonly reviewResultService?: ReviewResultService;
-  readonly browserRouter?: Pick<BrowserRouter, "deliver">;
+  readonly browserRouter?: Pick<BrowserRouter, "deliver"> & Partial<Pick<BrowserRouter, "supportsDurableResume">>;
   readonly completionRouter?: Pick<ReviewCompletionRouter, "collect">;
   readonly verdictParser?: Pick<ReviewVerdictParser, "parse">;
   readonly extensionDeliveries?: ExtensionDeliveryService;
@@ -350,12 +352,13 @@ export interface AutoIterationServiceOptions {
     readonly authorizationStore?: AuthorizationReader;
   };
   readonly terminalListener?: AutoIterationTerminalListener;
+  readonly retryDelayMs?: number;
 }
 
 export class AutoIterationService {
   public readonly storageRoot: string;
   public readonly registry: WorkspaceRegistry;
-  public readonly browserRouter: Pick<BrowserRouter, "deliver">;
+  public readonly browserRouter: Pick<BrowserRouter, "deliver"> & Partial<Pick<BrowserRouter, "supportsDurableResume">>;
   public readonly completionRouter: Pick<ReviewCompletionRouter, "collect">;
   public readonly controlledActuation: ControlledActuationPort;
   public readonly extensionDeliveries: ExtensionDeliveryService;
@@ -370,6 +373,8 @@ export class AutoIterationService {
   private readonly parser: Pick<ReviewVerdictParser, "parse">;
   private readonly authorizationStore: AuthorizationReader;
   private readonly flights = new Map<string, Promise<AutoIteration>>();
+  private readonly retryTimers = new Map<string, NodeJS.Timeout>();
+  private readonly retryDelayMs: number;
   private terminalListener?: AutoIterationTerminalListener;
 
   public constructor(
@@ -377,6 +382,10 @@ export class AutoIterationService {
     options: AutoIterationServiceOptions = {},
   ) {
     this.registry = registry;
+    this.retryDelayMs = options.retryDelayMs ?? 30_000;
+    if (!Number.isSafeInteger(this.retryDelayMs) || this.retryDelayMs < 1) {
+      throw new Error("retryDelayMs must be a positive integer.");
+    }
     this.storageRoot = resolve(
       options.storageRoot
         ?? options.executionContextService?.storageRoot
@@ -435,6 +444,11 @@ export class AutoIterationService {
 
   public restore(): Promise<void> {
     return this.store.restore();
+  }
+
+  public dispose(): void {
+    for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    this.retryTimers.clear();
   }
 
   public async getLoop(loopId: string): Promise<AutoIteration | null> {
@@ -550,10 +564,20 @@ export class AutoIterationService {
 
   private async advanceOnce(loopId: string): Promise<AutoIteration> {
     for (let step = 0; step < 32; step += 1) {
-      const loop = await this.store.get(loopId);
+      let loop = await this.store.get(loopId);
       if (loop === null) throw new Error(`Auto iteration loop "${loopId}" was not found.`);
       if (loop.stage === "completed" || loop.stage === "human_required" || loop.stage === "failed") {
         return loop;
+      }
+      if (loop.retry_at !== undefined) {
+        const delay = Date.parse(loop.retry_at) - Date.now();
+        if (delay > 0) {
+          this.scheduleRetry(loop.loop_id, delay);
+          return loop;
+        }
+        clearTimeout(this.retryTimers.get(loop.loop_id));
+        this.retryTimers.delete(loop.loop_id);
+        loop = await this.update(loop, { retry_at: undefined });
       }
       if (loop.stage === "review_request"
         || loop.stage === "routing"
@@ -599,6 +623,26 @@ export class AutoIterationService {
       }
     }
     throw new Error(`Auto iteration loop "${loopId}" did not reach a stable stage.`);
+  }
+
+  private scheduleRetry(loopId: string, delay: number): void {
+    if (this.retryTimers.has(loopId)) return;
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(loopId);
+      void this.advance(loopId).catch((error: unknown) => {
+        console.warn(`Review recovery failed for loop "${loopId}"`, errorMessage(error));
+      });
+    }, delay);
+    timer.unref?.();
+    this.retryTimers.set(loopId, timer);
+  }
+
+  private async retryReview(loop: AutoIteration, attempts: number, reason: string, summary?: string): Promise<void> {
+    if (attempts >= 5) {
+      await this.humanRequired(loop, `${reason}_RETRY_EXHAUSTED`, summary);
+      return;
+    }
+    await this.update(loop, { retry_at: new Date(Date.now() + this.retryDelayMs).toISOString() });
   }
 
   private async advanceExecution(loop: AutoIteration): Promise<AutoIteration> {
@@ -742,10 +786,13 @@ export class AutoIterationService {
         await this.update(current, { stage: "review_completion" });
         return;
       }
-      if (delivery.status !== "pending") {
+      if (delivery.status !== "pending"
+        && !(delivery.status === "delivering" && this.browserRouter.supportsDurableResume === true)
+        && !(delivery.status === "failed" && delivery.last_error?.retryable === true)) {
         await this.humanRequired(
           current,
-          delivery.status === "delivering" ? "DELIVERY_UNCERTAIN" : "DELIVERY_FAILED",
+          delivery.status === "delivering" ? "DELIVERY_UNCERTAIN"
+            : delivery.last_error?.code ?? "REVIEW_TRANSPORT_FAILED",
           delivery.last_error?.message,
         );
         return;
@@ -755,13 +802,19 @@ export class AutoIterationService {
       try {
         delivered = await this.browserRouter.deliver(current.workspace_id, routingId);
       } catch (error: unknown) {
-        await this.humanRequired(current, "DELIVERY_FAILED", errorMessage(error));
+        await this.humanRequired(current, "REVIEW_TRANSPORT_EXCEPTION", errorMessage(error));
         return;
       }
       if (delivered.status !== "delivered") {
+        if (delivered.status === "failed" && delivered.last_error?.retryable === true) {
+          await this.retryReview(current, delivered.attempt_count,
+            delivered.last_error.code ?? "REVIEW_TRANSPORT_FAILED", delivered.last_error.message);
+          return;
+        }
         await this.humanRequired(
           current,
-          delivered.status === "delivering" ? "DELIVERY_UNCERTAIN" : "DELIVERY_FAILED",
+          delivered.status === "delivering" ? "DELIVERY_UNCERTAIN"
+            : delivered.last_error?.code ?? "REVIEW_TRANSPORT_FAILED",
           delivered.last_error?.message,
         );
         return;
@@ -791,7 +844,7 @@ export class AutoIterationService {
       if (result === null && loop.review_result_id !== undefined) {
         result = await this.results.getReviewResultByRequest(loop.workspace_id, reviewRequestId);
       }
-      if (result === null) {
+      if (result === null || result.status === "TIMEOUT") {
         try {
           result = await this.completionRouter.collect(loop.workspace_id, routingId);
         } catch (error: unknown) {
@@ -814,6 +867,12 @@ export class AutoIterationService {
           reviewRequestId,
           { status: "requested" },
         );
+        if (result.status === "TIMEOUT") {
+          const attempts = (loop.completion_attempt_count ?? 0) + 1;
+          const current = await this.update(loop, { completion_attempt_count: attempts });
+          await this.retryReview(current, attempts, "REVIEW_COMPLETION_TIMEOUT", result.error);
+          return;
+        }
         await this.humanRequired(loop, `REVIEW_COMPLETION_${result.status}`, result.error);
         return;
       }
@@ -887,6 +946,7 @@ export class AutoIterationService {
         routing_id: undefined,
         delivery_id: undefined,
         review_result_id: undefined,
+        completion_attempt_count: undefined,
         actuation_id: nextActuationId,
         authorization_id: undefined,
         pending_iteration: {

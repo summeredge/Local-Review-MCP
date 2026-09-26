@@ -25,6 +25,7 @@ export const reviewDeliveryTimestampSchema = z.string().datetime({ offset: true 
 export const reviewDeliveryErrorSchema = z.object({
   code: z.string().min(1).max(128).optional(),
   message: z.string().min(1).max(4000),
+  retryable: z.boolean().optional(),
 }).strict();
 
 export const reviewDeliverySchema = z.object({

@@ -8,6 +8,7 @@ import type { ReviewDeliveryStatus } from "./review-delivery-schema.js";
 export interface ReviewDeliveryError {
   readonly code?: string;
   readonly message: string;
+  readonly retryable?: boolean;
 }
 
 export interface ReviewDelivery {

@@ -27,5 +27,6 @@ export type ReviewDeliveryResult =
   };
 
 export interface ReviewDeliveryAdapter {
+  readonly supportsDurableResume?: boolean;
   deliver(request: ReviewDeliveryRequest): Promise<ReviewDeliveryResult>;
 }

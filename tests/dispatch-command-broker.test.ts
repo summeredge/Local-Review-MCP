@@ -191,7 +191,7 @@ describe("DispatchCommandBroker", () => {
     await expect(deliveries.claim(owner(review.conversation_id, "late"))).resolves.toBeNull();
   });
 
-  it("drains a late owner ACK without changing an already timed-out delivery", async () => {
+  it("reconciles a late owner ACK through the same durable command without sending twice", async () => {
     const root = await makeStorageRoot();
     const deliveries = new ExtensionDeliveryService(root);
     const review = request("delivery-leased-timeout", "conversation-leased-timeout");
@@ -216,13 +216,18 @@ describe("DispatchCommandBroker", () => {
       status: "sent",
       message_id: "late-message",
     })).resolves.toMatchObject({
-      accepted: "existing",
-      receipt: { status: "ambiguous" },
+      accepted: "new",
+      receipt: { status: "delivered" },
     });
     await expect(deliveries.get(command.delivery_id)).resolves.toMatchObject({
-      phase: "ambiguous",
+      phase: "delivered",
       ack_time: expect.any(Number),
     });
+    const resumed = new ExtensionDeliveryAdapter(new DispatchCommandBroker(deliveries,
+      { timeoutMs: 10, readiness: () => ({ ready: false }) }));
+    await expect(resumed.deliver(review)).resolves.toMatchObject({ status: 'delivered' });
+    await expect(deliveries.getByLogicalDeliveryId(review.delivery_id)).resolves.toMatchObject({ delivery_id: command.delivery_id });
+    await expect(deliveries.claim(claim)).resolves.toBeNull();
   });
 
   it("keeps a not-ready ReviewDelivery failed until a later explicit retry is ready", async () => {

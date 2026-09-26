@@ -1129,8 +1129,8 @@ describe("Control Plane control loop integration", () => {
 
   it.each([
     ["FAILED", "failed" as const, "human_required" as const],
-    ["TIMEOUT", "timeout" as const, "human_required" as const],
-  ])("maps Extension Completion %s to human_required", async (_label, outcome, expectedStatus) => {
+    ["TIMEOUT", "timeout" as const, "running" as const],
+  ])("distinguishes terminal Extension Completion %s from a recoverable wait", async (_label, outcome, expectedStatus) => {
     const harness = await createExtensionHarness(["APPROVE"], outcome);
     const value = plan(`goal-extension-${outcome}`);
     const { goal } = await startPlan(harness, value);
@@ -1138,7 +1138,9 @@ describe("Control Plane control loop integration", () => {
 
     const loop = await harness.auto.getLoop(goal.loop_id!);
     expect((await harness.goals.getGoal(value.goal_id))?.status).toBe(expectedStatus);
-    expect(loop?.stage).toBe(expectedStatus);
+    expect(loop?.stage).toBe(outcome === 'timeout' ? 'review_completion' : expectedStatus);
+    if (outcome === 'timeout') expect(loop?.retry_at).toEqual(expect.any(String));
+    harness.auto.dispose();
     expect(harness.extension.completionRequests).toHaveLength(1);
     expect(await new ReviewResultService(harness.root).getReviewResultByRequest(
       value.workspace_id,

@@ -220,6 +220,27 @@ function finalMessage(id = "assistant-final", text = "Final answer", options: Pa
 }
 
 describe("MAIN-world review completion observation", () => {
+  function timelineReply(items: Record<string, unknown>[], status = 'complete', conversationId = CONVERSATION_A) {
+    const timeline: Section = { getAttribute: name => name === 'data-turn-key' ? 'current-turn' : null,
+      __reactFiber$test: { memoizedProps: { entry: { conversationId, turn: { items, status } } }, return: null } };
+    return completionReply([timeline]);
+  }
+
+  it('observes the production timeline final answer only after the exact delivered user and terminal state', () => {
+    const u = { type: 'user-message', messageId: EXPECTED_USER, serverMessageId: EXPECTED_USER };
+    const a = { type: 'assistant-message', messageId: 'answer-001', latestMessageId: 'answer-001',
+      completed: true, phase: 'final_answer', content: '<lrm-review-result>review</lrm-review-result>' };
+    expect(timelineReply([u, a])).toMatchObject({ status: 'completed', assistant_message_id: 'answer-001', content: a.content });
+    expect(timelineReply([u, a], 'in_progress')).toMatchObject({ status: 'pending' });
+    expect(timelineReply([u, { ...a, completed: false }])).toMatchObject({ status: 'pending' });
+    expect(timelineReply([{ ...u, messageId: 'other', serverMessageId: 'other' }, a])).toMatchObject({ status: 'pending' });
+    expect(timelineReply([u, a], 'complete', CONVERSATION_B)).toMatchObject({ status: 'ambiguous' });
+    expect(timelineReply([u, { ...a, latestMessageId: 'conflicting-id' }])).toMatchObject({ status: 'ambiguous' });
+    expect(timelineReply([u, { type: 'chatgpt-reasoning-group', items: [a] }])).toMatchObject({ status: 'pending' });
+    expect(timelineReply([u, { ...a, phase: 'commentary' }])).toMatchObject({ status: 'pending' });
+    expect(timelineReply([u, { ...u, messageId: 'new-user' }, a])).toMatchObject({ status: 'ambiguous' });
+  });
+
   it("observes separate user/assistant turns from streaming through completion", () => {
     const response = finalMessage();
     response.streaming = true;

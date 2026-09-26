@@ -250,6 +250,7 @@ function domHarness(options: {
   emptyComposerBlock?: boolean;
   normalizeAsync?: boolean;
   message?: string;
+  timeline?: boolean;
 } = {}): {
   dom: {
     ready(): boolean;
@@ -280,7 +281,7 @@ function domHarness(options: {
   composer.isConnected = true;
   composer.parentElement = form;
   composer.closest = (selector) => selector === "form" ? form : null;
-  form.querySelector = () => attachment ? node() : null;
+  form.querySelector = (selector) => selector === 'button[type="submit"]' ? button : attachment ? node() : null;
   if (options.blockComposer) {
     Object.defineProperty(composer, "childNodes", { configurable: true, get: () => blockNodes });
     Object.defineProperty(composer, "innerText", {
@@ -316,19 +317,28 @@ function domHarness(options: {
     message.hasAttribute = (name) => name === "data-message-id";
     message.getAttribute = (name) => name === "data-message-id" ? clickReceipt : null;
     message.querySelectorAll = (selector) => selector === ".whitespace-pre-wrap" ? [node(submittedMessage)] : [];
+    if (options.timeline) {
+      message.getAttribute = (name) => name === 'data-chatgpt-search-message-ids' ? clickReceipt : null;
+      const bubble = node();
+      bubble.querySelectorAll = () => [node(submittedMessage)];
+      message.querySelector = (selector) => selector === '[data-user-message-bubble]' ? bubble : null;
+    }
     users.push(message);
     observer?.();
   };
   const document = {
     documentElement: {},
     querySelector(selector: string) {
-      if (selector === "#prompt-textarea") return composer;
+      if (selector === "#prompt-textarea") return options.timeline ? null : composer;
+      if (selector === '[data-composer-markdown][role="textbox"][contenteditable="true"]') return options.timeline ? composer : null;
       if (selector.includes("stop-button")) return stop ? node() : null;
-      if (selector.includes("send-button")) return button;
+      if (selector.includes("send-button")) return options.timeline ? null : button;
       return null;
     },
     querySelectorAll(selector: string) {
-      return selector === '[data-message-author-role="user"]' ? users : [];
+      return selector === (options.timeline
+        ? '[data-chatgpt-search-unit-key$=":user"][data-chatgpt-search-message-ids]'
+        : '[data-message-author-role="user"]') ? users : [];
     },
     execCommand(action: string, _ui: boolean, value?: string) {
       if (action === "insertText") setComposerText(value ?? "");
@@ -389,6 +399,15 @@ function paragraph(value: string, children = [textNode(value)]): FakeNode {
 }
 
 describe("ChatGPT DOM delivery adapter", () => {
+  it('delivers through the production timeline composer and proves the exact stable user receipt', async () => {
+    const h = domHarness({ timeline: true, blockComposer: true, emptyComposerBlock: true, message: REVIEW_REQUEST });
+    expect(h.dom.ready()).toBe(true);
+    await expect(h.dom.insertPrompt(REVIEW_REQUEST)).resolves.toBe(true);
+    h.setClickReceipt('timeline-user-message');
+    await expect(h.dom.send(REVIEW_REQUEST, () => true, 50)).resolves.toEqual({ clicked: true, message_id: 'timeline-user-message' });
+    expect(h.clickCount()).toBe(1);
+  });
+
   it("treats only structurally empty composers as ready", () => {
     expect(domHarness().dom.ready()).toBe(true);
 

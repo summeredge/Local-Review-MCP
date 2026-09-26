@@ -482,6 +482,7 @@ export async function startApp(
       );
     }
     server.once("close", () => {
+      context.autoIteration?.dispose();
       cleanupDesktopToolsPipeLifecycle();
       try {
         desktopSyncObserver.dispose();

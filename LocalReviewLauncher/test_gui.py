@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QLabel,
@@ -26,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from config_manager import LauncherConfig
-from gui import LauncherState, LauncherWindow
+from gui import BUTTON_HEIGHT, BUTTON_WIDTH, LauncherState, LauncherWindow
 from status_checker import (
     BrowserReadiness,
     CapabilityStatus,
@@ -67,16 +68,18 @@ class LauncherLogTests(unittest.TestCase):
             window.timer.stop()
             window.show()
             self.application.processEvents()
-            title = next(label for label in window.findChildren(QLabel) if label.text() == "Local Review MCP")
             actions = window.start_button.parentWidget()
             overview = actions.parentWidget().layout().itemAt(0).layout()
-            self.assertIs(overview.itemAt(0).widget(), title)
-            self.assertIs(overview.itemAt(1).widget(), actions)
+            self.assertIs(overview.itemAt(0).widget(), actions)
             self.assertEqual(actions.width(), 680 * 3 // 4)
-            self.assertEqual(actions.x(), title.x())
-            self.assertGreater(actions.y(), title.geometry().bottom())
+            self.assertEqual(actions.x(), window.launcher_state.parentWidget().x())
             self.assertLess(actions.geometry().bottom(), window.launcher_state.parentWidget().y())
-            self.assertTrue(any(label.text() == "Browser:" for label in window.findChildren(QLabel)))
+            self.assertTrue(any(label.text() == "浏览器：" for label in window.findChildren(QLabel)))
+            self.assertFalse(any(label.text() == "Local Review MCP" for label in window.findChildren(QLabel)))
+            for button in window.findChildren(QPushButton) + [window.capability_timeline_toggle, window.session_viewer_toggle]:
+                self.assertEqual((button.width(), button.height()), (BUTTON_WIDTH, BUTTON_HEIGHT))
+                self.assertEqual(button.font().family(), window.font().family())
+                self.assertEqual(button.font().pointSize(), window.font().pointSize())
             connected_desktop = DesktopSyncStatus(
                 connected=True,
                 current_conversation_id="conversation-1",
@@ -109,28 +112,36 @@ class LauncherLogTests(unittest.TestCase):
                 "2026-09-24T01:00:00.000Z",
                 (DoctorCheckStatus("Desktop Handoff", "WARN", "desktop_tools_pipe_unavailable", "2026-09-24T01:00:00.000Z"),),
             ))
-            self.assertIn("Status: DEGRADED", window.doctor_status.text())
-            self.assertIn("[WARN] Desktop Handoff", window.doctor_status.text())
+            self.assertIn("状态：降级（DEGRADED）", window.doctor_status.text())
+            self.assertIn("[警告] Desktop Handoff", window.doctor_status.text())
             self.assertIn("desktop_tools_pipe_unavailable", window.doctor_status.text())
+            self.assertIn('style="color: #946200">[警告] Desktop Handoff', window.doctor_status.text())
+            window._render_doctor(DoctorStatus(
+                "READY",
+                "2026-09-24T01:00:00.000Z",
+                (DoctorCheckStatus("MCP Runtime", "PASS"),),
+            ))
+            self.assertIn('style="color: #16803c">状态：已就绪（READY）', window.doctor_status.text())
+            self.assertIn('style="color: #16803c">[通过] MCP Runtime', window.doctor_status.text())
             window._render_doctor(DoctorStatus())
-            self.assertIn("[FAIL] Doctor — doctor_unavailable", window.doctor_status.text())
+            self.assertIn("[失败] 诊断 — doctor_unavailable", window.doctor_status.text())
             window._apply_controls(window._last_status)
-            self.assertIn("Connected", window.desktop_sync_status.text())
-            self.assertIn("Mode: Auto", window.desktop_sync_status.text())
-            self.assertIn("Source: Desktop IPC", window.desktop_sync_status.text())
-            self.assertIn("Conversation: conversation-1", window.desktop_sync_status.text())
-            self.assertIn("Following: Yes", window.desktop_sync_status.text())
-            self.assertIn("Desktop IPC: Connected", window.desktop_sync_status.text())
-            self.assertIn("Desktop Identity: Ready", window.desktop_sync_status.text())
-            self.assertIn("Tools Pipe: Active", window.desktop_sync_status.text())
-            self.assertIn("Capability: pipeSource=handoff", window.desktop_sync_status.text())
-            self.assertIn("Execution: execution-1", window.capability_status.text())
-            self.assertIn("Source: Desktop", window.capability_status.text())
-            self.assertIn("State: desktop_failed", window.capability_status.text())
-            self.assertIn("Desktop: Failed", window.capability_status.text())
-            self.assertIn("Error code: owner_binding_timeout", window.capability_status.text())
-            self.assertIn("Waiting for user decision", window.capability_status.text())
-            self.assertIn("Automatic fallback in:", window.capability_status.text())
+            self.assertIn("已连接", window.desktop_sync_status.text())
+            self.assertIn("模式：自动", window.desktop_sync_status.text())
+            self.assertIn("来源：Desktop IPC", window.desktop_sync_status.text())
+            self.assertIn("会话：conversation-1", window.desktop_sync_status.text())
+            self.assertIn("跟随：是", window.desktop_sync_status.text())
+            self.assertIn("Desktop IPC：已连接", window.desktop_sync_status.text())
+            self.assertIn("Desktop 身份：已就绪", window.desktop_sync_status.text())
+            self.assertIn("Tools Pipe：活动", window.desktop_sync_status.text())
+            self.assertIn("能力：pipeSource=handoff", window.desktop_sync_status.text())
+            self.assertIn("执行：execution-1", window.capability_status.text())
+            self.assertIn("来源：Desktop", window.capability_status.text())
+            self.assertIn("状态：Desktop 失败（desktop_failed）", window.capability_status.text())
+            self.assertIn("Desktop：失败", window.capability_status.text())
+            self.assertIn("错误代码：owner_binding_timeout", window.capability_status.text())
+            self.assertIn("等待用户选择", window.capability_status.text())
+            self.assertIn("自动备用路径倒计时：", window.capability_status.text())
             self.assertTrue(window.recheck_desktop_button.isEnabled())
             self.assertTrue(window.standalone_button.isEnabled())
 
@@ -141,8 +152,8 @@ class LauncherLogTests(unittest.TestCase):
                 desktop_sync=connected_desktop,
                 capability=CapabilityStatus(state="desktop_pending", source="desktop"),
             ))
-            self.assertIn("Desktop: Pending", window.capability_status.text())
-            self.assertIn("Waiting for handoff", window.capability_status.text())
+            self.assertIn("Desktop：等待中", window.capability_status.text())
+            self.assertIn("等待 Desktop 接管", window.capability_status.text())
 
             window._render_status(LauncherStatus(
                 True,
@@ -156,9 +167,9 @@ class LauncherLogTests(unittest.TestCase):
                     error_code="desktop_handoff_timeout",
                 ),
             ))
-            self.assertIn("Fallback activated", window.capability_status.text())
-            self.assertIn("Provider: Standalone", window.capability_status.text())
-            self.assertIn("Desktop handoff timeout", window.capability_status.text())
+            self.assertIn("已启用备用路径", window.capability_status.text())
+            self.assertIn("提供方：Standalone", window.capability_status.text())
+            self.assertIn("Desktop 交接超时", window.capability_status.text())
 
             window._render_status(LauncherStatus(
                 True,
@@ -172,15 +183,15 @@ class LauncherLogTests(unittest.TestCase):
                     execution_id="execution-1",
                 ),
             ))
-            self.assertIn("Desktop: Ready", window.capability_status.text())
-            self.assertIn("Source: Desktop", window.capability_status.text())
-            self.assertIn("desktop_binding_recovered", window.capability_status.text())
+            self.assertIn("Desktop：已就绪", window.capability_status.text())
+            self.assertIn("来源：Desktop", window.capability_status.text())
+            self.assertIn("Desktop 绑定已恢复", window.capability_status.text())
 
             offline_status = LauncherStatus(False, False, False)
             window._render_status(offline_status)
             window._apply_controls(offline_status)
-            self.assertIn("State: unavailable", window.capability_status.text())
-            self.assertIn("MCP capability unavailable", window.capability_status.text())
+            self.assertIn("状态：不可用（unavailable）", window.capability_status.text())
+            self.assertIn("MCP 能力不可用", window.capability_status.text())
             self.assertFalse(window.recheck_desktop_button.isEnabled())
             self.assertFalse(window.standalone_button.isEnabled())
 
@@ -191,19 +202,19 @@ class LauncherLogTests(unittest.TestCase):
                 desktop_sync=replace(connected_desktop, owner_client_id=None),
                 desktop_capability=DesktopCapabilityStatus(pipe_state="pending"),
             ))
-            self.assertIn("Desktop Identity: Waiting for activation", window.desktop_sync_status.text())
-            self.assertIn("Tools Pipe: Pending", window.desktop_sync_status.text())
-            self.assertIn("Capability: Waiting for Desktop activation", window.desktop_sync_status.text())
+            self.assertIn("Desktop 身份：等待激活", window.desktop_sync_status.text())
+            self.assertIn("Tools Pipe：等待中", window.desktop_sync_status.text())
+            self.assertIn("能力：等待 Desktop 激活", window.desktop_sync_status.text())
 
             unmatched = replace(connected_desktop, association_status="unmatched")
             window._render_status(LauncherStatus(True, True, True, desktop_sync=unmatched))
-            self.assertIn("Source: Desktop IPC", window.desktop_sync_status.text())
-            self.assertIn("Association: Unmatched", window.desktop_sync_status.text())
+            self.assertIn("来源：Desktop IPC", window.desktop_sync_status.text())
+            self.assertIn("关联：未匹配", window.desktop_sync_status.text())
             self.assertNotIn("Legacy app-server", window.desktop_sync_status.text())
 
             conflict = replace(connected_desktop, association_status="conflict")
             window._render_status(LauncherStatus(True, True, True, desktop_sync=conflict))
-            self.assertIn("Association: Conflict", window.desktop_sync_status.text())
+            self.assertIn("关联：冲突", window.desktop_sync_status.text())
 
             fallback = DesktopSyncStatus(
                 active_source="legacy_app_server",
@@ -212,12 +223,12 @@ class LauncherLogTests(unittest.TestCase):
             )
             window._render_status(LauncherStatus(True, True, True, desktop_sync=fallback))
             self.assertEqual(window.desktop_sync_status.text(),
-                             "Unavailable\nMode: Auto\nSource: Legacy app-server\n"
-                             "Reason: Desktop unavailable\n\n"
-                             "Desktop IPC: Disconnected\n"
-                             "Desktop Identity: Unavailable\n"
-                             "Tools Pipe: Unavailable\n"
-                             "Capability: Unavailable")
+                             "不可用\n模式：自动\n来源：Legacy app-server\n"
+                             "原因：Desktop 不可用\n\n"
+                             "Desktop IPC：已断开\n"
+                             "Desktop 身份：不可用\n"
+                             "Tools Pipe：不可用\n"
+                             "能力：不可用")
 
             evidence_unavailable = replace(
                 fallback,
@@ -225,54 +236,68 @@ class LauncherLogTests(unittest.TestCase):
                 fallback_reason="desktop_evidence_unavailable",
             )
             window._render_status(LauncherStatus(True, True, True, desktop_sync=evidence_unavailable))
-            self.assertIn("Source: Legacy app-server", window.desktop_sync_status.text())
-            self.assertIn("Reason: Desktop evidence unavailable", window.desktop_sync_status.text())
+            self.assertIn("来源：Legacy app-server", window.desktop_sync_status.text())
+            self.assertIn("原因：Desktop 证据不可用", window.desktop_sync_status.text())
 
             self.assertEqual(window.state, state_before)
             self.assertTrue(window._last_status.mcp_running)
             window._render_status(LauncherStatus(True, True, True, desktop_sync=DesktopSyncStatus()))
             self.assertEqual(window.desktop_sync_status.text(),
-                             "Unavailable\nMode: Auto\nSource: Legacy app-server\n"
-                             "Reason: Desktop unavailable\n\n"
-                             "Desktop IPC: Disconnected\n"
-                             "Desktop Identity: Unavailable\n"
-                             "Tools Pipe: Unavailable\n"
-                             "Capability: Unavailable")
+                             "不可用\n模式：自动\n来源：Legacy app-server\n"
+                             "原因：Desktop 不可用\n\n"
+                             "Desktop IPC：已断开\n"
+                             "Desktop 身份：不可用\n"
+                             "Tools Pipe：不可用\n"
+                             "能力：不可用")
             for state, reason in (("extension_not_paired", "Extension is not paired."),
                                   ("extension_not_present", "Extension is not connected.")):
                 browser = BrowserReadiness(False, state, True, state == "extension_not_present", False,
                                            123, reason, "Refresh ChatGPT page / 刷新 ChatGPT 页面")
                 window._render_status(LauncherStatus(True, True, True, browser=browser))
-                self.assertEqual(window.browser_status.text(), f"NOT READY\nReason: {reason}\nAction: {browser.action}")
+                expected_reason = "扩展未配对。" if state == "extension_not_paired" else "扩展未连接。"
+                self.assertEqual(window.browser_status.text(), f"未就绪\n原因：{expected_reason}\n操作：刷新 ChatGPT 页面")
+            bilingual_action = (
+                "Refresh the ChatGPT page and wait for the extension to reconnect. "
+                "Reload/更新扩展后，请刷新 ChatGPT 页面并等待扩展重新连接。"
+            )
+            window._render_status(LauncherStatus(
+                True, True, True,
+                browser=BrowserReadiness(False, "extension_not_paired", True, False, False, 123,
+                                         "Extension is not paired.", bilingual_action),
+            ))
+            self.assertEqual(
+                window.browser_status.text(),
+                "未就绪\n原因：扩展未配对。\n操作：请刷新 ChatGPT 页面并等待扩展重新连接。",
+            )
             ready = BrowserReadiness(True, "ready", True, True, True, 123, "", "")
             window._render_status(LauncherStatus(True, True, True, browser=ready))
-            self.assertEqual(window.browser_status.text(), "READY")
+            self.assertEqual(window.browser_status.text(), "已就绪")
             missing = BrowserReadiness(False, "extension_not_present", True, True, False,
                                        123, "Extension is not connected.", "Refresh ChatGPT page")
             with patch("gui.monotonic", return_value=100) as clock:
                 window._render_status(LauncherStatus(True, True, True, browser=missing))
-                self.assertEqual(window.browser_status.text(), "READY")
+                self.assertEqual(window.browser_status.text(), "已就绪")
                 self.assertFalse(window._last_status.browser.ready)  # Raw readiness stays authoritative.
                 clock.return_value = 114.9
                 window._render_status(LauncherStatus(True, True, True, browser=missing))
-                self.assertEqual(window.browser_status.text(), "READY")
+                self.assertEqual(window.browser_status.text(), "已就绪")
                 clock.return_value = 115
                 window._render_status(LauncherStatus(True, True, True, browser=missing))
-                self.assertTrue(window.browser_status.text().startswith("DEGRADED\nReason:"))
-                self.assertIn(missing.action, window.browser_status.text())
+                self.assertTrue(window.browser_status.text().startswith("降级\n原因："))
+                self.assertIn("刷新 ChatGPT 页面", window.browser_status.text())
                 window._render_status(LauncherStatus(True, True, True, browser=ready))
-                self.assertEqual(window.browser_status.text(), "READY")
+                self.assertEqual(window.browser_status.text(), "已就绪")
                 clock.return_value = 200
                 window._render_status(LauncherStatus(True, True, True, browser=missing))
-                self.assertEqual(window.browser_status.text(), "READY")
+                self.assertEqual(window.browser_status.text(), "已就绪")
                 for hard_failure in (BrowserReadiness(), BrowserReadiness(
                     False, "extension_not_paired", True, False, False, None, "Not paired", "Refresh ChatGPT page"
                 )):
                     window._render_status(LauncherStatus(True, True, True, browser=ready))
                     window._render_status(LauncherStatus(True, True, True, browser=hard_failure))
-                    self.assertTrue(window.browser_status.text().startswith("NOT READY"))
+                    self.assertTrue(window.browser_status.text().startswith("未就绪"))
                     window._render_status(LauncherStatus(True, True, True, browser=missing))
-                    self.assertTrue(window.browser_status.text().startswith("NOT READY"))
+                    self.assertTrue(window.browser_status.text().startswith("未就绪"))
             first_row = (window.start_button, window.stop_button, window.refresh_button)
             second_row = (window.refresh_oauth_button, window.reset_oauth_button, window.delete_oauth_button)
             for column, (upper, lower) in enumerate(zip(first_row, second_row)):
@@ -281,6 +306,12 @@ class LauncherLogTests(unittest.TestCase):
                 self.assertEqual(upper.x(), lower.x())
                 self.assertEqual(upper.width(), lower.width())
                 self.assertGreater(lower.y(), upper.geometry().bottom())
+            initial_x = {button: button.mapTo(window, button.rect().topLeft()).x()
+                         for button in window.findChildren(QPushButton) + [window.capability_timeline_toggle, window.session_viewer_toggle]}
+            window.resize(window.width() + 400, window.height())
+            self.application.processEvents()
+            for button, x in initial_x.items():
+                self.assertEqual(button.mapTo(window, button.rect().topLeft()).x(), x)
 
     def test_capability_timeline_renders_state_and_failure_fields(self) -> None:
         manager = Mock()
@@ -314,7 +345,7 @@ class LauncherLogTests(unittest.TestCase):
         )
         window._render_capability_timeline(())
         self.assertEqual(window.capability_timeline_table.rowCount(), 0)
-        self.assertEqual(window.capability_timeline_empty_label.text(), "No recent capability timeline events.")
+        self.assertEqual(window.capability_timeline_empty_label.text(), "暂无最近的能力时间线事件。")
 
     def test_capability_doctor_has_own_tab_between_startup_and_tasks(self) -> None:
         manager = Mock()
@@ -336,6 +367,11 @@ class LauncherLogTests(unittest.TestCase):
         capability = tabs.widget(1)
         self.assertIsInstance(capability, QScrollArea)
         self.assertIs(window.capability_scroll_area, capability)
+        self.assertTrue(capability.widget().layout().alignment() & Qt.AlignmentFlag.AlignTop)
+        self.assertIs(
+            capability.widget().layout().itemAt(0).layout().itemAt(0).widget(),
+            window.run_doctor_button,
+        )
         self.assertNotIn(window.doctor_status, startup.findChildren(QLabel))
         self.assertIn(window.doctor_status, capability.findChildren(QLabel))
         for widget in (
@@ -450,10 +486,10 @@ class LauncherLogTests(unittest.TestCase):
         LauncherWindow._render_oauth_status(window, status)  # type: ignore[arg-type]
 
         text = window.oauth_status_label.text()
-        self.assertIn("OAuth Clients: 1", text)
+        self.assertIn("OAuth 客户端数：1", text)
         self.assertIn("ChatGPT", text)
-        self.assertIn("client_id: client-1", text)
-        self.assertIn("Created: 123", text)
+        self.assertIn("客户端 ID：client-1", text)
+        self.assertIn("创建时间：123", text)
 
     def test_delete_oauth_client_deletes_selected_client_and_refreshes(self) -> None:
         status = OAuthRegistryStatus(
@@ -480,7 +516,7 @@ class LauncherLogTests(unittest.TestCase):
             LauncherWindow.delete_oauth_client(window)  # type: ignore[arg-type]
 
         self.assertEqual(get_item.call_args.args[3], ["ChatGPT (client-1)", "ChatGPT (client-2)"])
-        self.assertIn("只删除选中的 OAuth Client，不影响其他 Client", confirm.call_args.args[2])
+        self.assertIn("只删除选中的 OAuth 客户端，不影响其他客户端", confirm.call_args.args[2])
         delete.assert_called_once_with("client-2")
         window.status_checker.reset_oauth_clients.assert_not_called()
         window.refresh_status.assert_called_once_with()
@@ -696,9 +732,9 @@ class LauncherDashboardTests(unittest.TestCase):
                 window.session_table.selectRow(0)
                 LauncherWindow._render_selected_session(window)
                 self.assertEqual(window.session_table.item(0, 7).text(), full_time)
-                self.assertIn(f"updated_at: {full_time}", window.session_details_label.text())
-                self.assertIn(f"started_at: {full_time}", window.execution_details_label.text())
-                self.assertIn(f"finished_at: {full_time}", window.execution_details_label.text())
+                self.assertIn(f"更新时间：{full_time}", window.session_details_label.text())
+                self.assertIn(f"开始时间：{full_time}", window.execution_details_label.text())
+                self.assertIn(f"结束时间：{full_time}", window.execution_details_label.text())
                 self.assertEqual(window.event_table.item(0, 0).text(), expected.strftime("%H:%M:%S"))
                 self.assertEqual(view.updated_at, timestamp)
 
@@ -720,14 +756,14 @@ class LauncherDashboardTests(unittest.TestCase):
             window._render_session_dashboard((view,))
             window.session_table.selectRow(0)
             window._render_selected_session()
-            self.assertIn("summary: —", window.execution_details_label.text())
+            self.assertIn("摘要：—", window.execution_details_label.text())
 
     def test_empty_dashboard_shows_no_active_sessions(self) -> None:
         window = self._window()
 
         LauncherWindow._render_session_dashboard(window, ())  # type: ignore[arg-type]
 
-        self.assertEqual(window.session_empty_label.text(), "No active sessions")
+        self.assertEqual(window.session_empty_label.text(), "暂无活动会话")
         self.assertTrue(window.session_empty_label.isVisible())
         self.assertEqual(window.session_table.rowCount(), 0)
         self.assertFalse(window.open_codex_task_button.isEnabled())
@@ -753,7 +789,7 @@ class LauncherDashboardTests(unittest.TestCase):
 
         self.assertEqual(window.session_table.item(0, 1).text(), "failed")
         self.assertEqual(view.execution.summary, execution["summary"])
-        self.assertIn("summary: " + execution["summary"], window.execution_details_label.text())
+        self.assertIn("摘要：" + execution["summary"], window.execution_details_label.text())
         self.assertEqual(window.event_table.item(3, 1).text(), "execution_failed")
         self.assertEqual(window.event_table.item(3, 2).text(), "provider failed")
 

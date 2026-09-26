@@ -4,6 +4,7 @@ import {
   ExtensionDeliveryNotFoundError,
   ExtensionDeliveryNotReadyError,
   ExtensionDeliveryUnavailableError,
+  retryableNotSent,
   type ExtensionDeliveryReceipt,
 } from "../control-plane/extension-delivery.js";
 import type { ReviewDeliveryError } from "../context/review-delivery.js";
@@ -44,6 +45,7 @@ function brokerFailure(error: unknown): ReviewDeliveryResult {
 }
 
 export class ExtensionDeliveryAdapter implements ReviewDeliveryAdapter {
+  public readonly supportsDurableResume = true;
   public constructor(
     private readonly broker: Pick<DispatchCommandBroker, "dispatch"> = new DispatchCommandBroker(),
   ) {}
@@ -72,6 +74,11 @@ export class ExtensionDeliveryAdapter implements ReviewDeliveryAdapter {
       };
     }
     if (receipt.status === "ambiguous") {
+      if (receipt.error === "Extension Delivery timed out before an acknowledgement was recorded.") {
+        return { status: "failed", retryable: true, error: {
+          code: "EXTENSION_DELIVERY_ACK_TIMEOUT", message: receipt.error,
+        } };
+      }
       return {
         status: "ambiguous",
         error: receiptError(receipt, "Extension Delivery could not prove whether the message was sent."),
@@ -79,8 +86,9 @@ export class ExtensionDeliveryAdapter implements ReviewDeliveryAdapter {
     }
     return {
       status: "failed",
-      retryable: false,
-      error: receiptError(receipt, "Extension Delivery did not send the message."),
+      retryable: retryableNotSent(receipt),
+      error: { ...receiptError(receipt, "Extension Delivery did not send the message."),
+        code: retryableNotSent(receipt) ? "EXTENSION_DELIVERY_NOT_SENT" : "EXTENSION_DELIVERY_FAILED" },
     };
   }
 }

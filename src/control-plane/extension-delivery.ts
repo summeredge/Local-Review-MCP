@@ -208,6 +208,11 @@ function sameOwner(lease: ExtensionDeliveryLease, owner: ExtensionDeliveryClaim)
     && lease.navigation_epoch === owner.navigation_epoch;
 }
 
+export function retryableNotSent(receipt: ExtensionDeliveryReceipt): boolean {
+  return receipt.status === "failed" && ["composer_busy", "send control unavailable",
+    "document identity changed before send", "document identity changed before submit"].includes(receipt.error ?? "");
+}
+
 function receiptFor(ack: ExtensionDeliveryAck, completedAt: number): ExtensionDeliveryReceipt {
   return {
     delivery_id: ack.delivery_id,
@@ -301,7 +306,11 @@ export class ExtensionDeliveryService {
           if (existing.conversation_id !== parsed.conversation_id || existing.message !== parsed.message) {
             throw new ExtensionDeliveryConflictError("logical delivery command already targets different content");
           }
-          return clone(existing);
+          if (!existing.receipt || !retryableNotSent(existing.receipt)) return clone(existing);
+          // The old attempt has durable proof of no send. Keep its receipt for late
+          // duplicate ACKs; a fresh physical id fences those ACKs from the retry.
+          const { logical_delivery_id: _logicalId, ...retired } = existing;
+          next.set(existing.delivery_id, retired);
         }
       }
       while (next.size >= MAX_DELIVERIES) {
@@ -385,13 +394,16 @@ export class ExtensionDeliveryService {
         if (current.receipt.status === "ambiguous"
           && current.receipt.error === current.timeout_reason
           && sameReceiptOwner(current.receipt, ack)) {
-          if (current.ack_time === undefined) {
-            const next = new Map(this.deliveries);
-            next.set(current.delivery_id, { ...current, ack_time: Date.now() });
-            await this.persist(next);
-            this.deliveries = next;
-          }
-          return { accepted: "existing", receipt: clone(current.receipt) };
+          // Timeout is not evidence of non-delivery. The fenced original owner can
+          // still prove the result; no lease was reissued after timeout retirement.
+          const receipt = receiptFor(ack, Date.now());
+          const next = new Map(this.deliveries);
+          next.set(current.delivery_id, { ...current, ack_time: receipt.completed_at,
+            phase: receipt.status, receipt });
+          await this.persist(next);
+          this.deliveries = next;
+          this.wake(receipt);
+          return { accepted: "new", receipt: clone(receipt) };
         }
         if (!sameReceipt(current.receipt, ack)) throw new ExtensionDeliveryConflictError("conflicting delivery receipt");
         return { accepted: "existing", receipt: clone(current.receipt) };

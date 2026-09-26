@@ -12,7 +12,10 @@ import type {
 import { BrowserWorkerClient } from "../browser-worker-client/browser-worker-client.js";
 import { BrowserWorkerDeliveryAdapter } from "../delivery/browser-worker-delivery-adapter.js";
 
+const deliveryFlights = new Map<string, Promise<ReviewDelivery>>();
+
 export class BrowserRouter {
+  public get supportsDurableResume(): boolean { return this.adapter.supportsDurableResume === true; }
   private readonly routings: ConversationRoutingService;
   private readonly deliveries: ReviewDeliveryService;
 
@@ -28,6 +31,18 @@ export class BrowserRouter {
   }
 
   public async deliver(workspaceId: string, routingId: string): Promise<ReviewDelivery> {
+    const key = `${this.deliveries.storageRoot}\0${workspaceId}\0${routingId}`;
+    const pending = deliveryFlights.get(key);
+    if (pending) return pending;
+    const operation = this.deliverOnce(workspaceId, routingId);
+    deliveryFlights.set(key, operation);
+    void operation.finally(() => {
+      if (deliveryFlights.get(key) === operation) deliveryFlights.delete(key);
+    }).catch(() => undefined);
+    return operation;
+  }
+
+  private async deliverOnce(workspaceId: string, routingId: string): Promise<ReviewDelivery> {
     const routing = await this.routings.getRouting(workspaceId, routingId);
     if (routing === null) throw new Error(`Conversation routing "${routingId}" was not found.`);
     await this.routings.validateRouting(routing);
@@ -39,8 +54,13 @@ export class BrowserRouter {
     }
     await this.deliveries.validateDelivery(delivery);
     if (delivery.status === "delivered") return delivery;
+    if (delivery.status === "delivering" && !this.supportsDurableResume) {
+      throw new Error("Delivery outcome is uncertain; adapter cannot safely resume the durable command.");
+    }
 
-    const attempt = await this.deliveries.beginDeliveryAttempt(workspaceId, delivery.delivery_id);
+    // Resume the same durable command after restart; the broker owns send deduplication.
+    const attempt = delivery.status === "delivering" ? delivery
+      : await this.deliveries.beginDeliveryAttempt(workspaceId, delivery.delivery_id);
     const request: ReviewDeliveryRequest = {
       delivery_id: attempt.delivery_id,
       workspace_id: attempt.workspace_id,
@@ -73,6 +93,7 @@ export class BrowserRouter {
     if (result.status === "ambiguous") {
       return this.deliveries.markAmbiguous(workspaceId, attempt.delivery_id, result.error);
     }
-    return this.deliveries.markFailed(workspaceId, attempt.delivery_id, result.error);
+    return this.deliveries.markFailed(workspaceId, attempt.delivery_id,
+      { ...result.error, retryable: result.retryable });
   }
 }

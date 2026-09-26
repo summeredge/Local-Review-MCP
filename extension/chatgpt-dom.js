@@ -2,7 +2,7 @@ globalThis.LRM_DOM = (() => {
   'use strict';
 
   const STOP = 'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], '
-    + 'button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[aria-label="Stop answering"]';
+    + 'button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[aria-label="Stop answering"], button[aria-label="停止"]';
   const SEND = 'button[data-testid="send-button"], form button[aria-label^="Send" i]';
   const BLOCK_ELEMENTS = new Set([
     'ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DD', 'DIV', 'DL', 'DT', 'FIELDSET',
@@ -40,7 +40,8 @@ globalThis.LRM_DOM = (() => {
   const sameText = (actual, expected) => canonicalText(actual) === canonicalText(expected);
 
   function composer() {
-    return document.querySelector('#prompt-textarea');
+    return document.querySelector('#prompt-textarea')
+      || document.querySelector('[data-composer-markdown][role="textbox"][contenteditable="true"]');
   }
 
   function stopButton() {
@@ -48,7 +49,8 @@ globalThis.LRM_DOM = (() => {
   }
 
   function sendButton() {
-    return document.querySelector(SEND);
+    return document.querySelector(SEND)
+      || composer()?.closest('form')?.querySelector('button[type="submit"]');
   }
 
   function composerText(box = composer()) {
@@ -122,6 +124,14 @@ globalThis.LRM_DOM = (() => {
       const parts = [...node.querySelectorAll('.whitespace-pre-wrap')]
         .map((part) => plainText(part));
       found.push({ message_id: messageId, text: parts.length ? parts.join('\n') : plainText(node), node });
+    }
+    for (const node of document.querySelectorAll('[data-chatgpt-search-unit-key$=":user"][data-chatgpt-search-message-ids]')) {
+      const ids = (node.getAttribute('data-chatgpt-search-message-ids') || '').trim().split(/\s+/u);
+      if (ids.length !== 1 || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(ids[0])) continue;
+      const bubble = node.querySelector('[data-user-message-bubble]');
+      const parts = [...(bubble?.querySelectorAll('.whitespace-pre-wrap') || [])];
+      if (parts.length !== 1) continue;
+      found.push({ message_id: ids[0], text: plainText(parts[0]), node });
     }
     return found;
   }

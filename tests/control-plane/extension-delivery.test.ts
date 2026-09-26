@@ -214,7 +214,21 @@ describe("ExtensionDeliveryService", () => {
     }
   });
 
-  it("drains a late owner ACK without changing a timeout ambiguity into success", async () => {
+  it('retries only proven not-sent attempts and fences duplicate old ACKs from the new lease', async () => {
+    const { deliveries } = await service();
+    const first = await deliveries.enqueue(conversation, 'retry-safe', 'logical-retry');
+    await deliveries.claim(owner);
+    const ack = { ...owner, delivery_id: first.delivery_id, status: 'not_sent' as const, error: 'composer_busy' };
+    await deliveries.acknowledge(ack);
+    const second = await deliveries.enqueue(conversation, 'retry-safe', 'logical-retry');
+    expect(second.delivery_id).not.toBe(first.delivery_id);
+    await expect(deliveries.claim(owner)).resolves.toMatchObject({ delivery_id: second.delivery_id });
+    await expect(deliveries.acknowledge(ack)).resolves.toMatchObject({ accepted: 'existing' });
+    await expect(deliveries.get(second.delivery_id)).resolves.toMatchObject({ phase: 'leased' });
+    await expect(deliveries.enqueue(conversation, 'retry-safe', 'logical-retry')).resolves.toMatchObject({ delivery_id: second.delivery_id });
+  });
+
+  it("reconciles a late owner ACK exactly once without reissuing a timed-out send", async () => {
     const { deliveries } = await service();
     const queued = await deliveries.enqueue(conversation, "late ack after local timeout");
     const lateOwner = {
@@ -227,23 +241,26 @@ describe("ExtensionDeliveryService", () => {
     await expect(deliveries.expire(queued.delivery_id)).resolves.toBeNull();
     const timeout = (await deliveries.get(queued.delivery_id))?.receipt;
     expect(timeout).toMatchObject({ delivery_id: queued.delivery_id, status: "ambiguous" });
+    await expect(deliveries.claim(lateOwner)).resolves.toBeNull();
+    await expect(deliveries.acknowledge({ ...lateOwner, document_id: 'other-document',
+      delivery_id: queued.delivery_id, status: 'sent', message_id: 'wrong-owner' })).rejects.toThrow();
 
     await expect(deliveries.acknowledge({
       ...lateOwner,
       delivery_id: queued.delivery_id,
       status: "sent",
       message_id: "message-late",
-    })).resolves.toMatchObject({ accepted: "existing", receipt: timeout });
+    })).resolves.toMatchObject({ accepted: "new", receipt: { status: 'delivered', message_id: 'message-late' } });
     await expect(deliveries.acknowledge({
       ...lateOwner,
       delivery_id: queued.delivery_id,
       status: "sent",
       message_id: "message-late",
-    })).resolves.toMatchObject({ accepted: "existing", receipt: timeout });
+    })).resolves.toMatchObject({ accepted: "existing", receipt: { status: 'delivered', message_id: 'message-late' } });
     await expect(deliveries.get(queued.delivery_id)).resolves.toMatchObject({
-      phase: "ambiguous",
+      phase: "delivered",
       ack_time: expect.any(Number),
-      receipt: { status: "ambiguous" },
+      receipt: { status: "delivered" },
     });
   });
 

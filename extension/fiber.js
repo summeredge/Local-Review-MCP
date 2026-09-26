@@ -8,8 +8,10 @@
   const COMPLETION_ASK = 'lrm-extension-review-completion-ask';
   const COMPLETION_REPLY = 'lrm-extension-review-completion-reply';
   const TURN_SELECTOR = 'section[data-testid^="conversation-turn"]';
+  const IDENTITY_TURN_SELECTOR = `${TURN_SELECTOR}, [data-turn-key]`;
   const MAX_CLIMB = 80;
   const MAX_TURNS = 100;
+  const MAX_UNANCHORED_TAIL_TURNS = 3;
   const MAX_COMPLETION_MESSAGE_CANDIDATES = 20;
   const MAX_COMPLETION_CONTENT = 256 * 1024;
   const MAX_TOOL_PAYLOAD = 512 * 1024;
@@ -33,6 +35,7 @@
       const props = at.memoizedProps;
       if (!props || typeof props !== 'object') continue;
       const turn = props.turn && typeof props.turn === 'object' ? props.turn : null;
+      const entry = props.entry?.turn && Array.isArray(props.entry.turn.items) ? props.entry : null;
       // Current ChatGPT turn fibers carry the conversation model beside `turn`; older
       // shapes expose one of the flat/thread fields below. All readable identities must agree.
       const conversation = props.conversation && typeof props.conversation === 'object' ? props.conversation : null;
@@ -57,6 +60,7 @@
         turn?.clientThreadId,
         turn?.conversationId,
         modelConversationId,
+        entry?.conversationId,
       ];
       for (const value of values) {
         if (value === null || value === undefined) continue;
@@ -521,6 +525,7 @@
       const message = messages[index];
       if (!requestOf(message)) continue;
       const inspection = submitGoalInspectionOf(message);
+      if (!inspection.recognized) continue;
       return { found: true, key: inspection.key, submit_goal_found: inspection.recognized, reason: inspection.reason };
     }
     return { found: false, key: null, submit_goal_found: false, reason: 'recipient_mismatch' };
@@ -546,10 +551,175 @@
     return groups;
   }
 
+  function snapshotOf(section) {
+    try {
+      const fiber = fiberOf(section);
+      if (section.getAttribute?.('data-turn-key')) {
+        for (let at = fiber, depth = 0; at && depth < MAX_CLIMB; at = at.return, depth += 1) {
+          const entry = at.memoizedProps?.entry;
+          if (!entry) continue;
+          if (!Array.isArray(entry.turn?.items)) return null;
+          const messages = timelineMessagesOf(entry.turn.items);
+          return messages ? { fiber: at, messages, mostRecent: entry.isMostRecentTurn === true } : null;
+        }
+        return null;
+      }
+      const messages = fiber ? turnMessagesOf(fiber) : null;
+      return fiber && Array.isArray(messages) ? { fiber, messages } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Current ChatGPT uses ordered timeline items, including structured MCP invocations.
+  // Adapt one entry only; never parse displayed prose/results or merge sibling entries.
+  function timelineMessagesOf(items) {
+    const messages = [];
+    const ordered = [];
+    for (const item of items) {
+      if (item?.type === 'chatgpt-reasoning-group') {
+        if (!Array.isArray(item.items)) return null;
+        ordered.push(...item.items);
+      } else ordered.push(item);
+    }
+    for (const item of ordered) {
+      if (item?.type === 'user-message') {
+        messages.push({ id: item.messageId, author: { role: 'user' } });
+      } else if (item?.type === 'mcp-tool-call') {
+        const invocation = item.invocation;
+        const tool = typeof invocation?.tool === 'string'
+          ? /^link_[A-Za-z0-9_-]+\/(submit_goal)$/u.exec(invocation.tool)?.[1] : null;
+        const namedSubmit = typeof item.functionName === 'string'
+          && /^Local MCP Connector__link_[A-Za-z0-9_-]+\/submit_goal$/u.test(item.functionName);
+        if (!namedSubmit && !(invocation?.server === 'Local MCP Connector' && tool)) continue;
+        // A recognized but inconsistent/malformed latest invocation must block fallback.
+        const validName = invocation?.server === 'Local MCP Connector' && tool
+          && item.functionName === `${invocation.server}__${invocation.tool}`;
+        messages.push({ author: { role: 'assistant' }, recipient: 'Local_MCP_Connector.submit_goal',
+          content: { content_type: 'tool_call', arguments: { arguments: validName ? invocation.arguments : null } } });
+      }
+    }
+    return messages;
+  }
+
+  function userIdentityOf(turn) {
+    for (let index = turn.sections.length - 1; index >= 0; index -= 1) {
+      const snapshot = snapshotOf(turn.sections[index]);
+      if (!snapshot) return { status: 'unreadable', userId: null };
+      let userId = null;
+      let userFound = false;
+      let unstableUser = false;
+      for (const message of snapshot.messages) {
+        if (message?.author?.role !== 'user') continue;
+        userFound = true;
+        const id = messageIdOf(message);
+        // Current ChatGPT does not guarantee a stable id on every visible user
+        // message. A readable snapshot with such a user is a user boundary that
+        // simply cannot be named, never a structural failure of the whole scan.
+        if (!id) {
+          unstableUser = true;
+          continue;
+        }
+        if (userId !== null && userId !== id) return { status: 'conflict', userId: null };
+        userId = id;
+      }
+      if (unstableUser) return { status: 'unstable_user', userId: null };
+      if (userFound) return { status: 'found', userId };
+    }
+    return { status: 'none', userId: null };
+  }
+
+  function toolSnapshotOf(turn, anchorUserId) {
+    for (let index = turn.sections.length - 1; index >= 0; index -= 1) {
+      const snapshot = snapshotOf(turn.sections[index]);
+      if (!snapshot) return { status: 'unreadable', snapshot: null };
+      let userBoundaryIndex = -1;
+      let lastSubmitGoalIndex = -1;
+      for (let at = 0; at < snapshot.messages.length; at += 1) {
+        const message = snapshot.messages[at];
+        if (message?.author?.role === 'user') {
+          const id = messageIdOf(message);
+          // A visible user without a stable id cannot prove same-user, but it is a real
+          // exchange boundary: it only decides the position, never the identity.
+          if (id && id !== anchorUserId) return { status: 'other_user', snapshot: null };
+          userBoundaryIndex = at;
+        }
+        if (requestOf(message) && submitGoalInspectionOf(message).recognized) lastSubmitGoalIndex = at;
+      }
+      if (lastSubmitGoalIndex < 0) {
+        continue;
+      }
+      if (userBoundaryIndex >= 0 && lastSubmitGoalIndex <= userBoundaryIndex) {
+        return { status: 'user_boundary', snapshot: null };
+      }
+      return { status: 'selected', snapshot: { ...snapshot,
+        currentTool: currentToolCorrelationOf(snapshot.messages) } };
+    }
+    return { status: 'no_tool', snapshot: null };
+  }
+
+  function currentExchangeToolSnapshotOf(turns) {
+    const first = Math.max(0, turns.length - MAX_TURNS);
+    const localFirst = Math.max(first, turns.length - MAX_UNANCHORED_TAIL_TURNS);
+    // A stable user anchor only narrows the current exchange; it is not a precondition
+    // for a current, unambiguous submit_goal. Only a user inside the current tail can
+    // qualify as an anchor: a stable user further back is indistinguishable from a
+    // historical exchange, so it must never lift the local limit. `unreadable` and
+    // `conflict` fail closed. A visible user without a stable id is an `unstable_user`
+    // boundary: it can never anchor, and it stops the probe so an older stable user
+    // is not mistaken for the current exchange.
+    let anchorUserId = null;
+    let anchorTurnIndex = -1;
+    for (let turnIndex = turns.length - 1; turnIndex >= localFirst; turnIndex -= 1) {
+      const identity = userIdentityOf(turns[turnIndex]);
+      if (identity.status === 'found') {
+        anchorUserId = identity.userId;
+        anchorTurnIndex = turnIndex;
+        break;
+      }
+      if (identity.status === 'unstable_user') break;
+      if (identity.status === 'unreadable' || identity.status === 'conflict') return null;
+    }
+
+    // Without a current-tail anchor there is no exchange to isolate, so the fallback is
+    // only the newest few logical turns. A current-tail anchor keeps the full window.
+    const toolSearchFirst = anchorUserId
+      ? first
+      : localFirst;
+    let pending = null;
+    let pendingTurnIndex = -1;
+    for (let turnIndex = turns.length - 1; turnIndex >= toolSearchFirst; turnIndex -= 1) {
+      const identity = userIdentityOf(turns[turnIndex]);
+      if (identity.status === 'unreadable' || identity.status === 'conflict') return null;
+      if (identity.status === 'found' && identity.userId !== anchorUserId) return null;
+
+      const observation = toolSnapshotOf(turns[turnIndex], anchorUserId);
+      if (observation.status === 'unreadable' || observation.status === 'other_user') return null;
+      if (observation.status === 'selected') {
+        if (pending || identity.status === 'found') return pending || observation.snapshot;
+        pending = observation.snapshot;
+        pendingTurnIndex = turnIndex;
+        if (!anchorUserId) return pending;
+      }
+      if (identity.status === 'found' && pending) return pending;
+      // A visible user without a stable id cannot prove same-user, so it closes the
+      // historical lookback. Without a stable anchor that boundary turn itself already
+      // bounds the newest current exchange. With a stable anchor the pending tool still
+      // has to sit after that anchor, otherwise it belongs to an older exchange that the
+      // unnamed user could not be shown to share.
+      if (identity.status === 'unstable_user') {
+        return anchorUserId ? (pendingTurnIndex > anchorTurnIndex ? pending : null) : pending;
+      }
+    }
+    // Without a newer same-exchange return, a pending submit_goal older than the anchor
+    // user turn belongs to a previous exchange and must not be claimed.
+    return pendingTurnIndex > anchorTurnIndex ? pending : null;
+  }
+
   function scan(nonce) {
     let sections;
     try {
-      sections = document.querySelectorAll(TURN_SELECTOR);
+      sections = document.querySelectorAll(IDENTITY_TURN_SELECTOR);
     } catch {
       sections = [];
     }
@@ -563,43 +733,20 @@
     const currentTurn = turns[turns.length - 1];
     if (currentTurn) {
       try {
-        const conversationIds = new Set();
-        let conversationConflict = false;
-        let conversationUnreadable = false;
-        const mergedMessages = [];
-        const seenMessageIds = new Set();
-        let messagesFound = false;
-        for (const section of currentTurn.sections) {
-          const fiber = fiberOf(section);
-          if (!fiber) continue;
-          fiberRootDetected = true;
-          const candidateConversation = conversationEvidenceDetailsOf(fiber);
-          const candidateMessages = turnMessagesOf(fiber);
-          if (candidateConversation?.conflict) conversationConflict = true;
-          if (candidateConversation?.unreadable) conversationUnreadable = true;
-          if (candidateConversation?.conversationId) {
-            conversationIds.add(candidateConversation.conversationId);
-          }
-          if (!Array.isArray(candidateMessages)) continue;
-          messagesFound = true;
-          for (const message of candidateMessages) {
-            const messageId = messageIdOf(message);
-            if (messageId) {
-              if (seenMessageIds.has(messageId)) continue;
-              seenMessageIds.add(messageId);
-            }
-            mergedMessages.push(message);
-          }
-        }
-
-        if (conversationIds.size > 1) conversationConflict = true;
-        currentTurnConversationId = !conversationConflict && !conversationUnreadable
-          && conversationIds.size === 1 ? [...conversationIds][0] : null;
-        conversation = fiberRootDetected
-          ? { conversationId: currentTurnConversationId, conflict: conversationConflict, unreadable: conversationUnreadable }
-          : null;
-        messages = messagesFound ? mergedMessages : null;
-        currentTool = currentToolCorrelationOf(mergedMessages);
+        // A virtualized historical viewport is not the current exchange. New timeline
+        // entries already contain the complete user/tool sequence for a logical turn.
+        const latest = currentTurn.sections[currentTurn.sections.length - 1];
+        const timeline = Boolean(latest.getAttribute?.('data-turn-key'));
+        const latestSnapshot = timeline ? snapshotOf(latest) : null;
+        const snapshot = timeline && !latestSnapshot?.mostRecent ? null
+          : currentExchangeToolSnapshotOf(timeline ? [currentTurn] : turns);
+        const fiber = snapshot?.fiber;
+        fiberRootDetected = Boolean(fiber);
+        conversation = fiber ? conversationEvidenceDetailsOf(fiber) : null;
+        currentTurnConversationId = conversation && !conversation.conflict && !conversation.unreadable
+          ? conversation.conversationId : null;
+        messages = snapshot?.messages ?? null;
+        currentTool = snapshot?.currentTool ?? currentTool;
       } catch {
         // An unreadable current turn must not turn into guessed identity evidence.
       }
@@ -845,6 +992,56 @@
     return null;
   }
 
+  function scanTimelineCompletion(nodes, conversationId, expectedUserMessageId, diagnostic, reply) {
+    const matches = [];
+    for (const node of nodes.slice(-MAX_TURNS)) {
+      for (let at = fiberOf(node), depth = 0; at && depth < MAX_CLIMB; at = at.return, depth += 1) {
+        const entry = at.memoizedProps?.entry;
+        if (!entry) continue;
+        diagnostic.fiber_scan_count += 1;
+        if (!Array.isArray(entry.turn?.items)) break;
+        const users = entry.turn.items.filter((item) => item?.type === 'user-message');
+        if (users.some((item) => item.messageId === expectedUserMessageId || item.serverMessageId === expectedUserMessageId)) {
+          matches.push({ entry, users, identity: conversationEvidenceDetailsOf(at) });
+        }
+        break;
+      }
+    }
+    diagnostic.matched_user_turn_count = matches.length;
+    if (!matches.length) return reply('pending');
+    if (matches.length !== 1) return reply('ambiguous', { error: 'completion_identity_ambiguous' });
+    const { entry, users, identity } = matches[0];
+    if (identity.conflict || (identity.conversationId && identity.conversationId !== conversationId)) {
+      return reply('ambiguous', { error: 'completion_conversation_conflict' });
+    }
+    if (identity.unreadable || !identity.conversationId) return reply('pending');
+    if (users.length !== 1 || [users[0].messageId, users[0].serverMessageId]
+      .some((id) => id != null && id !== expectedUserMessageId)) {
+      return reply('ambiguous', { error: 'completion_user_identity_ambiguous' });
+    }
+    const userIndex = entry.turn.items.indexOf(users[0]);
+    const assistants = entry.turn.items.slice(userIndex + 1)
+      .filter((item) => item?.type === 'assistant-message' && item.phase === 'final_answer');
+    diagnostic.assistant_candidate_count = assistants.length;
+    const terminal = assistants[assistants.length - 1];
+    if (entry.turn.status !== 'complete' || terminal?.completed !== true) {
+      diagnostic.completion_state_reason = 'assistant_not_terminal';
+      return reply('pending');
+    }
+    const id = validMessageId(terminal.messageId);
+    if (!id || (terminal.latestMessageId != null && terminal.latestMessageId !== id)) {
+      return reply('ambiguous', { error: 'completion_assistant_identity_ambiguous' });
+    }
+    if (typeof terminal.content !== 'string' || !terminal.content) return reply('pending');
+    if (utf8Length(terminal.content) > MAX_COMPLETION_CONTENT) {
+      return reply('failed', { error: 'completion_content_too_large' });
+    }
+    diagnostic.identity_source = 'timeline_message_id';
+    diagnostic.selected_identity_type = 'message_id';
+    diagnostic.completion_state_reason = 'completed';
+    return reply('completed', { assistant_message_id: id, content: terminal.content });
+  }
+
   function scanCompletion(nonce, completionId, conversationId, expectedUserMessageId) {
     const diagnostic = { fiber_scan_count: 0, candidate_count: 0, matched_user_turn_count: 0,
       assistant_candidate_count: 0, identity_source: 'none', selected_identity_type: 'none',
@@ -859,6 +1056,13 @@
       reply('ambiguous', {
         error: 'completion_conversation_conflict',
       });
+      return;
+    }
+
+    const timelineNodes = queryAll(document, '[data-turn-key]')
+      .filter((node) => attributeOf(node, 'data-turn-key'));
+    if (timelineNodes.length) {
+      scanTimelineCompletion(timelineNodes, conversationId, expectedUserMessageId, diagnostic, reply);
       return;
     }
 

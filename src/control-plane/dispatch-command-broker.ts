@@ -1,6 +1,7 @@
 import {
   EXTENSION_DELIVERY_LEASE_MS,
   ExtensionDeliveryNotReadyError,
+  ExtensionDeliveryConflictError,
   ExtensionDeliveryService,
   type ExtensionDeliveryReceipt,
   type ExtensionDeliveryReadinessCheck,
@@ -21,7 +22,7 @@ export class DispatchCommandBroker {
 
   public constructor(
     private readonly extensionDeliveries: Pick<ExtensionDeliveryService, "enqueue" | "awaitResult">
-      & Partial<Pick<ExtensionDeliveryService, "expire">> = new ExtensionDeliveryService(),
+      & Partial<Pick<ExtensionDeliveryService, "expire" | "getByLogicalDeliveryId">> = new ExtensionDeliveryService(),
     options: DispatchCommandBrokerOptions = {},
   ) {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_DISPATCH_COMMAND_TIMEOUT_MS;
@@ -32,6 +33,15 @@ export class DispatchCommandBroker {
   }
 
   public async dispatch(request: ReviewDeliveryRequest): Promise<ExtensionDeliveryReceipt | null> {
+    const message = request.message ?? buildReviewMessage(request);
+    const existing = await this.extensionDeliveries.getByLogicalDeliveryId?.(request.delivery_id);
+    if (existing) {
+      if (existing.conversation_id !== request.conversation_id || existing.message !== message) {
+        throw new ExtensionDeliveryConflictError("logical delivery command already targets different content");
+      }
+      // A durable receipt is authoritative even if the extension has since disconnected.
+      if (existing.receipt?.status === "delivered") return existing.receipt;
+    }
     const readinessCheckTime = Date.now();
     let readiness: Awaited<ReturnType<ExtensionDeliveryReadinessCheck>>;
     try {
@@ -51,7 +61,7 @@ export class DispatchCommandBroker {
 
     const command = await this.extensionDeliveries.enqueue(
       request.conversation_id,
-      request.message ?? buildReviewMessage(request),
+      message,
       request.delivery_id,
       {
         readiness_check_time: readinessCheckTime,

@@ -230,6 +230,54 @@ function startInput(overrides: Partial<AutoIterationStartInput> = {}): AutoItera
 }
 
 describe("AutoIterationService", () => {
+  it('recovers a transient delivery after restart and a late completion without duplicating the review', async () => {
+    const f = await fixture();
+    f.deliveryCalls.mockImplementationOnce(async () => ({ status: 'failed' as const, retryable: true,
+      error: { code: 'EXTENSION_DELIVERY_TIMEOUT', message: 'unclaimed command timed out' } }));
+    let observations = 0;
+    const completion = new ReviewCompletionRouter(f.root, { collect: async (request) => {
+      observations += 1;
+      return observations === 1 ? { status: 'TIMEOUT', error: 'still generating' }
+        : { status: 'COMPLETED', content: verdict(request.review_request_id, 'APPROVE') };
+    } });
+    const make = () => new AutoIterationService(f.registry, { storageRoot: f.root,
+      browserRouter: f.auto.browserRouter, completionRouter: completion,
+      controlledActuation: f.auto.controlledActuation, retryDelayMs: 50 });
+    const first = make();
+    const waiting = await first.start(startInput());
+    expect(waiting).toMatchObject({ stage: 'delivery', retry_at: expect.any(String) });
+    expect(waiting.terminal_decision).toBeUndefined();
+    first.dispose();
+    const restarted = make();
+    try {
+      await restarted.recover();
+      await vi.waitFor(async () => expect((await restarted.getLoop('loop-001'))?.stage).toBe('completed'));
+      expect(f.deliveryCalls).toHaveBeenCalledTimes(2);
+      expect(observations).toBe(2);
+      expect(await new ReviewRequestService(f.root).listReviewRequests('workspace-a')).toHaveLength(1);
+      expect(await new ReviewResultService(f.root).listReviewResults('workspace-a')).toHaveLength(1);
+      await Promise.all([restarted.advance('loop-001'), restarted.advance('loop-001')]);
+      expect(f.deliveryCalls).toHaveBeenCalledTimes(2);
+      expect(observations).toBe(2);
+      expect(f.starts).toHaveLength(0);
+    } finally { restarted.dispose(); }
+  });
+
+  it('bounds repeated recoverable failures and retains the exact transport reason', async () => {
+    const f = await fixture();
+    f.deliveryCalls.mockImplementation(async () => ({ status: 'failed' as const, retryable: true,
+      error: { code: 'EXTENSION_NOT_READY', message: 'extension offline' } }));
+    const auto = new AutoIterationService(f.registry, { storageRoot: f.root,
+      browserRouter: f.auto.browserRouter, retryDelayMs: 10 });
+    try {
+      await auto.start(startInput());
+      await vi.waitFor(async () => expect(await auto.getLoop('loop-001')).toMatchObject({
+        stage: 'human_required', terminal_reason: 'EXTENSION_NOT_READY_RETRY_EXHAUSTED' }));
+      expect(f.deliveryCalls).toHaveBeenCalledTimes(5);
+      expect(f.starts).toHaveLength(0);
+    } finally { auto.dispose(); }
+  });
+
   it("notifies only after terminal persistence and replays terminal notifications on recovery", async () => {
     const f = await fixture();
     const listener = vi.fn(async (loop: AutoIteration) => {
@@ -377,7 +425,7 @@ describe("AutoIterationService", () => {
     expect(invalid.starts).toHaveLength(0);
   });
 
-  it.each(["TIMEOUT", "FAILED"] as const)(
+  it.each(["FAILED"] as const)(
     "maps Review Result %s to human_required without retrying completion",
     async (status) => {
       const value = await fixture(["APPROVE"]);
@@ -417,7 +465,7 @@ describe("AutoIterationService", () => {
       const value = await fixture(["APPROVE"], delivery);
       await expect(value.auto.start(startInput())).resolves.toMatchObject({
         stage: "human_required",
-        terminal_reason: "DELIVERY_FAILED",
+        terminal_reason: delivery === 'failed' ? 'TEST_DELIVERY_FAILED' : 'TEST_DELIVERY_AMBIGUOUS',
       });
       expect(value.starts).toHaveLength(0);
       expect(value.deliveryCalls).toHaveBeenCalledTimes(1);
