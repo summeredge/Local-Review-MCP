@@ -646,6 +646,10 @@ export class AutoIterationService {
     await this.update(loop, { retry_at: new Date(Date.now() + this.retryDelayMs).toISOString() });
   }
 
+  private async retryDelivery(loop: AutoIteration): Promise<void> {
+    await this.update(loop, { retry_at: new Date(Date.now() + this.retryDelayMs).toISOString() });
+  }
+
   private async advanceExecution(loop: AutoIteration): Promise<AutoIteration> {
     const execution = await this.executions.getExecutionContext(
       loop.workspace_id,
@@ -808,8 +812,7 @@ export class AutoIterationService {
       }
       if (delivered.status !== "delivered") {
         if (delivered.status === "failed" && delivered.last_error?.retryable === true) {
-          await this.retryReview(current, delivered.attempt_count,
-            delivered.last_error.code ?? "REVIEW_TRANSPORT_FAILED", delivered.last_error.message);
+          await this.retryDelivery(current);
           return;
         }
         await this.humanRequired(

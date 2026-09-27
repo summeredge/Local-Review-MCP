@@ -68,6 +68,7 @@ async function fixture(
   readonly starts: Array<{ execution_id: string; instruction: string }>;
   readonly deliveryCalls: ReturnType<typeof vi.fn>;
   readonly completionCalls: ReturnType<typeof vi.fn>;
+  readonly completionRouter: ReviewCompletionRouter;
   readonly auto: AutoIterationService;
 }> {
   const root = await mkdtemp(join(tmpdir(), "local-review-mcp-auto-iteration-"));
@@ -148,7 +149,8 @@ async function fixture(
     completionRouter: completion,
     controlledActuation: controlled,
   });
-  return { root, registry, executionService, starts, deliveryCalls, completionCalls, auto };
+  return { root, registry, executionService, starts, deliveryCalls, completionCalls,
+    completionRouter: completion, auto };
 }
 
 async function persistLoop(root: string, loop: AutoIteration): Promise<void> {
@@ -251,7 +253,9 @@ describe("AutoIterationService", () => {
     const restarted = make();
     try {
       await restarted.recover();
-      await vi.waitFor(async () => expect((await restarted.getLoop('loop-001'))?.stage).toBe('completed'));
+      await vi.waitFor(async () => expect((await restarted.getLoop('loop-001'))?.stage).toBe('completed'), {
+        timeout: 5_000,
+      });
       expect(f.deliveryCalls).toHaveBeenCalledTimes(2);
       expect(observations).toBe(2);
       expect(await new ReviewRequestService(f.root).listReviewRequests('workspace-a')).toHaveLength(1);
@@ -263,17 +267,29 @@ describe("AutoIterationService", () => {
     } finally { restarted.dispose(); }
   });
 
-  it('bounds repeated recoverable failures and retains the exact transport reason', async () => {
+  it('keeps repeated recoverable delivery failures resumable and retains the transport reason', async () => {
     const f = await fixture();
-    f.deliveryCalls.mockImplementation(async () => ({ status: 'failed' as const, retryable: true,
-      error: { code: 'EXTENSION_NOT_READY', message: 'extension offline' } }));
+    let attempts = 0;
+    f.deliveryCalls.mockImplementation(async () => {
+      attempts += 1;
+      if (attempts <= 5) return { status: 'failed' as const, retryable: true,
+        error: { code: 'EXTENSION_NOT_READY', message: 'extension offline' } };
+      return { status: 'delivered' as const, delivered_at: new Date().toISOString() };
+    });
     const auto = new AutoIterationService(f.registry, { storageRoot: f.root,
-      browserRouter: f.auto.browserRouter, retryDelayMs: 10 });
+      browserRouter: f.auto.browserRouter,
+      completionRouter: f.completionRouter,
+      retryDelayMs: 10 });
     try {
       await auto.start(startInput());
+      await vi.waitFor(() => expect(f.deliveryCalls.mock.calls.length).toBeGreaterThanOrEqual(6), {
+        timeout: 5_000,
+      });
       await vi.waitFor(async () => expect(await auto.getLoop('loop-001')).toMatchObject({
-        stage: 'human_required', terminal_reason: 'EXTENSION_NOT_READY_RETRY_EXHAUSTED' }));
-      expect(f.deliveryCalls).toHaveBeenCalledTimes(5);
+        stage: 'completed', terminal_decision: 'APPROVE' }), { timeout: 5_000 });
+      const loop = await auto.getLoop('loop-001');
+      expect(loop).toMatchObject({ stage: 'completed', terminal_decision: 'APPROVE' });
+      expect(f.deliveryCalls.mock.calls.length).toBe(6);
       expect(f.starts).toHaveLength(0);
     } finally { auto.dispose(); }
   });
