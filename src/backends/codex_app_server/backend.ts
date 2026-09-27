@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { ExecutionContextService } from "../../context/execution-service.js";
 import { SessionStore } from "../../context/session-store.js";
+import { TaskContextService } from "../../context/service.js";
 import type { ExecutionContext, Session } from "../../context/types.js";
 import { defaultTaskContextStorageRoot } from "../../context/task.js";
 import type { WorkspaceRegistry } from "../../workspace/registry.js";
@@ -24,6 +25,25 @@ import {
 
 const APP_SERVER_COMMAND = "codex app-server --listen stdio://";
 const SUMMARY_MAX_LENGTH = 4_000;
+/** Stable summary when the backend shuts down before a turn produced terminal evidence. */
+export const BACKEND_CLOSED_SUMMARY = "Codex AppServer backend closed before terminal turn evidence.";
+/** Stable summary for a running Execution a previous runtime left behind. */
+export const ORPHANED_EXECUTION_SUMMARY =
+  "Codex AppServer execution was orphaned by a previous runtime shutdown.";
+
+interface ExecutionIdentity {
+  readonly workspace_id: string;
+  readonly task_id: string;
+  readonly execution_id: string;
+}
+
+interface WatcherEntry {
+  readonly identity: ExecutionIdentity;
+  readonly request: ExecutionBackendStartRequest;
+  readonly sessionId: string;
+  readonly turnId: string;
+  readonly done: Promise<void>;
+}
 
 type AppServerClient = Pick<
   CodexAppServerClient,
@@ -119,6 +139,13 @@ export class CodexAppServerBackend implements ExecutionBackend {
   private readonly requestTimeoutMs: number | undefined;
   private readonly inFlight = new Map<string, Promise<ExecutionStartResult>>();
   private readonly clients = new Map<string, AppServerClient>();
+  /**
+   * Watchers this backend instance actually owns, keyed by Execution. A watcher is the only live
+   * proof that a persisted running Execution is still executing in this process, so both
+   * `existing()` ownership checks and `close()` drain this map.
+   */
+  private readonly watchers = new Map<string, WatcherEntry>();
+  private readonly tasks: TaskContextService;
   private terminalListener: ExecutionTerminalListener | undefined;
   private closing = false;
 
@@ -129,6 +156,7 @@ export class CodexAppServerBackend implements ExecutionBackend {
     this.storageRoot = resolve(options.storageRoot ?? defaultTaskContextStorageRoot());
     this.sessions = new SessionStore(this.storageRoot);
     this.executions = new ExecutionContextService(this.storageRoot);
+    this.tasks = new TaskContextService(this.storageRoot);
     this.events = options.eventStore ?? new EventStore(this.storageRoot);
     this.environment = { ...process.env, ...(options.environment ?? {}) };
     this.executable = options.executable?.trim() || undefined;
@@ -165,6 +193,11 @@ export class CodexAppServerBackend implements ExecutionBackend {
     const clients = [...this.clients.values()];
     this.clients.clear();
     await Promise.all(clients.map((client) => client.close().catch(() => undefined)));
+    // Closing the client ends its event stream, which is what releases every watcher blocked on
+    // client.events(). Drain them so a turn interrupted by shutdown has already persisted its
+    // terminal failure and notified the terminal listener before close() resolves.
+    await Promise.all([...this.watchers.values()].map((entry) => entry.done.catch(() => undefined)));
+    this.watchers.clear();
   }
 
   private async startOnce(request: ExecutionBackendStartRequest): Promise<ExecutionStartResult> {
@@ -257,7 +290,14 @@ export class CodexAppServerBackend implements ExecutionBackend {
         await this.fail(request, session.session_id, turn.turn_id);
         throw new Error("Codex app-server turn failed to start.");
       } else {
-        void this.watch(client, request, session.session_id, thread.thread_id, turn.turn_id, eventAdapter);
+        this.startWatching(
+          client,
+          request,
+          session.session_id,
+          thread.thread_id,
+          turn.turn_id,
+          eventAdapter,
+        );
       }
 
       return {
@@ -288,6 +328,16 @@ export class CodexAppServerBackend implements ExecutionBackend {
     if (session === null || session.thread_id === undefined) {
       throw new Error(`Interactive Execution "${execution.execution_id}" has no recoverable Session.`);
     }
+    // A persisted running record is not proof of a live turn. Only a watcher this instance still
+    // owns proves the app-server client is running here; anything else is an orphan from a previous
+    // runtime, which is reported as failed instead of being resumed or reported as existing.
+    const owned = this.watchers.get(execution.execution_id);
+    if (owned === undefined || owned.sessionId !== session.session_id) {
+      await this.terminate(execution, session.session_id, ORPHANED_EXECUTION_SUMMARY);
+      throw new Error(
+        `Interactive Execution "${execution.execution_id}" has no live Codex app-server client in this runtime.`,
+      );
+    }
     return {
       execution_id: execution.execution_id,
       process_id: execution.process_id,
@@ -296,6 +346,45 @@ export class CodexAppServerBackend implements ExecutionBackend {
       session_id: session.session_id,
       thread_id: session.thread_id,
     };
+  }
+
+  /**
+   * Startup orphan reconciliation. It never resumes, retries, or migrates anything: a running
+   * app-server Execution that this instance does not own is terminated as failed so Goal and
+   * Auto Iteration see the standard execution failure and route to human handling. Safe to call
+   * repeatedly; an already terminal record is left untouched and not notified twice.
+   */
+  public async reconcileOrphanedExecutions(): Promise<ExecutionContext[]> {
+    const reconciled: ExecutionContext[] = [];
+    const sessions = (await this.sessions.listSessions())
+      .filter((session) => session.backend_type === "codex_app_server");
+    for (const task of await this.tasks.listTaskContexts()) {
+      let executions: ExecutionContext[];
+      try {
+        executions = await this.executions.listExecutions(task.workspace_id, task.task_id);
+      } catch (error: unknown) {
+        console.warn(
+          `Codex AppServer orphan reconciliation could not list executions for Task ${task.task_id}; `
+          + "keeping execution state unchanged",
+          errorMessage(error),
+        );
+        continue;
+      }
+      const session = sessions
+        .filter((candidate) => candidate.task_id === task.task_id)
+        .sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
+      for (const execution of executions) {
+        if (execution.status !== "running" || execution.command !== APP_SERVER_COMMAND) continue;
+        if (this.watchers.has(execution.execution_id)) continue;
+        const next = await this.terminate(
+          execution,
+          session?.session_id,
+          ORPHANED_EXECUTION_SUMMARY,
+        );
+        if (next !== null) reconciled.push(next);
+      }
+    }
+    return reconciled;
   }
 
   private async findSession(request: ExecutionBackendStartRequest): Promise<Session | null> {
@@ -339,10 +428,48 @@ export class CodexAppServerBackend implements ExecutionBackend {
           return;
         }
       }
-      if (!this.closing) await this.fail(request, sessionId, turnId, "app-server ended without terminal turn evidence");
+      // The event stream ending is the end of this watcher's evidence. A normal unexpected end and
+      // a backend shutdown both leave the turn without terminal evidence, so both persist the same
+      // terminal failure; only the summary distinguishes them for the human reader.
+      await this.fail(
+        request,
+        sessionId,
+        turnId,
+        this.closing
+          ? BACKEND_CLOSED_SUMMARY
+          : "app-server ended without terminal turn evidence",
+      );
     } catch (error: unknown) {
-      if (!this.closing) await this.fail(request, sessionId, turnId, errorMessage(error));
+      if (this.closing) await this.fail(request, sessionId, turnId, BACKEND_CLOSED_SUMMARY);
+      else await this.fail(request, sessionId, turnId, errorMessage(error));
     }
+  }
+
+  private startWatching(
+    client: AppServerClient,
+    request: ExecutionBackendStartRequest,
+    sessionId: string,
+    threadId: string,
+    turnId: string,
+    eventAdapter: CodexEventAdapter,
+  ): void {
+    const identity: ExecutionIdentity = {
+      workspace_id: request.workspace_id,
+      task_id: request.task_id,
+      execution_id: request.execution_id,
+    };
+    // Ownership is published before the loop starts, so a concurrent existing() or a close() that
+    // races the first provider event sees a live watcher instead of an orphan.
+    const entry: WatcherEntry = {
+      identity,
+      request,
+      sessionId,
+      turnId,
+      done: this.watch(client, request, sessionId, threadId, turnId, eventAdapter).finally(() => {
+        if (this.watchers.get(identity.execution_id) === entry) this.watchers.delete(identity.execution_id);
+      }),
+    };
+    this.watchers.set(request.execution_id, entry);
   }
 
   private async complete(
@@ -387,6 +514,30 @@ export class CodexAppServerBackend implements ExecutionBackend {
     );
     await this.sessions.updateSession(sessionId, { status: "failed" });
     await this.notifyTerminal(next);
+  }
+
+  /**
+   * Single terminal write for every path where the turn will not produce further evidence:
+   * backend shutdown and startup orphan reconciliation. A non-running Execution is left alone, so
+   * an already terminal record is never downgraded and never notified twice.
+   */
+  private async terminate(
+    execution: ExecutionContext,
+    sessionId: string | undefined,
+    summary: string,
+  ): Promise<ExecutionContext | null> {
+    if (execution.status !== "running") return null;
+    const next = await this.executions.updateExecutionContext(
+      execution.workspace_id,
+      execution.task_id,
+      execution.execution_id,
+      { status: "failed", summary: boundedSummary(summary, summary) },
+    );
+    if (sessionId !== undefined) {
+      await this.sessions.updateSession(sessionId, { status: "failed" });
+    }
+    await this.notifyTerminal(next);
+    return next;
   }
 
   private async failLaunch(

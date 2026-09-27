@@ -568,6 +568,13 @@ export async function startApp(
     } catch {
       console.warn("Codex execution completion recovery failed; local MCP remains available");
     }
+    // A running app-server Execution cannot outlive the runtime that owned its client. This is
+    // reconciliation, not recovery: orphans are failed and reported, never resumed or resubmitted.
+    try {
+      await context.codexAppServerBackend?.reconcileOrphanedExecutions();
+    } catch {
+      console.warn("Codex AppServer orphan reconciliation failed; local MCP remains available");
+    }
     try {
       await context.autoIteration?.recover();
     } catch {
