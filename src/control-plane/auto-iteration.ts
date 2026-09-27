@@ -407,7 +407,8 @@ export class AutoIterationService {
     });
     const adapter = options.reviewDeliveryAdapter ?? new ExtensionDeliveryAdapter(broker);
     this.browserRouter = options.browserRouter ?? new BrowserRouter(this.storageRoot, adapter);
-    this.completionRouter = options.completionRouter ?? new ReviewCompletionRouter(this.storageRoot);
+    this.completionRouter = options.completionRouter
+      ?? new ReviewCompletionRouter(this.storageRoot, undefined, registry);
     this.parser = options.verdictParser ?? new ReviewVerdictParser();
     this.authorizationStore = options.authorizationStore
       ?? options.controlledActuation?.authorizationStore

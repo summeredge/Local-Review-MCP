@@ -82,6 +82,17 @@ async function request(path: string, options: RequestOptions = {}): Promise<{
   };
 }
 
+async function waitForCondition(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 1_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await predicate())) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting for Bridge identity resolution");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 async function listen(server: Server, port = 0): Promise<number> {
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -771,20 +782,34 @@ describe("Local Control Bridge app lifecycle", () => {
   it("routes accepted identity evidence into the production correlation registry", async () => {
     await stopBridge();
     const root = await mkdtemp(join(tmpdir(), "local-review-mcp-app-correlation-"));
+    const workspaceB = join(root, "workspace-b");
+    await mkdir(workspaceB, { recursive: true });
     await mkdir(join(root, "control-plane"), { recursive: true });
     await writeFile(join(root, "control-plane", "request-correlations.json"), "{broken", "utf8");
-    const runtime = createAppContext(settings());
+    const runtimeSettings: ResolvedSettings = {
+      ...settings(),
+      workspaceIdentity: { id: "workspace-a", name: "Workspace A", path: process.cwd() },
+      workspaces: [
+        { id: "workspace-a", name: "Workspace A", path: process.cwd() },
+        { id: "workspace-b", name: "Workspace B", path: workspaceB },
+      ],
+    };
+    const runtime = createAppContext(runtimeSettings);
     const context = {
       ...runtime,
       correlations: new ConversationCorrelationRegistry(root),
     };
+    vi.spyOn(runtime.pendingGoalSubmission!, "get").mockImplementation(async (requestId) =>
+      requestId === "wfr_app_integration" ? { workspace_id: "workspace-b" } as never : null);
+    const diagnose = vi.spyOn(runtime.pendingGoalSubmission!, "diagnoseEvidence").mockResolvedValue();
+    const scheduleResolve = vi.spyOn(runtime.pendingGoalSubmission!, "scheduleResolve");
     const trace = vi.spyOn(runtime.identityTrace!, "record");
     const transportTrace = vi.spyOn(runtime.evidenceTransportTrace!, "record");
     const observer = vi.fn();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     let server: Server | null = null;
     try {
-      server = await startApp(settings(), context, {
+      server = await startApp(runtimeSettings, context, {
         bridgePorts: [0],
         onIdentityEvidence: observer,
       });
@@ -807,7 +832,9 @@ describe("Local Control Bridge app lifecycle", () => {
         event: "extension_evidence_received",
         correlation_key: evidence.request_id,
         conversation_id: evidence.conversation_id,
+        workspace_id: "workspace-b",
       }));
+      expect(diagnose).toHaveBeenCalledWith(evidence, "workspace-b");
       expect(transportTrace).toHaveBeenCalledWith(expect.objectContaining({
         event: "connector_evidence_received",
         correlation_key: evidence.request_id,
@@ -819,9 +846,89 @@ describe("Local Control Bridge app lifecycle", () => {
         conversation_id: evidence.conversation_id,
       }));
       expect(observer).toHaveBeenCalledWith(evidence);
+      const unboundEvidence = {
+        ...evidence,
+        request_id: "wfr_without_pending",
+        conversation_id: "conversation-unbound",
+      };
+      expect(await request("/identity-evidence", { method: "POST", token, body: unboundEvidence }))
+        .toMatchObject({ status: 202 });
+      expect(context.correlations.correlation(unboundEvidence.request_id)).toBeNull();
+      expect(trace).not.toHaveBeenCalledWith(expect.objectContaining({
+        correlation_key: unboundEvidence.request_id,
+      }));
+      expect(diagnose).toHaveBeenCalledTimes(1);
+      expect(scheduleResolve).toHaveBeenCalledTimes(1);
+      expect(scheduleResolve).not.toHaveBeenCalledWith(unboundEvidence.request_id);
       expect(warning).toHaveBeenCalledWith(
         "Conversation correlation state could not be restored; starting without restored proof",
       );
+    } finally {
+      if (server !== null) await close(server);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let Evidence received before a Goal create correlation authority", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-app-evidence-before-goal-"));
+    const correlationKey = "00000000-0000-4000-8000-000000000004";
+    const runtimeSettings = settings();
+    const runtime = createAppContext(runtimeSettings);
+    const correlations = new ConversationCorrelationRegistry(root);
+    const submitGoal = vi.fn(async (_request: GoalSubmissionRequest): Promise<GoalSubmissionResult> => ({
+      goal_id: "goal-evidence-before-goal",
+      phase_id: "phase-evidence-before-goal",
+      task_id: "task-evidence-before-goal",
+      execution_id: "execution-evidence-before-goal",
+      status: "running",
+    }));
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {
+      storageRoot: root,
+      browserReadiness: () => ({ ready: true, readiness_state: "ready" }),
+      environment: { LRM_PENDING_IDENTITY_TIMEOUT_MS: "5000" },
+    });
+    const context = {
+      ...runtime,
+      correlations,
+      pendingGoalSubmission: pending,
+    };
+    const scheduleResolve = vi.spyOn(pending, "scheduleResolve");
+    let server: Server | null = null;
+    try {
+      server = await startApp(runtimeSettings, context, { bridgePorts: [0] });
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+      const evidence = {
+        request_id: correlationKey,
+        conversation_id: "conversation-before-goal",
+        document_id: "document-before-goal",
+        navigation_epoch: 1,
+      };
+
+      expect(await request("/identity-evidence", { method: "POST", token, body: evidence }))
+        .toMatchObject({ status: 202 });
+      expect(correlations.correlation(correlationKey)).toBeNull();
+      expect(scheduleResolve).not.toHaveBeenCalledWith(correlationKey);
+
+      await pending.accept({
+        correlation_key: correlationKey,
+        workspace_id: "workspace-a",
+        title: "Evidence before Goal",
+        goal: "Wait for a new authorized identity evidence event.",
+        requirements: ["Do not consume pre-goal evidence."],
+        acceptance_criteria: ["The Goal starts only after post-goal evidence."],
+        max_iterations: 1,
+      });
+      await expect(pending.get(correlationKey)).resolves.toMatchObject({ state: "pending_identity" });
+      expect(correlations.correlation(correlationKey)).toBeNull();
+      expect(submitGoal).not.toHaveBeenCalled();
+
+      expect(await request("/identity-evidence", { method: "POST", token, body: evidence }))
+        .toMatchObject({ status: 202 });
+      await waitForCondition(() => submitGoal.mock.calls.length === 1);
+      expect(correlations.correlation(correlationKey)?.conversation_id).toBe(evidence.conversation_id);
+      expect(scheduleResolve).toHaveBeenCalledWith(correlationKey);
+      await expect(pending.get(correlationKey)).resolves.toMatchObject({ state: "started" });
     } finally {
       if (server !== null) await close(server);
       await rm(root, { recursive: true, force: true });
@@ -840,6 +947,9 @@ describe("Local Control Bridge app lifecycle", () => {
       correlations: new ConversationCorrelationRegistry(root),
       extensionDeliveries: new ExtensionDeliveryService(root),
     };
+    vi.spyOn(runtime.pendingGoalSubmission!, "get").mockResolvedValue({
+      workspace_id: runtime.registry.active.id,
+    } as never);
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     let server: Server | null = null;
     try {

@@ -6,8 +6,11 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 const ORIGIN = "https://chatgpt.com";
 const CONVERSATION_A = "11111111-2222-3333-4444-555555555555";
 const CONVERSATION_B = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-const WFR_REQUEST_ID = "wfr_01a014bdd7cd7a15b6b533d3ce2b42f2";
+// Legacy `metadata.request_id` sample and non-UUID key. Only negative tests may use it:
+// the formal correlation source is a strict UUIDv4 `submit_goal` correlation key.
+const LEGACY_REQUEST_ID = "wfr_01a014bdd7cd7a15b6b533d3ce2b42f2";
 const UUID_REQUEST_ID = "32ca0d45-8b29-414a-bbe4-8e26c3aae911";
+const UUID_REQUEST_ID_B = "7f3d9c1a-5b6e-4d2f-8a91-0c4e6b8d2f37";
 const REAL_TURN_DEPTH = 30;
 
 let fiberSource = "";
@@ -108,6 +111,20 @@ function scanFiber(sections: Record<string, unknown>[]): Record<string, unknown>
   return reply;
 }
 
+// Correlation authority is the current submit_goal `arguments.correlation_key`, never
+// `metadata.request_id` and never prose content.
+function submitGoalRequest(
+  args: Record<string, unknown>,
+  id = "submit-current",
+): Record<string, unknown> {
+  return {
+    id,
+    author: { role: "assistant" },
+    recipient: "Local_MCP_Connector.submit_goal",
+    content: { content_type: "tool_call", arguments: { arguments: args } },
+  };
+}
+
 describe("MAIN-world Fiber identity evidence", () => {
   it("is directly loadable as one minimal Chrome/Edge MV3 extension", () => {
     expect(manifest.manifest_version).toBe(3);
@@ -125,20 +142,31 @@ describe("MAIN-world Fiber identity evidence", () => {
     expect(JSON.stringify(manifest)).not.toMatch(/popup|scripting|webNavigation|activeTab|tabs/iu);
   });
 
-  it("allowlists metadata.request_id and the matching Fiber conversation", () => {
+  it("allowlists the current submit_goal correlation key and the matching Fiber conversation", () => {
     const reply = scanFiber([fiberSection(CONVERSATION_A, [
-      { metadata: { request_id: WFR_REQUEST_ID }, content: { text: '{"args":{"secret":"no"}}' } },
-      { metadata: { request_id: "invalid.id" } },
+      submitGoalRequest({ correlation_key: UUID_REQUEST_ID }),
     ])]);
     expect(reply.evidence).toEqual([{
-      request_id: WFR_REQUEST_ID,
+      request_id: UUID_REQUEST_ID,
       fiber_conversation_id: CONVERSATION_A,
     }]);
+    expect(reply.scan_diagnostic).toMatchObject({
+      submit_goal_found: true,
+      correlation_key_found: true,
+      correlation_key: UUID_REQUEST_ID,
+      conversation_id_found: true,
+      conversation_conflict: false,
+      conversation_unreadable: false,
+    });
+    // Neither a tool `metadata.request_id` nor prose content is a correlation source.
+    expect(scanFiber([fiberSection(CONVERSATION_A, [
+      { metadata: { request_id: LEGACY_REQUEST_ID }, content: { text: '{"args":{"secret":"no"}}' } },
+    ])]).evidence).toEqual([]);
   });
 
-  it("preserves an opaque UUID request id from Fiber through content evidence", async () => {
+  it("preserves the submit_goal correlation key from Fiber through content evidence", async () => {
     const reply = scanFiber([fiberSection(CONVERSATION_A, [
-      { metadata: { request_id: UUID_REQUEST_ID } },
+      submitGoalRequest({ correlation_key: UUID_REQUEST_ID }),
     ])]);
     const evidence = reply.evidence as Array<{ request_id: string; fiber_conversation_id: string }>;
     expect(evidence).toEqual([{
@@ -150,7 +178,7 @@ describe("MAIN-world Fiber identity evidence", () => {
       CONVERSATION_A,
       CONVERSATION_A,
       `/c/${CONVERSATION_A}`,
-      evidence[0]!.request_id,
+      UUID_REQUEST_ID,
     );
     await settleContent();
     expect(harness.messages.filter((message) => message.type === "identity_evidence")).toEqual([{
@@ -162,38 +190,51 @@ describe("MAIN-world Fiber identity evidence", () => {
   });
 
   it("follows the real section-to-turn Fiber traversal and groups split sections", () => {
-    const message = { metadata: { request_id: "wfr_deep_turn" } };
+    const message = submitGoalRequest({ correlation_key: UUID_REQUEST_ID }, "submit-split");
     const reply = scanFiber([
       fiberSection(CONVERSATION_A, [message], {}, "logical-turn"),
       fiberSection(CONVERSATION_A, [message], {}, "logical-turn"),
     ]);
     expect(reply.evidence).toEqual([{
-      request_id: "wfr_deep_turn",
+      request_id: UUID_REQUEST_ID,
       fiber_conversation_id: CONVERSATION_A,
     }]);
   });
 
-  it("fails closed for missing/invalid request ids and unknown Fiber shapes", () => {
+  it("fails closed for missing/invalid correlation keys and unknown Fiber shapes", () => {
     expect(scanFiber([fiberSection(CONVERSATION_A, [
       { metadata: {} },
-      { metadata: { request_id: "wfr.bad" } },
+      submitGoalRequest({ correlation_key: LEGACY_REQUEST_ID }, "not-a-uuid"),
+    ])]).evidence).toEqual([]);
+    expect(scanFiber([fiberSection(CONVERSATION_A, [
+      submitGoalRequest({}, "missing-key"),
+    ])]).evidence).toEqual([]);
+    expect(scanFiber([fiberSection(CONVERSATION_A, [
+      submitGoalRequest({ correlation_key: undefined }, "undefined-key"),
     ])]).evidence).toEqual([]);
     expect(scanFiber([{ __reactFiber$test: { memoizedProps: { random: true }, return: null } }]).evidence).toEqual([]);
   });
 
   it("fails closed when a Fiber branch has conflicting conversations", () => {
-    const reply = scanFiber([fiberSection(CONVERSATION_A, [{ metadata: { request_id: "wfr_conflict" } }], {
+    const reply = scanFiber([fiberSection(CONVERSATION_A, [submitGoalRequest({ correlation_key: UUID_REQUEST_ID })], {
       conversationId: CONVERSATION_B,
     })]);
     expect(reply.evidence).toEqual([]);
+    // The key was recognized but withheld: a conflicting conversation is fail closed.
+    expect(reply.scan_diagnostic).toMatchObject({
+      current_key_found: true,
+      correlation_key: UUID_REQUEST_ID,
+      conversation_conflict: true,
+      conversation_id_found: false,
+    });
   });
 
-  it("drops an id that appears under two different Fiber conversations", () => {
-    const reply = scanFiber([
-      fiberSection(CONVERSATION_A, [{ metadata: { request_id: "wfr_same" } }], {}, "turn-a"),
-      fiberSection(CONVERSATION_B, [{ metadata: { request_id: "wfr_same" } }], {}, "turn-b"),
+  it("drops a correlation key that appears under two different Fiber conversations", async () => {
+    const harness = loadContent(CONVERSATION_A, CONVERSATION_A, `/c/${CONVERSATION_A}`, UUID_REQUEST_ID, [
+      { request_id: UUID_REQUEST_ID, fiber_conversation_id: CONVERSATION_B },
     ]);
-    expect(reply.evidence).toEqual([]);
+    await settleContent();
+    expect(harness.messages.filter((message) => message.type === "identity_evidence")).toEqual([]);
   });
 
   it("does not give page code a Bridge or bearer-token path", () => {
@@ -217,7 +258,8 @@ function loadContent(
   initialConversation: string,
   initialFiberConversation: string,
   initialPath = `/c/${initialConversation}`,
-  requestId = "wfr_content",
+  requestId = UUID_REQUEST_ID,
+  extraEvidence: Record<string, unknown>[] = [],
 ): ContentHarness {
   const listeners = new Map<string, Set<(event: Record<string, unknown>) => void>>();
   const messages: Record<string, unknown>[] = [];
@@ -239,7 +281,7 @@ function loadContent(
         source: "lrm-extension-identity-reply",
         nonce: (data as Record<string, unknown>).nonce,
         version: 1,
-        evidence: [{ request_id: requestId, fiber_conversation_id: fiberConversation }],
+        evidence: [{ request_id: requestId, fiber_conversation_id: fiberConversation }, ...extraEvidence],
       };
       for (const listener of listeners.get("message") ?? []) {
         listener({ source: window, origin: ORIGIN, data: reply });
@@ -287,18 +329,18 @@ async function settleContent(): Promise<void> {
 }
 
 describe("content route ownership and navigation epochs", () => {
-  it("publishes Project identity evidence with the request id from Fiber metadata", async () => {
+  it("publishes Project identity evidence with the submit_goal correlation key", async () => {
     const harness = loadContent(
       CONVERSATION_A,
       CONVERSATION_A,
       `/g/g-p-6a951d05cc448191a399974588cdcf2b/c/${CONVERSATION_A}`,
-      "wfr_project",
+      UUID_REQUEST_ID_B,
     );
     await settleContent();
 
     expect(harness.messages.filter((message) => message.type === "identity_evidence")).toEqual([{
       type: "identity_evidence",
-      request_id: "wfr_project",
+      request_id: UUID_REQUEST_ID_B,
       conversation_id: CONVERSATION_A,
       navigation_epoch: 0,
     }]);

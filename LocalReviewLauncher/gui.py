@@ -13,20 +13,25 @@ from math import ceil
 from pathlib import Path
 from time import monotonic
 
-from PySide6.QtCore import QThreadPool, QTimer, Qt, Slot
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QEvent, QThreadPool, QTimer, Qt, Slot
+from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QFrame,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QInputDialog,
+    QMenu,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QStyle,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -36,7 +41,6 @@ from PySide6.QtWidgets import (
 )
 
 from config_manager import (
-    DEFAULT_REMOTE_ENDPOINT,
     ConfigManager,
     LauncherConfig,
     LauncherConfigError,
@@ -128,12 +132,17 @@ class LauncherWindow(QMainWindow):
         self.mcp_status = QLabel()
         self.tunnel_status = QLabel()
         self.remote_status = QLabel()
-        self.browser_status = QLabel("未就绪")
+        self.browser_status = QLabel("不可用")
         self.browser_status.setWordWrap(True)
         self.browser_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.browser_diagnostic_status = QLabel("未运行")
+        self.browser_diagnostic_status.setWordWrap(True)
+        self.browser_diagnostic_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.desktop_status = QLabel("不可用")
         self.desktop_sync_status = QLabel("不可用")
         self.desktop_sync_status.setWordWrap(True)
         self.desktop_sync_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.execution_summary_status = QLabel("不可用")
         self.capability_status = QLabel(IDLE_CAPABILITY_TEXT)
         self.capability_status.setWordWrap(True)
         self.capability_status.setTextFormat(Qt.TextFormat.PlainText)
@@ -174,18 +183,8 @@ class LauncherWindow(QMainWindow):
         self._capability_timeline_loading = False
         self.oauth_status_label = QLabel("不可用")
         self.oauth_status_label.setWordWrap(True)
-        self.workspace_label = QLabel()
-        self.workspace_label.setWordWrap(True)
-        self.runtime_workspace_label = QLabel()
-        self.runtime_workspace_label.setWordWrap(True)
-        self.production_config_label = QLabel()
-        self.production_config_label.setWordWrap(True)
-        self.tunnel_mode_label = QLabel()
-        self.remote_endpoint_label = QLabel()
-        self.remote_endpoint_label.setWordWrap(True)
-        self.cloudflared_version_label = QLabel("不可用")
-        self.workspace_table = QTableWidget(0, 3)
-        self.workspace_table.setHorizontalHeaderLabels(["工作区 ID", "名称", "路径"])
+        self.workspace_table = QTableWidget(0, 4)
+        self.workspace_table.setHorizontalHeaderLabels(["默认", "工作区 ID", "名称", "路径"])
         self.workspace_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.workspace_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.workspace_table.horizontalHeader().setStretchLastSection(True)
@@ -212,6 +211,9 @@ class LauncherWindow(QMainWindow):
             + 2 * self.session_table.frameWidth()
         )
         self.session_empty_label = QLabel("暂无活动会话")
+        self.query_workspace_label = QLabel()
+        self.query_workspace_label.setWordWrap(True)
+        self.query_workspace_label.setTextFormat(Qt.TextFormat.PlainText)
         self.session_details_label = QLabel("请选择会话查看详情。")
         self.session_details_label.setWordWrap(True)
         self.execution_details_label = QLabel("执行：—")
@@ -253,11 +255,11 @@ class LauncherWindow(QMainWindow):
         self.workspace_button = QPushButton("添加工作区")
         self.delete_workspace_button = QPushButton("删除工作区")
         self.rename_workspace_button = QPushButton("编辑名称")
-        self.set_current_workspace_button = QPushButton("设为当前")
+        self.set_current_workspace_button = QPushButton("设为默认")
         self.open_config_button = QPushButton("打开配置文件")
         self.backup_config_button = QPushButton("备份配置")
         self.validate_config_button = QPushButton("校验配置")
-        self.open_codex_task_button = QPushButton("打开 Codex 任务")
+        self.open_codex_task_button = QPushButton("线程信息")
         self.open_codex_task_button.setEnabled(False)
         self.copy_log_button = QPushButton("复制日志")
         self.clear_log_button = QPushButton("清空显示")
@@ -293,18 +295,6 @@ class LauncherWindow(QMainWindow):
         startup_layout.setContentsMargins(CONTENT_MARGIN, CONTENT_MARGIN, CONTENT_MARGIN, CONTENT_MARGIN)
         startup_layout.setSpacing(CONTENT_SPACING)
         startup_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        overview_layout = QVBoxLayout()
-        overview_layout.setContentsMargins(0, 0, 0, 0)
-        overview_layout.setSpacing(8)
-        overview_layout.addWidget(self._row("启动器状态：", self.launcher_state))
-        overview_layout.addWidget(self._row("MCP 运行时：", self.mcp_status))
-        overview_layout.addWidget(self._row("Cloudflare 隧道：", self.tunnel_status))
-        overview_layout.addWidget(self._row("远程端点：", self.remote_status))
-        overview_layout.addWidget(self._row("浏览器：", self.browser_status))
-        overview_layout.addWidget(self._row("Desktop 同步：", self.desktop_sync_status))
-        overview_layout.addWidget(self._row("执行能力：", self.capability_status))
-        overview_layout.addWidget(self._row("OAuth 状态：", self.oauth_status_label))
-        overview_layout.addWidget(self._row("工作区：", self.workspace_label))
         top_actions = QWidget()
         top_actions.setFixedWidth(510)
         top_actions_layout = QVBoxLayout(top_actions)
@@ -317,18 +307,31 @@ class LauncherWindow(QMainWindow):
         control_buttons.addWidget(self.stop_button)
         control_buttons.addWidget(self.refresh_button)
         top_actions_layout.addLayout(control_buttons)
-        oauth_buttons = QHBoxLayout()
-        oauth_buttons.setSpacing(BUTTON_SPACING)
-        oauth_buttons.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        oauth_buttons.addWidget(self.refresh_oauth_button)
-        oauth_buttons.addWidget(self.reset_oauth_button)
-        oauth_buttons.addWidget(self.delete_oauth_button)
-        top_actions_layout.addLayout(oauth_buttons)
-        overview_layout.insertWidget(0, top_actions, 0, Qt.AlignmentFlag.AlignLeft)
-        startup_layout.addLayout(overview_layout)
+        startup_layout.addWidget(top_actions, 0, Qt.AlignmentFlag.AlignLeft)
+        status_cards = QGridLayout()
+        status_cards.setContentsMargins(0, 0, 0, 0)
+        status_cards.setHorizontalSpacing(CONTENT_SPACING)
+        status_cards.setVerticalSpacing(CONTENT_SPACING)
+        status_cards.setColumnStretch(0, 1)
+        status_cards.setColumnStretch(1, 1)
+        for row in range(4):
+            status_cards.setRowStretch(row, 1)
+        for row, (left, right) in enumerate((
+            ("启动器状态", self.launcher_state),
+            ("MCP 运行时", self.mcp_status),
+            ("Cloudflare 隧道", self.tunnel_status),
+            ("远程端点", self.remote_status),
+            ("浏览器", self.browser_status),
+            ("Desktop", self.desktop_status),
+            ("执行能力", self.execution_summary_status),
+            ("OAuth", self.oauth_status_label),
+        )):
+            status_cards.addWidget(self._status_card(left, right), row // 2, row % 2)
+        startup_layout.addLayout(status_cards)
         startup_layout.addSpacing(6)
         startup_layout.addWidget(self._section_title("工作区注册表"))
         startup_layout.addWidget(self.workspace_table)
+        startup_layout.addWidget(QLabel("默认工作区仅用于未指定 workspace_id 的调用，不限制其他工作区执行。"))
         workspace_buttons = QHBoxLayout()
         workspace_buttons.setSpacing(BUTTON_SPACING)
         workspace_buttons.setAlignment(Qt.AlignmentFlag.AlignLeft)
@@ -338,13 +341,6 @@ class LauncherWindow(QMainWindow):
         workspace_buttons.addWidget(self.set_current_workspace_button)
         startup_layout.addLayout(workspace_buttons)
         startup_layout.addSpacing(6)
-        startup_layout.addWidget(self._section_title("运行信息"))
-        startup_layout.addWidget(self._row("工作区：", self.runtime_workspace_label))
-        startup_layout.addWidget(self._row("生产配置：", self.production_config_label))
-        startup_layout.addWidget(self._row("隧道模式：", self.tunnel_mode_label))
-        startup_layout.addWidget(self._row("远程端点：", self.remote_endpoint_label))
-        startup_layout.addWidget(self._row("cloudflared 版本：", self.cloudflared_version_label))
-        startup_layout.addSpacing(6)
         startup_layout.addWidget(self._section_title("配置"))
         config_buttons = QHBoxLayout()
         config_buttons.setSpacing(BUTTON_SPACING)
@@ -353,8 +349,16 @@ class LauncherWindow(QMainWindow):
         config_buttons.addWidget(self.backup_config_button)
         config_buttons.addWidget(self.validate_config_button)
         startup_layout.addLayout(config_buttons)
+        oauth_buttons = QHBoxLayout()
+        oauth_buttons.setSpacing(BUTTON_SPACING)
+        oauth_buttons.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        oauth_buttons.addWidget(self.refresh_oauth_button)
+        oauth_buttons.addWidget(self.reset_oauth_button)
+        oauth_buttons.addWidget(self.delete_oauth_button)
+        startup_layout.addWidget(self._section_title("OAuth 操作"))
+        startup_layout.addLayout(oauth_buttons)
         startup_layout.addWidget(self.message_label)
-        startup_layout.addWidget(QLabel("启动日志："))
+        startup_layout.addWidget(self._section_title("运行日志"))
         startup_layout.addWidget(self.log_output)
         log_buttons = QHBoxLayout()
         log_buttons.setSpacing(BUTTON_SPACING)
@@ -376,8 +380,11 @@ class LauncherWindow(QMainWindow):
         capability_buttons.addWidget(self.recheck_desktop_button)
         capability_buttons.addWidget(self.standalone_button)
         capability_layout.addLayout(capability_buttons)
-        capability_layout.addWidget(self._section_title("当前诊断状态"))
+        capability_layout.addWidget(self._section_title("能力详细状态"))
         capability_layout.addWidget(self._row("诊断状态：", self.doctor_status))
+        capability_layout.addWidget(self._row("浏览器详情：", self.browser_diagnostic_status))
+        capability_layout.addWidget(self._row("Desktop 诊断：", self.desktop_sync_status))
+        capability_layout.addWidget(self._row("执行能力诊断：", self.capability_status))
         capability_layout.addWidget(self.capability_timeline_content)
 
         task_layout = QVBoxLayout()
@@ -385,14 +392,11 @@ class LauncherWindow(QMainWindow):
         task_layout.setSpacing(CONTENT_SPACING)
         task_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         task_layout.addWidget(self._section_title("任务面板"))
-        task_toolbar = QHBoxLayout()
-        task_toolbar.setSpacing(BUTTON_SPACING)
-        task_toolbar.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        task_toolbar.addWidget(self.clear_task_cache_button)
-        task_toolbar.addWidget(self.clear_persisted_task_button)
-        task_layout.addLayout(task_toolbar)
+        task_layout.addWidget(self._section_title("Session Table"))
         task_layout.addWidget(self.session_table)
         task_layout.addWidget(self.session_empty_label)
+        task_layout.addWidget(self._section_title("线程信息"))
+        task_layout.addWidget(self._row("当前查询工作区：", self.query_workspace_label))
         task_layout.addWidget(self.open_codex_task_button)
         self.session_viewer_toggle = QToolButton()
         self.session_viewer_toggle.setText("会话查看器")
@@ -402,11 +406,19 @@ class LauncherWindow(QMainWindow):
         session_viewer_layout = QVBoxLayout(self.session_viewer_content)
         session_viewer_layout.setContentsMargins(0, 0, 0, 0)
         session_viewer_layout.addWidget(self.session_details_label)
+        session_viewer_layout.addWidget(self._section_title("Execution"))
         session_viewer_layout.addWidget(self.execution_details_label)
         task_layout.addWidget(self.session_viewer_toggle)
         task_layout.addWidget(self.session_viewer_content)
-        task_layout.addWidget(self._section_title("事件流"))
+        task_layout.addWidget(self._section_title("Event Stream"))
         task_layout.addWidget(self.event_table)
+        task_layout.addWidget(self._section_title("维护"))
+        maintenance = QHBoxLayout()
+        maintenance.setSpacing(BUTTON_SPACING)
+        maintenance.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        maintenance.addWidget(self.clear_task_cache_button)
+        maintenance.addWidget(self.clear_persisted_task_button)
+        task_layout.addLayout(maintenance)
         self._set_session_viewer_expanded(False)
         self._set_capability_timeline_expanded(False)
 
@@ -467,6 +479,9 @@ class LauncherWindow(QMainWindow):
         tabs.addTab(task_scroll_area, "任务信息")
         self.setCentralWidget(tabs)
         self.resize(820, 680)
+        self.tray_icon: QSystemTrayIcon | None = None
+        self.tray_menu: QMenu | None = None
+        self._setup_tray_icon()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._refresh_status_automatically)
@@ -480,6 +495,7 @@ class LauncherWindow(QMainWindow):
         self.startup_timer.timeout.connect(self._poll_startup)
         self._set_state(LauncherState.STOPPED)
         self._render_workspace_registry()
+        self._render_query_workspace()
         self._render_session_dashboard(())
         self._render_runtime_info()
         self.refresh_status()
@@ -491,6 +507,58 @@ class LauncherWindow(QMainWindow):
         label = QLabel(text)
         label.setStyleSheet("font-weight: 600;")
         return label
+
+    @staticmethod
+    def _status_card(title: str, value: QLabel) -> QFrame:
+        card = QFrame()
+        card.setFrameShape(QFrame.Shape.StyledPanel)
+        card.setFrameShadow(QFrame.Shadow.Plain)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+        layout.addWidget(QLabel(title))
+        value.setWordWrap(True)
+        value.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(value)
+        return card
+
+    def _setup_tray_icon(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray_icon = QSystemTrayIcon(self)
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        self.tray_icon.setIcon(icon)
+        self.tray_menu = QMenu(self)
+        show_action = QAction("显示 Launcher", self.tray_menu)
+        quit_action = QAction("退出 Launcher", self.tray_menu)
+        show_action.triggered.connect(self.show_and_activate)
+        quit_action.triggered.connect(self.close)
+        self.tray_menu.addAction(show_action)
+        self.tray_menu.addAction(quit_action)
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self._tray_icon_activated)
+        self.tray_icon.show()
+
+    def show_and_activate(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    @Slot(QSystemTrayIcon.ActivationReason)
+    def _tray_icon_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.show_and_activate()
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if (
+            event.type() == QEvent.Type.WindowStateChange
+            and self.isMinimized()
+            and self.tray_icon is not None
+        ):
+            self.hide()
 
     @staticmethod
     def _row(name: str, value: QLabel) -> QWidget:
@@ -550,9 +618,13 @@ class LauncherWindow(QMainWindow):
             )
         )
         self._last_status = replace(status, sessions=sessions)
-        self._set_status(self.mcp_status, "运行中" if status.mcp_running else "已停止", status.mcp_running)
-        self._set_status(self.tunnel_status, "已连接" if status.tunnel_connected else "离线", status.tunnel_connected)
-        self._set_status(self.remote_status, "在线" if status.remote_online else "离线", status.remote_online)
+        self._set_status(self.mcp_status, "运行中" if status.mcp_running else "未运行", status.mcp_running)
+        self._set_status(
+            self.tunnel_status,
+            "已连接" if status.tunnel_connected else "未连接",
+            status.tunnel_connected,
+            warning=status.mcp_running and not status.tunnel_connected,
+        )
         browser = status.browser
         display_state = "READY" if browser.ready else "NOT READY"
         if browser.ready:
@@ -568,24 +640,36 @@ class LauncherWindow(QMainWindow):
         else:
             self._browser_was_ready = False
             self._browser_missing_since = None
+        browser_label = "已连接" if display_state == "READY" else (
+            "未连接" if display_state == "DEGRADED" else {
+                "extension_not_paired": "未配对",
+                "extension_not_present": "未连接",
+            }.get(browser.readiness_state, "不可用")
+        )
+        browser_color = "#16803c" if display_state == "READY" else (
+            "#946200" if display_state == "DEGRADED" or browser.readiness_state in {
+                "extension_not_paired", "extension_not_present",
+            } else "#666666"
+        )
+        self._set_value(self.browser_status, browser_label, browser_color)
         browser_reason = self._localize_browser_text(browser.reason)
         browser_action = self._localize_browser_text(browser.action)
-        browser_label = {"READY": "已就绪", "DEGRADED": "降级", "NOT READY": "未就绪"}[display_state]
-        browser_text = browser_label if display_state == "READY" else (
-            f"{browser_label}\n原因：{browser_reason}\n操作：{browser_action}"
+        browser_detail_label = {"READY": "已就绪", "DEGRADED": "降级", "NOT READY": "未就绪"}[display_state]
+        browser_detail = browser_detail_label if display_state == "READY" else (
+            f"{browser_detail_label}\n原因：{browser_reason}\n操作：{browser_action}"
         )
-        self.browser_status.setText(browser_text)
-        self.browser_status.setStyleSheet("color: " + {
-            "READY": "#16803c", "DEGRADED": "#946200", "NOT READY": "#9b1c1c",
-        }[display_state])
-        self.browser_status.setToolTip(
-            "显示宽限期：最近未检测到浏览器，但 submit_goal 仍会检查实时就绪状态。"
-            if display_state == "READY" and not browser.ready else ""
-        )
+        self._set_value(self.browser_diagnostic_status, browser_detail, browser_color)
+        self.browser_status.setToolTip("")
         desktop_sync = getattr(status, "desktop_sync", DesktopSyncStatus())
         desktop_capability = getattr(status, "desktop_capability", DesktopCapabilityStatus())
         capability = getattr(status, "capability", CapabilityStatus())
         self._render_capability_status(capability, status.mcp_running)
+        capability_summary = {
+            "desktop_ready": ("Desktop 可用", "#16803c"),
+            "fallback_ready": ("Standalone", "#946200"),
+            "fallback_running": ("Standalone", "#946200"),
+        }.get(capability.state, ("不可用", "#666666" if not status.mcp_running else "#9b1c1c"))
+        self._set_value(self.execution_summary_status, *capability_summary)
         # A connected Desktop IPC observer says nothing about the Desktop codex_app capability, so
         # the handoff state is always rendered separately instead of being read as the same thing.
         identity_state = (
@@ -625,9 +709,11 @@ class LauncherWindow(QMainWindow):
                 *capability_lines,
             ]))
             self.desktop_sync_status.setStyleSheet("color: #666666")
+            self._set_value(self.desktop_status, "不可用（Tools Pipe 未连接）", "#666666")
         elif not desktop_sync.connected:
             self.desktop_sync_status.setText("\n".join(["不可用", *capability_lines]))
             self.desktop_sync_status.setStyleSheet("color: #666666")
+            self._set_value(self.desktop_status, "不可用", "#666666")
         else:
             lines = [
                 "已连接",
@@ -651,13 +737,9 @@ class LauncherWindow(QMainWindow):
                 "color: #946200" if desktop_sync.association_status in {"conflict", "unavailable"}
                 else "color: #16803c"
             )
+            self._set_value(self.desktop_status, "已连接", "#16803c")
         self._render_oauth_status(status.oauth_registry)
         self._render_session_dashboard(sessions)
-        self.workspace_label.setText(self._current_workspace_text())
-        cloudflared_version = getattr(status, "cloudflared_version", None)
-        self.cloudflared_version_label.setText(
-            "不可用" if not cloudflared_version or cloudflared_version == "unavailable" else cloudflared_version
-        )
 
     @staticmethod
     def _localize_browser_text(text: str) -> str:
@@ -864,28 +946,33 @@ class LauncherWindow(QMainWindow):
 
     def _render_oauth_status(self, status: OAuthRegistryStatus | None) -> None:
         if status is None:
-            self.oauth_status_label.setText("不可用")
+            LauncherWindow._set_value(self.oauth_status_label, "不可用", "#666666")
             return
-        lines = [
-            f"OAuth 客户端数：{status.client_count}",
-            f"注册表：{status.storage_path}",
-            f"已加载：{'是' if status.loaded else '否'}",
-        ]
-        for client in status.clients:
-            lines.extend([
-                "",
-                client.client_name,
-                f"客户端 ID：{client.client_id}",
-                f"创建时间：{client.created_at}",
-            ])
-            if client.last_used is not None:
-                lines.append(f"最近使用：{client.last_used}")
-        self.oauth_status_label.setText("\n".join(lines))
+        LauncherWindow._set_value(
+            self.oauth_status_label,
+            "正常" if status.loaded else "未配置",
+            "#16803c" if status.loaded else "#666666",
+        )
 
-    def _current_workspace_text(self) -> str:
-        if not self.configuration.workspace:
-            return "未配置"
-        current = next(
+    def _render_workspace_registry(self) -> None:
+        self.workspace_table.setRowCount(0)
+        active_row = -1
+        for row, record in enumerate(self.configuration.workspaces):
+            self.workspace_table.insertRow(row)
+            self.workspace_table.setItem(
+                row, 0, QTableWidgetItem("✓" if record.id == self.configuration.active_workspace_id else "")
+            )
+            self.workspace_table.setItem(row, 1, QTableWidgetItem(record.id))
+            self.workspace_table.setItem(row, 2, QTableWidgetItem(record.name))
+            self.workspace_table.setItem(row, 3, QTableWidgetItem(record.path))
+            if record.id == self.configuration.active_workspace_id:
+                active_row = row
+        self.workspace_table.resizeColumnsToContents()
+        if active_row >= 0:
+            self.workspace_table.selectRow(active_row)
+
+    def _render_query_workspace(self) -> None:
+        record = next(
             (
                 record
                 for record in self.configuration.workspaces
@@ -893,25 +980,14 @@ class LauncherWindow(QMainWindow):
             ),
             None,
         )
-        return f"{current.name} ({current.path})" if current else self.configuration.workspace
-
-    def _render_workspace_registry(self) -> None:
-        self.workspace_table.setRowCount(0)
-        active_row = -1
-        for row, record in enumerate(self.configuration.workspaces):
-            self.workspace_table.insertRow(row)
-            self.workspace_table.setItem(row, 0, QTableWidgetItem(record.id))
-            self.workspace_table.setItem(row, 1, QTableWidgetItem(record.name))
-            self.workspace_table.setItem(row, 2, QTableWidgetItem(record.path))
-            if record.id == self.configuration.active_workspace_id:
-                active_row = row
-        self.workspace_table.resizeColumnsToContents()
-        if active_row >= 0:
-            self.workspace_table.selectRow(active_row)
+        if record is None:
+            self.query_workspace_label.setText("未配置")
+            return
+        self.query_workspace_label.setText(f"{record.name}（{record.id}）")
 
     def _selected_workspace_id(self) -> str | None:
         row = self.workspace_table.currentRow()
-        item = self.workspace_table.item(row, 0) if row >= 0 else None
+        item = self.workspace_table.item(row, 1) if row >= 0 else None
         return item.text() if item is not None else None
 
     def _selected_session_id(self) -> str | None:
@@ -1081,7 +1157,7 @@ class LauncherWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "清理持久化任务记录",
-            "删除当前 Workspace 中已结束的 Session、Event、Execution 和 Task 记录？\n"
+            "删除默认工作区中已结束的 Session、Event、Execution 和 Task 记录？\n"
             "运行中的任务不会删除。\n\n继续吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -1111,8 +1187,7 @@ class LauncherWindow(QMainWindow):
             return
         QMessageBox.information(
             self,
-            "打开 Codex 任务",
-            "当前启动器无法直接打开 Codex Desktop。\n\n"
+            "线程信息",
             f"线程 ID：{session.thread_id or '—'}\n"
             f"会话 ID：{session.session_id}",
         )
@@ -1121,15 +1196,10 @@ class LauncherWindow(QMainWindow):
         try:
             info = self.config_manager.runtime_info(self.configuration)
         except LauncherConfigError:
-            self.runtime_workspace_label.setText(self.configuration.workspace or "未配置")
-            self.production_config_label.setText(str(self.config_manager.production_path(self.configuration.config_file)))
-            self.tunnel_mode_label.setText("不可用")
-            self.remote_endpoint_label.setText(DEFAULT_REMOTE_ENDPOINT)
+            self._set_value(self.remote_status, "未配置", "#666666")
             return
-        self.runtime_workspace_label.setText(info.workspace or "未配置")
-        self.production_config_label.setText(str(info.production_config))
-        self.tunnel_mode_label.setText({"auto": "自动"}.get(info.tunnel_mode, info.tunnel_mode))
-        self.remote_endpoint_label.setText(info.remote_endpoint)
+        endpoint = getattr(info, "remote_endpoint", "") or "未配置"
+        self._set_value(self.remote_status, endpoint, "#333333")
 
     def _update_log(self) -> None:
         self.log_output.setPlainText(self.process_manager.get_output())
@@ -1281,7 +1351,7 @@ class LauncherWindow(QMainWindow):
             LauncherState.STOPPING: "停止中",
             LauncherState.FAILED: "失败",
         }
-        self.launcher_state.setText(f'<span style="color: {colors[state]}">●</span> {labels[state]}')
+        self._set_value(self.launcher_state, labels[state], colors[state])
 
     def _poll_startup(self) -> None:
         if self.state != LauncherState.STARTING:
@@ -1317,9 +1387,14 @@ class LauncherWindow(QMainWindow):
         self._update_log()
 
     @staticmethod
-    def _set_status(label: QLabel, text: str, healthy: bool) -> None:
-        color = "#16803c" if healthy else "#9b1c1c"
-        label.setText(f'<span style="color: {color}">●</span> {text}')
+    def _set_value(label: QLabel, text: str, color: str) -> None:
+        label.setText(text)
+        label.setStyleSheet(f"color: {color}")
+
+    @staticmethod
+    def _set_status(label: QLabel, text: str, healthy: bool, warning: bool = False) -> None:
+        color = "#16803c" if healthy else "#946200" if warning else "#666666"
+        LauncherWindow._set_value(label, text, color)
 
     def start_mcp(self) -> None:
         if self.state in (LauncherState.STARTING, LauncherState.RUNNING, LauncherState.STOPPING):
@@ -1452,7 +1527,8 @@ class LauncherWindow(QMainWindow):
             return
         self.status_checker.workspace_id = self.configuration.active_workspace_id
         self._render_workspace_registry()
-        self.message_label.setText("工作区已添加并设为当前工作区，将在下次启动 MCP 时使用。")
+        self._render_query_workspace()
+        self.message_label.setText("工作区已添加并设为默认工作区，将在下次启动 MCP 时生效。")
         self.refresh_status()
 
     def delete_workspace(self) -> None:
@@ -1483,6 +1559,7 @@ class LauncherWindow(QMainWindow):
             return
         self.status_checker.workspace_id = self.configuration.active_workspace_id
         self._render_workspace_registry()
+        self._render_query_workspace()
         self.message_label.setText("工作区已从注册表移除，磁盘目录未删除。")
         self.refresh_status()
 
@@ -1507,13 +1584,14 @@ class LauncherWindow(QMainWindow):
             self._show_error(str(error))
             return
         self._render_workspace_registry()
+        self._render_query_workspace()
         self.message_label.setText("工作区名称已保存。")
         self.refresh_status()
 
     def set_current_workspace(self) -> None:
         workspace_id = self._selected_workspace_id()
         if workspace_id is None:
-            self._show_error("请选择要设为当前工作区的项目。")
+            self._show_error("请选择要设为默认工作区的项目。")
             return
         try:
             self.configuration = self.config_manager.set_active_workspace(self.configuration, workspace_id)
@@ -1522,7 +1600,8 @@ class LauncherWindow(QMainWindow):
             return
         self.status_checker.workspace_id = self.configuration.active_workspace_id
         self._render_workspace_registry()
-        self.message_label.setText("当前工作区已保存，将在下次启动 MCP 时使用。")
+        self._render_query_workspace()
+        self.message_label.setText("默认工作区已保存，将在下次启动 MCP 时生效。")
         self.refresh_status()
 
     def open_config(self) -> None:
@@ -1583,6 +1662,11 @@ class LauncherWindow(QMainWindow):
                 self.process_manager.stop()
             except RuntimeError:
                 pass
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
+            self.tray_icon.setContextMenu(None)
+            self.tray_icon.deleteLater()
+            self.tray_icon = None
         event.accept()
 
     def _show_error(self, message: str) -> None:

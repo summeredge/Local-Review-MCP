@@ -384,7 +384,7 @@ hash-only, correlation-key-scoped diagnostics and never return raw payloads,
 tokens, cookies, or message text.
 
 After identity matching, Goal preflight still checks runtime readiness, the
-active registered workspace identity, and verified Connector/OAuth/remote
+requested registered workspace identity, and verified Connector/OAuth/remote
 readiness; Browser presence alone never authorizes a Goal.
 
 The exact ChatGPT Web menu labels and availability depend on the workspace
@@ -395,6 +395,14 @@ describes remote MCP server URLs and tool approval configuration.
 At least one workspace is required. With a registry, the first entry is the
 legacy active workspace unless the top-level `workspace` matches another
 registered path. Without `workspace_id`, tools use that active workspace.
+One LRM instance may serve multiple registered workspaces: an explicit
+`workspace_id` selects that workspace, while omission keeps the active workspace
+as the default. For an interactive Goal, the immutable `workspace_id` resolves
+its canonical root, the matching Codex Desktop Project, and a new target Thread
+for that Goal. Changing the Launcher active workspace affects only later default
+queries and presentation; it does not move an existing Goal, Session, Execution,
+Review, Project, or target Thread. The workspaces share LRM, MCP, Bridge, and
+Desktop IPC infrastructure, not execution or review ownership.
 
 The current nineteen read-only tools are `workspace_info`, `list_files`,
 `read_file`, `search_text`, `git_status`, `git_diff`, `workspace_get_info`,

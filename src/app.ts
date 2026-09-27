@@ -132,7 +132,20 @@ export function createAppContext(
     validateWorkspaceIdentityConsistency(registry.active, runtimeIdentity);
   }
   const storageRoot = defaultTaskContextStorageRoot(environment);
-  const connectorEvidence = new ChatGPTConnectorStore(registry.active.id, storageRoot);
+  const connectorStores = new Map<string, ChatGPTConnectorStore>();
+  const connectorStoreFor = (workspaceId: string): ChatGPTConnectorStore => {
+    const selection = registry.resolve(workspaceId);
+    let store = connectorStores.get(selection.id);
+    if (store === undefined) {
+      store = new ChatGPTConnectorStore(selection.id, storageRoot);
+      connectorStores.set(selection.id, store);
+    }
+    return store;
+  };
+  const connectorEvidence = {
+    recordEvidence: async (input: Parameters<ChatGPTConnectorStore["recordEvidence"]>[0]) =>
+      connectorStoreFor(input.workspace_id).recordEvidence(input),
+  };
   const extensionDeliveries = new ExtensionDeliveryService(storageRoot);
   const extensionReviewCompletions = new ExtensionReviewCompletionService(storageRoot);
   const codexExecutionCompletion = new CodexExecutionCompletionService(storageRoot);
@@ -160,7 +173,7 @@ export function createAppContext(
   const completionRouter = new ReviewCompletionRouter(
     storageRoot,
     new ExtensionReviewCompletionAdapter(extensionDeliveries, extensionReviewCompletions),
-    runtimeIdentity,
+    registry,
   );
   const autoIteration = new AutoIterationService(registry, {
     storageRoot,
@@ -245,6 +258,7 @@ export async function startApp(
       : {
           listSessionSummaries: (workspaceId) => context.statusQuery!.listSessionSummaries(workspaceId),
         },
+    // Launcher/HTTP presentation defaults only; execution routing uses each request.workspace_id.
     workspaceId: context.registry.active.id,
   });
   const desktopToolsPipeHandoff = new DesktopToolsPipeHandoff(undefined, (event) => {
@@ -307,7 +321,6 @@ export async function startApp(
       timeline: capabilityTimeline,
       desktopState: () => desktopSyncObserver.getState(),
       desktopPipeResolver: desktopToolsPipeResolver,
-      workspaceId: context.registry.active.id,
     });
     doctorRunner = new DoctorRunner({
       settings,
@@ -401,6 +414,8 @@ export async function startApp(
         ports: options.bridgePorts,
         evidenceTransportTrace: context.evidenceTransportTrace,
         onIdentityEvidence: async (evidence) => {
+          const pending = await context.pendingGoalSubmission?.get(evidence.request_id)
+            .catch(() => null) ?? null;
           context.evidenceTransportTrace?.record({
             event: "connector_evidence_received",
             correlation_key: evidence.request_id,
@@ -411,11 +426,15 @@ export async function startApp(
             correlation_key: evidence.request_id,
             conversation_id: evidence.conversation_id,
           });
+          if (pending === null) {
+            await options.onIdentityEvidence?.(evidence);
+            return;
+          }
           context.identityTrace?.record({
             event: "extension_evidence_received",
             correlation_key: evidence.request_id,
             conversation_id: evidence.conversation_id,
-            workspace_id: context.registry.active.id,
+            workspace_id: pending.workspace_id,
           });
           const previous = context.correlations.correlation(evidence.request_id);
           const result = await context.correlations.observe(evidence);
@@ -424,15 +443,13 @@ export async function startApp(
               event: "evidence_match_failed",
               correlation_key: evidence.request_id,
               conversation_id: evidence.conversation_id,
-              workspace_id: context.registry.active.id,
+              workspace_id: pending.workspace_id,
               reason: "conversation_mismatch",
               ...(previous === null ? {} : { expected_conversation_id: previous.conversation_id }),
             });
           }
-          void context.pendingGoalSubmission?.diagnoseEvidence(
-            evidence,
-            context.registry.active.id,
-          ).catch(() => undefined);
+          void context.pendingGoalSubmission?.diagnoseEvidence(evidence, pending.workspace_id)
+            .catch(() => undefined);
           if (result !== "refused") context.pendingGoalSubmission?.scheduleResolve(evidence.request_id);
           await options.onIdentityEvidence?.(evidence);
         },

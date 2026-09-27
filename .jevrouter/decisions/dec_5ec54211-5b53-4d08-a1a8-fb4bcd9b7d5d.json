@@ -1,0 +1,150 @@
+{
+  "request_id": "req_e2ab1b46-f135-4668-ab1f-572e9b0ab6ec",
+  "decision_id": "dec_5ec54211-5b53-4d08-a1a8-fb4bcd9b7d5d",
+  "mode": "decision_only",
+  "execution": {
+    "enabled": false,
+    "status": "not_started"
+  },
+  "provenance": {
+    "jev_provider": "openrouter:typesafe/jev-1.13",
+    "candidate_snapshot_hash": "sha256:8dc1d529b184762703b8981e0337ab1ee45de9abb7c4d7019e6cc544629453de",
+    "policy_hash": "sha256:2d89a115cfd2515a9e9dd7e1f976b2ff0efdf441b4d5066e8b419a52dbc9f205"
+  },
+  "status": "selected",
+  "decision": {
+    "kind": "choice",
+    "question": "Which single capability should handle this request?",
+    "selected": "main",
+    "jev_choice": "main",
+    "candidates": [
+      {
+        "id": "luna-high",
+        "type": "subagent",
+        "name": "luna-high",
+        "jev_probability": 0.15,
+        "jev_confidence": 0.79,
+        "jev_stage": "single",
+        "router_rank": 2,
+        "router": {
+          "available": true,
+          "verified": true,
+          "verification_status": "verified",
+          "verification_source": "subagent_registry",
+          "allowed": true,
+          "risk_level": "low",
+          "requires_confirmation": false,
+          "filtered": false,
+          "filter_reason": null
+        }
+      },
+      {
+        "id": "luna-max",
+        "type": "subagent",
+        "name": "luna-max",
+        "jev_probability": 0,
+        "jev_confidence": 0.79,
+        "jev_stage": "single",
+        "router_rank": 3,
+        "router": {
+          "available": true,
+          "verified": true,
+          "verification_status": "verified",
+          "verification_source": "subagent_registry",
+          "allowed": true,
+          "risk_level": "low",
+          "requires_confirmation": false,
+          "filtered": false,
+          "filter_reason": null
+        }
+      },
+      {
+        "id": "main",
+        "type": "main",
+        "name": "Current main agent",
+        "jev_probability": 0.85,
+        "jev_confidence": 0.79,
+        "jev_stage": "single",
+        "router_rank": 1,
+        "router": {
+          "available": true,
+          "verified": true,
+          "verification_status": "verified",
+          "verification_source": "subagent_router",
+          "allowed": true,
+          "risk_level": "low",
+          "requires_confirmation": false,
+          "filtered": false,
+          "filter_reason": null
+        }
+      },
+      {
+        "id": "sol-high",
+        "type": "subagent",
+        "name": "sol-high",
+        "jev_probability": 0,
+        "jev_confidence": 0.79,
+        "jev_stage": "single",
+        "router_rank": 4,
+        "router": {
+          "available": true,
+          "verified": true,
+          "verification_status": "verified",
+          "verification_source": "subagent_registry",
+          "allowed": true,
+          "risk_level": "low",
+          "requires_confirmation": false,
+          "filtered": false,
+          "filter_reason": null
+        }
+      }
+    ]
+  },
+  "fallback": {
+    "type": null,
+    "reason": null
+  },
+  "raw_jev": {
+    "model": "typesafe/jev-1.13-20260917",
+    "answers": {
+      "tool": {
+        "type": "choice",
+        "choice": "main",
+        "probabilities": {
+          "luna-high": 0.15,
+          "luna-max": 0,
+          "sol-high": 0,
+          "main": 0.85
+        },
+        "confidence": 0.79
+      }
+    },
+    "usage": {
+      "input_tokens": 521,
+      "output_tokens": 50,
+      "cost": 0.000021882
+    },
+    "id": "gen-dec-1790472820-hKo2UsnNI3kni02q64GN",
+    "provider": "TypeSafe",
+    "_openrouter": {
+      "id": "gen-dec-1790472820-hKo2UsnNI3kni02q64GN",
+      "provider": "openrouter",
+      "model": "typesafe/jev-1.13-20260917"
+    }
+  },
+  "subagent": {
+    "selected": "main",
+    "confidence": 0.79,
+    "candidates": {
+      "luna-high": 0.15,
+      "luna-max": 0,
+      "main": 0.85,
+      "sol-high": 0
+    },
+    "spawn": null,
+    "fallback_reason": null,
+    "main_model": null,
+    "main_reasoning_effort": null,
+    "handled_by_main": true
+  }
+}

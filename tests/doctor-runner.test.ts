@@ -33,6 +33,7 @@ function runner(
   overrides: Partial<ConstructorParameters<typeof DoctorRunner>[0]> = {},
 ) {
   const snapshot = {
+    workspace_id: "workspace-a",
     execution_id: "execution-1",
     task_id: "task-1",
     actuation_id: null,

@@ -287,6 +287,14 @@ function initialResult(input: GoalPreflightInput): GoalPreflightResult {
   });
 }
 
+function settingsForWorkspace(settings: ResolvedSettings, workspaceId: string): ResolvedSettings {
+  const identity = settings.workspaces?.find((workspace) => workspace.id === workspaceId)
+    ?? (settings.workspaceIdentity?.id === workspaceId ? settings.workspaceIdentity : undefined);
+  return identity === undefined
+    ? settings
+    : { ...settings, workspace: identity.path, workspaceIdentity: identity };
+}
+
 function fail(
   result: GoalPreflightResult,
   stage: GoalPreflightResult["failure_stage"],
@@ -416,10 +424,7 @@ export class GoalPreflightService {
         : this.options.registry.resolve(parsed.workspace_id);
       workspaceIdValid = resolved !== null
         && resolved !== undefined
-        && resolved.id === parsed.workspace_id
-        && this.options.registry.active.id === parsed.workspace_id
-        && (this.options.settings.workspaceIdentity === undefined
-          || this.options.settings.workspaceIdentity.id === parsed.workspace_id);
+        && resolved.id === parsed.workspace_id;
     } catch {
       workspaceIdValid = false;
     }
@@ -428,7 +433,7 @@ export class GoalPreflightService {
       workspace: { valid: workspaceIdValid, workspace_id: parsed.workspace_id },
     });
     if (!workspaceIdValid) {
-      return fail(result, "workspace", "workspace identity does not match the active workspace");
+      return fail(result, "workspace", "workspace_id is not registered");
     }
 
     let runtimeReady: boolean;
@@ -471,7 +476,7 @@ export class GoalPreflightService {
 
     let connector: ChatGPTConnectorDiagnostic;
     try {
-      connector = await this.connectorCheck(this.options.settings);
+      connector = await this.connectorCheck(settingsForWorkspace(this.options.settings, parsed.workspace_id));
     } catch (error: unknown) {
       return fail(result, "connector", `Connector readiness check failed: ${errorMessage(error)}`);
     }

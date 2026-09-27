@@ -12,7 +12,11 @@ import type {
   ReviewCompletionAdapter,
   ReviewCompletionResult,
 } from "../delivery/review-completion-adapter.js";
+import { validateWorkspaceIdentityConsistency } from "../workspace/identity.js";
+import type { WorkspaceRegistry } from "../workspace/registry.js";
 import type { WorkspaceIdentity } from "../workspace/types.js";
+
+type ReviewWorkspaceAuthority = WorkspaceIdentity | Pick<WorkspaceRegistry, "resolve">;
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message.length > 0) return error.message.slice(0, 4000);
@@ -54,21 +58,17 @@ function completionResultInput(
 }
 
 export class ReviewCompletionRouter {
-  private readonly routings: ConversationRoutingService;
-  private readonly deliveries: ReviewDeliveryService;
+  private readonly storageRoot: string;
   private readonly reviewRequests: ReviewRequestService;
-  private readonly results: ReviewResultService;
   private readonly inFlight = new Map<string, Promise<ReviewResult>>();
 
   public constructor(
     storageRoot: string = defaultTaskContextStorageRoot(),
     private readonly adapter: ReviewCompletionAdapter = new BrowserWorkerReviewCompletionAdapter(),
-    runtimeIdentity?: WorkspaceIdentity,
+    private readonly workspaceAuthority?: ReviewWorkspaceAuthority,
   ) {
-    this.routings = new ConversationRoutingService(storageRoot, runtimeIdentity);
-    this.deliveries = new ReviewDeliveryService(storageRoot, runtimeIdentity);
     this.reviewRequests = new ReviewRequestService(storageRoot);
-    this.results = new ReviewResultService(storageRoot, runtimeIdentity);
+    this.storageRoot = this.reviewRequests.storageRoot;
   }
 
   public collect(workspaceId: string, routingId: string): Promise<ReviewResult> {
@@ -84,24 +84,28 @@ export class ReviewCompletionRouter {
   }
 
   private async collectOnce(workspaceId: string, routingId: string): Promise<ReviewResult> {
-    const routing = await this.routings.getRouting(workspaceId, routingId);
+    const runtimeIdentity = this.workspaceIdentityFor(workspaceId);
+    const routings = new ConversationRoutingService(this.storageRoot, runtimeIdentity);
+    const deliveries = new ReviewDeliveryService(this.storageRoot, runtimeIdentity);
+    const results = new ReviewResultService(this.storageRoot, runtimeIdentity);
+    const routing = await routings.getRouting(workspaceId, routingId);
     if (routing === null) throw new Error(`Conversation routing "${routingId}" was not found.`);
-    await this.routings.validateRouting(routing);
+    await routings.validateRouting(routing);
 
     const request = await this.reviewRequests.getReviewRequest(workspaceId, routing.review_request_id);
     if (request === null) {
       throw new Error(`Review request "${routing.review_request_id}" was not found.`);
     }
-    const delivery = await this.deliveries.getDeliveryByRouting(workspaceId, routing.routing_id);
+    const delivery = await deliveries.getDeliveryByRouting(workspaceId, routing.routing_id);
     if (delivery === null) {
       throw new Error(`Review delivery for routing "${routing.routing_id}" was not found.`);
     }
-    await this.deliveries.validateDelivery(delivery);
+    await deliveries.validateDelivery(delivery);
     if (delivery.status !== "delivered") {
       throw new Error("Review completion requires a delivered review request.");
     }
 
-    const existing = await this.results.getReviewResultByRequest(
+    const existing = await results.getReviewResultByRequest(
       workspaceId,
       request.review_request_id,
     );
@@ -138,7 +142,7 @@ export class ReviewCompletionRouter {
       };
     }
 
-    const result = await this.results.createReviewResult(completionResultInput(
+    const result = await results.createReviewResult(completionResultInput(
       completion,
       workspaceId,
       routing.task_id,
@@ -151,6 +155,16 @@ export class ReviewCompletionRouter {
       { status: result.status === "COMPLETED" ? "completed" : "requested" },
     );
     return result;
+  }
+
+  private workspaceIdentityFor(workspaceId: string): WorkspaceIdentity | undefined {
+    if (this.workspaceAuthority === undefined) return undefined;
+    if ("resolve" in this.workspaceAuthority) return this.workspaceAuthority.resolve(workspaceId);
+    validateWorkspaceIdentityConsistency(
+      { ...this.workspaceAuthority, id: workspaceId },
+      this.workspaceAuthority,
+    );
+    return this.workspaceAuthority;
   }
 }
 

@@ -49,6 +49,7 @@ export interface CapabilityNegotiationTimestamps {
 }
 
 export interface CapabilityNegotiationContext {
+  readonly workspace_id: string;
   readonly execution_id: string;
   readonly task_id: string;
   readonly actuation_id: string | null;
@@ -171,6 +172,7 @@ export interface CapabilityNegotiatorOptions {
   readonly desktopPipeResolver?: Pick<DesktopToolsPipeResolver, "resolve">;
   /** Compatibility alias for callers that already name this dependency `pipeResolver`. */
   readonly pipeResolver?: Pick<DesktopToolsPipeResolver, "resolve">;
+  /** @deprecated Capability ownership comes from each Execution request. */
   readonly workspaceId?: string;
 }
 
@@ -240,7 +242,6 @@ export class CapabilityNegotiator implements ExecutionBackend {
   private readonly timelineStore: Pick<CapabilityTimeline, "record" | "recent">;
   private readonly desktopState: (() => DesktopSyncState) | undefined;
   private readonly desktopPipeResolver: Pick<DesktopToolsPipeResolver, "resolve"> | undefined;
-  private readonly workspaceId: string | undefined;
   private readonly inFlight = new Map<string, Promise<ExecutionStartResult>>();
   private readonly contexts = new Map<string, StoredCapabilityNegotiationContext>();
 
@@ -256,7 +257,6 @@ export class CapabilityNegotiator implements ExecutionBackend {
     this.timelineStore = options.timeline ?? new CapabilityTimeline();
     this.desktopState = options.desktopState;
     this.desktopPipeResolver = options.desktopPipeResolver ?? options.pipeResolver;
-    this.workspaceId = options.workspaceId;
   }
 
   public snapshot(executionId?: string): CapabilitySnapshot | null {
@@ -619,8 +619,7 @@ export class CapabilityNegotiator implements ExecutionBackend {
     const conversationId = state.connected === true ? nonEmpty(state.currentConversationId) : undefined;
     if (conversationId === undefined) return undefined;
     const matches = [...this.contexts.values()].filter((context) =>
-      (this.workspaceId === undefined || context.workspace_id === this.workspaceId)
-      && context.desktop_conversation_id === conversationId
+      context.desktop_conversation_id === conversationId
       && this.canRestoreDesktop(context, state),
     );
     return matches.length === 1 ? matches[0] : undefined;
@@ -631,7 +630,6 @@ export class CapabilityNegotiator implements ExecutionBackend {
     state: DesktopSyncState,
   ): boolean {
     if (state.connected !== true
-      || this.workspaceId !== undefined && context.workspace_id !== this.workspaceId
       || context.desktop_conversation_id !== nonEmpty(state.currentConversationId)) {
       return false;
     }
@@ -711,6 +709,7 @@ export class CapabilityNegotiator implements ExecutionBackend {
 
   private publicContext(context: StoredCapabilityNegotiationContext): CapabilityNegotiationContext {
     return {
+      workspace_id: context.workspace_id,
       execution_id: context.execution_id,
       task_id: context.task_id,
       actuation_id: context.actuation_id,

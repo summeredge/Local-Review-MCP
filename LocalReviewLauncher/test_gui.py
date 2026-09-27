@@ -16,6 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QGridLayout,
     QLabel,
     QMessageBox,
     QPlainTextEdit,
@@ -69,12 +70,17 @@ class LauncherLogTests(unittest.TestCase):
             window.show()
             self.application.processEvents()
             actions = window.start_button.parentWidget()
-            overview = actions.parentWidget().layout().itemAt(0).layout()
-            self.assertIs(overview.itemAt(0).widget(), actions)
+            self.assertIs(actions.layout().itemAt(0).layout().itemAt(0).widget(), window.start_button)
             self.assertEqual(actions.width(), 680 * 3 // 4)
             self.assertEqual(actions.x(), window.launcher_state.parentWidget().x())
             self.assertLess(actions.geometry().bottom(), window.launcher_state.parentWidget().y())
-            self.assertTrue(any(label.text() == "浏览器：" for label in window.findChildren(QLabel)))
+            startup = window.findChild(QTabWidget).widget(0)
+            cards = startup.widget().layout().itemAt(1).layout()
+            self.assertIsInstance(cards, QGridLayout)
+            self.assertEqual((cards.rowCount(), cards.columnCount()), (4, 2))
+            self.assertEqual(cards.itemAtPosition(2, 0).widget().findChildren(QLabel)[0].text(), "浏览器")
+            self.assertEqual(cards.itemAtPosition(2, 1).widget().findChildren(QLabel)[0].text(), "Desktop")
+            self.assertFalse(any(label.text() == "浏览器：" for label in window.findChildren(QLabel)))
             self.assertFalse(any(label.text() == "Local Review MCP" for label in window.findChildren(QLabel)))
             for button in window.findChildren(QPushButton) + [window.capability_timeline_toggle, window.session_viewer_toggle]:
                 self.assertEqual((button.width(), button.height()), (BUTTON_WIDTH, BUTTON_HEIGHT))
@@ -258,8 +264,7 @@ class LauncherLogTests(unittest.TestCase):
                 browser = BrowserReadiness(False, state, True, state == "extension_not_present", False,
                                            123, reason, "Refresh ChatGPT page / 刷新 ChatGPT 页面")
                 window._render_status(LauncherStatus(True, True, True, browser=browser))
-                expected_reason = "扩展未配对。" if state == "extension_not_paired" else "扩展未连接。"
-                self.assertEqual(window.browser_status.text(), f"未就绪\n原因：{expected_reason}\n操作：刷新 ChatGPT 页面")
+                self.assertEqual(window.browser_status.text(), "未配对" if state == "extension_not_paired" else "未连接")
             bilingual_action = (
                 "Refresh the ChatGPT page and wait for the extension to reconnect. "
                 "Reload/更新扩展后，请刷新 ChatGPT 页面并等待扩展重新连接。"
@@ -269,47 +274,35 @@ class LauncherLogTests(unittest.TestCase):
                 browser=BrowserReadiness(False, "extension_not_paired", True, False, False, 123,
                                          "Extension is not paired.", bilingual_action),
             ))
-            self.assertEqual(
-                window.browser_status.text(),
-                "未就绪\n原因：扩展未配对。\n操作：请刷新 ChatGPT 页面并等待扩展重新连接。",
-            )
+            self.assertEqual(window.browser_status.text(), "未配对")
             ready = BrowserReadiness(True, "ready", True, True, True, 123, "", "")
             window._render_status(LauncherStatus(True, True, True, browser=ready))
-            self.assertEqual(window.browser_status.text(), "已就绪")
+            self.assertEqual(window.browser_status.text(), "已连接")
             missing = BrowserReadiness(False, "extension_not_present", True, True, False,
                                        123, "Extension is not connected.", "Refresh ChatGPT page")
             with patch("gui.monotonic", return_value=100) as clock:
                 window._render_status(LauncherStatus(True, True, True, browser=missing))
-                self.assertEqual(window.browser_status.text(), "已就绪")
+                self.assertEqual(window.browser_status.text(), "已连接")
                 self.assertFalse(window._last_status.browser.ready)  # Raw readiness stays authoritative.
                 clock.return_value = 114.9
                 window._render_status(LauncherStatus(True, True, True, browser=missing))
-                self.assertEqual(window.browser_status.text(), "已就绪")
+                self.assertEqual(window.browser_status.text(), "已连接")
                 clock.return_value = 115
                 window._render_status(LauncherStatus(True, True, True, browser=missing))
-                self.assertTrue(window.browser_status.text().startswith("降级\n原因："))
-                self.assertIn("刷新 ChatGPT 页面", window.browser_status.text())
+                self.assertEqual(window.browser_status.text(), "未连接")
                 window._render_status(LauncherStatus(True, True, True, browser=ready))
-                self.assertEqual(window.browser_status.text(), "已就绪")
+                self.assertEqual(window.browser_status.text(), "已连接")
                 clock.return_value = 200
                 window._render_status(LauncherStatus(True, True, True, browser=missing))
-                self.assertEqual(window.browser_status.text(), "已就绪")
+                self.assertEqual(window.browser_status.text(), "已连接")
                 for hard_failure in (BrowserReadiness(), BrowserReadiness(
                     False, "extension_not_paired", True, False, False, None, "Not paired", "Refresh ChatGPT page"
                 )):
                     window._render_status(LauncherStatus(True, True, True, browser=ready))
                     window._render_status(LauncherStatus(True, True, True, browser=hard_failure))
-                    self.assertTrue(window.browser_status.text().startswith("未就绪"))
+                    self.assertIn(window.browser_status.text(), {"不可用", "未配对", "未连接"})
                     window._render_status(LauncherStatus(True, True, True, browser=missing))
-                    self.assertTrue(window.browser_status.text().startswith("未就绪"))
-            first_row = (window.start_button, window.stop_button, window.refresh_button)
-            second_row = (window.refresh_oauth_button, window.reset_oauth_button, window.delete_oauth_button)
-            for column, (upper, lower) in enumerate(zip(first_row, second_row)):
-                self.assertIs(actions.layout().itemAt(0).layout().itemAt(column).widget(), upper)
-                self.assertIs(actions.layout().itemAt(1).layout().itemAt(column).widget(), lower)
-                self.assertEqual(upper.x(), lower.x())
-                self.assertEqual(upper.width(), lower.width())
-                self.assertGreater(lower.y(), upper.geometry().bottom())
+                    self.assertIn(window.browser_status.text(), {"不可用", "未配对", "未连接"})
             initial_x = {button: button.mapTo(window, button.rect().topLeft()).x()
                          for button in window.findChildren(QPushButton) + [window.capability_timeline_toggle, window.session_viewer_toggle]}
             window.resize(window.width() + 400, window.height())
@@ -522,7 +515,7 @@ class LauncherLogTests(unittest.TestCase):
         self.assertEqual(window.log_output.toPlainText(), "")
         process_log.assert_not_called()
 
-    def test_render_oauth_status_shows_client_identity(self) -> None:
+    def test_render_oauth_status_shows_summary_only(self) -> None:
         window = SimpleNamespace(oauth_status_label=QLabel())
         status = OAuthRegistryStatus(
             "oauth/clients.json",
@@ -534,10 +527,8 @@ class LauncherLogTests(unittest.TestCase):
         LauncherWindow._render_oauth_status(window, status)  # type: ignore[arg-type]
 
         text = window.oauth_status_label.text()
-        self.assertIn("OAuth 客户端数：1", text)
-        self.assertIn("ChatGPT", text)
-        self.assertIn("客户端 ID：client-1", text)
-        self.assertIn("创建时间：123", text)
+        self.assertEqual(text, "正常")
+        self.assertNotIn("client-1", text)
 
     def test_delete_oauth_client_deletes_selected_client_and_refreshes(self) -> None:
         status = OAuthRegistryStatus(
@@ -629,6 +620,127 @@ class LauncherLogTests(unittest.TestCase):
             LauncherWindow.delete_oauth_client(window)  # type: ignore[arg-type]
 
         get_item.assert_not_called()
+
+
+class LauncherLayoutAcceptanceTests(unittest.TestCase):
+    """Locks the information-architecture contract of the three tabs."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def _window(self, config: LauncherConfig | None = None) -> LauncherWindow:
+        manager = Mock()
+        manager.load.return_value = config or LauncherConfig("", "config.production.json", False)
+        with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
+            LauncherWindow, "refresh_status"
+        ), patch.object(LauncherWindow, "_render_runtime_info"):
+            process.return_value.has_started = False
+            window = LauncherWindow(Path.cwd(), manager)
+        window.timer.stop()
+        self.addCleanup(window.close)
+        return window
+
+    @staticmethod
+    def _label_texts(window: LauncherWindow) -> list[str]:
+        return [label.text() for label in window.findChildren(QLabel)]
+
+    @staticmethod
+    def _button_texts(window: LauncherWindow) -> list[str]:
+        return [button.text() for button in window.findChildren(QPushButton)]
+
+    def test_status_cards_pin_eight_positions(self) -> None:
+        window = self._window()
+        startup = window.findChild(QTabWidget).widget(0)
+        cards = startup.widget().layout().itemAt(1).layout()
+        self.assertIsInstance(cards, QGridLayout)
+        self.assertEqual((cards.rowCount(), cards.columnCount()), (4, 2))
+        expected = (
+            (0, 0, "启动器状态"),
+            (0, 1, "MCP 运行时"),
+            (1, 0, "Cloudflare 隧道"),
+            (1, 1, "远程端点"),
+            (2, 0, "浏览器"),
+            (2, 1, "Desktop"),
+            (3, 0, "执行能力"),
+            (3, 1, "OAuth"),
+        )
+        for row, column, title in expected:
+            card = cards.itemAtPosition(row, column).widget()
+            labels = card.findChildren(QLabel)
+            self.assertEqual(labels[0].text(), title, f"card {row},{column}")
+            self.assertEqual(len(labels), 2, f"card {row},{column} must show title + value only")
+            self.assertFalse(card.findChildren(QPushButton), f"card {row},{column} must hold no button")
+        self.assertEqual(cards.itemAtPosition(0, 0).widget(), cards.itemAtPosition(0, 0).widget())
+        self.assertEqual(cards.columnStretch(0), cards.columnStretch(1))
+
+    def test_workspace_registry_columns_and_default_marker(self) -> None:
+        config = LauncherConfig("", "config.production.json", False)
+        config = replace(
+            config,
+            active_workspace_id="ws-default",
+            workspaces=(
+                SimpleNamespace(id="ws-default", name="主仓库", path="C:/repo"),
+                SimpleNamespace(id="ws-other", name="副仓库", path="C:/other"),
+            ),
+        )
+        window = self._window(config)
+        table = window.workspace_table
+        self.assertEqual(table.columnCount(), 4)
+        self.assertEqual(
+            [table.horizontalHeaderItem(c).text() for c in range(4)],
+            ["默认", "工作区 ID", "名称", "路径"],
+        )
+        window._render_workspace_registry()
+        self.assertEqual(table.item(0, 0).text(), "✓")
+        self.assertEqual(table.item(1, 0).text(), "")
+        self.assertIn("设为默认", self._button_texts(window))
+        self.assertNotIn("设为当前", self._button_texts(window))
+        self.assertIn(
+            "默认工作区仅用于未指定 workspace_id 的调用，不限制其他工作区执行。",
+            self._label_texts(window),
+        )
+
+    def test_removed_runtime_information_is_absent(self) -> None:
+        window = self._window()
+        labels = self._label_texts(window)
+        for removed in ("运行信息", "工作区：", "生产配置：", "隧道模式：", "cloudflared 版本："):
+            self.assertNotIn(removed, labels)
+
+    def test_task_tab_uses_thread_info_and_query_workspace(self) -> None:
+        window = self._window()
+        texts = self._label_texts(window)
+        self.assertIn("当前查询工作区：", texts)
+        self.assertIn("线程信息", texts)
+        self.assertIn("维护", texts)
+        self.assertNotIn("会话所属工作区：", texts)
+        self.assertNotIn("打开 Codex 任务", self._button_texts(window))
+        self.assertIn("线程信息", self._button_texts(window))
+
+    def test_thread_info_dialog_shows_ids_only(self) -> None:
+        window = self._window()
+        session = SimpleNamespace(session_id="session-1", thread_id="thread-1")
+        with patch("gui.QMessageBox.information") as information:
+            window._selected_session = Mock(return_value=session)  # type: ignore[method-assign]
+            window.open_codex_task()
+        title, message = information.call_args.args[1], information.call_args.args[2]
+        self.assertEqual(title, "线程信息")
+        self.assertIn("线程 ID：thread-1", message)
+        self.assertIn("会话 ID：session-1", message)
+        self.assertNotIn("Codex Desktop", message)
+
+    def test_runtime_log_section_renamed(self) -> None:
+        window = self._window()
+        self.assertIn("运行日志", self._label_texts(window))
+        self.assertNotIn("启动日志", self._label_texts(window))
+        for action in ("复制日志", "清空显示", "保存日志"):
+            self.assertIn(action, self._button_texts(window))
+
+    def test_user_visible_workspace_wording_stays_unambiguous(self) -> None:
+        window = self._window()
+        for ambiguous in ("当前工作区", "当前 Workspace", "设为当前"):
+            for text in self._label_texts(window) + self._button_texts(window):
+                self.assertNotIn(ambiguous, text)
 
 
 class LauncherDashboardTests(unittest.TestCase):
@@ -951,6 +1063,115 @@ class LauncherDashboardTests(unittest.TestCase):
             with self.subTest(page=invalid), patch.object(checker, "_call_tool", side_effect=[pages[0], invalid]):
                 with self.assertRaises(StatusQueryError):
                     checker._session_events(session)
+
+
+class SingleInstanceAndTrayTests(unittest.TestCase):
+    """Locks the single-instance handshake and the minimize-to-tray contract."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def _window(self) -> LauncherWindow:
+        manager = Mock()
+        manager.load.return_value = LauncherConfig("", "config.production.json", False)
+        with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
+            LauncherWindow, "refresh_status"
+        ), patch.object(LauncherWindow, "_render_runtime_info"):
+            process.return_value.has_started = False
+            window = LauncherWindow(Path.cwd(), manager)
+        window.timer.stop()
+        self.addCleanup(window.close)
+        return window
+
+    def test_change_event_hides_window_when_minimized_and_tray_present(self) -> None:
+        window = self._window()
+        window.tray_icon = Mock()
+        window.show()
+        self.application.processEvents()
+        window.setWindowState(window.windowState() | Qt.WindowState.WindowMinimized)
+        self.application.processEvents()
+        self.assertFalse(window.isVisible())
+
+    def test_change_event_keeps_window_visible_without_tray(self) -> None:
+        window = self._window()
+        window.tray_icon = None
+        window.show()
+        self.application.processEvents()
+        window.setWindowState(window.windowState() | Qt.WindowState.WindowMinimized)
+        self.application.processEvents()
+        self.assertTrue(window.isVisible())
+        self.assertTrue(window.isMinimized())
+
+    def test_show_and_activate_restores_normal_state(self) -> None:
+        window = self._window()
+        window.show()
+        self.application.processEvents()
+        window.setWindowState(window.windowState() | Qt.WindowState.WindowMinimized)
+        self.application.processEvents()
+        window.tray_icon = None
+        window.show_and_activate()
+        self.application.processEvents()
+        self.assertTrue(window.isVisible())
+        self.assertFalse(window.isMinimized())
+
+    def test_tray_menu_only_offers_show_and_quit(self) -> None:
+        window = self._window()
+        with patch("gui.QSystemTrayIcon.isSystemTrayAvailable", return_value=True):
+            window._setup_tray_icon()
+        self.addCleanup(self._destroy_tray, window)
+        self.assertEqual([action.text() for action in window.tray_menu.actions()], ["显示 Launcher", "退出 Launcher"])
+
+    @staticmethod
+    def _destroy_tray(window: LauncherWindow) -> None:
+        if window.tray_icon is not None:
+            window.tray_icon.hide()
+            window.tray_icon = None
+
+    def test_close_destroys_tray_icon(self) -> None:
+        window = self._window()
+        window.tray_icon = Mock()
+        window.close()
+        self.assertIsNone(window.tray_icon)
+
+
+class SingleInstanceServerTests(unittest.TestCase):
+    """Locks the launcher.py handshake: first instance listens, second instance defers."""
+
+    def test_second_instance_sends_activation_and_defers_window_creation(self) -> None:
+        from PySide6.QtNetwork import QLocalServer
+
+        import launcher
+
+        application = QApplication.instance() or QApplication([])
+        name = f"{launcher.INSTANCE_NAME}Test"
+        activated: list[str] = []
+        server = QLocalServer()
+        QLocalServer.removeServer(name)
+        self.assertTrue(server.listen(name))
+        server.newConnection.connect(lambda: launcher._accept_connections(server, lambda: activated.append("x")))
+        with patch.object(launcher, "INSTANCE_NAME", name):
+            self.assertIsNone(launcher._create_single_instance_server(lambda: activated.append("y")))
+        self.assertEqual(activated, [])
+        application.processEvents()
+        server.close()
+        QLocalServer.removeServer(name)
+
+    def test_stale_endpoint_is_reclaimed_after_failed_connect(self) -> None:
+        from PySide6.QtNetwork import QLocalServer
+
+        import launcher
+
+        QApplication.instance() or QApplication([])
+        name = f"{launcher.INSTANCE_NAME}Stale"
+        with patch.object(launcher, "_send_activation_request", return_value=False) as send:
+            with patch.object(QLocalServer, "removeServer") as remove:
+                with patch.object(QLocalServer, "listen", return_value=True) as listen:
+                    self.assertIsNotNone(launcher._create_single_instance_server(lambda: None))
+        self.assertEqual(listen.call_count, 1)
+        self.assertEqual(remove.call_count, 1)
+        self.assertEqual(send.call_count, 1)
+        QLocalServer.removeServer(name)
 
 
 if __name__ == "__main__":
