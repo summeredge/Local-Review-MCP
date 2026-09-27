@@ -15,7 +15,9 @@ import {
 } from "./goal-submission.js";
 import {
   GoalPreflightError,
+  goalConnectorProvenanceSchema,
   goalPreflightResultSchema,
+  type GoalConnectorProvenance,
   type GoalPreflightResult,
 } from "./goal-preflight.js";
 import type { ConversationCorrelationRegistry } from "./conversation-correlation.js";
@@ -59,6 +61,7 @@ const pendingBaseSchema = pendingPayloadSchema.extend({
   correlation_key: correlationKeySchema,
   accepted_at: timestampSchema,
   expires_at: timestampSchema,
+  connector_provenance: goalConnectorProvenanceSchema.optional(),
 }).strict();
 
 export const pendingGoalSubmissionSchema = z.discriminatedUnion("state", [
@@ -96,6 +99,9 @@ const stateSchema = z.object({
 export type PendingGoalSubmissionInput = z.input<typeof pendingGoalSubmissionInputSchema>;
 export type PendingGoalSubmission = z.infer<typeof pendingGoalSubmissionSchema>;
 export type PendingGoalSubmissionState = PendingGoalSubmission["state"];
+type PendingGoalSubmissionCandidate = z.output<typeof pendingGoalSubmissionInputSchema> & {
+  readonly connector_provenance?: GoalConnectorProvenance;
+};
 type TerminalPendingGoalSubmission = Extract<
   PendingGoalSubmission,
   { state: "started" | "failed" | "indeterminate" }
@@ -150,7 +156,7 @@ function nowIso(now: number): string {
   return timestampSchema.parse(value);
 }
 
-function payloadFingerprint(value: PendingGoalSubmission | z.output<typeof pendingGoalSubmissionInputSchema>): string {
+function payloadFingerprint(value: PendingGoalSubmission | PendingGoalSubmissionCandidate): string {
   return JSON.stringify({
     workspace_id: value.workspace_id,
     title: value.title,
@@ -161,12 +167,13 @@ function payloadFingerprint(value: PendingGoalSubmission | z.output<typeof pendi
     execution_mode: value.execution_mode ?? "batch",
     model: value.model ?? null,
     reasoning_effort: value.reasoning_effort ?? null,
+    connector_provenance: value.connector_provenance?.source ?? null,
   });
 }
 
 function samePayload(
   current: PendingGoalSubmission,
-  input: z.output<typeof pendingGoalSubmissionInputSchema>,
+  input: PendingGoalSubmissionCandidate,
 ): boolean {
   return payloadFingerprint(current) === payloadFingerprint(input);
 }
@@ -241,14 +248,23 @@ export class PendingGoalSubmissionService {
     return this.restorePromise;
   }
 
-  public async accept(input: PendingGoalSubmissionInput): Promise<GoalSubmissionAccepted> {
+  public async accept(
+    input: PendingGoalSubmissionInput,
+    connectorProvenance?: GoalConnectorProvenance,
+  ): Promise<GoalSubmissionAccepted> {
     const parsed = pendingGoalSubmissionInputSchema.parse(input);
+    const provenance = connectorProvenance === undefined
+      ? undefined
+      : goalConnectorProvenanceSchema.parse(connectorProvenance);
+    const candidate: PendingGoalSubmissionCandidate = provenance === undefined
+      ? parsed
+      : { ...parsed, connector_provenance: provenance };
     await this.restore();
     const receipt = await this.exclusive(async () => {
       const now = this.currentTime();
       const current = this.submissions.get(parsed.correlation_key);
       if (current !== undefined) {
-        if (!samePayload(current, parsed)) {
+        if (!samePayload(current, candidate)) {
           throw new PendingGoalSubmissionConflictError(
             "correlation_key already targets a different pending Goal submission",
           );
@@ -276,7 +292,7 @@ export class PendingGoalSubmissionService {
       }
       const acceptedAt = nowIso(now);
       const record = pendingGoalSubmissionSchema.parse({
-        ...parsed,
+        ...candidate,
         accepted_at: acceptedAt,
         expires_at: nowIso(now + this.identityTimeoutMs),
         state: "pending_identity",
@@ -420,7 +436,7 @@ export class PendingGoalSubmissionService {
     if (claimed === null) return;
 
     try {
-      const result = await this.goalSubmission.submitGoal({
+      const request = {
         workspace_id: claimed.record.workspace_id,
         conversation_id: claimed.conversation_id,
         title: claimed.record.title,
@@ -435,7 +451,10 @@ export class PendingGoalSubmissionService {
         ...(claimed.record.reasoning_effort === undefined
           ? {}
           : { reasoning_effort: claimed.record.reasoning_effort }),
-      });
+      };
+      const result = claimed.record.connector_provenance === undefined
+        ? await this.goalSubmission.submitGoal(request)
+        : await this.goalSubmission.submitGoal(request, claimed.record.connector_provenance);
       await this.finishStarted(key, result);
     } catch (error: unknown) {
       await this.finishTerminal(

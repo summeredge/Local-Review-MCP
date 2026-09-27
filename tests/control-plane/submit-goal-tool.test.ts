@@ -69,7 +69,11 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
   }
 }
 
-async function fixture(options: { readonly now?: () => number; readonly browserReady?: boolean } = {}) {
+async function fixture(options: {
+  readonly now?: () => number;
+  readonly browserReady?: boolean;
+  readonly authenticated?: boolean;
+} = {}) {
   if (options.browserReady !== false) {
     await startBridge({ ports: [0] });
     await pairBrowser();
@@ -79,7 +83,10 @@ async function fixture(options: { readonly now?: () => number; readonly browserR
   temporaryDirectories.push(workspace, storageRoot);
   const registry = WorkspaceRegistry.fromManager(new WorkspaceManager(workspace));
   const correlations = new ConversationCorrelationRegistry(storageRoot);
-  const submitGoal = vi.fn(async (request: GoalSubmissionRequest): Promise<GoalSubmissionResult> => ({
+  const submitGoal = vi.fn(async (
+    request: GoalSubmissionRequest,
+    _provenance?: { readonly source: "authenticated_mcp_invocation" },
+  ): Promise<GoalSubmissionResult> => ({
     goal_id: `goal-${request.conversation_id}`,
     phase_id: "phase-1",
     task_id: "task-1",
@@ -93,6 +100,17 @@ async function fixture(options: { readonly now?: () => number; readonly browserR
     identityTrace: { record },
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  if (options.authenticated) {
+    const send = clientTransport.send.bind(clientTransport);
+    clientTransport.send = (message, sendOptions) => send(message, {
+      ...sendOptions,
+      authInfo: {
+        token: "access-token-secret",
+        clientId: "chatgpt-client",
+        scopes: [],
+      },
+    });
+  }
   const server = createMcpServer({
     registry,
     correlations,
@@ -381,5 +399,33 @@ describe("submit_goal MCP tool", () => {
     expect(callerConversation.isError).toBe(true);
     expect(invalidKey.isError).toBe(true);
     expect(submitGoal).not.toHaveBeenCalled();
+  });
+
+  it("derives connector provenance from SDK AuthInfo and never accepts it from tool input", async () => {
+    const { client, correlations, pending, submitGoal, storageRoot } = await fixture({ authenticated: true });
+
+    const forged = await callFor(client, {
+      ...goalArguments(),
+      connector_provenance: { source: "authenticated_mcp_invocation" },
+    });
+    expect(forged.isError).toBe(true);
+    expect(submitGoal).not.toHaveBeenCalled();
+    expect(await pending.get(CORRELATION_A)).toBeNull();
+
+    const accepted = await callFor(client);
+    expect(accepted.isError).not.toBe(true);
+    expect(await pending.get(CORRELATION_A)).toMatchObject({
+      connector_provenance: { source: "authenticated_mcp_invocation" },
+    });
+    await expect(readFile(pendingGoalSubmissionStateFile(storageRoot), "utf8"))
+      .resolves.not.toContain("access-token-secret");
+
+    await correlations.observe(evidence(CORRELATION_A, "conversation-authenticated"));
+    pending.scheduleResolve(CORRELATION_A);
+    await waitFor(() => submitGoal.mock.calls.length === 1);
+    expect(submitGoal).toHaveBeenCalledWith(
+      expect.objectContaining({ workspace_id: expect.any(String) }),
+      { source: "authenticated_mcp_invocation" },
+    );
   });
 });

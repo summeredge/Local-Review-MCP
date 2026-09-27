@@ -46,6 +46,12 @@ export const goalPreflightInputSchema = z.object({
   execution_mode: executionModeSchema.optional(),
 }).strict();
 
+export const goalConnectorProvenanceSchema = z.object({
+  source: z.literal("authenticated_mcp_invocation"),
+}).strict();
+
+export type GoalConnectorProvenance = z.infer<typeof goalConnectorProvenanceSchema>;
+
 const readinessStateSchema = z.enum([
   "bridge_unavailable",
   "extension_not_paired",
@@ -406,8 +412,14 @@ export class GoalPreflightService {
     this.desktopWaitReporter = reporter;
   }
 
-  public async checkGoalPreflight(input: GoalPreflightInput): Promise<GoalPreflightResult> {
+  public async checkGoalPreflight(
+    input: GoalPreflightInput,
+    connectorProvenance?: GoalConnectorProvenance,
+  ): Promise<GoalPreflightResult> {
     const parsed = goalPreflightInputSchema.parse(input);
+    const provenance = connectorProvenance === undefined
+      ? undefined
+      : goalConnectorProvenanceSchema.parse(connectorProvenance);
     let result = initialResult(parsed);
     if (parsed.conversation_id.trim() === "") {
       result = goalPreflightResultSchema.parse({
@@ -474,33 +486,6 @@ export class GoalPreflightService {
       }
     }
 
-    let connector: ChatGPTConnectorDiagnostic;
-    try {
-      connector = await this.connectorCheck(settingsForWorkspace(this.options.settings, parsed.workspace_id));
-    } catch (error: unknown) {
-      return fail(result, "connector", `Connector readiness check failed: ${errorMessage(error)}`);
-    }
-    if (connector.workspace_id !== undefined && connector.workspace_id !== parsed.workspace_id) {
-      return fail(result, "workspace", "Connector workspace identity does not match the requested workspace");
-    }
-    const connectorReady = connector.ok
-      && (connector.remote === undefined || connector.remote.ready)
-      && (connector.oauth === undefined || connector.oauth.ready)
-      && connector.connector.status === "verified"
-      && connector.connector.action === "none";
-    result = goalPreflightResultSchema.parse({
-      ...result,
-      connector: {
-        ready: connectorReady,
-        status: connector.connector.status,
-        action: connector.connector.action,
-        reason: connector.connector.reason,
-        ...(connector.remote === undefined ? {} : { remote_ready: connector.remote.ready }),
-        ...(connector.remote?.readiness?.timeline === undefined
-          ? {} : { timeline: connector.remote.readiness.timeline }),
-        ...(connector.oauth === undefined ? {} : { oauth_ready: connector.oauth.ready }),
-      },
-    });
     const readExtension = async (waitForReady: boolean): Promise<GoalPreflightResult["extension"]> => {
       try {
         const readiness = waitForReady
@@ -515,11 +500,51 @@ export class GoalPreflightService {
         return { ready: false, reason: `Extension readiness check failed: ${errorMessage(error)}` };
       }
     };
-    if (!connectorReady) {
-      result = goalPreflightResultSchema.parse({ ...result, extension: await readExtension(false) });
-      return fail(result, "connector", connector.connector.reason || "Connector is not ready");
-    }
 
+    const authenticatedInvocation = provenance?.source === "authenticated_mcp_invocation";
+    if (authenticatedInvocation) {
+      result = goalPreflightResultSchema.parse({
+        ...result,
+        connector: {
+          ready: true,
+          reason: "authenticated_mcp_invocation",
+          remote_ready: true,
+          oauth_ready: true,
+        },
+      });
+    } else {
+      let connector: ChatGPTConnectorDiagnostic;
+      try {
+        connector = await this.connectorCheck(settingsForWorkspace(this.options.settings, parsed.workspace_id));
+      } catch (error: unknown) {
+        return fail(result, "connector", `Connector readiness check failed: ${errorMessage(error)}`);
+      }
+      if (connector.workspace_id !== undefined && connector.workspace_id !== parsed.workspace_id) {
+        return fail(result, "workspace", "Connector workspace identity does not match the requested workspace");
+      }
+      const diagnosedConnectorReady = connector.ok
+        && (connector.remote === undefined || connector.remote.ready)
+        && (connector.oauth === undefined || connector.oauth.ready)
+        && connector.connector.status === "verified"
+        && connector.connector.action === "none";
+      result = goalPreflightResultSchema.parse({
+        ...result,
+        connector: {
+          ready: diagnosedConnectorReady,
+          status: connector.connector.status,
+          action: connector.connector.action,
+          reason: connector.connector.reason,
+          ...(connector.remote === undefined ? {} : { remote_ready: connector.remote.ready }),
+          ...(connector.remote?.readiness?.timeline === undefined
+            ? {} : { timeline: connector.remote.readiness.timeline }),
+          ...(connector.oauth === undefined ? {} : { oauth_ready: connector.oauth.ready }),
+        },
+      });
+      if (!diagnosedConnectorReady) {
+        result = goalPreflightResultSchema.parse({ ...result, extension: await readExtension(false) });
+        return fail(result, "connector", connector.connector.reason || "Connector is not ready");
+      }
+    }
     const extension = await readExtension(true);
     result = goalPreflightResultSchema.parse({ ...result, extension });
     const { failure_stage: _failureStage, failure_reason: _failureReason, ...withoutFailure } = result;

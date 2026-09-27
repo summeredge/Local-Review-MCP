@@ -9,6 +9,7 @@ import {
 import { correlationKeySchema } from "../mcp/schema/common.js";
 import {
   GoalPreflightError,
+  type GoalConnectorProvenance,
   type GoalPreflightService,
 } from "./goal-preflight.js";
 import {
@@ -106,14 +107,20 @@ export class GoalSubmissionService {
     private readonly preflight: GoalSubmissionPreflight,
   ) {}
 
-  public async submitGoal(request: GoalSubmissionRequest): Promise<GoalSubmissionResult> {
+  public async submitGoal(
+    request: GoalSubmissionRequest,
+    connectorProvenance?: GoalConnectorProvenance,
+  ): Promise<GoalSubmissionResult> {
     const parsed = goalSubmissionRequestSchema.parse(request);
-    const preflight = await this.preflight.checkGoalPreflight({
+    const preflightInput = {
       workspace_id: parsed.workspace_id,
       conversation_id: parsed.conversation_id,
       // The interactive Desktop route has a backend capability precondition; batch does not.
       ...(parsed.execution_mode === "interactive" ? { execution_mode: parsed.execution_mode } : {}),
-    });
+    };
+    const preflight = connectorProvenance === undefined
+      ? await this.preflight.checkGoalPreflight(preflightInput)
+      : await this.preflight.checkGoalPreflight(preflightInput, connectorProvenance);
     if (!preflight.ready) throw new GoalPreflightError(preflight);
     const plan = buildPlan(parsed);
     const created = await this.orchestration.createGoal(plan);

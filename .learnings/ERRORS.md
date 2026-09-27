@@ -777,3 +777,33 @@ Launcher 任务信息清理改动。
 - See Also: none
 
 ---
+
+## [ERR-20260927-001] Local MCP Connector workspace query returned internal error
+
+**Priority**: medium
+**Status**: pending
+**Area**: tools
+
+### 摘要
+
+任务完成后尝试通过 Local MCP Connector 查询当前 Workspace 以通知 ChatGPT 网页时，workspace_list 与 workspace_info 都返回 MCP -32603 Internal error；未猜测 workspace_id，也未继续调用 submit_goal。
+
+### 错误信息
+
+Mcp error: -32603: Internal error
+
+### 上下文
+
+- 工具：codex_apps/local_mcp_connector.workspace_list、codex_apps/local_mcp_connector.workspace_info
+- 目的：按用户要求通过 LRM 工具通知 ChatGPT 网页
+
+### 建议修复
+
+先恢复 LRM Connector 的 Workspace registry/runtime，再重试只读 Workspace 查询；在无法确认目标 Workspace 时不要猜测 workspace_id 或提交 Goal。
+
+### 元数据
+
+- Reproducible: unknown
+- See Also: none
+
+---

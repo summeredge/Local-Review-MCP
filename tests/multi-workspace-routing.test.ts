@@ -18,6 +18,10 @@ import {
 import { ConversationCorrelationRegistry } from "../src/control-plane/conversation-correlation.js";
 import { GoalPreflightService } from "../src/control-plane/goal-preflight.js";
 import { GoalOrchestrationService } from "../src/control-plane/goal-orchestration.js";
+import {
+  GoalSubmissionService,
+  type GoalSubmissionOrchestration,
+} from "../src/control-plane/goal-submission.js";
 import { PendingGoalSubmissionService } from "../src/control-plane/pending-goal-submission.js";
 import type {
   ExecutionBackendStartRequest,
@@ -54,19 +58,25 @@ async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<voi
 async function workspaceFixture(): Promise<{
   readonly workspaceA: string;
   readonly workspaceB: string;
+  readonly workspaceD: string;
   readonly workspaces: readonly { readonly id: string; readonly name: string; readonly path: string }[];
   readonly registry: WorkspaceRegistry;
   readonly settings: ResolvedSettings;
 }> {
   const workspaceA = await root("lrm-multi-a-");
   const workspaceB = await root("lrm-multi-b-");
+  const workspaceC = await root("lrm-multi-c-");
+  const workspaceD = await root("lrm-multi-d-");
   const workspaces = [
     { id: "workspace-a", name: "Workspace A", path: workspaceA },
     { id: "workspace-b", name: "Workspace B", path: workspaceB },
+    { id: "workspace-c", name: "Workspace C", path: workspaceC },
+    { id: "workspace-d", name: "Workspace D", path: workspaceD },
   ] as const;
   return {
     workspaceA,
     workspaceB,
+    workspaceD,
     workspaces,
     registry: new WorkspaceRegistry(workspaces, { activeWorkspaceId: "workspace-a" }),
     settings: {
@@ -82,31 +92,44 @@ async function workspaceFixture(): Promise<{
   };
 }
 
-function connectorDiagnostic(workspaceId: string, workspaceName: string) {
+function connectorDiagnostic(
+  workspaceId: string,
+  workspaceName: string,
+  overrides: Partial<{
+    ok: boolean;
+    status: "unconfigured" | "repair_required" | "verified";
+    action: "none" | "create" | "update";
+    reason: string;
+    remote_ready: boolean;
+    oauth_ready: boolean;
+    migration: "not_needed" | "migrated" | "reauthorization_required";
+    reauthorization_required: boolean;
+  }> = {},
+) {
   return {
-    ok: true,
+    ok: overrides.ok ?? true,
     workspace_id: workspaceId,
     workspace_name: workspaceName,
     remote: {
-      ready: true,
+      ready: overrides.remote_ready ?? true,
       mcp_url: "https://mcp.example.test/mcp",
       readiness: { attempts: 1, timeline: [], final_state: "ready" as const },
     },
     oauth: {
-      ready: true,
+      ready: overrides.oauth_ready ?? true,
       pkce_s256: true,
       dynamic_registration: true,
       refresh_token: true,
-      migration: "not_needed" as const,
-      reauthorization_required: false,
+      migration: overrides.migration ?? "not_needed" as const,
+      reauthorization_required: overrides.reauthorization_required ?? false,
     },
     connector: {
       name: workspaceName,
-      status: "verified" as const,
-      action: "none" as const,
+      status: overrides.status ?? "verified" as const,
+      action: overrides.action ?? "none" as const,
       mcp_url: "https://mcp.example.test/mcp",
       verified_mcp_url: "https://mcp.example.test/mcp",
-      reason: "verified_endpoint_matches",
+      reason: overrides.reason ?? "verified_endpoint_matches",
     },
     pages: {
       plugins: "https://chatgpt.com/admin/plugins",
@@ -269,6 +292,70 @@ describe("multi-workspace execution routing", () => {
       workspace_id: "workspace-missing",
       conversation_id: "conversation-x",
     })).resolves.toMatchObject({
+      ready: false,
+      failure_stage: "workspace",
+      failure_reason: "workspace_id is not registered",
+    });
+  });
+
+  it("starts a non-active registered Goal from authenticated MCP provenance without migrating Workspace OAuth state", async () => {
+    const fixture = await workspaceFixture();
+    const diagnoseConnector = vi.fn(async () => connectorDiagnostic("workspace-d", "Workspace D", {
+      oauth_ready: false,
+      migration: "reauthorization_required",
+      reauthorization_required: true,
+      reason: "legacy_oauth_reauthorization_required",
+    }));
+    const preflight = new GoalPreflightService({
+      settings: fixture.settings,
+      registry: fixture.registry,
+      runtimeReady: () => true,
+      diagnoseConnector,
+      extensionReadiness: async () => ({ ready: true }),
+      extensionReadyTimeoutMs: 0,
+    });
+    const createGoal = vi.fn(async () => ({ goal_id: "goal-d" } as never));
+    const startGoal = vi.fn(async () => ({
+      execution_id: "execution-d",
+      current_phase_id: "phase-d",
+      current_task_id: "task-d",
+      status: "running",
+    } as never));
+    const orchestration: GoalSubmissionOrchestration = { createGoal, startGoal };
+    const submission = new GoalSubmissionService(orchestration, preflight);
+    const request = {
+      workspace_id: "workspace-d",
+      conversation_id: "conversation-d",
+      title: "Run Workspace D Goal",
+      goal: "Start the requested Goal in Workspace D.",
+      requirements: ["Keep Workspace ownership immutable."],
+      acceptance_criteria: ["The Goal starts in Workspace D."],
+      max_iterations: 1,
+    };
+    const proof = { source: "authenticated_mcp_invocation" as const };
+
+    await expect(submission.submitGoal(request, proof)).resolves.toMatchObject({
+      execution_id: "execution-d",
+      status: "running",
+    });
+    expect(diagnoseConnector).not.toHaveBeenCalled();
+    expect(createGoal).toHaveBeenCalledTimes(1);
+    expect(startGoal).toHaveBeenCalledTimes(1);
+    expect(startGoal).toHaveBeenCalledWith({ goal_id: "goal-d" });
+
+    await expect(submission.submitGoal(request)).rejects.toMatchObject({
+      result: {
+        failure_stage: "connector",
+        failure_reason: "legacy_oauth_reauthorization_required",
+      },
+    });
+    expect(diagnoseConnector).toHaveBeenCalledTimes(1);
+    expect(createGoal).toHaveBeenCalledTimes(1);
+
+    await expect(preflight.checkGoalPreflight({
+      workspace_id: "workspace-missing",
+      conversation_id: "conversation-missing",
+    }, proof)).resolves.toMatchObject({
       ready: false,
       failure_stage: "workspace",
       failure_reason: "workspace_id is not registered",

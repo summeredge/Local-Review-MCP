@@ -297,6 +297,28 @@ function logMcpContextProbe(extra: unknown): void {
   }
 }
 
+function authenticatedMcpInvocationProof(extra: unknown): {
+  readonly source: "authenticated_mcp_invocation";
+} | undefined {
+  const origin = inboundRequestOrigin();
+  if (origin?.authentication === "oauth") {
+    return { source: "authenticated_mcp_invocation" };
+  }
+
+  // The SDK's AuthInfo is populated by its authentication middleware, not by tool input. Validate
+  // its required shape before using the only non-sensitive fact this path needs.
+  const context = isRecord(extra) ? extra : undefined;
+  const authInfo = isRecord(context?.authInfo) ? context.authInfo : undefined;
+  if (authInfo === undefined
+    || typeof authInfo.token !== "string" || authInfo.token.length === 0
+    || typeof authInfo.clientId !== "string" || authInfo.clientId.length === 0
+    || !Array.isArray(authInfo.scopes)
+    || !authInfo.scopes.every((scope) => typeof scope === "string")) {
+    return undefined;
+  }
+  return { source: "authenticated_mcp_invocation" };
+}
+
 interface ListedEntry {
   readonly path: string;
   readonly name: string;
@@ -1088,6 +1110,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async (input, extra) => {
       logMcpContextProbe(extra);
+      const connectorProvenance = authenticatedMcpInvocationProof(extra);
       const pendingGoalSubmission = context.pendingGoalSubmission;
       if (pendingGoalSubmission === undefined) {
         return toToolError(new Error("Goal submission runtime is unavailable."));
@@ -1105,7 +1128,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
           workspace_id: selection.id,
           execution_mode: input.execution_mode ?? "batch",
         });
-        return structuredResponse(goalSubmissionAcceptedSchema, await pendingGoalSubmission.accept({
+        const pendingInput = {
           correlation_key: input.correlation_key,
           workspace_id: selection.id,
           title: input.title,
@@ -1116,7 +1139,11 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
           ...(input.execution_mode === "interactive" ? { execution_mode: input.execution_mode } : {}),
           ...(input.model === undefined ? {} : { model: input.model }),
           ...(input.reasoning_effort === undefined ? {} : { reasoning_effort: input.reasoning_effort }),
-        }));
+        };
+        const accepted = connectorProvenance === undefined
+          ? await pendingGoalSubmission.accept(pendingInput)
+          : await pendingGoalSubmission.accept(pendingInput, connectorProvenance);
+        return structuredResponse(goalSubmissionAcceptedSchema, accepted);
       } catch (error: unknown) {
         return toToolError(error);
       }

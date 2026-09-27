@@ -192,6 +192,40 @@ describe("PendingGoalSubmissionService", () => {
     expect((await pending.get(CORRELATION_A))?.state).toBe("started");
   });
 
+  it("persists only authenticated provenance and keeps the correlation gate fail-closed", async () => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const submitGoal = vi.fn(async (
+      _request: GoalSubmissionRequest,
+      provenance?: { readonly source: "authenticated_mcp_invocation" },
+    ) => {
+      expect(provenance).toEqual({ source: "authenticated_mcp_invocation" });
+      return result();
+    });
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    const proof = { source: "authenticated_mcp_invocation" as const };
+
+    await pending.accept({ ...input(), workspace_id: "workspace-d" }, proof);
+    expect(await pending.get(CORRELATION_A)).toMatchObject({
+      state: "pending_identity",
+      workspace_id: "workspace-d",
+      connector_provenance: proof,
+    });
+    await expect(readFile(pendingGoalSubmissionStateFile(root), "utf8"))
+      .resolves.toContain('"source": "authenticated_mcp_invocation"');
+    await expect(readFile(pendingGoalSubmissionStateFile(root), "utf8"))
+      .resolves.not.toContain("access-token-secret");
+
+    await correlations.observe(evidence("00000000-0000-4000-8000-000000000002"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(submitGoal).not.toHaveBeenCalled();
+    expect((await pending.get(CORRELATION_A))?.state).toBe("pending_identity");
+
+    await correlations.observe(evidence());
+    await waitFor(() => submitGoal.mock.calls.length === 1);
+    expect((await pending.get(CORRELATION_A))?.state).toBe("started");
+  });
+
   it("uses the configured identity timeout in expiry and trace", async () => {
     const root = await makeRoot();
     let now = Date.now();
