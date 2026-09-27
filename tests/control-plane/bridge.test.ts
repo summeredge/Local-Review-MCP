@@ -812,6 +812,8 @@ describe("Local Control Bridge app lifecycle", () => {
       server = await startApp(runtimeSettings, context, {
         bridgePorts: [0],
         onIdentityEvidence: observer,
+        evidencePendingGraceMs: 20,
+        evidencePendingPollMs: 5,
       });
       const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
       const evidence = {
@@ -896,7 +898,11 @@ describe("Local Control Bridge app lifecycle", () => {
     const scheduleResolve = vi.spyOn(pending, "scheduleResolve");
     let server: Server | null = null;
     try {
-      server = await startApp(runtimeSettings, context, { bridgePorts: [0] });
+      server = await startApp(runtimeSettings, context, {
+        bridgePorts: [0],
+        evidencePendingGraceMs: 20,
+        evidencePendingPollMs: 5,
+      });
       const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
       const evidence = {
         request_id: correlationKey,
@@ -929,6 +935,153 @@ describe("Local Control Bridge app lifecycle", () => {
       expect(correlations.correlation(correlationKey)?.conversation_id).toBe(evidence.conversation_id);
       expect(scheduleResolve).toHaveBeenCalledWith(correlationKey);
       await expect(pending.get(correlationKey)).resolves.toMatchObject({ state: "started" });
+    } finally {
+      if (server !== null) await close(server);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves a Pending Goal from Evidence that arrived before the Pending existed", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-app-evidence-first-"));
+    const correlationKey = "00000000-0000-4000-8000-000000000005";
+    const runtimeSettings = settings();
+    const runtime = createAppContext(runtimeSettings);
+    const correlations = new ConversationCorrelationRegistry(root);
+    const submitGoal = vi.fn(async (_request: GoalSubmissionRequest): Promise<GoalSubmissionResult> => ({
+      goal_id: "goal-evidence-first",
+      phase_id: "phase-evidence-first",
+      task_id: "task-evidence-first",
+      execution_id: "execution-evidence-first",
+      status: "running",
+    }));
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {
+      storageRoot: root,
+      browserReadiness: () => ({ ready: true, readiness_state: "ready" }),
+      environment: { LRM_PENDING_IDENTITY_TIMEOUT_MS: "5000" },
+    });
+    const context = { ...runtime, correlations, pendingGoalSubmission: pending };
+    // The first lookup must miss, exactly like the real sub-second Evidence/Pending race.
+    const realGet = pending.get.bind(pending);
+    let firstLookup = true;
+    vi.spyOn(pending, "get").mockImplementation(async (key) => {
+      if (firstLookup) {
+        firstLookup = false;
+        return null;
+      }
+      return realGet(key);
+    });
+    const diagnose = vi.spyOn(pending, "diagnoseEvidence");
+    const scheduleResolve = vi.spyOn(pending, "scheduleResolve");
+    const transportTrace = vi.spyOn(runtime.evidenceTransportTrace!, "record");
+    let server: Server | null = null;
+    try {
+      server = await startApp(runtimeSettings, context, {
+        bridgePorts: [0],
+        evidencePendingGraceMs: 1_000,
+        evidencePendingPollMs: 5,
+      });
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+      const evidence = {
+        request_id: correlationKey,
+        conversation_id: "conversation-evidence-first",
+        document_id: "document-evidence-first",
+        navigation_epoch: 1,
+      };
+
+      // Evidence is posted first; the pending Goal only exists while the Bridge is still waiting.
+      const posted = request("/identity-evidence", { method: "POST", token, body: evidence });
+      await waitForCondition(() => firstLookup === false);
+      await pending.accept({
+        correlation_key: correlationKey,
+        workspace_id: "workspace-a",
+        title: "Evidence first",
+        goal: "Resolve the Goal from the already-delivered Evidence.",
+        requirements: ["Do not require a second Evidence resend."],
+        acceptance_criteria: ["The Goal starts from the first Evidence."],
+        max_iterations: 1,
+      });
+
+      expect(await posted).toMatchObject({ status: 202 });
+      await waitForCondition(() => submitGoal.mock.calls.length === 1);
+      expect(correlations.correlation(correlationKey)?.conversation_id).toBe(evidence.conversation_id);
+      expect(diagnose).toHaveBeenCalledWith(evidence, "workspace-a");
+      expect(scheduleResolve).toHaveBeenCalledWith(correlationKey);
+      await waitForCondition(async () => (await pending.get(correlationKey))?.state === "started");
+      expect(transportTrace).toHaveBeenCalledWith(expect.objectContaining({
+        event: "connector_evidence_received",
+        correlation_key: correlationKey,
+      }));
+      expect(transportTrace).toHaveBeenCalledWith(expect.objectContaining({
+        event: "extension_evidence_received",
+        correlation_key: correlationKey,
+      }));
+    } finally {
+      if (server !== null) await close(server);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps Evidence without a matching Pending fail-closed after the grace window", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-app-grace-expired-"));
+    const correlationKey = "00000000-0000-4000-8000-000000000006";
+    const otherCorrelationKey = "00000000-0000-4000-8000-000000000007";
+    const runtimeSettings = settings();
+    const runtime = createAppContext(runtimeSettings);
+    const correlations = new ConversationCorrelationRegistry(root);
+    const submitGoal = vi.fn(async (_request: GoalSubmissionRequest): Promise<GoalSubmissionResult> => ({
+      goal_id: "goal-grace-expired",
+      phase_id: "phase-grace-expired",
+      task_id: "task-grace-expired",
+      execution_id: "execution-grace-expired",
+      status: "running",
+    }));
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {
+      storageRoot: root,
+      browserReadiness: () => ({ ready: true, readiness_state: "ready" }),
+      environment: { LRM_PENDING_IDENTITY_TIMEOUT_MS: "5000" },
+    });
+    const context = { ...runtime, correlations, pendingGoalSubmission: pending };
+    const scheduleResolve = vi.spyOn(pending, "scheduleResolve");
+    const diagnose = vi.spyOn(pending, "diagnoseEvidence");
+    const trace = vi.spyOn(runtime.identityTrace!, "record");
+    let server: Server | null = null;
+    try {
+      server = await startApp(runtimeSettings, context, {
+        bridgePorts: [0],
+        evidencePendingGraceMs: 20,
+        evidencePendingPollMs: 5,
+      });
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+      // A different correlation key must never be consumed by unrelated Evidence.
+      await pending.accept({
+        correlation_key: otherCorrelationKey,
+        workspace_id: "workspace-a",
+        title: "Unrelated Goal",
+        goal: "Keep this Pending bound to its own correlation key.",
+        requirements: ["Do not consume Evidence for another correlation key."],
+        acceptance_criteria: ["Only the matching correlation key resolves."],
+        max_iterations: 1,
+      });
+      const evidence = {
+        request_id: correlationKey,
+        conversation_id: "conversation-grace-expired",
+        document_id: "document-grace-expired",
+        navigation_epoch: 1,
+      };
+
+      expect(await request("/identity-evidence", { method: "POST", token, body: evidence }))
+        .toMatchObject({ status: 202 });
+      expect(correlations.correlation(correlationKey)).toBeNull();
+      expect(scheduleResolve).not.toHaveBeenCalledWith(correlationKey);
+      expect(diagnose).not.toHaveBeenCalledWith(evidence, expect.anything());
+      expect(trace).not.toHaveBeenCalledWith(expect.objectContaining({
+        event: "extension_evidence_received",
+        correlation_key: correlationKey,
+      }));
+      expect(await pending.get(correlationKey)).toBeNull();
+      await expect(pending.get(otherCorrelationKey)).resolves.toMatchObject({ state: "pending_identity" });
     } finally {
       if (server !== null) await close(server);
       await rm(root, { recursive: true, force: true });

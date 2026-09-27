@@ -1,0 +1,150 @@
+{
+  "request_id": "req_bb91ba7a-c062-4b30-bb39-9bd229b2cd49",
+  "decision_id": "dec_8b6a44bb-b8fe-429b-b005-6066e9a044fe",
+  "mode": "decision_only",
+  "execution": {
+    "enabled": false,
+    "status": "not_started"
+  },
+  "provenance": {
+    "jev_provider": "openrouter:typesafe/jev-1.13",
+    "candidate_snapshot_hash": "sha256:374bc89aee064901275eb8328c32f099d13262ccf470b617174d08e909d1bdd2",
+    "policy_hash": "sha256:2d89a115cfd2515a9e9dd7e1f976b2ff0efdf441b4d5066e8b419a52dbc9f205"
+  },
+  "status": "no_decision",
+  "decision": {
+    "kind": "choice",
+    "question": "Which single capability should handle this request?",
+    "selected": null,
+    "jev_choice": "luna-high",
+    "candidates": [
+      {
+        "id": "luna-high",
+        "type": "subagent",
+        "name": "luna-high",
+        "jev_probability": 0.56,
+        "jev_confidence": 0.41,
+        "jev_stage": "single",
+        "router_rank": 1,
+        "router": {
+          "available": true,
+          "verified": true,
+          "verification_status": "verified",
+          "verification_source": "subagent_registry",
+          "allowed": true,
+          "risk_level": "low",
+          "requires_confirmation": false,
+          "filtered": false,
+          "filter_reason": null
+        }
+      },
+      {
+        "id": "luna-max",
+        "type": "subagent",
+        "name": "luna-max",
+        "jev_probability": 0.15,
+        "jev_confidence": 0.41,
+        "jev_stage": "single",
+        "router_rank": 3,
+        "router": {
+          "available": true,
+          "verified": true,
+          "verification_status": "verified",
+          "verification_source": "subagent_registry",
+          "allowed": true,
+          "risk_level": "low",
+          "requires_confirmation": false,
+          "filtered": false,
+          "filter_reason": null
+        }
+      },
+      {
+        "id": "main",
+        "type": "main",
+        "name": "Current main agent",
+        "jev_probability": 0.08,
+        "jev_confidence": 0.41,
+        "jev_stage": "single",
+        "router_rank": 4,
+        "router": {
+          "available": true,
+          "verified": true,
+          "verification_status": "verified",
+          "verification_source": "subagent_router",
+          "allowed": true,
+          "risk_level": "low",
+          "requires_confirmation": false,
+          "filtered": false,
+          "filter_reason": null
+        }
+      },
+      {
+        "id": "sol-high",
+        "type": "subagent",
+        "name": "sol-high",
+        "jev_probability": 0.21,
+        "jev_confidence": 0.41,
+        "jev_stage": "single",
+        "router_rank": 2,
+        "router": {
+          "available": true,
+          "verified": true,
+          "verification_status": "verified",
+          "verification_source": "subagent_registry",
+          "allowed": true,
+          "risk_level": "low",
+          "requires_confirmation": false,
+          "filtered": false,
+          "filter_reason": null
+        }
+      }
+    ]
+  },
+  "fallback": {
+    "type": "low_confidence",
+    "reason": "Jev confidence 0.410 is below 0.550"
+  },
+  "raw_jev": {
+    "model": "typesafe/jev-1.13-20260917",
+    "answers": {
+      "tool": {
+        "type": "choice",
+        "choice": "luna-high",
+        "probabilities": {
+          "sol-high": 0.21,
+          "main": 0.08,
+          "luna-max": 0.15,
+          "luna-high": 0.56
+        },
+        "confidence": 0.41
+      }
+    },
+    "usage": {
+      "input_tokens": 1491,
+      "output_tokens": 52,
+      "cost": 0.000062622
+    },
+    "id": "gen-dec-1790485067-uhoiKZjJq70U73XJWFHh",
+    "provider": "TypeSafe",
+    "_openrouter": {
+      "id": "gen-dec-1790485067-uhoiKZjJq70U73XJWFHh",
+      "provider": "openrouter",
+      "model": "typesafe/jev-1.13-20260917"
+    }
+  },
+  "subagent": {
+    "selected": null,
+    "confidence": 0.41,
+    "candidates": {
+      "luna-high": 0.56,
+      "luna-max": 0.15,
+      "main": 0.08,
+      "sol-high": 0.21
+    },
+    "spawn": null,
+    "fallback_reason": "low_confidence",
+    "main_model": null,
+    "main_reasoning_effort": null,
+    "handled_by_main": true
+  }
+}

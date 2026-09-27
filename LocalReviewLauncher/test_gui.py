@@ -47,6 +47,28 @@ from status_checker import (
 )
 
 
+class FakeLocalServer:
+    """Injected in place of QLocalServer so C++ class state is never patched."""
+
+    listen = Mock(return_value=True)
+    removed: list[str] = []
+
+    def __init__(self) -> None:
+        self.newConnection = Mock()
+
+    @staticmethod
+    def removeServer(name: str) -> None:
+        FakeLocalServer.removed.append(name)
+
+    def close(self) -> None:
+        pass
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.listen = Mock(return_value=True)
+        cls.removed = []
+
+
 class LauncherLogTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1139,39 +1161,253 @@ class SingleInstanceServerTests(unittest.TestCase):
     """Locks the launcher.py handshake: first instance listens, second instance defers."""
 
     def test_second_instance_sends_activation_and_defers_window_creation(self) -> None:
-        from PySide6.QtNetwork import QLocalServer
-
         import launcher
 
-        application = QApplication.instance() or QApplication([])
-        name = f"{launcher.INSTANCE_NAME}Test"
-        activated: list[str] = []
-        server = QLocalServer()
-        QLocalServer.removeServer(name)
-        self.assertTrue(server.listen(name))
-        server.newConnection.connect(lambda: launcher._accept_connections(server, lambda: activated.append("x")))
-        with patch.object(launcher, "INSTANCE_NAME", name):
-            self.assertIsNone(launcher._create_single_instance_server(lambda: activated.append("y")))
-        self.assertEqual(activated, [])
-        application.processEvents()
-        server.close()
-        QLocalServer.removeServer(name)
+        # A live peer is served by a stub socket here on purpose: the requester
+        # blocks on waitForReadyRead(), so driving a real responder from the same
+        # thread would deadlock. ActivationHandshakeTests covers both protocol
+        # sides, and the real-socket path is exercised by the launcher itself.
+        FakeLocalServer.reset()
+        socket = _StubSocket(writes=8, acks=[b"ok"])
+        with patch.object(launcher, "QLocalSocket", return_value=socket):
+            with patch.object(launcher, "QLocalServer", FakeLocalServer):
+                self.assertIsNone(launcher._create_single_instance_server(lambda: None))
+        self.assertEqual(bytes(socket.written), b"activate")
+        self.assertEqual(FakeLocalServer.removed, [])
+        FakeLocalServer.listen.assert_not_called()
+        FakeLocalServer.reset()
 
     def test_stale_endpoint_is_reclaimed_after_failed_connect(self) -> None:
-        from PySide6.QtNetwork import QLocalServer
-
         import launcher
 
         QApplication.instance() or QApplication([])
-        name = f"{launcher.INSTANCE_NAME}Stale"
+        fake = FakeLocalServer
         with patch.object(launcher, "_send_activation_request", return_value=False) as send:
-            with patch.object(QLocalServer, "removeServer") as remove:
-                with patch.object(QLocalServer, "listen", return_value=True) as listen:
-                    self.assertIsNotNone(launcher._create_single_instance_server(lambda: None))
-        self.assertEqual(listen.call_count, 1)
-        self.assertEqual(remove.call_count, 1)
+            with patch.object(launcher, "QLocalServer", fake):
+                self.assertIsNotNone(launcher._create_single_instance_server(lambda: None))
+        self.assertEqual(fake.listen.call_count, 1)
+        self.assertEqual(fake.removed, [launcher.INSTANCE_NAME])
         self.assertEqual(send.call_count, 1)
-        QLocalServer.removeServer(name)
+        fake.reset()
+
+
+class _StubSocket:
+    """Minimal QLocalSocket stand-in so each handshake branch is deterministic."""
+
+    def __init__(
+        self,
+        *,
+        connects=True,
+        writes=0,
+        acks=(),
+        flush_ok=True,
+        bytes_written=True,
+        pending_after_write=0,
+        prebuffered=False,
+    ) -> None:
+        self._connects = connects
+        self._write_result = writes
+        self._acks = [bytes(ack) for ack in acks]
+        self._flush_ok = flush_ok
+        self._bytes_written = bytes_written
+        self._pending_after_write = pending_after_write
+        # prebuffered: bytes are already in the buffer and no new readyRead
+        # will ever fire, so waitForReadyRead() must not be relied upon.
+        self._prebuffered = prebuffered
+        self.ready_read_calls = 0
+        self.written = bytearray()
+        self.connected_to: str | None = None
+        self.aborted = False
+        self.disconnected = False
+        self._pending = 0
+        self.delete_later = False
+
+    def connectToServer(self, name: str) -> None:
+        self.connected_to = name
+
+    def waitForConnected(self, _timeout: int) -> bool:
+        return self._connects
+
+    def write(self, payload: bytes) -> int:
+        self.written += payload
+        return self._write_result
+
+    def flush(self) -> bool:
+        return self._flush_ok
+
+    def bytesToWrite(self) -> int:
+        return self._pending_after_write
+
+    def waitForBytesWritten(self, _timeout: int) -> bool:
+        self._pending = 0
+        return self._bytes_written
+
+    def bytesAvailable(self) -> int:
+        return sum(len(ack) for ack in self._acks)
+
+    def waitForReadyRead(self, _timeout: int) -> bool:
+        self.ready_read_calls += 1
+        if self._prebuffered:
+            return False
+        return bool(self._acks)
+
+    def readAll(self) -> bytearray:
+        return bytearray(self._acks.pop(0))
+
+    def abort(self) -> None:
+        self.aborted = True
+
+    def disconnectFromServer(self) -> None:
+        self.disconnected = True
+
+    def deleteLater(self) -> None:
+        self.delete_later = True
+
+
+class ActivationHandshakeTests(unittest.TestCase):
+    """Locks the requester/server sides of the activate/ok protocol."""
+
+    def setUp(self) -> None:
+        import launcher
+
+        self.launcher = launcher
+        QApplication.instance() or QApplication([])
+
+    def _request(self, **stub_kwargs) -> tuple[bool, _StubSocket]:
+        socket = _StubSocket(**stub_kwargs)
+        with patch.object(self.launcher, "QLocalSocket", return_value=socket):
+            return self.launcher._send_activation_request(), socket
+
+    def test_activate_then_ok_returns_true(self) -> None:
+        result, socket = self._request(writes=8, acks=[b"ok"])
+        self.assertTrue(result)
+        self.assertEqual(bytes(socket.written), b"activate")
+        self.assertFalse(socket.aborted)
+        self.assertTrue(socket.disconnected)
+
+    def test_connect_failure_returns_false(self) -> None:
+        result, socket = self._request(connects=False, writes=8, acks=[b"ok"])
+        self.assertFalse(result)
+        self.assertTrue(socket.aborted)
+        self.assertEqual(bytes(socket.written), b"")
+
+    def test_missing_ack_times_out_to_false(self) -> None:
+        result, socket = self._request(writes=8, acks=[])
+        self.assertFalse(result)
+        self.assertTrue(socket.aborted)
+
+    def test_wrong_ack_returns_false(self) -> None:
+        for wrong in (b"", b"no", b"okay", b"nope"):
+            with self.subTest(ack=wrong):
+                result, _ = self._request(writes=8, acks=[wrong])
+                self.assertFalse(result)
+
+    def test_partial_ack_then_timeout_returns_false(self) -> None:
+        result, _ = self._request(writes=8, acks=[b"o"])
+        self.assertFalse(result)
+
+    def test_partial_ack_then_completion_returns_true(self) -> None:
+        result, _ = self._request(writes=8, acks=[b"o", b"k"])
+        self.assertTrue(result)
+
+    def test_write_failure_returns_false(self) -> None:
+        result, _ = self._request(writes=3, acks=[b"ok"])
+        self.assertFalse(result)
+
+    def test_flush_failure_returns_false(self) -> None:
+        result, _ = self._request(writes=8, flush_ok=False, acks=[b"ok"])
+        self.assertFalse(result)
+
+    def test_pending_bytes_that_never_flush_return_false(self) -> None:
+        socket = _StubSocket(writes=8, acks=[b"ok"], bytes_written=False, pending_after_write=8)
+        with patch.object(self.launcher, "QLocalSocket", return_value=socket):
+            self.assertFalse(self.launcher._send_activation_request())
+
+    def test_server_activates_once_and_answers_ok(self) -> None:
+        socket = _StubSocket(writes=2, acks=[b"activate"])
+        calls: list[str] = []
+        self.launcher._read_activation_request(socket, lambda: calls.append("activate"))
+        self.assertEqual(calls, ["activate"])
+        self.assertEqual(bytes(socket.written), b"ok")
+        self.assertTrue(socket.disconnected)
+        self.assertTrue(socket.delete_later)
+
+    def test_server_accepts_fragmented_activation(self) -> None:
+        for fragments in ([b"acti", b"vate"], [b"a", b"c", b"t", b"i", b"v", b"a", b"t", b"e"]):
+            with self.subTest(fragments=fragments):
+                socket = _StubSocket(writes=2, acks=fragments)
+                calls: list[str] = []
+                self.launcher._read_activation_request(socket, lambda: calls.append("activate"))
+                self.assertEqual(calls, ["activate"])
+                self.assertEqual(bytes(socket.written), b"ok")
+                self.assertTrue(socket.disconnected)
+                self.assertTrue(socket.delete_later)
+
+    def test_server_ignores_non_activation_messages(self) -> None:
+        for message in (b"", b"nope", b"activate activate", b"deactivate", b" activate ", b"\nactivate\n", b"activate "):
+            with self.subTest(message=message):
+                socket = _StubSocket(writes=2, acks=[message])
+                calls: list[str] = []
+                self.launcher._read_activation_request(socket, lambda: calls.append("activate"))
+                self.assertEqual(calls, [])
+                self.assertEqual(bytes(socket.written), b"")
+                self.assertTrue(socket.disconnected)
+                self.assertTrue(socket.delete_later)
+
+    def test_server_rejects_incomplete_or_silent_message(self) -> None:
+        for fragments in ([], [b"acti"], [b"a"]):
+            with self.subTest(fragments=fragments):
+                socket = _StubSocket(writes=2, acks=fragments)
+                calls: list[str] = []
+                self.launcher._read_activation_request(socket, lambda: calls.append("activate"))
+                self.assertEqual(calls, [])
+                self.assertEqual(bytes(socket.written), b"")
+                self.assertTrue(socket.disconnected)
+                self.assertTrue(socket.delete_later)
+
+    def test_server_cleans_up_when_ack_write_fails(self) -> None:
+        socket = _StubSocket(writes=0, acks=[b"activate"])
+        calls: list[str] = []
+        self.launcher._read_activation_request(socket, lambda: calls.append("activate"))
+        self.assertEqual(calls, ["activate"])
+        self.assertTrue(socket.disconnected)
+        self.assertTrue(socket.delete_later)
+
+    def test_ack_already_buffered_needs_no_new_ready_read(self) -> None:
+        socket = _StubSocket(writes=8, acks=[b"ok"], prebuffered=True)
+        self.assertEqual(socket.bytesAvailable(), 2)
+        with patch.object(self.launcher, "QLocalSocket", return_value=socket):
+            self.assertTrue(self.launcher._send_activation_request())
+        self.assertEqual(socket.ready_read_calls, 0)
+
+    def test_activation_already_buffered_needs_no_new_ready_read(self) -> None:
+        socket = _StubSocket(writes=2, acks=[b"activate"], prebuffered=True)
+        self.assertEqual(socket.bytesAvailable(), 8)
+        calls: list[str] = []
+        self.launcher._read_activation_request(socket, lambda: calls.append("activate"))
+        self.assertEqual(calls, ["activate"])
+        self.assertEqual(bytes(socket.written), b"ok")
+        self.assertEqual(socket.ready_read_calls, 0)
+        self.assertTrue(socket.disconnected)
+        self.assertTrue(socket.delete_later)
+
+    def test_buffered_prefix_then_fragmented_completion(self) -> None:
+        socket = _StubSocket(writes=2, acks=[b"acti", b"vate"])
+        calls: list[str] = []
+        self.launcher._read_activation_request(socket, lambda: calls.append("activate"))
+        self.assertEqual(calls, ["activate"])
+        self.assertEqual(bytes(socket.written), b"ok")
+        self.assertTrue(socket.disconnected)
+        self.assertTrue(socket.delete_later)
+
+    def test_successful_handshake_never_removes_live_server(self) -> None:
+        FakeLocalServer.reset()
+        with patch.object(self.launcher, "_send_activation_request", return_value=True):
+            with patch.object(self.launcher, "QLocalServer", FakeLocalServer):
+                self.assertIsNone(self.launcher._create_single_instance_server(lambda: None))
+        self.assertEqual(FakeLocalServer.removed, [])
+        FakeLocalServer.listen.assert_not_called()
+        FakeLocalServer.reset()
 
 
 if __name__ == "__main__":

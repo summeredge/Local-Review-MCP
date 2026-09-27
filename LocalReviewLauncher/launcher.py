@@ -16,32 +16,93 @@ from gui import LauncherWindow
 INSTANCE_NAME = "LocalReviewMCPLauncher"
 ACTIVATION_MESSAGE = b"activate"
 ACTIVATION_ACK = b"ok"
+TIMEOUT_MS = 500
+
+
+def _write_message(socket, payload: bytes) -> bool:
+    """Write a full message; False when any byte failed to leave the socket."""
+    if socket.write(payload) != len(payload):
+        return False
+    if not socket.flush():
+        return False
+    # waitForBytesWritten() returns False when the buffer is already empty, so it
+    # is only meaningful while bytes are still pending.
+    if socket.bytesToWrite() and not socket.waitForBytesWritten(TIMEOUT_MS):
+        return False
+    return True
+
+
+def _read_available(socket) -> bytes | None:
+    """Consume buffered bytes, waiting for new ones only when nothing is buffered.
+
+    Data can already sit in the socket buffer when this runs, and no fresh
+    readyRead will ever fire for it, so buffered bytes must be drained first.
+    Returns None on timeout.
+    """
+    if socket.bytesAvailable() <= 0 and not socket.waitForReadyRead(TIMEOUT_MS):
+        return None
+    return bytes(socket.readAll())
+
+
+def _read_activation_ack(socket) -> bool:
+    """True only when the exact ACTIVATION_ACK arrives before the timeout."""
+    buffer = bytearray()
+    while True:
+        if buffer == ACTIVATION_ACK:
+            return True
+        # A longer or diverging payload can never become the exact ACK.
+        if not ACTIVATION_ACK.startswith(buffer):
+            return False
+        chunk = _read_available(socket)
+        if chunk is None:
+            return False
+        buffer += chunk
 
 
 def _send_activation_request() -> bool:
+    """Activate an existing instance; True only after a completed activate/ok handshake."""
     socket = QLocalSocket()
     socket.connectToServer(INSTANCE_NAME)
-    if not socket.waitForConnected(500):
+    if not socket.waitForConnected(TIMEOUT_MS):
         socket.abort()
         return False
-    socket.write(ACTIVATION_MESSAGE)
-    socket.flush()
-    socket.waitForBytesWritten(500)
-    socket.waitForReadyRead(500)
+    if not _write_message(socket, ACTIVATION_MESSAGE):
+        socket.abort()
+        return False
+    if not _read_activation_ack(socket):
+        socket.abort()
+        return False
     socket.disconnectFromServer()
     return True
 
 
+def _receive_activation_message(socket) -> bool:
+    """Read exactly ACTIVATION_MESSAGE, tolerating fragmentation.
+
+    Bounded by len(ACTIVATION_MESSAGE): never buffers more than the protocol
+    needs, rejects as soon as the bytes diverge from the expected prefix, and
+    gives up on the first timeout.
+    """
+    buffer = bytearray()
+    while len(buffer) < len(ACTIVATION_MESSAGE):
+        chunk = _read_available(socket)
+        if chunk is None:
+            return False
+        buffer += chunk
+        if not ACTIVATION_MESSAGE.startswith(bytes(buffer)):
+            return False
+    return True
+
+
 def _read_activation_request(socket: QLocalSocket, activate) -> None:
-    if not socket.bytesAvailable() and not socket.waitForReadyRead(500):
-        return
-    if bytes(socket.readAll()).strip() == ACTIVATION_MESSAGE:
+    try:
+        if not _receive_activation_message(socket):
+            return
         activate()
-        socket.write(ACTIVATION_ACK)
-        socket.flush()
-        socket.waitForBytesWritten(500)
-    socket.disconnectFromServer()
-    socket.deleteLater()
+        _write_message(socket, ACTIVATION_ACK)
+    finally:
+        socket.disconnectFromServer()
+        socket.deleteLater()
 
 
 def _accept_connections(server: QLocalServer, activate) -> None:
