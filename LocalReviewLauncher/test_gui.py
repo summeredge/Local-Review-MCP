@@ -723,6 +723,27 @@ class LauncherLayoutAcceptanceTests(unittest.TestCase):
             self._label_texts(window),
         )
 
+    def test_start_blocks_when_registered_workspace_directory_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as existing:
+            config = replace(
+                LauncherConfig(existing, "config.production.json", False),
+                active_workspace_id="ws-live",
+                workspaces=(
+                    SimpleNamespace(id="ws-live", name="在用仓库", path=existing),
+                    SimpleNamespace(id="ws-gone", name="Jev", path=str(Path(existing) / "Jev")),
+                ),
+            )
+            window = self._window(config)
+            with patch.object(LauncherWindow, "_show_error") as show_error, patch.object(
+                window.process_manager, "start"
+            ) as start:
+                window.start_mcp()
+            start.assert_not_called()
+            show_error.assert_called_once()
+            message = show_error.call_args.args[0]
+            self.assertIn("Jev", message)
+            self.assertIn(str(Path(existing) / "Jev"), message)
+
     def test_removed_runtime_information_is_absent(self) -> None:
         window = self._window()
         labels = self._label_texts(window)

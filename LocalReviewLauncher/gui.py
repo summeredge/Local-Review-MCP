@@ -1407,6 +1407,18 @@ class LauncherWindow(QMainWindow):
         if not Path(self.configuration.workspace).is_dir():
             self._show_error(f"工作区不是已存在的目录：{self.configuration.workspace}")
             return
+        missing = [
+            record
+            for record in self.configuration.workspaces
+            if not Path(record.path).is_dir()
+        ]
+        if missing:
+            self._show_error(
+                "以下工作区目录不存在，MCP 无法启动：\n"
+                + "\n".join(f"· {record.name}：{record.path}" for record in missing)
+                + "\n\n请在工作区列表中删除这些记录后重试。"
+            )
+            return
         if self._last_status.mcp_running:
             self._apply_controls(self._last_status)
             self.message_label.setText("MCP 已在运行。")
