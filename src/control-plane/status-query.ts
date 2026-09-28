@@ -377,10 +377,14 @@ export class StatusQueryService {
     const terminal = new Set(["completed", "failed", "terminated"]);
     const candidates: Array<{ readonly session: Session; readonly workspace_id: string }> = [];
     for (const session of sessions) {
-      if (session.backend_type !== "codex_app_server" || !terminal.has(session.status)) continue;
+      if (session.backend_type !== "codex_app_server") continue;
       const goal = await this.optionalGoal(session.goal_id);
       if (goal === undefined || (workspaceId !== undefined && goal.workspace_id !== workspaceId)) continue;
-      candidates.push({ session, workspace_id: goal.workspace_id });
+      // A Session can stay non-terminal after its Execution already failed, so the Session
+      // status alone leaves dead records behind. The Execution decides in that case.
+      if (terminal.has(session.status) || await this.executionFailed(session, goal)) {
+        candidates.push({ session, workspace_id: goal.workspace_id });
+      }
     }
 
     const candidateIds = new Set(candidates.map(({ session }) => session.session_id));
@@ -535,6 +539,19 @@ export class StatusQueryService {
 
   private async optionalGoal(goalId: string): Promise<GoalOrchestration | undefined> {
     return this.goals === undefined ? undefined : (await this.goals.getGoal(goalId)) ?? undefined;
+  }
+
+  private async executionFailed(session: Session, goal: GoalOrchestration): Promise<boolean> {
+    const events = await this.events.listEvents(session.session_id);
+    const executionId = this.executionIdFor(session, goal, events);
+    if (executionId === undefined) return false;
+    const execution = await this.executions.getExecutionContext(
+      goal.workspace_id,
+      session.task_id,
+      executionId,
+    );
+    // A missing Execution record only lets the trailing event speak; running is never cleanable.
+    return (execution?.status ?? eventStatus(latestEvent(events, executionId))) === "failed";
   }
 
   private async requiredGoal(goalId: string): Promise<GoalOrchestration> {

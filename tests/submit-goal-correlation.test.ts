@@ -216,6 +216,13 @@ describe("Extension submit_goal correlation evidence", () => {
       invocation: { server: 'Local MCP Connector', tool: 'link_test/submit_goal', arguments: { correlation_key: key } } };
   }
 
+  // Current ChatGPT invokes the Connector tool directly instead of the legacy linked
+  // `link_xxx/submit_goal` name, and spells the same call exactly once in functionName.
+  function directTimelineCall(key: unknown = KEY_A): Record<string, any> {
+    return { type: 'mcp-tool-call', functionName: 'Local_MCP_Connector.submit_goal',
+      invocation: { server: 'Local MCP Connector', tool: 'Local_MCP_Connector.submit_goal', arguments: { correlation_key: key } } };
+  }
+
   function scanTimeline(items: unknown[], options: { current?: boolean; conversation?: string; parentConversation?: string } = {}) {
     const entry = { isMostRecentTurn: options.current ?? true, conversationId: options.conversation ?? CONVERSATION,
       turn: { items } };
@@ -264,6 +271,114 @@ describe("Extension submit_goal correlation evidence", () => {
     expect(scanTimeline([timelineCall()], { parentConversation: CONVERSATION_B }).evidence).toEqual([]);
     expect(scanTimeline([timelineCall()], { conversation: 'invalid identity' }).evidence).toEqual([]);
     expect(scanTimeline([{ type: 'chatgpt-reasoning-group', items: null }, timelineCall()]).evidence).toEqual([]);
+  });
+
+  it('case A: reads one correlation key from the current direct Connector submit_goal timeline', () => {
+    const reply = scanTimeline([{ type: 'user-message', messageId: 'user-current' },
+      { type: 'chatgpt-reasoning-group', items: [directTimelineCall()] }, { type: 'assistant-message' }]);
+    expect(reply.evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+    expect(reply.scan_diagnostic).toMatchObject({ submit_goal_found: true, correlation_key_found: true,
+      current_key_found: true, submit_goal_reason: null, assistant_tool_calls_found: 1 });
+    // The same direct call also works when the connector qualifies the tool through its
+    // server instead of the tool name itself.
+    const viaServer = directTimelineCall();
+    viaServer.invocation.tool = 'submit_goal';
+    expect(scanTimeline([viaServer]).evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+  });
+
+  it('case B: fails closed on a malformed correlation_key in the direct submit_goal format', () => {
+    for (const [key, reason] of [['invalid', 'invalid_correlation_key'], [undefined, 'missing_correlation_key'],
+      [null, 'invalid_correlation_key'], [7, 'invalid_correlation_key'],
+      ['00000000-0000-1000-8000-000000000005', 'invalid_correlation_key']] as const) {
+      const call = directTimelineCall();
+      if (key === undefined) delete call.invocation.arguments.correlation_key;
+      else call.invocation.arguments.correlation_key = key;
+      const reply = scanTimeline([directTimelineCall(), call]);
+      expect(reply.evidence).toEqual([]);
+      expect(reply.scan_diagnostic).toMatchObject({ submit_goal_found: true, current_key_found: false,
+        submit_goal_reason: reason });
+    }
+  });
+
+  it('case C: fails closed when the direct invocation and functionName disagree', () => {
+    for (const name of ['Local_MCP_Connector.workspace_info', 'Other__submit_goal', 'submit_goal']) {
+      expect(scanTimeline([{ ...directTimelineCall(), functionName: name }]).evidence).toEqual([]);
+    }
+    // A direct submit_goal tool name under a foreign server is not this connector.
+    const foreignServer = directTimelineCall();
+    foreignServer.invocation.server = 'Other';
+    foreignServer.invocation.tool = 'submit_goal';
+    expect(scanTimeline([foreignServer]).evidence).toEqual([]);
+    // A recognized-but-inconsistent latest call still blocks an older valid one.
+    expect(scanTimeline([directTimelineCall(), { ...directTimelineCall(), functionName: 'Other__submit_goal' }])
+      .evidence).toEqual([]);
+  });
+
+  it('case C2: a Local direct submit_goal name never overrides a conflicting server', () => {
+    const foreignServer = directTimelineCall();
+    foreignServer.invocation.server = 'Other';
+    expect(scanTimeline([foreignServer]).evidence).toEqual([]);
+    expect(scanTimeline([foreignServer]).scan_diagnostic).toMatchObject({ submit_goal_found: true,
+      current_key_found: false, submit_goal_reason: 'missing_tool_payload' });
+    // A foreign server claiming submit_goal is recognized but never holds Local authority.
+    const foreignOnly: Record<string, any> = { ...directTimelineCall(), functionName: 'Other.submit_goal' };
+    foreignOnly.invocation = { ...directTimelineCall().invocation, server: 'Other', tool: 'submit_goal' };
+    expect(scanTimeline([foreignOnly]).evidence).toEqual([]);
+    expect(scanTimeline([foreignOnly]).scan_diagnostic).toMatchObject({ submit_goal_found: true,
+      current_key_found: false, submit_goal_reason: 'missing_tool_payload' });
+    // A newer foreign-server call must not hand authority back to an older valid one.
+    const blocked = scanTimeline([directTimelineCall(KEY_A), foreignServer]);
+    expect(blocked.evidence).toEqual([]);
+    expect(blocked.scan_diagnostic).toMatchObject({ submit_goal_found: true, current_key_found: false,
+      conversation_id_found: true });
+  });
+
+  it('case C3: every present field of a direct submit_goal call must agree', () => {
+    for (const conflicting of [
+      { functionName: 'Local_MCP_Connector.submit_goal', server: 'Other', tool: 'submit_goal' },
+      { functionName: 'Local_MCP_Connector.submit_goal', server: 'Local_MCP_Connector', tool: 'workspace_info' },
+      { functionName: 'Local_MCP_Connector.submit_goal', server: 'Other', tool: 'Local_MCP_Connector.submit_goal' },
+      { functionName: 'Local_MCP_Connector.submit_goal', server: 'Local MCP Connector', tool: 'link_test/submit_goal' },
+      { functionName: 'Local_MCP_Connector.submit_goal', server: 'Other', tool: null },
+    ]) {
+      const call = directTimelineCall();
+      call.functionName = conflicting.functionName;
+      call.invocation = { server: conflicting.server, tool: conflicting.tool, arguments: { correlation_key: KEY_B } };
+      const reply = scanTimeline([directTimelineCall(KEY_A), call]);
+      expect(reply.evidence).toEqual([]);
+      expect(reply.scan_diagnostic.current_key_found).toBe(false);
+    }
+    // An omitted server is not a conflict; a local server alone is enough authority.
+    const serverOnly = directTimelineCall();
+    delete serverOnly.invocation.server;
+    expect(scanTimeline([serverOnly]).evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+  });
+
+  it('case D: keeps the legacy linked submit_goal format working', () => {
+    expect(scanTimeline([timelineCall(KEY_B)]).evidence).toEqual([{ request_id: KEY_B, fiber_conversation_id: CONVERSATION }]);
+    // Both formats are accepted side by side in the same turn; the latest one wins.
+    expect(scanTimeline([directTimelineCall(KEY_A), timelineCall(KEY_B)]).evidence[0].request_id).toBe(KEY_B);
+  });
+
+  it('case E: does not fall back to an older valid direct submit_goal after a newer malformed one', () => {
+    const missingKey = directTimelineCall();
+    delete missingKey.invocation.arguments.correlation_key;
+    const reply = scanTimeline([directTimelineCall(KEY_A), missingKey]);
+    expect(reply.evidence).toEqual([]);
+    expect(reply.scan_diagnostic).toMatchObject({ submit_goal_found: true, current_key_found: false,
+      submit_goal_reason: 'missing_correlation_key' });
+    const noArguments = directTimelineCall();
+    noArguments.invocation = null;
+    expect(scanTimeline([directTimelineCall(KEY_A), noArguments]).evidence).toEqual([]);
+  });
+
+  it('case F: generates no direct-format evidence on conversation conflict or unreadable identity', () => {
+    expect(scanTimeline([directTimelineCall()], { parentConversation: CONVERSATION_B }).evidence).toEqual([]);
+    expect(scanTimeline([directTimelineCall()], { conversation: 'invalid identity' }).evidence).toEqual([]);
+    const conflict = scanTimeline([directTimelineCall()], { parentConversation: CONVERSATION_B });
+    expect(conflict.scan_diagnostic).toMatchObject({ conversation_conflict: true, conversation_id_found: false });
+    const unreadable = scanTimeline([directTimelineCall()], { conversation: 'invalid identity' });
+    expect(unreadable.scan_diagnostic).toMatchObject({ conversation_unreadable: true, conversation_id_found: false });
   });
 
   it("reports registration, Fiber reply timeout, worker rejection, and navigation fencing independently", async () => {

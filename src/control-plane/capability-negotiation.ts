@@ -39,7 +39,11 @@ export type CapabilityFailureReason =
   | "desktop_handoff_timeout"
   | "desktop_binding_recovered"
   | "desktop_execution_failed"
-  | "standalone_execution_failed";
+  | "standalone_execution_failed"
+  /** The launcher asked for the standalone fallback; the user chose it, not the clock. */
+  | "user_selected_standalone"
+  /** The AFK fallback window expired with no user action, so standalone was chosen for them. */
+  | "afk_fallback_timeout";
 
 export interface CapabilityNegotiationTimestamps {
   readonly createdAt: string;
@@ -162,6 +166,12 @@ export interface CapabilityNegotiatorOptions {
   readonly desktop: CapabilityProvider;
   readonly standalone: CapabilityProvider;
   readonly desktopTimeoutMs?: number;
+  /**
+   * AFK fallback timeout: how long a failed Desktop handoff waits for the user before standalone
+   * is selected for them. This is not the Desktop handoff timeout, which is `desktopTimeoutMs`.
+   */
+  readonly fallbackAfkTimeoutMs?: number;
+  /** @deprecated Misleading name for {@link fallbackAfkTimeoutMs}. */
   readonly fallbackTimeoutMs?: number;
   readonly pollIntervalMs?: number;
   readonly now?: () => number;
@@ -234,7 +244,7 @@ export class CapabilityNegotiator implements ExecutionBackend {
   private readonly desktop: CapabilityProvider;
   private readonly standalone: CapabilityProvider;
   private readonly desktopTimeoutMs: number;
-  private readonly fallbackTimeoutMs: number;
+  private readonly fallbackAfkTimeoutMs: number;
   private readonly pollIntervalMs: number;
   private readonly now: () => number;
   private readonly wait: (milliseconds: number) => Promise<void>;
@@ -249,7 +259,7 @@ export class CapabilityNegotiator implements ExecutionBackend {
     this.desktop = options.desktop;
     this.standalone = options.standalone;
     this.desktopTimeoutMs = options.desktopTimeoutMs ?? 30_000;
-    this.fallbackTimeoutMs = options.fallbackTimeoutMs ?? 30_000;
+    this.fallbackAfkTimeoutMs = options.fallbackAfkTimeoutMs ?? options.fallbackTimeoutMs ?? 300_000;
     this.pollIntervalMs = options.pollIntervalMs ?? 1_000;
     this.now = options.now ?? Date.now;
     this.wait = options.wait ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
@@ -333,7 +343,17 @@ export class CapabilityNegotiator implements ExecutionBackend {
       return context === undefined ? null : this.snapshotOf(context);
     }
     context.requestedAction = "standalone";
-    this.setState(context, "fallback_ready", "standalone", null, ["recheck"], undefined, "fallback_selected");
+    this.setState(
+      context,
+      "fallback_ready",
+      "standalone",
+      // A click on "Use Standalone" is the user choosing, so it is recorded as its own reason and
+      // never as the AFK timeout that would mean nobody was there to choose.
+      "user_selected_standalone",
+      ["recheck"],
+      undefined,
+      "fallback_user_selected",
+    );
     return this.snapshotOf(context);
   }
 
@@ -427,9 +447,11 @@ export class CapabilityNegotiator implements ExecutionBackend {
           context,
           choice.automatic
             ? {
-                reason: "desktop_handoff_timeout",
-                error_code: "desktop_handoff_timeout",
-                timelineEvent: "fallback_selected",
+                // The AFK window expired with no user action, so the fallback was not chosen by the
+                // user. Recording that as a handoff timeout would hide who actually decided.
+                reason: "afk_fallback_timeout",
+                error_code: "afk_fallback_timeout",
+                timelineEvent: "fallback_afk_timeout",
               }
             : undefined,
         );
@@ -496,10 +518,15 @@ export class CapabilityNegotiator implements ExecutionBackend {
   }
 
   private async waitForFallbackChoice(context: StoredCapabilityNegotiationContext): Promise<FallbackChoice> {
-    const deadline = this.now() + this.fallbackTimeoutMs;
+    const deadline = this.now() + this.fallbackAfkTimeoutMs;
     this.setDeadline(context, "fallbackDeadlineAt", deadline);
     this.recordTimeline(context, "fallback_waiting");
     while (true) {
+      // A Desktop that comes back before the AFK window expires cancels the fallback: no AppServer
+      // start and no backend migration, because the primary path is usable again.
+      if (context.state === "desktop_ready" && context.reason === "desktop_binding_recovered") {
+        return { action: "recheck", automatic: false };
+      }
       if (this.consumeAction(context, "recheck")) return { action: "recheck", automatic: false };
       if (this.consumeAction(context, "standalone")) {
         return { action: "standalone", automatic: false };
@@ -520,7 +547,9 @@ export class CapabilityNegotiator implements ExecutionBackend {
     },
   ): Promise<ExecutionStartResult> {
     context.requestedAction = null;
-    const fallbackReason = selection?.reason ?? null;
+    // With no explicit selection the user already clicked the standalone button, so that choice is
+    // kept as the reason instead of being cleared to no reason at all.
+    const fallbackReason = selection?.reason === undefined ? context.reason : selection.reason;
     const fallbackError = codedError(selection?.error_code);
     this.setState(
       context,
@@ -635,7 +664,6 @@ export class CapabilityNegotiator implements ExecutionBackend {
     }
     if (context.state === "fallback_ready" || context.state === "fallback_running") return false;
     if (context.state === "desktop_failed") {
-      if (context.timestamps.fallbackDeadlineAt !== null) return false;
       if (context.reason === "desktop_execution_failed") return false;
     }
     return context.state === "initializing"

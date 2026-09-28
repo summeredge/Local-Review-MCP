@@ -8,6 +8,8 @@ export type CapabilityTimelineEventName =
   | CapabilityState
   | "fallback_waiting"
   | "fallback_selected"
+  | "fallback_user_selected"
+  | "fallback_afk_timeout"
   | "desktop_capability_restored";
 
 export interface CapabilityTimelineEvent {

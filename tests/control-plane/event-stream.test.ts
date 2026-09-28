@@ -621,4 +621,207 @@ describe("Codex Event Adapter and LRM event stream", () => {
     )).resolves.toBeNull();
     await expect(events.listEvents(terminal.session_id)).resolves.toEqual([]);
   });
+
+  it("clears Sessions whose Execution already failed and keeps running ones", async () => {
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-stale-cleanup-"));
+    temporaryDirectories.push(root);
+    const sessions = new SessionStore(root);
+    const tasks = new TaskContextService(root);
+    const executions = new ExecutionContextService(root);
+    const events = new EventStore(root);
+
+    // Session status stayed running_turn after its Execution had already failed.
+    const stale = await sessions.createSession({
+      session_id: "session-stale",
+      goal_id: "goal-stale",
+      task_id: "task-stale",
+      backend_type: "codex_app_server",
+      status: "running_turn",
+      workspace: "C:\\workspace",
+      thread_id: "thread-stale",
+    });
+    // A genuinely active turn must survive the sweep.
+    const live = await sessions.createSession({
+      session_id: "session-live",
+      goal_id: "goal-live",
+      task_id: "task-live",
+      backend_type: "codex_app_server",
+      status: "running_turn",
+      workspace: "C:\\workspace",
+      thread_id: "thread-live",
+    });
+    const failed = await sessions.createSession({
+      session_id: "session-failed",
+      goal_id: "goal-failed",
+      task_id: "task-failed",
+      backend_type: "codex_app_server",
+      status: "failed",
+      workspace: "C:\\workspace",
+      thread_id: "thread-failed",
+    });
+
+    await tasks.createTaskContext({ task_id: stale.task_id, workspace_id: "workspace-1" });
+    await tasks.createTaskContext({ task_id: live.task_id, workspace_id: "workspace-1" });
+    await tasks.createTaskContext({ task_id: failed.task_id, workspace_id: "workspace-1" });
+    await executions.createExecutionContext({
+      execution_id: "execution-stale",
+      workspace_id: "workspace-1",
+      task_id: stale.task_id,
+      process_id: 9_002,
+    });
+    await executions.updateExecutionContext("workspace-1", stale.task_id, "execution-stale", {
+      status: "failed",
+    });
+    await executions.createExecutionContext({
+      execution_id: "execution-live",
+      workspace_id: "workspace-1",
+      task_id: live.task_id,
+      process_id: 9_003,
+    });
+    await executions.createExecutionContext({
+      execution_id: "execution-failed",
+      workspace_id: "workspace-1",
+      task_id: failed.task_id,
+      process_id: 9_004,
+    });
+    await events.appendEvent({
+      session_id: stale.session_id,
+      execution_id: "execution-stale",
+      thread_id: "thread-stale",
+      timestamp: "2026-09-15T00:00:00.000Z",
+      event_type: "execution_failed",
+      payload: {},
+    });
+    await events.appendEvent({
+      session_id: live.session_id,
+      execution_id: "execution-live",
+      thread_id: "thread-live",
+      timestamp: "2026-09-15T00:00:00.000Z",
+      event_type: "turn_started",
+      turn_id: "turn-live",
+      payload: {},
+    });
+    await events.appendEvent({
+      session_id: failed.session_id,
+      execution_id: "execution-failed",
+      thread_id: "thread-failed",
+      timestamp: "2026-09-15T00:00:00.000Z",
+      event_type: "execution_failed",
+      payload: {},
+    });
+
+    const query = new StatusQueryService({
+      storageRoot: root,
+      sessions,
+      goals: {
+        getGoal: async (goalId) => ({ goal_id: goalId, workspace_id: "workspace-1" } as GoalOrchestration),
+      },
+    });
+
+    await expect(query.clearSessionRecords("workspace-1")).resolves.toEqual({
+      deleted_sessions: 2,
+      deleted_events: 2,
+      deleted_tasks: 2,
+    });
+    await expect(sessions.getSession(stale.session_id)).resolves.toBeNull();
+    await expect(sessions.getSession(failed.session_id)).resolves.toBeNull();
+    await expect(events.listEvents(stale.session_id)).resolves.toEqual([]);
+    await expect(tasks.getTaskContext(stale.task_id)).resolves.toBeNull();
+    await expect(executions.getExecutionContext(
+      "workspace-1",
+      stale.task_id,
+      "execution-stale",
+    )).resolves.toBeNull();
+
+    await expect(sessions.getSession(live.session_id)).resolves.toMatchObject({ status: "running_turn" });
+    await expect(tasks.getTaskContext(live.task_id)).resolves.toMatchObject({ task_id: live.task_id });
+    await expect(executions.getExecutionContext(
+      "workspace-1",
+      live.task_id,
+      "execution-live",
+    )).resolves.toMatchObject({ status: "running" });
+  });
+
+  it("retains task data shared by a Session that survives the sweep", async () => {
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-shared-cleanup-"));
+    temporaryDirectories.push(root);
+    const sessions = new SessionStore(root);
+    const tasks = new TaskContextService(root);
+    const executions = new ExecutionContextService(root);
+    const events = new EventStore(root);
+
+    const stale = await sessions.createSession({
+      session_id: "session-shared-stale",
+      goal_id: "goal-shared",
+      task_id: "task-shared",
+      backend_type: "codex_app_server",
+      status: "running_turn",
+      workspace: "C:\\workspace",
+      thread_id: "thread-shared-stale",
+    });
+    const live = await sessions.createSession({
+      session_id: "session-shared-live",
+      goal_id: "goal-shared",
+      task_id: "task-shared",
+      backend_type: "codex_app_server",
+      status: "active",
+      workspace: "C:\\workspace",
+      thread_id: "thread-shared-live",
+    });
+    await tasks.createTaskContext({ task_id: stale.task_id, workspace_id: "workspace-1" });
+    await executions.createExecutionContext({
+      execution_id: "execution-shared-stale",
+      workspace_id: "workspace-1",
+      task_id: stale.task_id,
+      process_id: 9_005,
+    });
+    await executions.updateExecutionContext("workspace-1", stale.task_id, "execution-shared-stale", {
+      status: "failed",
+    });
+    await executions.createExecutionContext({
+      execution_id: "execution-shared-live",
+      workspace_id: "workspace-1",
+      task_id: live.task_id,
+      process_id: 9_006,
+    });
+    await events.appendEvent({
+      session_id: stale.session_id,
+      execution_id: "execution-shared-stale",
+      thread_id: "thread-shared-stale",
+      timestamp: "2026-09-15T00:00:00.000Z",
+      event_type: "execution_failed",
+      payload: {},
+    });
+    await events.appendEvent({
+      session_id: live.session_id,
+      execution_id: "execution-shared-live",
+      thread_id: "thread-shared-live",
+      timestamp: "2026-09-15T00:00:00.000Z",
+      event_type: "turn_started",
+      turn_id: "turn-shared-live",
+      payload: {},
+    });
+
+    const query = new StatusQueryService({
+      storageRoot: root,
+      sessions,
+      goals: {
+        getGoal: async (goalId) => ({ goal_id: goalId, workspace_id: "workspace-1" } as GoalOrchestration),
+      },
+    });
+
+    await expect(query.clearSessionRecords("workspace-1")).resolves.toEqual({
+      deleted_sessions: 1,
+      deleted_events: 1,
+      deleted_tasks: 0,
+    });
+    await expect(sessions.getSession(stale.session_id)).resolves.toBeNull();
+    await expect(sessions.getSession(live.session_id)).resolves.toMatchObject({ status: "active" });
+    await expect(tasks.getTaskContext(live.task_id)).resolves.toMatchObject({ task_id: live.task_id });
+    await expect(executions.getExecutionContext(
+      "workspace-1",
+      live.task_id,
+      "execution-shared-live",
+    )).resolves.toMatchObject({ status: "running" });
+  });
 });

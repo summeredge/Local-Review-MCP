@@ -729,6 +729,7 @@ class StatusChecker:
                     "desktop_tools_pipe_unavailable", "desktop_handoff_failed", "desktop_handoff_timeout",
                     "desktop_binding_recovered",
                     "desktop_execution_failed", "standalone_execution_failed",
+                    "user_selected_standalone", "afk_fallback_timeout",
                 }),
             )
             actions_value = document.get("actions")
@@ -792,7 +793,8 @@ class StatusChecker:
                 "fallback_ready", "fallback_running",
             })
             event_names = states | frozenset({
-                "fallback_waiting", "fallback_selected", "desktop_capability_restored",
+                "fallback_waiting", "fallback_selected", "fallback_user_selected",
+                "fallback_afk_timeout", "desktop_capability_restored",
             })
             sources = frozenset({"desktop", "standalone"})
             reasons = frozenset({
@@ -800,6 +802,7 @@ class StatusChecker:
                 "desktop_tools_pipe_unavailable", "desktop_handoff_failed", "desktop_handoff_timeout",
                 "desktop_binding_recovered",
                 "desktop_execution_failed", "standalone_execution_failed",
+                "user_selected_standalone", "afk_fallback_timeout",
             })
             events: list[CapabilityTimelineEvent] = []
             for value in values:

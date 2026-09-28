@@ -532,6 +532,30 @@ class StatusCheckerTests(unittest.TestCase):
                 ),
             )
 
+    def test_capability_status_keeps_fallback_sources_distinguishable(self) -> None:
+        # The launcher must be able to read both fallback reasons, otherwise an AFK fallback is
+        # indistinguishable from the user having chosen standalone.
+        for reason in ("user_selected_standalone", "afk_fallback_timeout"):
+            with self.subTest(reason=reason), patch.object(StatusChecker, "_request_json", return_value={
+                "execution_id": "execution-1",
+                "task_id": "task-1",
+                "state": "fallback_running",
+                "source": "standalone",
+                "reason": reason,
+                "actions": [],
+            }):
+                self.assertEqual(
+                    StatusChecker().capability_status(),
+                    CapabilityStatus(
+                        state="fallback_running",
+                        source="standalone",
+                        reason=reason,
+                        actions=(),
+                        execution_id="execution-1",
+                        task_id="task-1",
+                    ),
+                )
+
     def test_capability_status_accepts_desktop_binding_recovery(self) -> None:
         checker = StatusChecker()
         with patch.object(checker, "_request_json", return_value={

@@ -572,6 +572,38 @@
   }
 
   // Current ChatGPT uses ordered timeline items, including structured MCP invocations.
+  // A direct Connector call is named once, qualified as `Local_MCP_Connector.<tool>`;
+  // the legacy linked tool spelled the same call `<server>__link_xxx/submit_goal` over a
+  // `link_xxx/submit_goal` tool. Both must normalize to one internal submit_goal request.
+  const DIRECT_SUBMIT_NAME = 'Local_MCP_Connector.submit_goal';
+  const CONNECTOR_SERVERS = ['Local MCP Connector', 'Local_MCP_Connector'];
+  const LEGACY_SUBMIT_FUNCTION = /^Local MCP Connector__link_[A-Za-z0-9_-]+\/submit_goal$/u;
+  const LEGACY_SUBMIT_TOOL = /^link_[A-Za-z0-9_-]+\/submit_goal$/u;
+
+  function timelineSubmitGoalArgumentsOf(item) {
+    const invocation = item && typeof item.invocation === 'object' ? item.invocation : null;
+    const functionName = typeof item?.functionName === 'string' ? item.functionName : null;
+    const tool = typeof invocation?.tool === 'string' ? invocation.tool : null;
+    const server = typeof invocation?.server === 'string' ? invocation.server : null;
+    const legacyFunction = functionName !== null && LEGACY_SUBMIT_FUNCTION.test(functionName);
+    if (legacyFunction || (tool !== null && LEGACY_SUBMIT_TOOL.test(tool))) {
+      const consistent = server === 'Local MCP Connector' && tool !== null
+        && functionName === `${server}__${tool}`;
+      return { recognized: true, arguments: consistent ? invocation.arguments : null };
+    }
+    // The connector may qualify the tool itself, or qualify it through its server.
+    // A Local submit_goal name is authority only while every other present field agrees:
+    // a foreign server never inherits it, and an absent field is not a conflict.
+    const localServer = server === null || CONNECTOR_SERVERS.includes(server);
+    const namedDirect = functionName === DIRECT_SUBMIT_NAME;
+    const directTool = tool !== null && (tool === DIRECT_SUBMIT_NAME || tool === 'submit_goal');
+    if (!namedDirect && !directTool) return { recognized: false, arguments: null };
+    // A recognized but inconsistent/malformed latest invocation must block fallback.
+    const consistent = localServer
+      && (functionName === null || namedDirect) && (tool === null || directTool);
+    return { recognized: true, arguments: consistent ? invocation.arguments : null };
+  }
+
   // Adapt one entry only; never parse displayed prose/results or merge sibling entries.
   function timelineMessagesOf(items) {
     const messages = [];
@@ -586,17 +618,10 @@
       if (item?.type === 'user-message') {
         messages.push({ id: item.messageId, author: { role: 'user' } });
       } else if (item?.type === 'mcp-tool-call') {
-        const invocation = item.invocation;
-        const tool = typeof invocation?.tool === 'string'
-          ? /^link_[A-Za-z0-9_-]+\/(submit_goal)$/u.exec(invocation.tool)?.[1] : null;
-        const namedSubmit = typeof item.functionName === 'string'
-          && /^Local MCP Connector__link_[A-Za-z0-9_-]+\/submit_goal$/u.test(item.functionName);
-        if (!namedSubmit && !(invocation?.server === 'Local MCP Connector' && tool)) continue;
-        // A recognized but inconsistent/malformed latest invocation must block fallback.
-        const validName = invocation?.server === 'Local MCP Connector' && tool
-          && item.functionName === `${invocation.server}__${invocation.tool}`;
+        const call = timelineSubmitGoalArgumentsOf(item);
+        if (!call.recognized) continue;
         messages.push({ author: { role: 'assistant' }, recipient: 'Local_MCP_Connector.submit_goal',
-          content: { content_type: 'tool_call', arguments: { arguments: validName ? invocation.arguments : null } } });
+          content: { content_type: 'tool_call', arguments: { arguments: call.arguments } } });
       }
     }
     return messages;

@@ -188,7 +188,7 @@ describe("P5.9.1 capability negotiation", () => {
     await expect(pending).resolves.toEqual(startedFor(request));
   });
 
-  it("keeps fallback waiting when Desktop returns", async () => {
+  it("cancels the AFK fallback when Desktop recovers before the window expires", async () => {
     const desktopState: DesktopSyncState = {
       connected: true,
       currentConversationId: "conversation-1",
@@ -202,10 +202,11 @@ describe("P5.9.1 capability negotiation", () => {
         source: "handoff" as const,
       })),
     };
+    const standaloneStart = vi.fn(async (value: ExecutionBackendStartRequest) => startedFor(value));
     const negotiator = new CapabilityNegotiator({
       desktop: provider("desktop", { ready: false, reason: "desktop_handoff_failed" }),
-      standalone: provider("standalone", { ready: true }),
-      fallbackTimeoutMs: 10_000,
+      standalone: new StandaloneCapabilityProvider({ start: standaloneStart }),
+      fallbackAfkTimeoutMs: 10_000,
       now: waits.now,
       wait: waits.wait,
       desktopState: () => desktopState,
@@ -220,15 +221,21 @@ describe("P5.9.1 capability negotiation", () => {
       source: "desktop",
       timestamps: { fallbackDeadlineAt: expect.any(String) },
     });
+    // Desktop comes back inside the AFK window, so the fallback is cancelled rather than started.
     expect(negotiator.reconcileDesktopCapability(request.execution_id)).toMatchObject({
-      state: "desktop_failed",
+      state: "desktop_ready",
       source: "desktop",
-      reason: "desktop_handoff_failed",
+      reason: "desktop_binding_recovered",
     });
-    expect(pipeResolver.resolve).not.toHaveBeenCalled();
-    negotiator.selectStandalone(request.execution_id);
+    expect(pipeResolver.resolve).toHaveBeenCalledOnce();
     waits.release();
     await expect(pending).resolves.toEqual(startedFor(request));
+    expect(standaloneStart).not.toHaveBeenCalled();
+    expect(negotiator.snapshot(request.execution_id)).toMatchObject({
+      state: "desktop_ready",
+      source: "desktop",
+      timestamps: { fallbackDeadlineAt: null },
+    });
   });
 
   it("records an ordered execution timeline and preserves provider errors", async () => {
@@ -263,7 +270,7 @@ describe("P5.9.1 capability negotiation", () => {
       ["desktop_pending", "initializing", "desktop_pending", null, null],
       ["desktop_failed", "desktop_pending", "desktop_failed", "desktop_handoff_failed", "desktop_handoff_failed"],
       ["fallback_waiting", "desktop_failed", "desktop_failed", "desktop_handoff_failed", "desktop_handoff_failed"],
-      ["fallback_selected", "desktop_failed", "fallback_ready", "desktop_handoff_timeout", "desktop_handoff_timeout"],
+      ["fallback_afk_timeout", "desktop_failed", "fallback_ready", "afk_fallback_timeout", "afk_fallback_timeout"],
       ["fallback_ready", "fallback_ready", "fallback_ready", "standalone_execution_failed", "app_server_unavailable"],
     ]);
   });
@@ -413,7 +420,7 @@ describe("P5.9.1 capability negotiation", () => {
     expect(negotiator.snapshot(request.execution_id)).toMatchObject({
       state: "fallback_running",
       source: "standalone",
-      reason: null,
+      reason: "user_selected_standalone",
       error_code: null,
     });
     expect(negotiator.timeline(request.execution_id).map((event) => event.event)).toEqual([
@@ -421,7 +428,7 @@ describe("P5.9.1 capability negotiation", () => {
       "desktop_pending",
       "desktop_failed",
       "fallback_waiting",
-      "fallback_selected",
+      "fallback_user_selected",
       "fallback_running",
     ]);
     expect(negotiator.timeline(request.execution_id).at(-1)).toMatchObject({
@@ -475,13 +482,13 @@ describe("P5.9.1 capability negotiation", () => {
     ]);
   });
 
-  it("automatically falls back after the decision timeout", async () => {
+  it("automatically falls back with the AFK reason after the fallback window", async () => {
     const waits = clock();
     const standaloneStart = vi.fn(async (value: ExecutionBackendStartRequest) => startedFor(value));
     const negotiator = new CapabilityNegotiator({
       desktop: provider("desktop", { ready: false, reason: "desktop_handoff_failed" }),
       standalone: new StandaloneCapabilityProvider({ start: standaloneStart }),
-      fallbackTimeoutMs: 2,
+      fallbackAfkTimeoutMs: 2,
       pollIntervalMs: 1,
       now: waits.now,
       wait: waits.wait,
@@ -492,17 +499,54 @@ describe("P5.9.1 capability negotiation", () => {
     expect(negotiator.snapshot(request.execution_id)).toMatchObject({
       state: "fallback_running",
       source: "standalone",
-      reason: "desktop_handoff_timeout",
-      error_code: "desktop_handoff_timeout",
+      reason: "afk_fallback_timeout",
+      error_code: "afk_fallback_timeout",
     });
     expect(negotiator.timeline(request.execution_id).map((event) => event.event)).toEqual([
       "initializing",
       "desktop_pending",
       "desktop_failed",
       "fallback_waiting",
-      "fallback_selected",
+      "fallback_afk_timeout",
       "fallback_running",
     ]);
+  });
+
+  it("defaults the AFK fallback window to 5 minutes without starting standalone early", async () => {
+    const waits = clock();
+    const standaloneStart = vi.fn(async (value: ExecutionBackendStartRequest) => startedFor(value));
+    // No fallbackAfkTimeoutMs: the default must be the 5 minute AFK window, not a short timeout.
+    const negotiator = new CapabilityNegotiator({
+      desktop: provider("desktop", { ready: false, reason: "desktop_handoff_failed" }),
+      standalone: new StandaloneCapabilityProvider({ start: standaloneStart }),
+      pollIntervalMs: 1_000,
+      now: waits.now,
+      wait: waits.wait,
+    });
+    const pending = negotiator.start(request);
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(negotiator.snapshot(request.execution_id)).toMatchObject({
+      state: "desktop_failed",
+      actions: ["recheck", "standalone"],
+      timestamps: { fallbackDeadlineAt: "1970-01-01T00:05:00.000Z" },
+    });
+    expect(standaloneStart).not.toHaveBeenCalled();
+
+    // Still waiting with almost no time left, so the deadline is still the same 5 minute one.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(standaloneStart).not.toHaveBeenCalled();
+    expect(negotiator.snapshot(request.execution_id)).toMatchObject({
+      timestamps: { fallbackDeadlineAt: "1970-01-01T00:05:00.000Z" },
+    });
+
+    negotiator.selectStandalone(request.execution_id);
+    waits.release();
+    await expect(pending).resolves.toEqual(startedFor(request));
+    expect(negotiator.snapshot(request.execution_id)).toMatchObject({
+      state: "fallback_running",
+      reason: "user_selected_standalone",
+    });
   });
 
   it("keeps fallback_ready when standalone start fails and preserves provider error details", async () => {

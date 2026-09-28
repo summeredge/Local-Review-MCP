@@ -91,6 +91,11 @@ STOPPED_CAPABILITY_TEXT = "\n".join([
     "状态：MCP 已停止",
     "说明：MCP 未运行，无法读取执行能力状态。",
 ])
+# The Desktop primary path can fail while the standalone app-server backend is still able to start
+# an execution, so that state is named as a degraded path rather than as a lost capability.
+DESKTOP_DOWN_FALLBACK_CAPABILITY_TEXT = "Desktop 不可用，可回退 AppServer"
+DEGRADED_CAPABILITY_COLOR = "#946200"
+UNAVAILABLE_CAPABILITY_COLOR = "#9b1c1c"
 
 
 class LauncherState(str, Enum):
@@ -664,12 +669,7 @@ class LauncherWindow(QMainWindow):
         desktop_capability = getattr(status, "desktop_capability", DesktopCapabilityStatus())
         capability = getattr(status, "capability", CapabilityStatus())
         self._render_capability_status(capability, status.mcp_running)
-        capability_summary = {
-            "desktop_ready": ("Desktop 可用", "#16803c"),
-            "fallback_ready": ("Standalone", "#946200"),
-            "fallback_running": ("Standalone", "#946200"),
-        }.get(capability.state, ("不可用", "#666666" if not status.mcp_running else "#9b1c1c"))
-        self._set_value(self.execution_summary_status, *capability_summary)
+        self._set_value(self.execution_summary_status, *self._capability_summary(capability, status.mcp_running))
         # A connected Desktop IPC observer says nothing about the Desktop codex_app capability, so
         # the handoff state is always rendered separately instead of being read as the same thing.
         identity_state = (
@@ -755,6 +755,31 @@ class LauncherWindow(QMainWindow):
         }.get(text, text)
 
     @staticmethod
+    def _capability_summary(capability: CapabilityStatus, mcp_running: bool) -> tuple[str, str]:
+        """Name the execution capability without downgrading a usable fallback path to "unavailable".
+
+        The fail-closed default, which no execution has established, is the only state without a
+        backend behind it, so it is the only one reported as a lost capability. A failed Desktop
+        primary path is degraded rather than lost, because the standalone app-server fallback can
+        still start an execution. A fallback state that failed on the standalone side is the one
+        case where no backend is left, so that is what is reported as a lost capability.
+        """
+
+        if capability == CapabilityStatus():
+            return ("当前空闲" if mcp_running else "MCP 已停止", "#666666")
+        if capability.state == "desktop_ready":
+            return "Desktop 可用", "#16803c"
+        if capability.state in {"fallback_ready", "fallback_running"}:
+            if capability.reason == "standalone_execution_failed":
+                return "不可用", UNAVAILABLE_CAPABILITY_COLOR
+            return "Standalone", DEGRADED_CAPABILITY_COLOR
+        if capability.state == "desktop_failed":
+            return DESKTOP_DOWN_FALLBACK_CAPABILITY_TEXT, DEGRADED_CAPABILITY_COLOR
+        if capability.state in {"initializing", "desktop_pending"}:
+            return "正在建立执行能力", DEGRADED_CAPABILITY_COLOR
+        return "不可用", UNAVAILABLE_CAPABILITY_COLOR
+
+    @staticmethod
     def _capability_reason_text(reason: str | None) -> str:
         labels = {
             "desktop_disconnected": "Desktop 已断开",
@@ -766,6 +791,7 @@ class LauncherWindow(QMainWindow):
             "desktop_execution_failed": "Desktop 执行失败",
             "standalone_execution_failed": "Standalone 执行失败",
             "user_selected_standalone": "用户选择了 Standalone",
+            "afk_fallback_timeout": "用户未操作，已自动切换 Standalone",
         }
         return labels.get(reason or "", reason or "—")
 
@@ -810,18 +836,22 @@ class LauncherWindow(QMainWindow):
             "desktop_pending": "等待 Desktop 接管",
             "desktop_ready": "Desktop 已就绪",
             "desktop_failed": "Desktop 失败",
-            "fallback_ready": "Standalone 备用路径已选择",
+            "fallback_ready": "Standalone 备用路径已选择"
+            if capability.reason != "standalone_execution_failed"
+            else "Standalone 备用路径不可用",
             "fallback_running": "Standalone 备用后端运行中",
         }.get(capability.state, capability.state or "未知")
         capability_hint = {
-            "unavailable": "MCP 能力不可用。",
+            "unavailable": "MCP 未报告可用的执行后端。",
             "initializing": "正在等待当前执行能力。",
             "desktop_pending": "正在等待 Desktop 接管。",
             "desktop_ready": "Desktop 能力已就绪。",
-            "desktop_failed": "Desktop 交接失败；请重试 Desktop 或使用 Standalone。",
+            "desktop_failed": "Desktop 连接失败，请选择继续等待或使用 Standalone。",
             "fallback_ready": "已选择 Standalone 备用路径。",
             "fallback_running": "Standalone 备用后端运行中。",
-        }.get(capability.state, "能力状态不可用。")
+        }.get(capability.state, "执行能力状态未报告。")
+        if capability.state == "fallback_ready" and capability.reason == "standalone_execution_failed":
+            capability_hint = "Standalone 备用后端也不可用，当前没有可执行的执行路径。"
         capability_lines = [
             f"执行：{capability.execution_id or '—'}",
             f"来源：{capability_source}",
@@ -835,7 +865,7 @@ class LauncherWindow(QMainWindow):
             if capability.reason:
                 capability_lines.append(self._capability_reason_line(capability.reason))
         elif capability.state == "desktop_failed":
-            capability_lines.append("Desktop：失败")
+            capability_lines.append("Desktop：失败（Standalone 备用后端仍可执行）")
             capability_lines.append(self._capability_reason_line(capability.reason))
             if capability.error_code:
                 capability_lines.append(f"错误代码：{capability.error_code}")
@@ -860,10 +890,17 @@ class LauncherWindow(QMainWindow):
             if capability.error_code:
                 capability_lines.append(f"错误代码：{capability.error_code}")
         self.capability_status.setText("\n".join(capability_lines))
+        # A failed Desktop path and a failed standalone path are told apart on purpose: the first
+        # still has a backend to execute on, the second leaves nothing to start an execution with.
+        no_usable_backend = (
+            capability.reason == "standalone_execution_failed"
+            or not capability.state.startswith(("initializing", "desktop_", "fallback_"))
+        )
         self.capability_status.setStyleSheet(
             "color: #16803c" if capability.state in {"desktop_ready", "fallback_running"}
-            else "color: #946200" if capability.state in {"initializing", "desktop_pending", "fallback_ready"}
-            else "color: #9b1c1c"
+            and not no_usable_backend
+            else UNAVAILABLE_CAPABILITY_COLOR if no_usable_backend
+            else DEGRADED_CAPABILITY_COLOR
         )
 
     def _refresh_capability_countdown(self) -> None:

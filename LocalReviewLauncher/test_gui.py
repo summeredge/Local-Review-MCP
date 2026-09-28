@@ -28,7 +28,13 @@ from PySide6.QtWidgets import (
 )
 
 from config_manager import LauncherConfig
-from gui import BUTTON_HEIGHT, BUTTON_WIDTH, LauncherState, LauncherWindow
+from gui import (
+    BUTTON_HEIGHT,
+    BUTTON_WIDTH,
+    DESKTOP_DOWN_FALLBACK_CAPABILITY_TEXT,
+    LauncherState,
+    LauncherWindow,
+)
 from status_checker import (
     BrowserReadiness,
     CapabilityStatus,
@@ -168,6 +174,7 @@ class LauncherLogTests(unittest.TestCase):
             self.assertIn("状态：Desktop 失败（desktop_failed）", window.capability_status.text())
             self.assertIn("Desktop：失败", window.capability_status.text())
             self.assertIn("错误代码：owner_binding_timeout", window.capability_status.text())
+            self.assertIn("Desktop 连接失败，请选择继续等待或使用 Standalone", window.capability_status.text())
             self.assertIn("等待用户选择", window.capability_status.text())
             self.assertIn("自动备用路径倒计时：", window.capability_status.text())
             self.assertTrue(window.recheck_desktop_button.isEnabled())
@@ -214,6 +221,37 @@ class LauncherLogTests(unittest.TestCase):
             self.assertIn("Desktop：已就绪", window.capability_status.text())
             self.assertIn("来源：Desktop", window.capability_status.text())
             self.assertIn("Desktop 绑定已恢复", window.capability_status.text())
+
+            # An AFK fallback is reported as the clock having decided it, not as the user, so the
+            # two fallback sources stay distinguishable in the launcher.
+            window._render_status(LauncherStatus(
+                True,
+                True,
+                True,
+                desktop_sync=connected_desktop,
+                capability=CapabilityStatus(
+                    state="fallback_running",
+                    source="standalone",
+                    reason="afk_fallback_timeout",
+                    error_code="afk_fallback_timeout",
+                    execution_id="execution-1",
+                ),
+            ))
+            self.assertIn("用户未操作，已自动切换 Standalone", window.capability_status.text())
+
+            window._render_status(LauncherStatus(
+                True,
+                True,
+                True,
+                desktop_sync=connected_desktop,
+                capability=CapabilityStatus(
+                    state="fallback_running",
+                    source="standalone",
+                    reason="user_selected_standalone",
+                    execution_id="execution-1",
+                ),
+            ))
+            self.assertIn("用户选择了 Standalone", window.capability_status.text())
 
             offline_status = LauncherStatus(False, False, False)
             window._render_status(offline_status)
@@ -375,6 +413,103 @@ class LauncherLogTests(unittest.TestCase):
         ))
         self.assertIn("执行：execution-1", window.capability_status.text())
         self.assertIn("状态：Desktop 已就绪（desktop_ready）", window.capability_status.text())
+
+    def test_execution_summary_separates_a_down_desktop_path_from_a_lost_capability(self) -> None:
+        manager = Mock()
+        manager.load.return_value = LauncherConfig("", "config.production.json", False)
+        with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
+            LauncherWindow, "refresh_status"
+        ), patch.object(LauncherWindow, "_render_runtime_info"):
+            process.return_value.has_started = False
+            window = LauncherWindow(Path.cwd(), manager)
+            self.addCleanup(window.close)
+
+        connected_desktop = DesktopSyncStatus(
+            connected=True,
+            owner_client_id="client-1",
+            current_conversation_id="conversation-1",
+            active_source="desktop_ipc",
+            association_status="matched",
+            fallback_reason=None,
+        )
+        disconnected_desktop = DesktopSyncStatus()
+
+        # A: Desktop primary path healthy, AppServer standby.
+        window._render_status(LauncherStatus(
+            True, True, True,
+            desktop_sync=connected_desktop,
+            desktop_capability=DesktopCapabilityStatus(ready=True, pipe_source="handoff"),
+            capability=CapabilityStatus(state="desktop_ready", source="desktop", execution_id="execution-1"),
+        ))
+        self.assertEqual(window.execution_summary_status.text(), "Desktop 可用")
+        self.assertIn("#16803c", window.execution_summary_status.styleSheet())
+        self.assertNotIn("不可用", window.execution_summary_status.text())
+
+        # B: Desktop primary path down, AppServer fallback still usable. The summary must name the
+        # degraded primary path and must not claim the execution capability is unavailable.
+        for failed_state, reason in (
+            ("desktop_failed", "desktop_handoff_timeout"),
+            ("fallback_ready", "desktop_handoff_timeout"),
+            ("fallback_running", "desktop_handoff_timeout"),
+        ):
+            window._render_status(LauncherStatus(
+                True, True, True,
+                desktop_sync=disconnected_desktop,
+                capability=CapabilityStatus(
+                    state=failed_state,
+                    source="desktop" if failed_state == "desktop_failed" else "standalone",
+                    reason=reason,
+                    error_code=reason,
+                    execution_id="execution-1",
+                ),
+            ))
+            self.assertNotEqual(window.execution_summary_status.text(), "不可用")
+            self.assertNotIn("执行能力不可用", window.capability_status.text())
+            self.assertNotIn("#9b1c1c", window.execution_summary_status.styleSheet())
+
+        self.assertIn("Desktop 不可用，可回退 AppServer", DESKTOP_DOWN_FALLBACK_CAPABILITY_TEXT)
+        window._render_status(LauncherStatus(
+            True, True, True,
+            desktop_sync=disconnected_desktop,
+            capability=CapabilityStatus(
+                state="desktop_failed",
+                source="desktop",
+                reason="desktop_handoff_timeout",
+                execution_id="execution-1",
+            ),
+        ))
+        self.assertEqual(window.execution_summary_status.text(), DESKTOP_DOWN_FALLBACK_CAPABILITY_TEXT)
+        self.assertIn("Standalone 备用后端仍可执行", window.capability_status.text())
+        self.assertIn("#946200", window.execution_summary_status.styleSheet())
+
+        # C: every executable backend down. The standalone path failing is what leaves no backend
+        # behind, so that is the one case reported as a lost capability.
+        window._render_status(LauncherStatus(
+            True, True, True,
+            desktop_sync=disconnected_desktop,
+            capability=CapabilityStatus(
+                state="fallback_ready",
+                source="standalone",
+                reason="standalone_execution_failed",
+                error_code="standalone_execution_failed",
+                execution_id="execution-1",
+            ),
+        ))
+        self.assertEqual(window.execution_summary_status.text(), "不可用")
+        self.assertIn("#9b1c1c", window.execution_summary_status.styleSheet())
+        self.assertIn("#9b1c1c", window.capability_status.styleSheet())
+        self.assertIn("Standalone 备用路径不可用", window.capability_status.text())
+        self.assertIn("当前没有可执行的执行路径", window.capability_status.text())
+
+        # D: Desktop reconnects, so the summary recovers the normal primary-path wording.
+        window._render_status(LauncherStatus(
+            True, True, True,
+            desktop_sync=connected_desktop,
+            desktop_capability=DesktopCapabilityStatus(ready=True, pipe_source="handoff"),
+            capability=CapabilityStatus(state="desktop_ready", source="desktop", execution_id="execution-1"),
+        ))
+        self.assertEqual(window.execution_summary_status.text(), "Desktop 可用")
+        self.assertIn("#16803c", window.execution_summary_status.styleSheet())
 
     def test_capability_timeline_renders_state_and_failure_fields(self) -> None:
         manager = Mock()
