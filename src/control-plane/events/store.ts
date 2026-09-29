@@ -29,6 +29,23 @@ function json(events: readonly StoredLrmEvent[]): string {
   return `${JSON.stringify(events, null, 2)}\n`;
 }
 
+const windowsTransientRetryDelays = [10, 20, 40, 80, 160] as const;
+const windowsTransientErrorCodes = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/** Serialize read-modify-write operations per event file across all EventStore instances. */
+const eventWriteQueues = new Map<string, Promise<void>>();
+
+function serializedByFile<T>(file: string, operation: () => Promise<T>): Promise<T> {
+  const previous = eventWriteQueues.get(file) ?? Promise.resolve();
+  const result = previous.then(operation, operation);
+  const settled = result.then(() => undefined, () => undefined);
+  eventWriteQueues.set(file, settled);
+  void settled.finally(() => {
+    if (eventWriteQueues.get(file) === settled) eventWriteQueues.delete(file);
+  });
+  return result;
+}
+
 function safeErrorDetails(error: unknown): string {
   if (!(error instanceof Error)) return "";
   const { code, syscall, errno } = error as NodeJS.ErrnoException;
@@ -40,14 +57,17 @@ function safeErrorDetails(error: unknown): string {
 }
 
 async function writeEvents(file: string, events: readonly StoredLrmEvent[]): Promise<void> {
-  for (let attempt = 0; ; attempt++) {
+  for (let attempt = 0; ; attempt += 1) {
     try {
       await writeEventsOnce(file, events);
       return;
     } catch (error: unknown) {
-      if (process.platform !== "win32" || attempt >= 2
-        || !["EPERM", "EACCES", "EBUSY"].includes(errorCode(error) ?? "")) throw error;
-      await delay(10 * (attempt + 1));
+      const retryDelay = process.platform === "win32"
+        && windowsTransientErrorCodes.has(errorCode(error) ?? "")
+        ? windowsTransientRetryDelays[attempt]
+        : undefined;
+      if (retryDelay === undefined) throw error;
+      await delay(retryDelay);
     }
   }
 }
@@ -66,7 +86,6 @@ async function writeEventsOnce(file: string, events: readonly StoredLrmEvent[]):
 export class EventStore {
   public readonly storageRoot: string;
   public readonly eventsDirectory: string;
-  private operationQueue: Promise<void> = Promise.resolve();
 
   public constructor(storageRoot = defaultTaskContextStorageRoot()) {
     this.storageRoot = resolve(storageRoot);
@@ -75,7 +94,8 @@ export class EventStore {
 
   public appendEvent(event: LrmEvent): Promise<StoredLrmEvent> {
     const parsed = lrmEventInputSchema.parse(event);
-    return this.exclusive(async () => {
+    const file = eventsFile(this.storageRoot, parsed.session_id);
+    return serializedByFile(file, async () => {
       const current = await this.read(parsed.session_id);
       const next = lrmEventSchema.parse({
         ...parsed,
@@ -84,7 +104,7 @@ export class EventStore {
       await mkdir(this.eventsDirectory, { recursive: true, mode: 0o700 });
       await chmod(this.eventsDirectory, 0o700).catch(() => undefined);
       try {
-        await writeEvents(eventsFile(this.storageRoot, parsed.session_id), [...current, next]);
+        await writeEvents(file, [...current, next]);
       } catch (error: unknown) {
         throw new Error("Events could not be saved." + safeErrorDetails(error), { cause: error });
       }
@@ -128,9 +148,4 @@ export class EventStore {
     }
   }
 
-  private exclusive<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.operationQueue.then(operation, operation);
-    this.operationQueue = result.then(() => undefined, () => undefined);
-    return result;
-  }
 }

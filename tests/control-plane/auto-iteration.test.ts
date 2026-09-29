@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AutoIterationService,
+  REVIEW_DELIVERY_MAX_ATTEMPTS,
   autoIterationSchema,
   autoIterationStateFile,
   buildAutoIterationInstruction,
@@ -267,14 +268,11 @@ describe("AutoIterationService", () => {
     } finally { restarted.dispose(); }
   });
 
-  it('keeps repeated recoverable delivery failures resumable and retains the transport reason', async () => {
+  it('stops automatic delivery after the bounded retry budget and retains the transport reason', async () => {
     const f = await fixture();
-    let attempts = 0;
     f.deliveryCalls.mockImplementation(async () => {
-      attempts += 1;
-      if (attempts <= 5) return { status: 'failed' as const, retryable: true,
+      return { status: 'failed' as const, retryable: true,
         error: { code: 'EXTENSION_NOT_READY', message: 'extension offline' } };
-      return { status: 'delivered' as const, delivered_at: new Date().toISOString() };
     });
     const auto = new AutoIterationService(f.registry, { storageRoot: f.root,
       browserRouter: f.auto.browserRouter,
@@ -282,16 +280,131 @@ describe("AutoIterationService", () => {
       retryDelayMs: 10 });
     try {
       await auto.start(startInput());
-      await vi.waitFor(() => expect(f.deliveryCalls.mock.calls.length).toBeGreaterThanOrEqual(6), {
-        timeout: 5_000,
-      });
       await vi.waitFor(async () => expect(await auto.getLoop('loop-001')).toMatchObject({
-        stage: 'completed', terminal_decision: 'APPROVE' }), { timeout: 5_000 });
+        stage: 'human_required', terminal_decision: 'HUMAN_REQUIRED',
+        terminal_reason: 'EXTENSION_NOT_READY', terminal_summary: 'extension offline' }), { timeout: 5_000 });
+      await auto.advance('loop-001');
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(f.deliveryCalls.mock.calls.length).toBe(REVIEW_DELIVERY_MAX_ATTEMPTS);
       const loop = await auto.getLoop('loop-001');
-      expect(loop).toMatchObject({ stage: 'completed', terminal_decision: 'APPROVE' });
-      expect(f.deliveryCalls.mock.calls.length).toBe(6);
+      const budget = (await new ReviewDeliveryService(f.root)
+        .getDeliveryByRouting('workspace-a', loop!.routing_id!))!;
+      expect(budget.attempt_count).toBe(REVIEW_DELIVERY_MAX_ATTEMPTS);
       expect(f.starts).toHaveLength(0);
+      expect(f.completionCalls).toHaveLength(0);
     } finally { auto.dispose(); }
+  });
+
+  it('does not reset the delivery retry budget after a restart and recovery', async () => {
+    const f = await fixture();
+    f.deliveryCalls.mockImplementation(async () => ({ status: 'failed' as const, retryable: true,
+      error: { code: 'EXTENSION_NOT_READY', message: 'extension offline' } }));
+    const chain = await createDurableReviewChain(f.root, 'partial-budget');
+    const deliveries = new ReviewDeliveryService(f.root);
+    const spent = 4;
+    for (let attempt = 0; attempt < spent; attempt += 1) {
+      await deliveries.beginDeliveryAttempt('workspace-a', chain.delivery.delivery_id);
+      await deliveries.markFailed('workspace-a', chain.delivery.delivery_id, {
+        code: 'EXTENSION_NOT_READY', message: 'extension offline', retryable: true });
+    }
+    await persistLoop(f.root, checkpoint({
+      loop_id: 'loop-partial-budget',
+      review_request_id: chain.request.review_request_id,
+      routing_id: chain.routing.routing_id,
+      delivery_id: chain.delivery.delivery_id,
+      stage: 'delivery',
+    }));
+    const before = chain.routing.routing_id;
+
+    const restarted = new AutoIterationService(f.registry, { storageRoot: f.root,
+      browserRouter: f.auto.browserRouter, completionRouter: f.completionRouter,
+      retryDelayMs: 10 });
+    try {
+      await restarted.recover();
+      await vi.waitFor(async () => expect(await restarted.getLoop('loop-partial-budget')).toMatchObject({
+        stage: 'human_required', terminal_reason: 'EXTENSION_NOT_READY' }), { timeout: 5_000 });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(f.deliveryCalls.mock.calls.length).toBe(REVIEW_DELIVERY_MAX_ATTEMPTS - spent);
+      expect((await new ReviewDeliveryService(f.root).getDeliveryByRouting('workspace-a', before))!
+        .attempt_count).toBe(REVIEW_DELIVERY_MAX_ATTEMPTS);
+      expect(f.completionCalls).toHaveLength(0);
+    } finally { restarted.dispose(); }
+  }, 15_000);
+
+  it('does not deliver again when recovery finds an exhausted retry budget', async () => {
+    const value = await fixture(["APPROVE"]);
+    const chain = await createDurableReviewChain(value.root, "budget-exhausted");
+    const deliveries = new ReviewDeliveryService(value.root);
+    for (let attempt = 0; attempt < REVIEW_DELIVERY_MAX_ATTEMPTS; attempt += 1) {
+      await deliveries.beginDeliveryAttempt("workspace-a", chain.delivery.delivery_id);
+      await deliveries.markFailed("workspace-a", chain.delivery.delivery_id, {
+        code: "EXTENSION_NOT_READY",
+        message: "extension offline",
+        retryable: true,
+      });
+    }
+    const delivery = vi.fn(async () => {
+      throw new Error("must not deliver beyond the retry budget");
+    });
+    const restarted = new AutoIterationService(value.registry, {
+      storageRoot: value.root,
+      browserRouter: { deliver: delivery },
+      completionRouter: value.completionRouter,
+      controlledActuation: value.auto.controlledActuation,
+    });
+    const seeded = checkpoint({
+      loop_id: "loop-budget-exhausted",
+      review_request_id: chain.request.review_request_id,
+      routing_id: chain.routing.routing_id,
+      delivery_id: chain.delivery.delivery_id,
+      stage: "delivery",
+    });
+    await persistLoop(value.root, seeded);
+
+    const terminal = {
+      stage: "human_required",
+      terminal_decision: "HUMAN_REQUIRED",
+      terminal_reason: "EXTENSION_NOT_READY",
+      terminal_summary: "extension offline",
+    };
+
+    try {
+      await restarted.recover();
+
+      await expect(restarted.getLoop("loop-budget-exhausted")).resolves.toMatchObject(terminal);
+      expect(delivery).not.toHaveBeenCalled();
+      await expect(deliveries.getDelivery("workspace-a", chain.delivery.delivery_id))
+        .resolves.toMatchObject({
+          status: "failed",
+          attempt_count: REVIEW_DELIVERY_MAX_ATTEMPTS,
+          last_error: { code: "EXTENSION_NOT_READY", message: "extension offline" },
+        });
+      expect(value.completionCalls).toHaveLength(0);
+    } finally { restarted.dispose(); }
+
+    // The terminal checkpoint must be on disk, not just in the recovered instance.
+    const persisted = JSON.parse(
+      await readFile(autoIterationStateFile(value.root), "utf8"),
+    ) as { loops: AutoIteration[] };
+    const stored = persisted.loops.find((loop) => loop.loop_id === "loop-budget-exhausted");
+    expect(stored).toMatchObject(terminal);
+    expect(stored!.updated_at).not.toBe(seeded.updated_at);
+
+    // A third instance must reload the same checkpoint without spending an attempt.
+    const reloaded = new AutoIterationService(value.registry, {
+      storageRoot: value.root,
+      browserRouter: { deliver: delivery },
+      completionRouter: value.completionRouter,
+      controlledActuation: value.auto.controlledActuation,
+    });
+    try {
+      await reloaded.restore();
+      await reloaded.recover();
+      await expect(reloaded.getLoop("loop-budget-exhausted")).resolves.toMatchObject(terminal);
+      expect(delivery).not.toHaveBeenCalled();
+      await expect(deliveries.getDelivery("workspace-a", chain.delivery.delivery_id))
+        .resolves.toMatchObject({ attempt_count: REVIEW_DELIVERY_MAX_ATTEMPTS });
+    } finally { reloaded.dispose(); }
   });
 
   it("notifies only after terminal persistence and replays terminal notifications on recovery", async () => {

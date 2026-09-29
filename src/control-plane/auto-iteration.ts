@@ -52,6 +52,9 @@ import type { WorkspaceRegistry } from "../workspace/registry.js";
 
 const STATE_VERSION = 1;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+// ponytail: fixed budget, per-iteration delivery retry cap. Raise only if a real
+// incident needs a longer offline window; the counter is persisted in ReviewDelivery.
+export const REVIEW_DELIVERY_MAX_ATTEMPTS = 10;
 const timestampSchema = z.string().datetime({ offset: true });
 export const autoIterationIdSchema = z.string()
   .min(1)
@@ -646,7 +649,15 @@ export class AutoIterationService {
     await this.update(loop, { retry_at: new Date(Date.now() + this.retryDelayMs).toISOString() });
   }
 
-  private async retryDelivery(loop: AutoIteration): Promise<void> {
+  private async retryDelivery(loop: AutoIteration, delivery: ReviewDelivery): Promise<void> {
+    if (delivery.attempt_count >= REVIEW_DELIVERY_MAX_ATTEMPTS) {
+      await this.humanRequired(
+        loop,
+        delivery.last_error?.code ?? "REVIEW_TRANSPORT_FAILED",
+        delivery.last_error?.message,
+      );
+      return;
+    }
     await this.update(loop, { retry_at: new Date(Date.now() + this.retryDelayMs).toISOString() });
   }
 
@@ -802,6 +813,13 @@ export class AutoIterationService {
         );
         return;
       }
+      // A persisted retryable failure can outlive the Runtime, so re-check the budget
+      // before the adapter runs; otherwise recovery would spend an unearned attempt.
+      if (delivery.status === "failed"
+        && delivery.attempt_count >= REVIEW_DELIVERY_MAX_ATTEMPTS) {
+        await this.retryDelivery(current, delivery);
+        return;
+      }
 
       let delivered: ReviewDelivery;
       try {
@@ -812,7 +830,7 @@ export class AutoIterationService {
       }
       if (delivered.status !== "delivered") {
         if (delivered.status === "failed" && delivered.last_error?.retryable === true) {
-          await this.retryDelivery(current);
+          await this.retryDelivery(current, delivered);
           return;
         }
         await this.humanRequired(

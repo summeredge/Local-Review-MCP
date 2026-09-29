@@ -1,6 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -295,6 +295,64 @@ describe("EvidenceTransportTraceService", () => {
     const contents = await readFile(trace.file, "utf8");
     expect(contents).toContain('"event":"bridge_evidence_rejected"');
     expect(contents).not.toContain(CONVERSATION_A);
+  });
+
+  it("rotates at the size threshold, keeps retained history queryable, and bounds disk usage", async () => {
+    const root = await makeRoot("local-review-mcp-evidence-transport-rotation-");
+    const trace = new EvidenceTransportTraceService(root, { maxBytes: 8_000, keepBytes: 2_000 });
+    for (let index = 0; index < 120; index += 1) {
+      trace.record({
+        event: "browser_identity_diagnostic",
+        diagnostic: {
+          stage: "fiber_scanned",
+          scan_id: index,
+          navigation_epoch: 0,
+          observed_at: new Date().toISOString(),
+          correlation_key_hash: identityHash(KEY_A),
+          conversation_id_hash: identityHash(CONVERSATION_A),
+          document_id_hash: 'b'.repeat(64),
+          flags: { messages_found: index % 2 === 0 },
+          assistant_tool_calls_found: 0,
+        },
+      });
+    }
+
+    const size = (await stat(trace.file)).size;
+    expect(size).toBeLessThanOrEqual(trace.maxBytes);
+    const lines = (await readFile(trace.file, "utf8")).split("\n").filter((line) => line.trim() !== "");
+    expect(lines.length).toBeLessThan(120);
+    expect(lines.length).toBeGreaterThanOrEqual(2);
+    for (const line of lines) expect(() => JSON.parse(line)).not.toThrow();
+
+    const retained = await trace.getEvidenceTransportTrace(KEY_A);
+    expect(retained.events.length).toBe(lines.length);
+    expect(retained.events.every((event) => event.event === "browser_identity_diagnostic")).toBe(true);
+    const scanIds = retained.events.map((event) => event.diagnostic!.scan_id);
+    expect(scanIds).toEqual([...scanIds].sort((left, right) => left - right));
+    expect(retained.events.at(-1)?.diagnostic?.scan_id).toBe(119);
+  });
+
+  it("keeps trace recording nonfatal when persistence fails", async () => {
+    const root = await makeRoot("local-review-mcp-evidence-transport-nonfatal-");
+    const trace = new EvidenceTransportTraceService(root, { maxBytes: 8_000, keepBytes: 2_000 });
+    trace.record({ event: "extension_evidence_created", correlation_key: KEY_A });
+
+    // A directory where the trace file belongs makes append and rotation both fail.
+    await rm(trace.file, { force: true });
+    await mkdir(trace.file, { recursive: true });
+    await expect(new EvidenceTransportTraceService(root)
+      .getEvidenceTransportTrace(KEY_A)).rejects.toThrow();
+    for (let index = 0; index < 200; index += 1) {
+      expect(() => trace.record({ event: "extension_evidence_created", correlation_key: KEY_A }))
+        .not.toThrow();
+    }
+
+    // An unusable storage root fails at directory creation instead.
+    const blocked = join(root, "blocked");
+    await writeFile(blocked, "not a directory", "utf8");
+    const unusable = new EvidenceTransportTraceService(blocked, { maxBytes: 8_000, keepBytes: 2_000 });
+    expect(() => unusable.record({ event: "extension_evidence_created", correlation_key: KEY_A }))
+      .not.toThrow();
   });
 
 });

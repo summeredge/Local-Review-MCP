@@ -190,26 +190,89 @@ describe("Codex Event Adapter and LRM event stream", () => {
     const event = adapter().adapt(providerEvents()[0]!)!;
     const expected = [await store.appendEvent(event)];
     const file = eventsFile(root, "session-1");
-    for (const code of ["EPERM", "EACCES", "EBUSY"]) {
-      const before = await fs.readFile(file, "utf8");
-      const mock = vi.mocked(fs[operation]);
-      mock.mockClear();
-      vi.mocked(delay).mockClear();
+    const codes = ["EPERM", "EACCES", "EBUSY", "EPERM"];
+    const before = await fs.readFile(file, "utf8");
+    const mock = vi.mocked(fs[operation]);
+    mock.mockClear();
+    vi.mocked(delay).mockClear();
+    for (const code of codes) {
       mock.mockImplementationOnce(async () => {
         expect(await fs.readFile(file, "utf8")).toBe(before);
         throw ioError(code, operation === "rename" ? "rename" : "open");
       });
-      expected.push(await store.appendEvent(event));
-      expect(mock).toHaveBeenCalledTimes(2);
-      expect(vi.mocked(delay).mock.calls).toEqual([[10]]);
-      expect(await store.listEvents("session-1")).toEqual(expected);
-      expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual(expected);
-      expect(await fs.readdir(store.eventsDirectory)).toEqual(["session-1.json"]);
     }
-    expect(expected.map((event) => event.sequence)).toEqual([1, 2, 3, 4]);
+    expected.push(await store.appendEvent(event));
+    expect(mock).toHaveBeenCalledTimes(codes.length + 1);
+    expect(vi.mocked(delay).mock.calls).toEqual([[10], [20], [40], [80]]);
+    expect(await store.listEvents("session-1")).toEqual(expected);
+    expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual(expected);
+    expect(await fs.readdir(store.eventsDirectory)).toEqual(["session-1.json"]);
   });
 
-  it.each(["writeFile", "rename"] as const)("bounds persistent Windows %s errors and preserves cause", async (operation) => {
+  it("serializes appends to one event file across EventStore instances", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lrm-event-shared-queue-"));
+    temporaryDirectories.push(root);
+    const firstStore = new EventStore(root);
+    const secondStore = new EventStore(root);
+    const events = providerEvents()
+      .map((event) => adapter().adapt(event))
+      .filter((event): event is LrmEvent => event !== undefined);
+
+    const saved = await Promise.all(events.map((event, index) => (
+      index % 2 === 0 ? firstStore : secondStore
+    ).appendEvent(event)));
+
+    expect(saved.map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5]);
+    expect(await secondStore.listEvents("session-1")).toEqual(saved);
+    expect(await fs.readdir(firstStore.eventsDirectory)).toEqual(["session-1.json"]);
+  });
+
+  it("does not serialize different event files behind one queue", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lrm-event-independent-"));
+    temporaryDirectories.push(root);
+    const store = new EventStore(root);
+    const firstEvent = adapter().adapt(providerEvents()[0]!)!;
+    const secondEvent: LrmEvent = { ...firstEvent, session_id: "session-2" };
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    let releaseFirst!: () => void;
+    let markFirstStarted!: () => void;
+    const firstReleased = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+
+    vi.mocked(fs.writeFile).mockImplementation(async (...args) => {
+      const contents = typeof args[1] === "string" ? args[1] : "";
+      if (contents.includes('"session_id": "session-1"')) {
+        markFirstStarted();
+        await firstReleased;
+      }
+      return actual.writeFile(...args);
+    });
+
+    const firstAppend = store.appendEvent(firstEvent);
+    await firstStarted;
+    const secondAppend = store.appendEvent(secondEvent);
+    try {
+      await expect(Promise.race([
+        secondAppend.then(() => "done" as const),
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 100)),
+      ])).resolves.toBe("done");
+    } finally {
+      releaseFirst();
+    }
+
+    await expect(firstAppend).resolves.toMatchObject({ sequence: 1, session_id: "session-1" });
+    await expect(secondAppend).resolves.toMatchObject({ sequence: 1, session_id: "session-2" });
+    expect(await store.listEvents("session-1")).toHaveLength(1);
+    expect(await store.listEvents("session-2")).toHaveLength(1);
+    expect((await fs.readdir(store.eventsDirectory)).sort()).toEqual([
+      "session-1.json", "session-2.json",
+    ]);
+  });
+
+  it.each([
+    ["writeFile", "EPERM"], ["writeFile", "EACCES"], ["writeFile", "EBUSY"],
+    ["rename", "EPERM"], ["rename", "EACCES"], ["rename", "EBUSY"],
+  ] as const)("bounds persistent Windows %s %s errors and preserves cause", async (operation, code) => {
     platform("win32");
     const root = await mkdtemp(join(tmpdir(), "lrm-event-failure-"));
     temporaryDirectories.push(root);
@@ -218,17 +281,18 @@ describe("Codex Event Adapter and LRM event stream", () => {
     const first = await store.appendEvent(event);
     const mock = vi.mocked(fs[operation]);
     mock.mockClear();
-    const error = ioError("EPERM", operation === "rename" ? "rename" : "open");
+    const error = ioError(code, operation === "rename" ? "rename" : "open");
     mock.mockRejectedValue(error);
     const caught = await store.appendEvent(event).catch((error: unknown) => error);
     expect(caught).toBeInstanceOf(Error);
     expect(caught).toMatchObject({ cause: error,
-      message: "Events could not be saved. [code=EPERM syscall=" + error.syscall + " errno=-4048]" });
+      message: "Events could not be saved. [code=" + code + " syscall=" + error.syscall + " errno=-4048]" });
     expect((caught as Error).cause).toBe(error);
     expect((caught as Error).message).not.toContain(error.path);
-    expect(mock).toHaveBeenCalledTimes(3);
-    expect(vi.mocked(delay).mock.calls).toEqual([[10], [20]]);
+    expect(mock).toHaveBeenCalledTimes(6);
+    expect(vi.mocked(delay).mock.calls).toEqual([[10], [20], [40], [80], [160]]);
     expect(await store.listEvents("session-1")).toEqual([first]);
+    expect(await fs.readdir(store.eventsDirectory)).toEqual(["session-1.json"]);
     mock.mockReset();
     expect((await store.appendEvent(event)).sequence).toBe(2);
     expect(await fs.readdir(store.eventsDirectory)).toEqual(["session-1.json"]);
@@ -387,7 +451,7 @@ describe("Codex Event Adapter and LRM event stream", () => {
       "execution-1",
     )).resolves.toMatchObject({ status: failed ? "failed" : "passed" });
     if (failed) {
-      expect(eventWrites).toBe(mode === "EPERM" ? 3 : 1);
+      expect(eventWrites).toBe(mode === "EPERM" ? 6 : 1);
       const query = new StatusQueryService({ storageRoot: root });
       await expect(query.getExecutionStatus({
         execution_id: "execution-1", workspace_id: "workspace-1", session_id: session!.session_id,

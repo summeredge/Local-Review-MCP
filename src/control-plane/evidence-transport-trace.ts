@@ -1,4 +1,13 @@
-import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
@@ -95,6 +104,11 @@ export function evidenceTransportTraceStateFile(storageRoot: string): string {
   return join(resolve(storageRoot), "control-plane", "evidence-transport-trace.jsonl");
 }
 
+// ponytail: two constants, not a retention policy engine. Raise maxBytes when a real
+// correlation window needs more; keepBytes bounds what rotation keeps after trimming.
+const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
+const DEFAULT_KEEP_BYTES = 4 * 1024 * 1024;
+
 function optionalHash(value: string | null | undefined): string {
   return value === undefined || value === null || value === "" ? "" : identityHash(value);
 }
@@ -110,15 +124,23 @@ function timestamp(now: number): string {
 export class EvidenceTransportTraceService {
   public readonly storageRoot: string;
   public readonly file: string;
+  public readonly maxBytes: number;
+  public readonly keepBytes: number;
   private readonly now: () => number;
 
   public constructor(
     storageRoot = defaultTaskContextStorageRoot(),
-    options: { readonly now?: () => number } = {},
+    options: {
+      readonly now?: () => number;
+      readonly maxBytes?: number;
+      readonly keepBytes?: number;
+    } = {},
   ) {
     this.storageRoot = resolve(storageRoot);
     this.file = evidenceTransportTraceStateFile(this.storageRoot);
     this.now = options.now ?? Date.now;
+    this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+    this.keepBytes = options.keepBytes ?? DEFAULT_KEEP_BYTES;
   }
 
   public record(input: EvidenceTransportTraceRecordInput): void {
@@ -133,11 +155,38 @@ export class EvidenceTransportTraceService {
       });
       mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 });
       chmodSync(dirname(this.file), 0o700);
+      this.rotateIfNeeded();
       appendFileSync(this.file, `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 });
       chmodSync(this.file, 0o600);
     } catch {
       // Diagnostic tracing is observational and must never affect runtime behavior.
     }
+  }
+
+  /** Trim the JSONL file in place to the newest whole lines that fit keepBytes. */
+  private rotateIfNeeded(): void {
+    let size: number;
+    try {
+      size = statSync(this.file).size;
+    } catch (error: unknown) {
+      if (errorCode(error) === "ENOENT") return;
+      throw error;
+    }
+    if (size <= this.maxBytes) return;
+
+    const keep = Math.min(this.keepBytes, size);
+    if (keep >= size) return;
+    const buffer = Buffer.alloc(keep);
+    const descriptor = openSync(this.file, "r");
+    try {
+      readSync(descriptor, buffer, 0, keep, size - keep);
+    } finally {
+      closeSync(descriptor);
+    }
+    const newline = buffer.indexOf(0x0a);
+    // Drop the partial leading line so the file only ever holds whole JSONL records.
+    const retained = newline === -1 ? "" : buffer.subarray(newline + 1).toString("utf8");
+    writeFileSync(this.file, retained, { encoding: "utf8", mode: 0o600 });
   }
 
   public async getEvidenceTransportTrace(
