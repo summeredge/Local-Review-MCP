@@ -65,6 +65,8 @@ import { DesktopIPCObserver } from "./desktop-sync/desktop-ipc-observer.js";
 import { DesktopSyncManager } from "./desktop-sync/desktop-sync-manager.js";
 import { DesktopToolsPipeHandoff } from "./desktop-codex/desktop-tools-pipe-handoff.js";
 import { DesktopToolsPipeResolver } from "./desktop-codex/desktop-tools-pipe-resolver.js";
+import { DesktopThreadActivator } from "./desktop-codex/desktop-thread-activator.js";
+import { DesktopThreadBindingStore } from "./desktop-codex/desktop-thread-binding-store.js";
 import { DesktopCodexRuntimeFactory } from "./desktop-codex/desktop-tools-pipe-probe.js";
 import { DesktopInteractivePreflight } from "./desktop-codex/desktop-interactive-preflight.js";
 import { DesktopCodexBackend } from "./desktop-codex/desktop-codex-backend.js";
@@ -140,6 +142,7 @@ export interface AppStartOptions extends HttpServerOptions {
   /** Bounded wait for the Pending Goal submission that authorizes identity Evidence. */
   readonly evidencePendingGraceMs?: number;
   readonly evidencePendingPollMs?: number;
+  readonly openDesktopThread?: (url: string) => Promise<void>;
   readonly runtimeDiagnosticLogger?: RuntimeDiagnosticLogger;
   readonly desktopSyncObserver?: Pick<DesktopIPCObserver, "start" | "stop" | "dispose" | "getState">
     & Partial<Pick<DesktopIPCObserver, "onStateChanged">>;
@@ -298,6 +301,7 @@ export async function startApp(
     // Launcher/HTTP presentation defaults only; execution routing uses each request.workspace_id.
     workspaceId: context.registry.active.id,
   });
+  let desktopThreadActivator: DesktopThreadActivator | undefined;
   const desktopToolsPipeHandoff = new DesktopToolsPipeHandoff(undefined, (event) => {
     writeRuntimeDiagnostic(runtimeDiagnosticLogger, {
       event: "desktop_tools_pipe_lifecycle",
@@ -309,7 +313,18 @@ export async function startApp(
       ...(event.expiresAt === undefined ? {} : { expires_at: event.expiresAt }),
       ...(event.discardReason === undefined ? {} : { discard_reason: event.discardReason }),
     });
+    if (event.state === "pending_registered") void desktopThreadActivator?.observe();
   });
+  desktopThreadActivator = new DesktopThreadActivator(
+    context.registry.active.id,
+    new DesktopThreadBindingStore(context.storageRoot),
+    desktopToolsPipeHandoff,
+    () => desktopSyncObserver.getState(),
+    options.openDesktopThread,
+    (state) => writeRuntimeDiagnostic(runtimeDiagnosticLogger, {
+      event: "desktop_thread_activation", timestamp: new Date().toISOString(), state,
+    }),
+  );
   const desktopToolsPipeResolver = new DesktopToolsPipeResolver(
     desktopToolsPipeHandoff,
     () => desktopSyncObserver.getState(),
@@ -386,6 +401,7 @@ export async function startApp(
   }
   let removeDesktopToolsPipeStateListener: (() => void) | undefined;
   const cleanupDesktopToolsPipeLifecycle = (): void => {
+    desktopThreadActivator?.dispose();
     removeDesktopToolsPipeStateListener?.();
     removeDesktopToolsPipeStateListener = undefined;
     desktopToolsPipeHandoff.clear();
@@ -417,6 +433,7 @@ export async function startApp(
     });
     removeDesktopToolsPipeStateListener = desktopSyncObserver.onStateChanged?.((state) => {
       desktopToolsPipeHandoff.observeDesktopState(state);
+      void desktopThreadActivator?.observe();
       context.capabilityNegotiator?.reconcileDesktopCapability(undefined, state);
     });
     try {

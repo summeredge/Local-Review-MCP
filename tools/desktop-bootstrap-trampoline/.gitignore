@@ -3,3 +3,4 @@ DesktopBootstrapTrampoline.exe
 trampoline.config.ini
 logs/
 
+trampoline-*.tmp

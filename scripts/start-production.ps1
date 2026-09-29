@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$Config = ""
+    [string]$Config = "",
+    [switch]$SkipDesktopBootstrap
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,6 +82,16 @@ try {
             throw "Production build failed with exit code $buildExitCode; the runtime was not started."
         }
         Write-Host "Build: PASS (local-review-mcp $packageVersion)"
+
+        if (-not $SkipDesktopBootstrap) {
+            try {
+                . (Join-Path $projectRoot 'tools\desktop-bootstrap-trampoline\scripts\setup.ps1')
+                Initialize-DesktopBootstrap -ConfigDocument $configDocument
+            } catch {
+                # Setup is best effort; do not expose token-bearing configuration in errors.
+                Write-Warning 'Desktop bootstrap setup failed; continuing with existing fallback.'
+            }
+        }
 
         Write-Host "Starting Local Review MCP..."
         if ($configDocument.supervisor.enabled -eq $true) {

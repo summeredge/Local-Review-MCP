@@ -2,7 +2,7 @@
 
 ## Current version
 
-V0.1 Release Candidate / Phase 5.6.1
+V0.1 / P6 Production Hardening
 
 ## Current capabilities
 
@@ -247,11 +247,11 @@ $env:LOCAL_REVIEW_MCP_REMOTE_TOKEN = $env:LOCAL_REVIEW_MCP_TOKEN
 
 `verify-remote.ps1` checks that unauthenticated and wrong-token health requests
 return HTTP 401, the correct token returns `status=ok`, MCP `initialize` works,
-and `tools/list` matches its embedded tool allowlist. The current runtime
-advertises nineteen read-only tools plus `submit_goal` (20 registered tools);
-this script still contains the older fifteen-tool allowlist, so its final
-comparison is not a complete current-surface check. The remote test suite uses
-the current registered-tool fixture for that check.
+and `tools/list` matches the registered tool surface. That expected list is read
+from the built `dist/src/mcp/server.js` module (`REGISTERED_TOOL_NAMES`), so the
+verifier and the runtime share one definition; run `npm run build` first. The
+current runtime advertises nineteen read-only tools plus `submit_goal`
+(20 registered tools).
 
 ## Remote MCP Setup
 
@@ -468,31 +468,21 @@ npm run build
 
 ### Current validation baseline
 
-Validation baseline recorded on 2026-09-24:
+Validation baseline recorded on 2026-09-29:
 
 ```text
 Command                         Result
 npm run typecheck               PASS
 npm run build                   PASS
-npm test                        PARTIAL FAILURE
+npm test                        PASS
 ```
 
-`npm test` result: 1,088 passed, 1 skipped, and 3 failed. The known failures
-are isolated to `tests/extension-identity.test.ts`:
-
-- `allowlists metadata.request_id and the matching Fiber conversation`
-- `preserves an opaque UUID request id from Fiber through content evidence`
-- `follows the real section-to-turn Fiber traversal and groups split sections`
-
-Expected: Fiber conversation evidence. Actual: `[]`.
-
-This baseline failure is independent of Capability Doctor, Capability Timeline,
-the Launcher Timeline Viewer, and the Desktop Handoff Fallback UX. The
-Capability/Fallback main-path tests pass, and both TypeScript typechecking and
-the production build pass. Do not modify the failing tests, Extension identity
-logic, Fiber traversal, Evidence transport, or CI thresholds as part of
-unrelated work; treat these three failures as a known baseline until their
-separate follow-up task is addressed.
+`npm test` result on this Windows host: 111 files passed, 1,189 tests passed,
+1 skipped, 0 failed. A first full run on a cold `%TEMP%` can report 5s test
+timeouts followed by `EBUSY` failures removing `%TEMP%\local-review-mcp-*`
+directories that the timed-out test still held open. Re-run a failing file on
+its own before treating it as a regression; do not modify test logic or product
+code to work around Windows temp-directory contention.
 
 The Browser Worker review-submission diagnostic drives the complete local
 Review Delivery chain with a mock Page and does not require a ChatGPT login:
@@ -510,8 +500,8 @@ npm run diagnose:goal-e2e -- --config config.production.json --conversation-id <
 ```
 
 It requires the exact connector, an open target conversation, and a paired and
-present Extension. The automated Phase 5.6 review-loop test uses an in-process
-app-server test double; it verifies LRM lifecycle and verdict parsing, not live
+present Extension. The automated review-loop test uses an in-process app-server
+test double; it verifies LRM lifecycle and verdict parsing, not live
 ChatGPT/browser delivery.
 
 The interactive app-server smoke uses a temporary state root and requires the

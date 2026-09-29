@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
+import { REGISTERED_TOOL_NAMES } from "../../src/mcp/server.js";
 
 const projectDirectory = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const preflightScript = join(projectDirectory, "scripts", "preflight-check.ps1");
@@ -180,25 +181,7 @@ async function makeRemoteServer(): Promise<string> {
             serverInfo: { name: "local-review-mcp", version: "0.1.0" },
           }
         : message.method === "tools/list"
-          ? {
-              tools: [
-                "workspace_info",
-                "list_files",
-                "read_file",
-                "search_text",
-                "git_status",
-                "git_diff",
-                "workspace_list",
-                "review_summary",
-                "execution_output",
-                "submit_goal",
-                "get_session_status",
-                "get_execution_status",
-                "list_session_events",
-                "get_identity_trace",
-                "get_evidence_transport_trace",
-              ].map((name) => ({ name })),
-            }
+          ? { tools: REGISTERED_TOOL_NAMES.map((name) => ({ name })) }
           : undefined;
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.end(`event: message\ndata: ${JSON.stringify({
@@ -294,7 +277,7 @@ describe("deployment scripts", () => {
 
     const result = await runPowerShell(
       startProductionScript,
-      ["-Config", config],
+      ["-Config", config, "-SkipDesktopBootstrap"],
       withNpmShim(shimDirectory, 0),
     );
 
@@ -312,7 +295,7 @@ describe("deployment scripts", () => {
 
     const result = await runPowerShell(
       startProductionScript,
-      ["-Config", config],
+      ["-Config", config, "-SkipDesktopBootstrap"],
       withNpmShim(shimDirectory, 1),
     );
 
@@ -332,7 +315,7 @@ describe("deployment scripts", () => {
     expect(result.code).toBe(0);
     expect(result.output).toMatch(/health: passed.*status=ok/i);
     expect(result.output).toMatch(/mcp initialize: passed/i);
-    expect(result.output).toMatch(/tools\/list: passed.*fifteen tools/i);
+    expect(result.output).toMatch(/tools\/list: passed.*\d+ tools/i);
     expect(result.output).toMatch(/remote verification passed/i);
     expect(result.output).not.toContain(REMOTE_TOKEN);
   });

@@ -3,8 +3,9 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createHttpServer } from "../src/mcp/http.js";
-import { startApp } from "../src/app.js";
+import { createHttpServer, LAUNCHER_DESKTOP_INTERACTIVE_PREFLIGHT_PATH } from "../src/mcp/http.js";
+import { createAppContext, startApp } from "../src/app.js";
+import { DesktopThreadBindingStore } from "../src/desktop-codex/desktop-thread-binding-store.js";
 import type { ResolvedSettings } from "../src/config/settings.js";
 import {
   DesktopToolsPipeHandoff,
@@ -32,6 +33,7 @@ const runningServers: Server[] = [];
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(runningServers.splice(0).map((server) => new Promise<void>((resolve) => {
     server.close(() => resolve());
   })));
@@ -462,10 +464,11 @@ it("does not accept an OAuth-shaped bearer as a desktop handoff credential", asy
   expect(response.status).toBe(401);
 });
 
-it("wires Desktop IPC state changes into handoff invalidation and removes the listener on close", async () => {
+it("automatically activates an ownerless conversation, promotes pending on owner evidence, and cleans up on disconnect", async () => {
+  vi.stubEnv("CODEX_APP_TOOLS_PIPE_PATH", undefined);
   const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-tools-pipe-wiring-"));
   temporaryDirectories.push(workspace);
-  let state = connectedState();
+  let state: DesktopSyncState = { connected: true, currentConversationId: "early-conversation", followingThreads: new Set() };
   let stateListener: ((next: DesktopSyncState) => void) | undefined;
   const unsubscribe = vi.fn();
   const observer = {
@@ -478,7 +481,18 @@ it("wires Desktop IPC state changes into handoff invalidation and removes the li
       return unsubscribe;
     }),
   };
-  const server = await startApp(settings(workspace), undefined, {
+  const context = createAppContext(settings(workspace), {
+    LOCALAPPDATA: workspace, XDG_STATE_HOME: workspace,
+  });
+  await new DesktopThreadBindingStore(context.storageRoot).createIfAbsent({
+    schema_version: 1, workspace_id: context.registry.active.id,
+    task_id: "task-activation", session_id: "session-activation",
+    backend_identity: "desktop_codex_app", target_thread_id: "trusted-thread", host_id: "local",
+    created_at: "2026-09-20T00:00:00Z", updated_at: "2026-09-20T00:00:00Z",
+  });
+  const openDesktopThread = vi.fn(async () => undefined);
+  const server = await startApp(settings(workspace), context, {
+    openDesktopThread,
     bridgePorts: [],
     desktopSyncObserver: observer,
     silent: true,
@@ -489,12 +503,23 @@ it("wires Desktop IPC state changes into handoff invalidation and removes the li
   const url = `http://127.0.0.1:${address.port}${LAUNCHER_DESKTOP_TOOLS_PIPE_PATH}`;
   const probeUrl = `http://127.0.0.1:${address.port}${LAUNCHER_DESKTOP_TOOLS_PIPE_PROBE_PATH}`;
   const headers = { authorization: "Bearer test-token", "content-type": "application/json" };
-  const accepted = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ pipePath: PIPE }),
+  const readinessUrl = `http://127.0.0.1:${address.port}${LAUNCHER_DESKTOP_INTERACTIVE_PREFLIGHT_PATH}`;
+  const pending = await fetch(url, {
+    method: "POST", headers, body: JSON.stringify({ pipePath: PIPE }),
   });
-  expect(accepted.status).toBe(200);
+  expect(pending.status).toBe(202);
+  await vi.waitFor(() => expect(openDesktopThread).toHaveBeenCalledExactlyOnceWith("codex://threads/trusted-thread"));
+  const pendingProbe = await fetch(probeUrl, { method: "POST", headers });
+  expect(pendingProbe.status).toBe(409);
+  const waiting = await fetch(readinessUrl, { headers });
+  expect(await waiting.json()).toMatchObject({ ready: false, pipeState: "pending", pipeSource: null });
+  state = connectedState();
+  stateListener!(state);
+  // No second handoff POST: IPC evidence alone must promote the original pending handoff.
+  const promoted = await fetch(readinessUrl, { headers });
+  expect(promoted.status).toBe(200);
+  expect(await promoted.json()).toMatchObject({ ready: true, pipeState: "active", pipeSource: "handoff" });
+  expect(openDesktopThread).toHaveBeenCalledTimes(1);
   expect(observer.onStateChanged).toHaveBeenCalledTimes(1);
   expect(stateListener).toBeDefined();
 

@@ -11,4 +11,5 @@ config.e2e.json
 docs/e2e-validation-marker.md
 __pycache__/
 *.pyc
+deployment-test-*/
 LocalReviewLauncher/launcher.config.json

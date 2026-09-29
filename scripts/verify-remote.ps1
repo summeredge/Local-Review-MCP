@@ -11,6 +11,26 @@ function Get-PropertyValue($Object, [string]$Name) {
     return $Object.PSObject.Properties[$Name].Value
 }
 
+function Get-RegisteredToolNames {
+    # Single source of truth: the production tool surface in src/mcp/server.ts,
+    # read from the build output so this verifier cannot drift from it.
+    $projectDirectory = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+    $module = [System.IO.Path]::GetFullPath("$projectDirectory\dist\src\mcp\server.js")
+    if (-not (Test-Path $module)) {
+        throw "Build output not found: $module. Run 'npm run build' first."
+    }
+    $reader = @'
+const moduleUrl = process.argv[1];
+const loaded = await import(moduleUrl);
+for (const name of loaded.REGISTERED_TOOL_NAMES) console.log(name);
+'@
+    $output = & node --input-type=module -e $reader ([System.Uri]::new($module).AbsoluteUri)
+    if ($LASTEXITCODE -ne 0 -or @($output).Count -eq 0) {
+        throw "Could not read the registered tool surface from $module."
+    }
+    return @($output)
+}
+
 function Invoke-RemoteRequest(
     [System.Net.Http.HttpClient]$Client,
     [System.Uri]$Uri,
@@ -157,34 +177,19 @@ try {
         $toolsMessage = Get-JsonMessage $toolsResponse.Body
         $toolsResult = Get-PropertyValue $toolsMessage "result"
         $tools = @(Get-PropertyValue $toolsResult "tools")
-        $expectedTools = @(
-            "workspace_info",
-            "list_files",
-            "read_file",
-            "search_text",
-            "git_status",
-            "git_diff",
-            "workspace_list",
-            "review_summary",
-            "execution_output",
-            "submit_goal",
-            "get_session_status",
-            "get_execution_status",
-            "list_session_events",
-            "get_identity_trace",
-            "get_evidence_transport_trace"
-        )
+        $expectedTools = @(Get-RegisteredToolNames)
         $actualTools = @($tools | ForEach-Object { Get-PropertyValue $_ "name" })
         if ($actualTools.Count -ne $expectedTools.Count -or (($actualTools | Sort-Object) -join ",") -ne (($expectedTools | Sort-Object) -join ",")) {
-            throw "tools/list returned an unexpected tool surface; expected fifteen tools."
+            throw "tools/list returned an unexpected tool surface; expected $($expectedTools.Count) tools."
         }
-        Write-Host "tools/list: passed (fifteen tools)"
+        Write-Host "tools/list: passed ($($expectedTools.Count) tools)"
         Write-Host "Remote verification passed."
         exit 0
     } finally {
         $client.Dispose()
     }
 } catch {
-    Write-Error $_.Exception.Message
+    Write-Host "Remote verification failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Error $_.Exception.Message -ErrorAction Continue
     exit 1
 }

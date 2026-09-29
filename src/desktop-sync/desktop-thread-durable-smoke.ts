@@ -1062,7 +1062,7 @@ export function formatDesktopThreadDurableSmokeResult(
     if (result.ok) {
       lines.push("NEXT ACTION:");
       lines.push("在 ChatGPT Desktop 中新建一个新的普通对话，使 executor context 发生变化。");
-      lines.push(`完成后运行：npm run diagnostic:p522c -- phase-b --run-id ${result.run_id}`);
+      lines.push(`完成后运行：npm run diagnose:desktop-thread-durability -- phase-b --run-id ${result.run_id}`);
     }
     return lines.join("\n");
   }

@@ -115,6 +115,7 @@ describe("CodexExecutionAdapter", () => {
     const spawnReady = new Promise<void>((resolve) => { releaseSpawn = resolve; });
     const adapter = new CodexExecutionAdapter(fixture.registry, {
       storageRoot: fixture.storageRoot,
+      codexExecutable: "codex",
       processRunner: (request) => {
         requests.push(request);
         spawnReady.then(() => process.emit("spawn"));
@@ -166,6 +167,7 @@ describe("CodexExecutionAdapter", () => {
     let spawnCount = 0;
     const adapter = new CodexExecutionAdapter(fixture.registry, {
       storageRoot: fixture.storageRoot,
+      codexExecutable: "codex",
       processRunner: () => {
         spawnCount += 1;
         throw new Error("ENOENT");
@@ -250,6 +252,7 @@ describe("CodexExecutionAdapter", () => {
     const process = new FakeProcess(4105);
     const adapter = new CodexExecutionAdapter(fixture.registry, {
       storageRoot: fixture.storageRoot,
+      codexExecutable: "codex",
       processRunner: runnerFor(process, []),
     });
 

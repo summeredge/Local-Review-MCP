@@ -36,6 +36,8 @@ export interface DesktopToolsPipeLifecycleDiagnosticEvent {
 }
 
 export type RuntimeDiagnosticEvent =
+  | { readonly event: "desktop_thread_activation"; readonly timestamp: string;
+      readonly state: "requested" | "failed" | "no_binding" }
   | BridgeStartedDiagnosticEvent
   | DesktopWaitDiagnosticEvent
   | DesktopToolsPipeLifecycleDiagnosticEvent;

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { defaultTaskContextStorageRoot } from "../context/task.js";
 import {
@@ -117,6 +117,28 @@ export class DesktopThreadBindingStore {
       }
       return this.requireSameIdentity(raced, parsed);
     }
+  }
+
+  /** Only durable bindings in this workspace may bootstrap Desktop activation. */
+  public async latest(workspaceId: string): Promise<DesktopThreadBinding | undefined> {
+    const directory = desktopThreadBindingsDirectory(this.storageRoot, workspaceId);
+    let files: string[];
+    try {
+      files = await readdir(directory);
+    } catch (error: unknown) {
+      if (errorCode(error) === "ENOENT") return undefined;
+      throw error;
+    }
+    let latest: DesktopThreadBinding | undefined;
+    for (const file of files.sort()) {
+      if (!file.endsWith(".json")) continue;
+      // load validates the schema, backend and workspace/session identity. Corrupt entries
+      // cannot authorize navigation; another independently valid binding may still do so.
+      const binding = await this.load(workspaceId, file.slice(0, -5)).catch(() => undefined);
+      if (binding !== undefined && (latest === undefined
+        || Date.parse(binding.updated_at) > Date.parse(latest.updated_at))) latest = binding;
+    }
+    return latest;
   }
 
   private requireSameIdentity(

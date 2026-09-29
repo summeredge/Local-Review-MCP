@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -34,6 +34,21 @@ function store(): DesktopThreadBindingStore {
 }
 
 describe("DesktopThreadBindingStore", () => {
+  it("selects the newest valid workspace binding with deterministic ties and skips corrupt entries", async () => {
+    const current = store();
+    expect(await current.latest("workspace-1")).toBeUndefined();
+    await current.createIfAbsent(binding());
+    const newer = binding({ session_id: "session-2", updated_at: "2026-09-22T00:00:00Z" });
+    await current.createIfAbsent(newer);
+    await current.createIfAbsent({ ...newer, session_id: "session-3" });
+    const file = desktopThreadBindingFile(current.storageRoot, "workspace-1", "bad");
+    for (const contents of ["{", JSON.stringify({ ...newer, session_id: "bad", backend_identity: "standalone" }),
+      JSON.stringify({ ...newer, session_id: "bad", workspace_id: "wrong" })]) {
+      writeFileSync(file, contents);
+      expect(await current.latest("workspace-1")).toEqual(newer);
+    }
+    expect(await current.latest("another-workspace")).toBeUndefined();
+  });
   it("creates and loads a binding", async () => {
     const current = store();
     const expected = binding();

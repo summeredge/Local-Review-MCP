@@ -6,15 +6,17 @@ The supported flow is:
 Desktop cold start
   -> CODEX_CLI_PATH trampoline captures CODEX_APP_TOOLS_PIPE_PATH
   -> pending handoff
-  -> user switches one existing conversation
+  -> 已有可信 binding 时，LRM 一次性打开 codex://threads/<target_thread_id>
   -> Desktop IPC owner binding
   -> pending promotion
   -> pipeSource=handoff
 ```
 
 The trampoline is only the capability capture/forwarding path. It does not create Desktop identity,
-change the Desktop IPC protocol, or authorize a pipe from its name. Without a user activation that
-provides Desktop owner identity, the handoff remains pending and the capability stays fail-closed.
+change the Desktop IPC protocol, or authorize a pipe from its name. LRM 从当前 workspace 的正式
+binding 读取可信 threadId，同一连接生命周期最多导航一次。首次使用没有 binding、导航失败或
+尚未收到 Desktop owner identity 时继续 pending/fallback；deep link 成功不代表 capability ready。
+自动激活以 `ownerClientId` 判定 identity 是否建立；仅有 `currentConversationId` 时仍可激活。
 
 The handoff does not end at first success. For as long as the spawned `codex.exe` is alive, a low
 frequency maintenance loop keeps the capability valid, so a restart of the MCP runtime alone is
@@ -88,6 +90,11 @@ unreachable runtime and after a 409/unavailable probe, `202 pending` followed by
 healthy, bounded backoff, no retry on 400/401/403, and the pipe path never reaching a log line.
 
 ## Build
+
+Launcher 的生产启动入口会自动调用 `scripts/setup.ps1` 完成构建、更新受限权限配置并设置用户级
+`CODEX_CLI_PATH`，重复启动无需手动配置。已运行的 Codex Desktop 需完整退出后重新启动，
+才能加载新的启动环境。token 只从配置/环境读入并写入被忽略的 INI，不进入 argv 或输出。
+setup 失败时生产入口继续现有 fallback；隔离部署测试使用 `-SkipDesktopBootstrap`。
 
 ```powershell
 pwsh -File tools/desktop-bootstrap-trampoline/scripts/build.ps1

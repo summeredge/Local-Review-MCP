@@ -110,15 +110,15 @@ try {
     const diagnostic = await runCodexAppEffectfulDiagnostic(argv.slice(1));
     console.log(JSON.stringify(diagnostic, null, 2));
     if (!diagnostic.ok) process.exitCode = 1;
-  } else if (argv[0] === "diagnostic-p522c") {
+  } else if (argv[0] === "diagnose-desktop-thread-durability") {
     const diagnostic = await runDesktopThreadDurableSmoke(argv.slice(1));
     console.log(formatDesktopThreadDurableSmokeResult(diagnostic));
     if (!diagnostic.ok) process.exitCode = 1;
-  } else if (argv[0] === "diagnostic-p530b") {
+  } else if (argv[0] === "diagnose-desktop-completion-contract") {
     const diagnostic = await runDesktopCompletionContractProbe(argv.slice(1));
     console.log(JSON.stringify(diagnostic, null, 2));
     if (!diagnostic.ok) process.exitCode = 1;
-  } else if (argv[0] === "diagnostic-p541-first-turn") {
+  } else if (argv[0] === "diagnose-desktop-first-turn") {
     const diagnostic = await runDesktopFirstTurnProbe(argv.slice(1));
     console.log(JSON.stringify(diagnostic, null, 2));
     if (!diagnostic.ok) process.exitCode = 1;
