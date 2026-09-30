@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QStyle,
     QSystemTrayIcon,
     QTableWidget,
@@ -144,6 +145,10 @@ class LauncherWindow(QMainWindow):
         self.browser_diagnostic_status.setWordWrap(True)
         self.browser_diagnostic_status.setTextFormat(Qt.TextFormat.PlainText)
         self.desktop_status = QLabel("不可用")
+        self.desktop_ipc_status = QLabel("不可用")
+        self.desktop_identity_status = QLabel("不可用")
+        self.tools_pipe_status = QLabel("不可用")
+        self.pipe_source_status = QLabel("不可用")
         self.desktop_sync_status = QLabel("不可用")
         self.desktop_sync_status.setWordWrap(True)
         self.desktop_sync_status.setTextFormat(Qt.TextFormat.PlainText)
@@ -297,7 +302,7 @@ class LauncherWindow(QMainWindow):
         self.save_log_button.clicked.connect(self.save_log)
 
         startup_layout = QVBoxLayout()
-        startup_layout.setContentsMargins(CONTENT_MARGIN, CONTENT_MARGIN, CONTENT_MARGIN, CONTENT_MARGIN)
+        startup_layout.setContentsMargins(12, 12, 12, 12)
         startup_layout.setSpacing(CONTENT_SPACING)
         startup_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         top_actions = QWidget()
@@ -315,23 +320,28 @@ class LauncherWindow(QMainWindow):
         startup_layout.addWidget(top_actions, 0, Qt.AlignmentFlag.AlignLeft)
         status_cards = QGridLayout()
         status_cards.setContentsMargins(0, 0, 0, 0)
-        status_cards.setHorizontalSpacing(CONTENT_SPACING)
-        status_cards.setVerticalSpacing(CONTENT_SPACING)
-        status_cards.setColumnStretch(0, 1)
-        status_cards.setColumnStretch(1, 1)
+        status_cards.setHorizontalSpacing(8)
+        status_cards.setVerticalSpacing(8)
+        for column in range(3):
+            status_cards.setColumnStretch(column, 1)
         for row in range(4):
             status_cards.setRowStretch(row, 1)
-        for row, (left, right) in enumerate((
+        for index, (title, value) in enumerate((
             ("启动器状态", self.launcher_state),
             ("MCP 运行时", self.mcp_status),
             ("Cloudflare 隧道", self.tunnel_status),
             ("远程端点", self.remote_status),
             ("浏览器", self.browser_status),
             ("Desktop", self.desktop_status),
+            ("Desktop IPC", self.desktop_ipc_status),
+            ("Desktop 身份", self.desktop_identity_status),
+            ("Tools Pipe", self.tools_pipe_status),
+            ("PipeSource", self.pipe_source_status),
             ("执行能力", self.execution_summary_status),
             ("OAuth", self.oauth_status_label),
         )):
-            status_cards.addWidget(self._status_card(left, right), row // 2, row % 2)
+            row, column = divmod(index, 3)
+            status_cards.addWidget(self._status_card(title, value), row, column)
         startup_layout.addLayout(status_cards)
         startup_layout.addSpacing(6)
         startup_layout.addWidget(self._section_title("工作区注册表"))
@@ -516,6 +526,7 @@ class LauncherWindow(QMainWindow):
     @staticmethod
     def _status_card(title: str, value: QLabel) -> QFrame:
         card = QFrame()
+        card.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         card.setFrameShape(QFrame.Shape.StyledPanel)
         card.setFrameShadow(QFrame.Shadow.Plain)
         layout = QVBoxLayout(card)
@@ -688,6 +699,37 @@ class LauncherWindow(QMainWindow):
             else "等待 Desktop 激活"
             if desktop_capability.pipe_state == "pending"
             else "不可用"
+        )
+        pipe_source_ready = desktop_capability.ready and bool(desktop_capability.pipe_source)
+        pipe_source_value = (
+            desktop_capability.pipe_source
+            if pipe_source_ready
+            else "等待 Desktop 激活"
+            if desktop_capability.pipe_state == "pending"
+            else "不可用"
+        )
+        self._set_status(
+            self.desktop_ipc_status,
+            "已连接" if desktop_sync.connected else "已断开",
+            desktop_sync.connected,
+        )
+        self._set_status(
+            self.desktop_identity_status,
+            identity_state,
+            desktop_sync.connected and bool(desktop_sync.owner_client_id),
+            warning=desktop_sync.connected and not desktop_sync.owner_client_id,
+        )
+        self._set_status(
+            self.tools_pipe_status,
+            pipe_state,
+            desktop_capability.pipe_state == "active",
+            warning=desktop_capability.pipe_state == "pending",
+        )
+        self._set_status(
+            self.pipe_source_status,
+            pipe_source_value,
+            pipe_source_ready,
+            warning=desktop_capability.pipe_state == "pending",
         )
         capability_lines = [
             "",

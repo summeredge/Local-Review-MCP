@@ -35,6 +35,8 @@ export interface CreateOrReuseThreadInput extends DesktopCodexCommandOptions {
   readonly session_id: string;
   readonly projectId: string;
   readonly prompt: string;
+  readonly model?: string;
+  readonly reasoningEffort?: string;
 }
 
 /**
@@ -84,6 +86,8 @@ export class DesktopThreadCoordinator {
       ...commandOptions(input),
       projectId: input.projectId,
       prompt: input.prompt,
+      ...(input.model === undefined ? {} : { model: input.model }),
+      ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
     });
     const now = new Date().toISOString();
     try {

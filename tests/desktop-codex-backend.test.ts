@@ -69,6 +69,11 @@ function desktopTools(): Tool[] {
         type: "object",
         properties: {
           prompt: { type: "string" },
+          model: { type: "string" },
+          thinking: {
+            type: "string",
+            enum: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+          },
           target: {
             type: "object",
             properties: {
@@ -564,7 +569,7 @@ describe("P5.4.1 Desktop preflight fail-closed", () => {
   });
 });
 
-describe("P5.4.1 Desktop route ignores provider model and reasoning_effort", () => {
+describe("Desktop interactive Goal model and reasoning effort", () => {
   it("dispatches create_thread for an interactive Goal that carries model and reasoning_effort", async () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
@@ -575,11 +580,13 @@ describe("P5.4.1 Desktop route ignores provider model and reasoning_effort", () 
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
     expect(execution?.status).toBe("passed");
 
-    // The Desktop keeps its own model selection: neither value reaches codex_app MCP.
     const createThread = value.desktop.calls.find((call) => call.name === "create_thread")!;
-    expect(Object.keys(createThread.arguments ?? {}).sort()).toEqual(["prompt", "target"]);
-    expect(JSON.stringify(value.desktop.calls.map((call) => call.arguments)))
-      .not.toContain("gpt-5.6-luna");
+    expect(createThread.arguments).toEqual({
+      model: "gpt-5.6-luna",
+      prompt: INSTRUCTION,
+      target: { type: "project", projectId: "project-1", environment: { type: "local" } },
+      thinking: "max",
+    });
 
     // Nor are they projected onto the Desktop Session, which needs no provider model.
     const session = (await value.sessions.listSessions())[0]!;

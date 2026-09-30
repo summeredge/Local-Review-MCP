@@ -24,6 +24,8 @@ export interface DesktopCodexCommandOptions {
 export interface CreateThreadInput extends DesktopCodexCommandOptions {
   readonly projectId: string;
   readonly prompt: string;
+  readonly model?: string;
+  readonly reasoningEffort?: string;
 }
 
 export interface SendMessageToThreadInput extends DesktopCodexCommandOptions {
@@ -160,6 +162,10 @@ export class DesktopCodexThreadCommands {
     const args: CreateThreadArguments = this.context.contracts.createThreadArguments(
       requiredPrompt(input.prompt),
       projectId,
+      {
+        ...(input.model === undefined ? {} : { model: input.model }),
+        ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
+      },
     );
     const result = await callCodexAppTool(callInput(
       this.context.client,

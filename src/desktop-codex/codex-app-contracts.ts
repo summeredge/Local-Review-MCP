@@ -16,6 +16,8 @@ export interface CreateThreadArguments {
     readonly projectId: string;
     readonly environment: { readonly type: "local" };
   };
+  readonly model?: string;
+  readonly thinking?: string;
 }
 
 export interface SendMessageToThreadArguments {
@@ -92,10 +94,55 @@ function schemaType(schema: JsonSchema, expected: string): boolean {
 function isStringSchema(schema: JsonSchema | undefined): boolean {
   if (schema === undefined) return false;
   if (schemaType(schema, "string")) return true;
+  if (typeof schema.const === "string") return true;
   if (Array.isArray(schema.enum) && schema.enum.length > 0) {
     return schema.enum.every((value) => typeof value === "string");
   }
   return schemaBranches(schema).some((branch) => branch !== schema && isStringSchema(branch));
+}
+
+function stringConstraintsAccept(schema: JsonSchema, value: string): boolean {
+  if (schema.type !== undefined && !schemaType(schema, "string")) return false;
+  if (schema.const !== undefined && schema.const !== value) return false;
+  if (schema.enum !== undefined
+    && (!Array.isArray(schema.enum) || !schema.enum.includes(value))) return false;
+
+  const length = Array.from(value).length;
+  if (schema.minLength !== undefined) {
+    if (typeof schema.minLength !== "number" || !Number.isSafeInteger(schema.minLength)
+      || schema.minLength < 0 || length < schema.minLength) return false;
+  }
+  if (schema.maxLength !== undefined) {
+    if (typeof schema.maxLength !== "number" || !Number.isSafeInteger(schema.maxLength)
+      || schema.maxLength < 0 || length > schema.maxLength) return false;
+  }
+  if (typeof schema.pattern === "string") {
+    try {
+      if (!new RegExp(schema.pattern, "u").test(value)) return false;
+    } catch {
+      return false;
+    }
+  }
+
+  for (const key of ["anyOf", "oneOf", "allOf"] as const) {
+    const rawBranches = schema[key];
+    if (!Array.isArray(rawBranches)) continue;
+    const branches = rawBranches.map(schemaRecord).filter((branch): branch is JsonSchema => branch !== undefined);
+    const accepted = branches.filter((branch) => stringConstraintsAccept(branch, value)).length;
+    if (key === "anyOf" && accepted === 0) return false;
+    if (key === "oneOf" && accepted !== 1) return false;
+    if (key === "allOf" && accepted !== branches.length) return false;
+  }
+
+  const excluded = schemaRecord(schema.not);
+  if (excluded !== undefined && stringConstraintsAccept(excluded, value)) return false;
+  return true;
+}
+
+function acceptsStringValue(schema: JsonSchema | undefined, value: string): boolean {
+  return schema !== undefined
+    && isStringSchema(schema)
+    && stringConstraintsAccept(schema, value);
 }
 
 function isNumberSchema(schema: JsonSchema | undefined): boolean {
@@ -143,8 +190,13 @@ function toolContracts(tools: readonly Tool[]): Map<string, ToolContract> {
   return result;
 }
 
-function incompatible(name: string): CodexAppRuntimeError {
-  return new CodexAppRuntimeError("tool_contract_incompatible", `${name} tool contract is incompatible.`);
+function incompatible(name: string, detail?: string): CodexAppRuntimeError {
+  return new CodexAppRuntimeError(
+    "tool_contract_incompatible",
+    detail === undefined
+      ? `${name} tool contract is incompatible.`
+      : `${name} tool contract is incompatible: ${detail}.`,
+  );
 }
 
 export class CodexAppToolContracts {
@@ -157,7 +209,11 @@ export class CodexAppToolContracts {
     }
   }
 
-  public createThreadArguments(prompt: string, projectId: string): CreateThreadArguments {
+  public createThreadArguments(
+    prompt: string,
+    projectId: string,
+    options: { readonly model?: string; readonly reasoningEffort?: string } = {},
+  ): CreateThreadArguments {
     const tool = this.tools.get("create_thread");
     if (tool === undefined) throw incompatible("create_thread");
     const schema = tool.inputSchema;
@@ -176,6 +232,13 @@ export class CodexAppToolContracts {
     if (localEnvironment === undefined || !requirementsWithin(localEnvironment, new Set(["type"]))) {
       throw incompatible("create_thread");
     }
+    if (options.model !== undefined && !acceptsStringValue(properties.model, options.model)) {
+      throw incompatible("create_thread", "model is absent or does not accept the Goal value");
+    }
+    if (options.reasoningEffort !== undefined
+      && !acceptsStringValue(properties.thinking, options.reasoningEffort)) {
+      throw incompatible("create_thread", "thinking is absent or does not accept the Goal reasoning_effort");
+    }
     return {
       prompt,
       target: {
@@ -183,6 +246,8 @@ export class CodexAppToolContracts {
         projectId,
         environment: { type: "local" },
       },
+      ...(options.model === undefined ? {} : { model: options.model }),
+      ...(options.reasoningEffort === undefined ? {} : { thinking: options.reasoningEffort }),
     };
   }
 

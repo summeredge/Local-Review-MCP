@@ -145,9 +145,6 @@ export class DesktopCodexBackend implements ExecutionBackend {
     if (parsed.goal_id === undefined) {
       throw new DesktopExecutionError("desktop_goal_required", "Interactive execution requires goal_id.");
     }
-    // A Goal may carry provider model/reasoning_effort for the batch route. The Desktop codex_app
-    // create_thread contract has no such argument and keeps its own model selection, so both fields
-    // are ignored here instead of failing an interactive Goal that was already accepted.
     if (this.closing) {
       throw new DesktopExecutionError("desktop_backend_closed", "Desktop codex_app backend is closed.");
     }
@@ -267,6 +264,8 @@ export class DesktopCodexBackend implements ExecutionBackend {
         executorThreadId,
         projectId,
         prompt: request.instruction,
+        ...(request.model === undefined ? {} : { model: request.model }),
+        ...(request.reasoning_effort === undefined ? {} : { reasoningEffort: request.reasoning_effort }),
       });
       if (!created.created) {
         throw new DesktopExecutionError(

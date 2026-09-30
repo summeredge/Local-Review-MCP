@@ -28,6 +28,11 @@ function appTools(): Tool[] {
         type: "object",
         properties: {
           prompt: { type: "string" },
+          model: { type: "string" },
+          thinking: {
+            type: "string",
+            enum: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+          },
           target: {
             type: "object",
             properties: {
@@ -125,6 +130,28 @@ describe("DesktopThreadCoordinator", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?._meta?.["openai/threadId"]).toBe("executor-A");
     await expect(bindings.load("workspace-1", "session-1")).resolves.toEqual(result);
+  });
+
+  it("passes Goal model and reasoning effort through only for the new thread", async () => {
+    const calls: CallToolRequestParams[] = [];
+    const commands = createCommands(async (params) => {
+      calls.push(params);
+      return toolResult({ threadId: "target-thread-1", hostId: "local" });
+    });
+    const coordinator = new DesktopThreadCoordinator({
+      commands,
+      bindings: new DesktopThreadBindingStore(createRoot()),
+    });
+
+    await coordinator.createOrReuseThread(input({ model: "gpt-6-astra", reasoningEffort: "high" }));
+
+    expect(calls[0]?.name).toBe("create_thread");
+    expect(calls[0]?.arguments).toEqual({
+      model: "gpt-6-astra",
+      prompt: "create",
+      target: { type: "project", projectId: "project-1", environment: { type: "local" } },
+      thinking: "high",
+    });
   });
 
   it("reuses an existing binding without calling create_thread", async () => {

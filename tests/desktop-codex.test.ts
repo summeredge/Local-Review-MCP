@@ -23,7 +23,7 @@ afterEach(() => {
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function appTools(): Tool[] {
+function appTools(options: { readonly includeModel?: boolean; readonly includeThinking?: boolean } = {}): Tool[] {
   return [
     {
       name: "list_projects",
@@ -35,6 +35,13 @@ function appTools(): Tool[] {
         type: "object",
         properties: {
           prompt: { type: "string" },
+          ...(options.includeModel === false ? {} : { model: { type: "string" } }),
+          ...(options.includeThinking === false ? {} : {
+            thinking: {
+              type: "string",
+              enum: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+            },
+          }),
           target: {
             anyOf: [{
               type: "object",
@@ -293,5 +300,78 @@ describe("desktop codex contracts", () => {
     const contracts = createCodexAppToolContracts(appTools().filter((tool) => tool.name !== "create_thread"));
     expect(() => contracts.createThreadArguments("create", "project-one"))
       .toThrowError(expect.objectContaining({ code: "tool_contract_incompatible" }));
+  });
+
+  it("maps Goal model and reasoning effort to create_thread model and thinking", () => {
+    const contracts = createCodexAppToolContracts(appTools());
+    expect(contracts.createThreadArguments("create", "project-one", {
+      model: "gpt-5.6-luna",
+      reasoningEffort: "max",
+    })).toEqual({
+      model: "gpt-5.6-luna",
+      prompt: "create",
+      target: { type: "project", projectId: "project-one", environment: { type: "local" } },
+      thinking: "max",
+    });
+  });
+
+  it("sends only model when the Goal omits reasoning effort", () => {
+    const contracts = createCodexAppToolContracts(appTools());
+    expect(contracts.createThreadArguments("create", "project-one", {
+      model: "gpt-6-astra",
+    })).toEqual({
+      model: "gpt-6-astra",
+      prompt: "create",
+      target: { type: "project", projectId: "project-one", environment: { type: "local" } },
+    });
+  });
+
+  it("sends only thinking when the Goal omits model", () => {
+    const contracts = createCodexAppToolContracts(appTools());
+    expect(contracts.createThreadArguments("create", "project-one", {
+      reasoningEffort: "high",
+    })).toEqual({
+      prompt: "create",
+      target: { type: "project", projectId: "project-one", environment: { type: "local" } },
+      thinking: "high",
+    });
+  });
+
+  it("keeps the original prompt and target arguments when the Goal specifies neither field", () => {
+    const contracts = createCodexAppToolContracts(appTools());
+    expect(contracts.createThreadArguments("create", "project-one")).toEqual({
+      prompt: "create",
+      target: { type: "project", projectId: "project-one", environment: { type: "local" } },
+    });
+  });
+
+  it("fails closed when reasoning effort is outside the live thinking enum", () => {
+    const contracts = createCodexAppToolContracts(appTools());
+    expect(() => contracts.createThreadArguments("create", "project-one", {
+      reasoningEffort: "reasoning-plus",
+    })).toThrowError(expect.objectContaining({
+      code: "tool_contract_incompatible",
+      message: expect.stringContaining("thinking"),
+    }));
+  });
+
+  it("fails closed when the live schema has no model field", () => {
+    const contracts = createCodexAppToolContracts(appTools({ includeModel: false }));
+    expect(() => contracts.createThreadArguments("create", "project-one", {
+      model: "gpt-5.6-luna",
+    })).toThrowError(expect.objectContaining({
+      code: "tool_contract_incompatible",
+      message: expect.stringContaining("model"),
+    }));
+  });
+
+  it("fails closed when the live schema has no thinking field", () => {
+    const contracts = createCodexAppToolContracts(appTools({ includeThinking: false }));
+    expect(() => contracts.createThreadArguments("create", "project-one", {
+      reasoningEffort: "max",
+    })).toThrowError(expect.objectContaining({
+      code: "tool_contract_incompatible",
+      message: expect.stringContaining("thinking"),
+    }));
   });
 });

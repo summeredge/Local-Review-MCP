@@ -105,9 +105,12 @@ class LauncherLogTests(unittest.TestCase):
             startup = window.findChild(QTabWidget).widget(0)
             cards = startup.widget().layout().itemAt(1).layout()
             self.assertIsInstance(cards, QGridLayout)
-            self.assertEqual((cards.rowCount(), cards.columnCount()), (4, 2))
-            self.assertEqual(cards.itemAtPosition(2, 0).widget().findChildren(QLabel)[0].text(), "浏览器")
-            self.assertEqual(cards.itemAtPosition(2, 1).widget().findChildren(QLabel)[0].text(), "Desktop")
+            self.assertEqual((cards.rowCount(), cards.columnCount()), (4, 3))
+            self.assertEqual(cards.count(), 12)
+            self.assertEqual(cards.itemAtPosition(1, 1).widget().findChildren(QLabel)[0].text(), "浏览器")
+            self.assertEqual(cards.itemAtPosition(1, 2).widget().findChildren(QLabel)[0].text(), "Desktop")
+            self.assertEqual(cards.itemAtPosition(2, 0).widget().findChildren(QLabel)[0].text(), "Desktop IPC")
+            self.assertEqual(cards.itemAtPosition(3, 0).widget().findChildren(QLabel)[0].text(), "PipeSource")
             self.assertFalse(any(label.text() == "浏览器：" for label in window.findChildren(QLabel)))
             self.assertFalse(any(label.text() == "Local Review MCP" for label in window.findChildren(QLabel)))
             for button in window.findChildren(QPushButton) + [window.capability_timeline_toggle, window.session_viewer_toggle]:
@@ -169,6 +172,14 @@ class LauncherLogTests(unittest.TestCase):
             self.assertIn("Desktop 身份：已就绪", window.desktop_sync_status.text())
             self.assertIn("Tools Pipe：活动", window.desktop_sync_status.text())
             self.assertIn("能力：pipeSource=handoff", window.desktop_sync_status.text())
+            for label, text in (
+                (window.desktop_ipc_status, "已连接"),
+                (window.desktop_identity_status, "已就绪"),
+                (window.tools_pipe_status, "活动"),
+                (window.pipe_source_status, "handoff"),
+            ):
+                self.assertEqual(label.text(), text)
+                self.assertEqual(label.styleSheet(), "color: #16803c")
             self.assertIn("执行：execution-1", window.capability_status.text())
             self.assertIn("来源：Desktop", window.capability_status.text())
             self.assertIn("状态：Desktop 失败（desktop_failed）", window.capability_status.text())
@@ -806,21 +817,26 @@ class LauncherLayoutAcceptanceTests(unittest.TestCase):
     def _button_texts(window: LauncherWindow) -> list[str]:
         return [button.text() for button in window.findChildren(QPushButton)]
 
-    def test_status_cards_pin_eight_positions(self) -> None:
+    def test_status_cards_pin_twelve_positions_in_four_by_three_grid(self) -> None:
         window = self._window()
         startup = window.findChild(QTabWidget).widget(0)
         cards = startup.widget().layout().itemAt(1).layout()
         self.assertIsInstance(cards, QGridLayout)
-        self.assertEqual((cards.rowCount(), cards.columnCount()), (4, 2))
+        self.assertEqual((cards.rowCount(), cards.columnCount()), (4, 3))
+        self.assertEqual(cards.count(), 12)
         expected = (
             (0, 0, "启动器状态"),
             (0, 1, "MCP 运行时"),
-            (1, 0, "Cloudflare 隧道"),
-            (1, 1, "远程端点"),
-            (2, 0, "浏览器"),
-            (2, 1, "Desktop"),
-            (3, 0, "执行能力"),
-            (3, 1, "OAuth"),
+            (0, 2, "Cloudflare 隧道"),
+            (1, 0, "远程端点"),
+            (1, 1, "浏览器"),
+            (1, 2, "Desktop"),
+            (2, 0, "Desktop IPC"),
+            (2, 1, "Desktop 身份"),
+            (2, 2, "Tools Pipe"),
+            (3, 0, "PipeSource"),
+            (3, 1, "执行能力"),
+            (3, 2, "OAuth"),
         )
         for row, column, title in expected:
             card = cards.itemAtPosition(row, column).widget()
@@ -830,6 +846,7 @@ class LauncherLayoutAcceptanceTests(unittest.TestCase):
             self.assertFalse(card.findChildren(QPushButton), f"card {row},{column} must hold no button")
         self.assertEqual(cards.itemAtPosition(0, 0).widget(), cards.itemAtPosition(0, 0).widget())
         self.assertEqual(cards.columnStretch(0), cards.columnStretch(1))
+        self.assertEqual(cards.columnStretch(1), cards.columnStretch(2))
 
     def test_workspace_registry_columns_and_default_marker(self) -> None:
         config = LauncherConfig("", "config.production.json", False)
