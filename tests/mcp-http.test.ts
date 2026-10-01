@@ -8,6 +8,9 @@ import { bridgePort, extensionDeliveryReadiness, EXTENSION_PRESENCE_TIMEOUT_MS, 
 import { startApp } from "../src/app.js";
 import { ExecutionContextService } from "../src/context/execution-service.js";
 import { TaskContextService } from "../src/context/service.js";
+import { SessionStore } from "../src/context/session-store.js";
+import { EventStore } from "../src/control-plane/events/store.js";
+import { goalOrchestrationSchema } from "../src/control-plane/goal-orchestration.js";
 import {
   createHttpServer,
   LAUNCHER_DOCTOR_PATH,
@@ -94,7 +97,7 @@ describe("MCP HTTP runtime", () => {
     await expect(response.json()).resolves.toEqual(report);
   });
 
-  it("serves the authenticated loopback launcher Session catalog without adding an MCP tool", async () => {
+  it.each(["/launcher/sessions", LAUNCHER_EXECUTION_CATALOG_PATH])("clears persisted Executions through %s without adding an MCP tool", async (cleanupPath) => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-launcher-catalog-"));
     temporaryDirectories.push(workspace);
     const registry = new WorkspaceRegistry([{
@@ -115,6 +118,33 @@ describe("MCP HTTP runtime", () => {
     });
     await executions.updateExecutionContext("catalog-workspace", "task-cleanup", "execution-cleanup", {
       status: "passed",
+    });
+    await tasks.createTaskContext({ task_id: "task-interactive", workspace_id: "catalog-workspace" });
+    await executions.createExecutionContext({
+      execution_id: "execution-interactive", task_id: "task-interactive", workspace_id: "catalog-workspace", status: "passed",
+    });
+    const goal = goalOrchestrationSchema.parse({
+      goal_id: "goal-interactive", workspace_id: "catalog-workspace", conversation_id: "conversation-1",
+      execution_mode: "interactive", status: "completed", current_task_id: "task-interactive",
+      current_phase_id: "phase-1", actuation_id: "actuation-1", loop_id: "loop-1",
+      execution_id: "execution-interactive", phases: [{
+        phase_id: "phase-1", objective: "Cleanup", status: "completed", tasks: [{
+          task_id: "task-interactive", goal: "Cleanup", requirements: ["Cleanup"],
+          acceptance_criteria: ["Cleanup"], max_iterations: 1,
+        }],
+      }], created_at: "2026-09-15T00:00:00.000Z", updated_at: "2026-09-15T00:00:00.000Z",
+    });
+    const sessions = new SessionStore(workspace);
+    await sessions.createSession({
+      session_id: "session-interactive", goal_id: goal.goal_id, task_id: "task-interactive",
+      backend_type: "desktop_codex_app", status: "completed", workspace,
+      thread_id: "thread-interactive",
+    });
+    const events = new EventStore(workspace);
+    await events.appendEvent({
+      session_id: "session-interactive", execution_id: "execution-interactive", event_type: "session_started",
+      thread_id: "thread-interactive",
+      timestamp: "2026-09-15T00:00:00.000Z", payload: {},
     });
     await tasks.createTaskContext({
       task_id: "task-other-workspace",
@@ -139,7 +169,7 @@ describe("MCP HTTP runtime", () => {
       registry,
       statusQuery: new StatusQueryService({
         storageRoot: workspace,
-        goals: { getGoal: async () => null, listGoals: async () => [] },
+        goals: { getGoal: async (id) => id === goal.goal_id ? goal : null, listGoals: async () => [goal] },
       }),
       browserReadiness: extensionDeliveryReadiness,
     });
@@ -153,6 +183,10 @@ describe("MCP HTTP runtime", () => {
     });
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ sessions: [] });
+    const beforeCleanup = await fetch(`http://127.0.0.1:${port}${LAUNCHER_EXECUTION_CATALOG_PATH}`, {
+      headers: { authorization: "Bearer test-token" },
+    });
+    expect((await beforeCleanup.json()).executions).toHaveLength(2);
 
     const readinessUrl = `http://127.0.0.1:${port}/launcher/readiness`;
     const headers = { authorization: "Bearer test-token" };
@@ -189,22 +223,30 @@ describe("MCP HTTP runtime", () => {
       await stopBridge();
     }
 
-    const cleanup = await fetch(`http://127.0.0.1:${port}/launcher/sessions`, {
+    const cleanupUrl = `http://127.0.0.1:${port}${cleanupPath}`;
+    expect((await fetch(cleanupUrl, { method: "DELETE" })).status).toBe(401);
+    expect((await fetch(cleanupUrl, {
+      method: "DELETE", headers: { authorization: "Bearer test-token", "x-forwarded-for": "127.0.0.1" },
+    })).status).toBe(404);
+    const cleanup = await fetch(cleanupUrl, {
       method: "DELETE",
       headers: { authorization: "Bearer test-token" },
     });
     expect(cleanup.status).toBe(200);
     await expect(cleanup.json()).resolves.toEqual({
       deleted: true,
-      deleted_executions: 1,
-      deleted_sessions: 0,
-      deleted_events: 0,
-      deleted_tasks: 1,
+      deleted_executions: 2,
+      deleted_sessions: 1,
+      deleted_events: 1,
+      deleted_tasks: 2,
     });
     const dashboard = await fetch(`http://127.0.0.1:${port}${LAUNCHER_EXECUTION_CATALOG_PATH}`, {
       headers: { authorization: "Bearer test-token" },
     });
     await expect(dashboard.json()).resolves.toEqual({ executions: [] });
+    await expect(sessions.getSession("session-interactive")).resolves.toBeNull();
+    await expect(events.listEvents("session-interactive")).resolves.toEqual([]);
+    await expect(tasks.getTaskContext("task-interactive")).resolves.toBeNull();
     await expect(executions.getExecutionContext(
       "other-workspace", "task-other-workspace", "execution-other-workspace",
     )).resolves.toMatchObject({ status: "failed" });

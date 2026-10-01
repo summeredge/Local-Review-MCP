@@ -258,6 +258,10 @@ async function handleLauncherExecutionCatalogRequest(
   context: HttpRuntimeContext,
   authToken: string,
 ): Promise<void> {
+  if (request.method === "DELETE") {
+    await handleLauncherSessionCatalogRequest(request, response, context, authToken);
+    return;
+  }
   if (!isDirectLoopbackRequest(request)) {
     request.resume();
     sendJson(response, 404, { error: "not_found" });

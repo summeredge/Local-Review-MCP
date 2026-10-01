@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { taskExecutionsDirectory } from "../../src/context/execution.js";
 import { ExecutionContextService } from "../../src/context/execution-service.js";
 import { SessionStore } from "../../src/context/session-store.js";
+import { sessionsDirectory } from "../../src/context/session.js";
 import { TaskContextService } from "../../src/context/service.js";
 import { EventStore } from "../../src/control-plane/events/store.js";
 import {
@@ -80,7 +81,7 @@ async function seedExecution(root: string, options: {
   readonly workspaceId: string;
   readonly taskId: string;
   readonly executionId: string;
-  readonly status?: "running" | "passed" | "failed";
+  readonly status?: "running" | "passed" | "failed" | "terminated";
   readonly command?: string;
   readonly summary?: string;
 }): Promise<void> {
@@ -134,6 +135,52 @@ async function seedSession(root: string, options: {
 }
 
 describe("Launcher Execution catalog", () => {
+  it.each(["passed", "failed", "terminated"] as const)("clears a %s batch Execution without creating a Session", async (status) => {
+    const root = await storageRoot();
+    await seedExecution(root, {
+      workspaceId: "workspace-1", taskId: "task-1", executionId: "execution-1", status,
+    });
+    await expect(queryFor(root, []).clearExecutionRecords("workspace-1")).resolves.toEqual({
+      deleted_executions: 1, deleted_sessions: 0, deleted_events: 0, deleted_tasks: 1,
+    });
+    await expect(new SessionStore(root).listSessions()).resolves.toEqual([]);
+    await expect(queryFor(root, []).listExecutionSummaries("workspace-1")).resolves.toEqual([]);
+  });
+
+  it("clears terminal Executions when Session metadata is damaged, retaining uncertain Tasks", async () => {
+    const root = await storageRoot();
+    await seedExecution(root, {
+      workspaceId: "workspace-1", taskId: "task-1", executionId: "execution-1", status: "passed",
+    });
+    const directory = sessionsDirectory(root);
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "session-broken.json"), "{ not json", "utf8");
+    await expect(queryFor(root, []).clearExecutionRecords("workspace-1")).resolves.toEqual({
+      deleted_executions: 1, deleted_sessions: 0, deleted_events: 0, deleted_tasks: 0,
+    });
+    await expect(new ExecutionContextService(root).getExecutionContext(
+      "workspace-1", "task-1", "execution-1",
+    )).resolves.toBeNull();
+    await expect(new TaskContextService(root).getTaskContext("task-1")).resolves.not.toBeNull();
+  });
+
+  it("fails closed without a valid Workspace scope or with damaged Execution metadata", async () => {
+    const root = await storageRoot();
+    await seedExecution(root, {
+      workspaceId: "workspace-1", taskId: "task-1", executionId: "execution-1", status: "passed",
+    });
+    const query = queryFor(root, []);
+    await expect(query.clearExecutionRecords()).rejects.toThrow("Workspace scope is required");
+    await expect(query.clearExecutionRecords("../workspace-1")).rejects.toThrow("Workspace scope is required");
+    await writeFile(join(taskExecutionsDirectory(root, "workspace-1", "task-1"), "execution-broken.json"), "{ not json", "utf8");
+    await expect(query.clearExecutionRecords("workspace-1")).resolves.toEqual({
+      deleted_executions: 0, deleted_sessions: 0, deleted_events: 0, deleted_tasks: 0,
+    });
+    await expect(new ExecutionContextService(root).getExecutionContext(
+      "workspace-1", "task-1", "execution-1",
+    )).resolves.toMatchObject({ status: "passed" });
+  });
+
   it("lists a batch Execution that owns no Session", async () => {
     const root = await storageRoot();
     const goal = plannedGoal({
@@ -462,7 +509,7 @@ describe("Launcher Execution catalog", () => {
     ]);
   });
 
-  it("clears a terminal interactive Execution, Session, and its Events", async () => {
+  it.each(["passed", "failed", "terminated"] as const)("clears a %s interactive Execution, Session, and its Events", async (status) => {
     const root = await storageRoot();
     const goal = plannedGoal({
       goalId: "goal-terminal-interactive",
@@ -475,7 +522,7 @@ describe("Launcher Execution catalog", () => {
       workspaceId: "workspace-1",
       taskId: "task-terminal-interactive",
       executionId: "execution-terminal-interactive",
-      status: "passed",
+      status,
     });
     await seedSession(root, {
       sessionId: "session-terminal-interactive",

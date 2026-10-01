@@ -34,6 +34,7 @@ export const EXECUTION_STATUSES = [
   "running",
   "passed",
   "failed",
+  "terminated",
 ] as const;
 
 export type ExecutionStatus = typeof EXECUTION_STATUSES[number];

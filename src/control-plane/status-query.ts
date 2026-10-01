@@ -545,7 +545,11 @@ export class StatusQueryService {
     }
   }
 
-  public async clearSessionRecords(workspaceId?: string): Promise<{
+  public async clearSessionRecords(workspaceId?: string) {
+    return this.clearExecutionRecords(workspaceId);
+  }
+
+  public async clearExecutionRecords(workspaceId?: string): Promise<{
     readonly deleted_executions: number;
     readonly deleted_sessions: number;
     readonly deleted_events: number;
@@ -555,8 +559,14 @@ export class StatusQueryService {
       throw new Error("Workspace scope is required to clear persisted task records.");
     }
 
-    const sessions = await this.sessions.listSessions();
-    const terminalExecutions = new Set(["passed", "failed"]);
+    let sessions: readonly Session[] | undefined;
+    try {
+      sessions = await this.sessions.listSessions();
+    } catch {
+      // Unreadable Session metadata must not block Execution cleanup or permit Task deletion.
+      sessions = undefined;
+    }
+    const terminalExecutions = new Set(["passed", "failed", "terminated"]);
     const terminalSessions = new Set(["completed", "failed", "terminated"]);
     const interactiveBackends = new Set(["codex_app_server", "desktop_codex_app"]);
     const sessionsToDelete = new Map<string, {
@@ -575,13 +585,12 @@ export class StatusQueryService {
       } catch {
         continue;
       }
-      const byId = new Map(executions.map((execution) => [execution.execution_id, execution]));
       const terminalIds = new Set(executions
         .filter((execution) => terminalExecutions.has(execution.status))
         .map((execution) => execution.execution_id));
       if (terminalIds.size === 0) continue;
 
-      for (const session of sessions) {
+      for (const session of sessions ?? []) {
         if (session.task_id !== target.task_id
           || !interactiveBackends.has(session.backend_type)
           || !terminalSessions.has(session.status)
@@ -604,7 +613,7 @@ export class StatusQueryService {
         ]);
         if (!relatedIds.some((id) => terminalIds.has(id))) continue;
         // Unknown or running associations keep the whole Session and its event stream intact.
-        if (relatedIds.some((id) => !byId.has(id) || byId.get(id)?.status === "running")) continue;
+        if (relatedIds.some((id) => !terminalIds.has(id))) continue;
         sessionsToDelete.set(session.session_id, {
           session,
           events: sessionEvents,
@@ -612,24 +621,24 @@ export class StatusQueryService {
         });
       }
 
-      for (const [sessionId, candidate] of sessionsToDelete) {
-        if (candidate.workspace_id !== target.workspace_id || candidate.session.task_id !== target.task_id) continue;
-        await rm(eventsFile(this.storageRoot, sessionId), { force: true });
-        await rm(sessionFile(this.storageRoot, sessionId), { force: true });
-        deletedEvents += candidate.events.length;
-      }
       for (const executionId of terminalIds) {
         await rm(executionFile(this.storageRoot, target.workspace_id, target.task_id, executionId), {
           force: true,
         });
         deletedExecutions += 1;
       }
+      for (const [sessionId, candidate] of sessionsToDelete) {
+        if (candidate.workspace_id !== target.workspace_id || candidate.session.task_id !== target.task_id) continue;
+        await rm(sessionFile(this.storageRoot, sessionId), { force: true });
+        await rm(eventsFile(this.storageRoot, sessionId), { force: true });
+        deletedEvents += candidate.events.length;
+      }
       if (executions.every((execution) => terminalIds.has(execution.execution_id))) {
         emptyTaskTargets.push(target);
       }
     }
 
-    const remainingSessions = new Set(sessions
+    const remainingSessions = new Set((sessions ?? [])
       .filter((session) => !sessionsToDelete.has(session.session_id))
       .map((session) => session.task_id));
     let taskContexts: Awaited<ReturnType<TaskReader["listTaskContexts"]>> | undefined;
@@ -646,7 +655,7 @@ export class StatusQueryService {
     }
     let deletedTasks = 0;
     for (const target of emptyTaskTargets) {
-      if (remainingSessions.has(target.task_id) || goalsForCleanup === undefined
+      if (sessions === undefined || remainingSessions.has(target.task_id) || goalsForCleanup === undefined
         || goalsForCleanup.some((goal) => goal.status !== "completed" && goal.status !== "failed"
           && goal.phases.some((phase) => phase.tasks.some((task) => task.task_id === target.task_id)))) continue;
       try {
