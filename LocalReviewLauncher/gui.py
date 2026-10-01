@@ -1751,17 +1751,17 @@ class LauncherWindow(QMainWindow):
         self.timer.stop()
         self.capability_countdown_timer.stop()
         self.startup_timer.stop()
-        if self.process_manager.has_started:
-            try:
-                self.process_manager.stop()
-            except RuntimeError:
-                pass
+        try:
+            self.process_manager.stop()
+        except RuntimeError:
+            pass
         if self.tray_icon is not None:
             self.tray_icon.hide()
             self.tray_icon.setContextMenu(None)
             self.tray_icon.deleteLater()
             self.tray_icon = None
         event.accept()
+        QApplication.quit()
 
     def _show_error(self, message: str) -> None:
         self.message_label.setText(message)
