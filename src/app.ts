@@ -24,10 +24,7 @@ import { AutoIterationService } from "./control-plane/auto-iteration.js";
 import { GoalPreflightService } from "./control-plane/goal-preflight.js";
 import { GoalOrchestrationService } from "./control-plane/goal-orchestration.js";
 import { GoalSubmissionService } from "./control-plane/goal-submission.js";
-import {
-  PendingGoalSubmissionService,
-  type PendingGoalSubmission,
-} from "./control-plane/pending-goal-submission.js";
+import { PendingGoalSubmissionService } from "./control-plane/pending-goal-submission.js";
 import { ExecutionRoutingService } from "./control-plane/execution-routing.js";
 import {
   CliExecutionBackend,
@@ -78,37 +75,6 @@ import {
 import { CapabilityTimeline } from "./control-plane/capability-timeline.js";
 import { DoctorRunner } from "./diagnostic/doctor.js";
 
-// Extension Evidence reaches the Bridge as soon as the submit_goal reply is read, which can be
-// sub-second earlier than the Control Plane records the Pending Goal submission. Rendezvous with
-// that Pending for a bounded window instead of dropping the first Evidence; the wait is only a
-// lookup window and never creates correlation authority by itself.
-const EVIDENCE_PENDING_GRACE_MS = 2_000;
-const EVIDENCE_PENDING_POLL_MS = 50;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolveSleep) => {
-    const timer = setTimeout(resolveSleep, ms);
-    timer.unref?.();
-  });
-}
-
-async function awaitPendingGoalSubmission(
-  get: ((correlationKey: string) => Promise<PendingGoalSubmission | null>) | undefined,
-  correlationKey: string,
-  graceMs = EVIDENCE_PENDING_GRACE_MS,
-  pollMs = EVIDENCE_PENDING_POLL_MS,
-): Promise<PendingGoalSubmission | null> {
-  if (get === undefined) return null;
-  const deadline = Date.now() + Math.max(0, graceMs);
-  for (;;) {
-    const pending = await get(correlationKey).catch(() => null);
-    if (pending !== null) return pending;
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) return null;
-    await sleep(Math.min(pollMs, remainingMs));
-  }
-}
-
 export interface AppContext extends McpRuntimeContext {
   readonly storageRoot?: string;
   readonly settings: ResolvedSettings;
@@ -139,9 +105,6 @@ export interface AppContext extends McpRuntimeContext {
 export interface AppStartOptions extends HttpServerOptions {
   readonly bridgePorts?: readonly number[];
   readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => void | Promise<void>;
-  /** Bounded wait for the Pending Goal submission that authorizes identity Evidence. */
-  readonly evidencePendingGraceMs?: number;
-  readonly evidencePendingPollMs?: number;
   readonly openDesktopThread?: (url: string) => Promise<void>;
   readonly runtimeDiagnosticLogger?: RuntimeDiagnosticLogger;
   readonly desktopSyncObserver?: Pick<DesktopIPCObserver, "start" | "stop" | "dispose" | "getState">
@@ -478,43 +441,11 @@ export async function startApp(
             correlation_key: evidence.request_id,
             conversation_id: evidence.conversation_id,
           });
-          // Evidence routinely beats the Pending record by a fraction of a second; wait inside a
-          // bounded grace window, then stay fail-closed if no matching Pending ever appears. The
-          // window stays below the Extension's 3s Bridge request timeout, so a slow rendezvous
-          // still ends in the same single 202 the Extension already treats as sent.
           const pendingService = context.pendingGoalSubmission;
-          const pending = await awaitPendingGoalSubmission(
-            pendingService === undefined ? undefined : (key) => pendingService.get(key),
-            evidence.request_id,
-            options.evidencePendingGraceMs,
-            options.evidencePendingPollMs,
-          );
-          if (pending === null) {
-            await options.onIdentityEvidence?.(evidence);
-            return;
-          }
-          context.identityTrace?.record({
-            event: "extension_evidence_received",
-            correlation_key: evidence.request_id,
-            conversation_id: evidence.conversation_id,
-            workspace_id: pending.workspace_id,
-          });
-          const previous = context.correlations.correlation(evidence.request_id);
-          const result = await context.correlations.observe(evidence);
-          if (result === "refused") {
-            context.identityTrace?.record({
-              event: "evidence_match_failed",
-              correlation_key: evidence.request_id,
-              conversation_id: evidence.conversation_id,
-              workspace_id: pending.workspace_id,
-              reason: "conversation_mismatch",
-              ...(previous === null ? {} : { expected_conversation_id: previous.conversation_id }),
-            });
-          }
-          void context.pendingGoalSubmission?.diagnoseEvidence(evidence, pending.workspace_id)
-            .catch(() => undefined);
-          if (result !== "refused") context.pendingGoalSubmission?.scheduleResolve(evidence.request_id);
+          if (pendingService === undefined) throw new Error("identity evidence state unavailable");
+          const ack = await pendingService.receiveIdentityEvidence(evidence);
           await options.onIdentityEvidence?.(evidence);
+          return ack;
         },
         claimExtensionDelivery: async (claim) => {
           if (!deliveryAvailable) throw new ExtensionDeliveryUnavailableError("extension delivery unavailable");

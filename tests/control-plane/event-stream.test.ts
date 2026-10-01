@@ -653,6 +653,9 @@ describe("Codex Event Adapter and LRM event stream", () => {
       task_id: terminal.task_id,
       process_id: 9_001,
     });
+    await executions.updateExecutionContext("workspace-1", terminal.task_id, "execution-terminal", {
+      status: "passed",
+    });
     const events = new EventStore(root);
     await events.appendEvent({
       session_id: terminal.session_id,
@@ -667,10 +670,12 @@ describe("Codex Event Adapter and LRM event stream", () => {
       sessions,
       goals: {
         getGoal: async (goalId) => ({ goal_id: goalId, workspace_id: "workspace-1" } as GoalOrchestration),
+        listGoals: async () => [],
       },
     });
 
     await expect(query.clearSessionRecords("workspace-1")).resolves.toEqual({
+      deleted_executions: 1,
       deleted_sessions: 1,
       deleted_events: 1,
       deleted_tasks: 1,
@@ -686,7 +691,7 @@ describe("Codex Event Adapter and LRM event stream", () => {
     await expect(events.listEvents(terminal.session_id)).resolves.toEqual([]);
   });
 
-  it("clears Sessions whose Execution already failed and keeps running ones", async () => {
+  it("clears terminal Executions but retains running Sessions and Executions", async () => {
     const root = await mkdtemp(join(tmpdir(), "local-review-mcp-stale-cleanup-"));
     temporaryDirectories.push(root);
     const sessions = new SessionStore(root);
@@ -779,18 +784,20 @@ describe("Codex Event Adapter and LRM event stream", () => {
       sessions,
       goals: {
         getGoal: async (goalId) => ({ goal_id: goalId, workspace_id: "workspace-1" } as GoalOrchestration),
+        listGoals: async () => [],
       },
     });
 
     await expect(query.clearSessionRecords("workspace-1")).resolves.toEqual({
-      deleted_sessions: 2,
-      deleted_events: 2,
-      deleted_tasks: 2,
+      deleted_executions: 1,
+      deleted_sessions: 0,
+      deleted_events: 0,
+      deleted_tasks: 0,
     });
-    await expect(sessions.getSession(stale.session_id)).resolves.toBeNull();
-    await expect(sessions.getSession(failed.session_id)).resolves.toBeNull();
-    await expect(events.listEvents(stale.session_id)).resolves.toEqual([]);
-    await expect(tasks.getTaskContext(stale.task_id)).resolves.toBeNull();
+    await expect(sessions.getSession(stale.session_id)).resolves.toMatchObject({ status: "running_turn" });
+    await expect(sessions.getSession(failed.session_id)).resolves.toMatchObject({ status: "failed" });
+    await expect(events.listEvents(stale.session_id)).resolves.toHaveLength(1);
+    await expect(tasks.getTaskContext(stale.task_id)).resolves.toMatchObject({ task_id: stale.task_id });
     await expect(executions.getExecutionContext(
       "workspace-1",
       stale.task_id,
@@ -798,6 +805,11 @@ describe("Codex Event Adapter and LRM event stream", () => {
     )).resolves.toBeNull();
 
     await expect(sessions.getSession(live.session_id)).resolves.toMatchObject({ status: "running_turn" });
+    await expect(executions.getExecutionContext(
+      "workspace-1",
+      failed.task_id,
+      "execution-failed",
+    )).resolves.toMatchObject({ status: "running" });
     await expect(tasks.getTaskContext(live.task_id)).resolves.toMatchObject({ task_id: live.task_id });
     await expect(executions.getExecutionContext(
       "workspace-1",
@@ -871,15 +883,18 @@ describe("Codex Event Adapter and LRM event stream", () => {
       sessions,
       goals: {
         getGoal: async (goalId) => ({ goal_id: goalId, workspace_id: "workspace-1" } as GoalOrchestration),
+        listGoals: async () => [],
       },
     });
 
     await expect(query.clearSessionRecords("workspace-1")).resolves.toEqual({
-      deleted_sessions: 1,
-      deleted_events: 1,
+      deleted_executions: 1,
+      deleted_sessions: 0,
+      deleted_events: 0,
       deleted_tasks: 0,
     });
-    await expect(sessions.getSession(stale.session_id)).resolves.toBeNull();
+    await expect(sessions.getSession(stale.session_id)).resolves.toMatchObject({ status: "running_turn" });
+    await expect(events.listEvents(stale.session_id)).resolves.toHaveLength(1);
     await expect(sessions.getSession(live.session_id)).resolves.toMatchObject({ status: "active" });
     await expect(tasks.getTaskContext(live.task_id)).resolves.toMatchObject({ task_id: live.task_id });
     await expect(executions.getExecutionContext(

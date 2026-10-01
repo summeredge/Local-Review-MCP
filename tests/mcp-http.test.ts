@@ -6,7 +6,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bridgePort, extensionDeliveryReadiness, EXTENSION_PRESENCE_TIMEOUT_MS, startBridge, stopBridge } from "../src/control-plane/bridge.js";
 import { startApp } from "../src/app.js";
-import { createHttpServer, LAUNCHER_DOCTOR_PATH } from "../src/mcp/http.js";
+import { ExecutionContextService } from "../src/context/execution-service.js";
+import { TaskContextService } from "../src/context/service.js";
+import {
+  createHttpServer,
+  LAUNCHER_DOCTOR_PATH,
+  LAUNCHER_EXECUTION_CATALOG_PATH,
+} from "../src/mcp/http.js";
 import { inboundRequestId } from "../src/mcp/inbound.js";
 import { StatusQueryService } from "../src/control-plane/status-query.js";
 import type { DesktopSyncState } from "../src/desktop-sync/desktop-sync-state.js";
@@ -96,6 +102,32 @@ describe("MCP HTTP runtime", () => {
       name: "Catalog Workspace",
       path: workspace,
     }]);
+    const tasks = new TaskContextService(workspace);
+    const executions = new ExecutionContextService(workspace);
+    await tasks.createTaskContext({
+      task_id: "task-cleanup",
+      workspace_id: "catalog-workspace",
+    });
+    await executions.createExecutionContext({
+      execution_id: "execution-cleanup",
+      task_id: "task-cleanup",
+      workspace_id: "catalog-workspace",
+    });
+    await executions.updateExecutionContext("catalog-workspace", "task-cleanup", "execution-cleanup", {
+      status: "passed",
+    });
+    await tasks.createTaskContext({
+      task_id: "task-other-workspace",
+      workspace_id: "other-workspace",
+    });
+    await executions.createExecutionContext({
+      execution_id: "execution-other-workspace",
+      task_id: "task-other-workspace",
+      workspace_id: "other-workspace",
+    });
+    await executions.updateExecutionContext(
+      "other-workspace", "task-other-workspace", "execution-other-workspace", { status: "failed" },
+    );
     const server = createHttpServer({
       host: "127.0.0.1",
       port: 0,
@@ -105,7 +137,10 @@ describe("MCP HTTP runtime", () => {
       supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
     }, {
       registry,
-      statusQuery: new StatusQueryService({ storageRoot: workspace }),
+      statusQuery: new StatusQueryService({
+        storageRoot: workspace,
+        goals: { getGoal: async () => null, listGoals: async () => [] },
+      }),
       browserReadiness: extensionDeliveryReadiness,
     });
     runningServers.push(server);
@@ -161,9 +196,76 @@ describe("MCP HTTP runtime", () => {
     expect(cleanup.status).toBe(200);
     await expect(cleanup.json()).resolves.toEqual({
       deleted: true,
+      deleted_executions: 1,
       deleted_sessions: 0,
       deleted_events: 0,
-      deleted_tasks: 0,
+      deleted_tasks: 1,
+    });
+    const dashboard = await fetch(`http://127.0.0.1:${port}${LAUNCHER_EXECUTION_CATALOG_PATH}`, {
+      headers: { authorization: "Bearer test-token" },
+    });
+    await expect(dashboard.json()).resolves.toEqual({ executions: [] });
+    await expect(executions.getExecutionContext(
+      "other-workspace", "task-other-workspace", "execution-other-workspace",
+    )).resolves.toMatchObject({ status: "failed" });
+  });
+
+  it("serves the authenticated loopback launcher Execution catalog inside the Workspace scope", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-launcher-executions-"));
+    temporaryDirectories.push(workspace);
+    const registry = new WorkspaceRegistry([{
+      id: "catalog-workspace",
+      name: "Catalog Workspace",
+      path: workspace,
+    }]);
+    const executions = new ExecutionContextService(workspace);
+    await executions.createExecutionContext({
+      execution_id: "execution-1",
+      task_id: "task-1",
+      workspace_id: "catalog-workspace",
+      command: "codex exec --json -",
+    });
+    // A stale record from a workspace this runtime does not serve must stay out of the catalog.
+    await executions.createExecutionContext({
+      execution_id: "execution-2",
+      task_id: "task-2",
+      workspace_id: "unregistered-workspace",
+    });
+    const server = createHttpServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      auth: { token: "test-token" },
+      remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
+    }, {
+      registry,
+      statusQuery: new StatusQueryService({ storageRoot: workspace }),
+    });
+    runningServers.push(server);
+    const port = await listen(server);
+    const url = `http://127.0.0.1:${port}${LAUNCHER_EXECUTION_CATALOG_PATH}`;
+    const headers = { authorization: "Bearer test-token" };
+
+    expect((await fetch(url)).status).toBe(401);
+    expect((await fetch(url, { method: "POST", headers })).status).toBe(405);
+    expect((await fetch(url, { headers: { ...headers, "x-forwarded-for": "127.0.0.1" } })).status).toBe(404);
+    expect((await fetch(url, { headers: { ...headers, "cf-connecting-ip": "127.0.0.1" } })).status).toBe(404);
+
+    const response = await fetch(url, { headers });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const catalog = await response.json() as { executions: Array<Record<string, unknown>> };
+    expect(catalog.executions.map((execution) => execution.execution_id)).toEqual(["execution-1"]);
+    expect(catalog.executions[0]).toEqual({
+      execution_id: "execution-1",
+      workspace_id: "catalog-workspace",
+      task_id: "task-1",
+      name: "task-1",
+      task_name: "task-1",
+      status: "running",
+      started_at: expect.any(String),
+      updated_at: expect.any(String),
     });
   });
 

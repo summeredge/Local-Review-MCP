@@ -510,6 +510,78 @@
     });
   }
 
+  const EVIDENCE_TTL_MS = 5 * 60 * 1000;
+  const EVIDENCE_RETRY_ALARM = 'identity-evidence-retry';
+  let evidenceQueue = Promise.resolve();
+
+  function serialEvidence(task) {
+    const work = evidenceQueue.then(task, task);
+    evidenceQueue = work.catch(() => undefined);
+    return work;
+  }
+
+  async function readEvidenceOutbox() {
+    const stored = await chrome.storage.local.get(['identityEvidenceOutbox']);
+    const entries = Object.prototype.hasOwnProperty.call(stored, 'identityEvidenceOutbox')
+      ? stored.identityEvidenceOutbox : [];
+    const valid = validStoredDeliveryEntries(entries, (entry) => entry
+      && Object.keys(entry).length === 6
+      && evidenceFromMessage(entry, entry.document_id, entry.navigation_epoch)
+      && requestedEpoch(entry) !== null
+      && Number.isSafeInteger(entry.received_at) && entry.received_at >= 0
+      && Number.isSafeInteger(entry.expires_at)
+      && entry.expires_at - entry.received_at === EVIDENCE_TTL_MS, 1000, 'request_id');
+    if (!valid) throw new Error('identity evidence outbox is corrupt');
+    return entries;
+  }
+
+  async function pruneEvidenceOutbox() {
+    const entries = await readEvidenceOutbox();
+    const current = entries.filter(entry => entry.expires_at > Date.now());
+    if (current.length !== entries.length) await chrome.storage.local.set({ identityEvidenceOutbox: current });
+    return current;
+  }
+
+  function queueEvidence(evidence) {
+    return serialEvidence(async () => {
+      const entries = await pruneEvidenceOutbox();
+      const previous = entries.find(entry => entry.request_id === evidence.request_id);
+      if (previous) {
+        return previous.conversation_id === evidence.conversation_id
+          ? { ok: true } : { ok: false, error: 'identity_evidence_conflict' };
+      }
+      if (entries.length >= 1000) return { ok: false, error: 'identity_evidence_outbox_full' };
+      const now = Date.now();
+      await chrome.storage.local.set({ identityEvidenceOutbox: [...entries,
+        { ...evidence, received_at: now, expires_at: now + EVIDENCE_TTL_MS }] });
+      return { ok: true };
+    });
+  }
+
+  function flushEvidenceOutbox() {
+    return serialEvidence(async () => {
+      let entries = await pruneEvidenceOutbox();
+      let conflict = null;
+      for (const entry of entries.slice()) {
+        if (entry.expires_at <= Date.now()) continue;
+        const { received_at, expires_at, ...evidence } = entry;
+        const delivered = await postEvidence(evidence);
+        if (delivered.status === 409) {
+          conflict = delivered;
+          continue; // Keep conflicting proof until TTL, without blocking unrelated keys.
+        }
+        if (!delivered.ok) return delivered;
+        if (delivered.status !== 202 || delivered.data?.accepted !== true || delivered.data?.durable !== true) {
+          return { ok: false, error: 'identity_evidence_ack_not_durable' };
+        }
+        const remaining = entries.filter(item => item.request_id !== entry.request_id);
+        await chrome.storage.local.set({ identityEvidenceOutbox: remaining });
+        entries = remaining;
+      }
+      return conflict || { ok: true };
+    });
+  }
+
   // Observation-only outbox, independent of identity/delivery state and pairing.
   // ponytail: newest 1000 observations survive an outage; export before a long offline run.
   const DIAGNOSTIC_STAGES = ['scan_started', 'scan_busy', 'document_registered', 'fiber_scanned',
@@ -608,8 +680,10 @@
     if (!authority.ok) return authority;
     const evidence = evidenceFromMessage(message, source.documentId, authority.navigation_epoch);
     if (!evidence) return { ok: false, error: 'invalid_evidence' };
+    const queued = await queueEvidence(evidence);
+    if (!queued.ok) return queued;
     evidenceDiagnostic('bridge_send_attempted', raw, sender);
-    const delivered = await postEvidence(evidence);
+    const delivered = await flushEvidenceOutbox();
     evidenceDiagnostic('bridge_send_finished', raw, sender, { bridge_reply_ok: delivered.ok === true });
     return delivered.ok ? { ok: true, evidence } : delivered;
   }
@@ -986,4 +1060,13 @@
     Promise.resolve(handler(message, sender)).then(sendResponse, () => sendResponse({ ok: false, error: 'internal_error' }));
     return true;
   });
+
+  // Alarms wake an MV3 worker even after the original Fiber/tool call has disappeared.
+  if (chrome.alarms) {
+    chrome.alarms.onAlarm.addListener((alarm) => {
+      if (alarm.name === EVIDENCE_RETRY_ALARM) void flushEvidenceOutbox().catch(() => undefined);
+    });
+    void chrome.alarms.create(EVIDENCE_RETRY_ALARM, { periodInMinutes: 1 });
+    void flushEvidenceOutbox().catch(() => undefined);
+  }
 })();

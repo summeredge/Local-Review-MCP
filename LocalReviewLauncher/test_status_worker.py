@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import unittest
@@ -10,7 +11,10 @@ from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 from unittest.mock import MagicMock, Mock, patch
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 from PySide6.QtCore import QCoreApplication, QThreadPool
+from PySide6.QtWidgets import QApplication
 from status_checker import (
     BrowserReadiness,
     CapabilityStatus,
@@ -19,11 +23,12 @@ from status_checker import (
     DoctorStatus,
     DesktopCapabilityStatus,
     DesktopSyncStatus,
+    ExecutionViewModel,
     StatusQueryError,
     OAuthClientStatus,
     OAuthRegistryStatus,
+    PersistedCleanupResult,
     LauncherStatus,
-    SessionViewModel,
     StatusChecker,
 )
 from status_worker import CapabilityTimelineCheckWorker, StatusCheckScheduler, StatusCheckWorker
@@ -142,7 +147,7 @@ class StatusCheckWorkerTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.application = QCoreApplication.instance() or QCoreApplication([])
+        cls.application = QApplication.instance() or QApplication([])
 
     def test_worker_returns_checker_status_without_lifecycle_calls(self) -> None:
         checker = SimpleNamespace(check=lambda: LauncherStatus(True, True, False))
@@ -200,26 +205,20 @@ class StatusCheckWorkerTests(unittest.TestCase):
 
         self.assertEqual(results, [LauncherStatus(True, True, False, "unavailable", oauth)])
 
-    def test_worker_includes_dashboard_sessions(self) -> None:
-        session = SessionViewModel(
-            "Goal",
-            "Task",
-            "running_turn",
-            "codex_app_server",
-            "gpt-5.6-luna",
-            "max",
-            "session-1",
-            "thread-1",
-            "2026-09-15T12:34:56+08:00",
-            "goal-1",
-            "task-1",
-            None,
-            (),
+    def test_worker_includes_dashboard_executions(self) -> None:
+        execution = ExecutionViewModel(
+            execution_id="execution-1",
+            name="Goal",
+            mode="batch",
+            backend="cli",
+            status="passed",
+            workspace_id="workspace-1",
+            task_id="task-1",
         )
         checker = SimpleNamespace(
             check=lambda: LauncherStatus(True, True, False),
             cloudflared_version=lambda: "unavailable",
-            dashboard_sessions=lambda: (session,),
+            dashboard_executions=lambda: (execution,),
         )
         results: list[LauncherStatus] = []
         worker = StatusCheckWorker(checker)  # type: ignore[arg-type]
@@ -227,7 +226,24 @@ class StatusCheckWorkerTests(unittest.TestCase):
 
         worker.run()
 
-        self.assertEqual(results[0].sessions, (session,))
+        self.assertEqual(results[0].executions, (execution,))
+
+    def test_worker_survives_a_failing_dashboard_query(self) -> None:
+        def explode() -> tuple[ExecutionViewModel, ...]:
+            raise StatusQueryError("Execution catalog unavailable")
+
+        checker = SimpleNamespace(
+            check=lambda: LauncherStatus(True, True, False),
+            cloudflared_version=lambda: "unavailable",
+            dashboard_executions=explode,
+        )
+        results: list[LauncherStatus] = []
+        worker = StatusCheckWorker(checker)  # type: ignore[arg-type]
+        worker.signals.finished.connect(lambda _generation, status: results.append(status))
+
+        worker.run()
+
+        self.assertEqual(results, [LauncherStatus(True, True, False, "unavailable")])
 
     def test_worker_runs_outside_the_gui_thread(self) -> None:
         checker = SimpleNamespace(thread_id=None)
@@ -737,56 +753,173 @@ class StatusCheckerTests(unittest.TestCase):
         self.assertEqual(request.get_method(), "POST")
         self.assertEqual(request.get_header("Authorization"), "Bearer secret")
 
-    def test_dashboard_uses_status_query_tools_for_each_session(self) -> None:
+    def test_dashboard_lists_batch_and_interactive_executions_without_session_filtering(self) -> None:
         timestamp = "2026-09-15T12:34:56+08:00"
-        summary = {
-            "session_id": "session-1",
-            "goal_name": "Goal",
-            "task_name": "Task",
-            "updated_at": timestamp,
-        }
-        session = {
-            "session_id": "session-1",
-            "goal_id": "goal-1",
-            "task_id": "task-1",
-            "backend_type": "codex_app_server",
-            "status": "running_turn",
-            "thread_id": "thread-1",
-            "model": "gpt-5.6-luna",
-            "reasoning_effort": "max",
-            "current_execution": {"execution_id": "execution-1", "status": "running", "turn_id": "turn-1"},
-        }
-        execution = {
-            "execution_id": "execution-1",
+        batch = {
+            "execution_id": "execution-batch",
             "workspace_id": "workspace-1",
-            "task_id": "task-1",
+            "task_id": "task-batch",
+            "goal_id": "goal-batch",
+            "name": "PCA WebUI",
+            "goal_name": "PCA WebUI",
+            "task_name": "Add the chart",
+            "execution_mode": "batch",
+            "backend": "cli",
+            "status": "passed",
+            "started_at": timestamp,
+            "finished_at": timestamp,
+            "summary": "Batch finished",
+        }
+        desktop = {
+            "execution_id": "execution-desktop",
+            "workspace_id": "workspace-1",
+            "task_id": "task-desktop",
+            "goal_id": "goal-desktop",
+            "name": "LRM interactive",
+            "goal_name": "LRM interactive",
+            "task_name": "Tune the dashboard",
+            "execution_mode": "interactive",
+            "backend": "desktop_codex_app",
+            "backend_type": "desktop_codex_app",
             "status": "running",
             "started_at": timestamp,
             "session_id": "session-1",
             "thread_id": "thread-1",
-            "turn_id": "turn-1",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "updated_at": timestamp,
         }
-        events = {"session_id": "session-1", "events": []}
+        app_server = {
+            "execution_id": "execution-app-server",
+            "workspace_id": "workspace-1",
+            "task_id": "task-app-server",
+            "goal_id": "goal-app-server",
+            "name": "AppServer fallback",
+            "goal_name": "AppServer fallback",
+            "task_name": "Retry the turn",
+            "execution_mode": "interactive",
+            "backend": "codex_app_server",
+            "backend_type": "codex_app_server",
+            "status": "failed",
+            "started_at": timestamp,
+            "finished_at": timestamp,
+            "session_id": "session-2",
+            "thread_id": "thread-2",
+            "updated_at": timestamp,
+        }
         checker = StatusChecker(auth_token="secret", workspace_id="workspace-1")
-        calls: list[tuple[str, dict[str, object]]] = []
+        with patch.object(
+            checker, "_execution_catalog", return_value=(batch, desktop, app_server)
+        ), patch.object(
+            checker,
+            "_session_events",
+            side_effect=lambda session_id, thread_id: {"session_id": session_id, "events": []},
+        ) as session_events:
+            result = checker.dashboard_executions()
 
-        def call_tool(name: str, arguments: dict[str, object]) -> dict[str, object]:
-            calls.append((name, arguments))
-            return {"get_session_status": session, "get_execution_status": execution, "list_session_events": events}[name]
+        self.assertEqual(
+            [execution.execution_id for execution in result],
+            ["execution-batch", "execution-desktop", "execution-app-server"],
+        )
+        self.assertEqual([execution.status for execution in result], ["passed", "running", "failed"])
+        self.assertEqual([execution.backend_label for execution in result],
+                         ["CLI Batch", "Desktop", "AppServer"])
+        self.assertEqual([execution.display_mode for execution in result],
+                         ["batch", "interactive", "interactive"])
 
-        with patch.object(checker, "_session_catalog", return_value=(summary,)), patch.object(
-            checker, "_call_tool", side_effect=call_tool
-        ):
-            result = checker.dashboard_sessions()
+        # A batch Execution owns no Session, no Thread, and no event stream.
+        self.assertIsNone(result[0].session)
+        self.assertIsNone(result[0].session_id)
+        self.assertIsNone(result[0].thread_id)
+        self.assertFalse(result[0].can_open_codex_task)
+        self.assertEqual(result[0].events, ())
+        self.assertEqual(result[0].summary, "Batch finished")
+        self.assertEqual(result[0].started_at, timestamp)
+        self.assertEqual(result[0].finished_at, timestamp)
 
-        self.assertEqual([name for name, _arguments in calls], [
-            "get_session_status",
-            "get_execution_status",
-            "list_session_events",
-        ])
-        self.assertTrue(all(arguments["workspace_id"] == "workspace-1" for _name, arguments in calls))
-        self.assertEqual(result[0].session_id, "session-1")
-        self.assertEqual(result[0].execution.started_at, timestamp)
+        # The interactive Session extension is preserved, including model and reasoning.
+        self.assertEqual(result[1].session_id, "session-1")
+        self.assertEqual(result[1].thread_id, "thread-1")
+        self.assertEqual(result[1].session.model, "gpt-5.6-luna")
+        self.assertEqual(result[1].session.reasoning_effort, "max")
+        self.assertEqual(result[1].session.updated_at, timestamp)
+        self.assertTrue(result[1].can_open_codex_task)
+
+        # An AppServer Session is observable but has no locatable Codex Task.
+        self.assertEqual(result[2].backend, "codex_app_server")
+        self.assertFalse(result[2].can_open_codex_task)
+        self.assertEqual(
+            [call.args for call in session_events.call_args_list],
+            [("session-1", "thread-1"), ("session-2", "thread-2")],
+        )
+
+    def test_dashboard_drops_one_damaged_entry_and_keeps_rows_without_events(self) -> None:
+        timestamp = "2026-09-15T12:34:56+08:00"
+        batch = {
+            "execution_id": "execution-batch",
+            "workspace_id": "workspace-1",
+            "task_id": "task-batch",
+            "name": "Batch",
+            "execution_mode": "batch",
+            "backend": "cli",
+            "status": "running",
+            "started_at": timestamp,
+        }
+        damaged = {"execution_id": "execution-damaged", "task_id": "task-damaged"}
+        desktop = {
+            "execution_id": "execution-desktop",
+            "workspace_id": "workspace-1",
+            "task_id": "task-desktop",
+            "name": "Desktop",
+            "execution_mode": "interactive",
+            "backend": "desktop_codex_app",
+            "backend_type": "desktop_codex_app",
+            "status": "running",
+            "started_at": timestamp,
+            "session_id": "session-1",
+            "thread_id": "thread-1",
+        }
+        checker = StatusChecker()
+        with patch.object(
+            checker, "_execution_catalog", return_value=(damaged, batch, desktop)
+        ), patch.object(checker, "_session_events", side_effect=StatusQueryError("events unavailable")):
+            result = checker.dashboard_executions()
+
+        self.assertEqual(
+            [execution.execution_id for execution in result],
+            ["execution-batch", "execution-desktop"],
+        )
+        # An unreadable event stream leaves the interactive row intact, without events.
+        self.assertEqual(result[1].session_id, "session-1")
+        self.assertEqual(result[1].events, ())
+
+    def test_dashboard_keeps_unknown_mode_and_backend_visible_as_placeholders(self) -> None:
+        checker = StatusChecker()
+        orphan = {
+            "execution_id": "execution-orphan",
+            "workspace_id": "workspace-1",
+            "task_id": "task-orphan",
+            "name": "task-orphan",
+            "task_name": "task-orphan",
+            "status": "running",
+            "started_at": "2026-09-15T12:34:56+08:00",
+        }
+        with patch.object(checker, "_execution_catalog", return_value=(orphan,)):
+            result = checker.dashboard_executions()
+
+        self.assertEqual(result[0].display_mode, "—")
+        self.assertEqual(result[0].backend_label, "—")
+        self.assertIsNone(result[0].goal_id)
+        self.assertIsNone(result[0].session)
+
+    def test_execution_catalog_reads_the_authenticated_launcher_endpoint(self) -> None:
+        checker = StatusChecker(auth_token="secret", execution_catalog_url="http://127.0.0.1:9/executions")
+        document = {"executions": [None, {"execution_id": "execution-1"}]}
+        with patch.object(checker, "_request_json", return_value=document) as request:
+            result = checker._execution_catalog()
+
+        request.assert_called_once_with("http://127.0.0.1:9/executions")
+        self.assertEqual(result, ({"execution_id": "execution-1"},))
 
     def test_oauth_status_reads_registry_metadata(self) -> None:
         payload = {
@@ -827,15 +960,19 @@ class StatusCheckerTests(unittest.TestCase):
         response = MagicMock()
         response.read.return_value = json.dumps({
             "deleted": True,
+            "deleted_executions": 3,
             "deleted_sessions": 2,
-            "deleted_events": 2,
+            "deleted_events": 5,
             "deleted_tasks": 1,
         }).encode("utf-8")
         response.headers.get.return_value = "application/json"
         response.__enter__.return_value = response
         response.__exit__.return_value = None
         with patch("status_checker.urlopen", return_value=response) as open_url:
-            self.assertEqual(StatusChecker(auth_token="secret").clear_persisted_task_records(), 2)
+            self.assertEqual(
+                StatusChecker(auth_token="secret").clear_persisted_task_records(),
+                PersistedCleanupResult(3, 2, 5, 1),
+            )
 
         request = open_url.call_args.args[0]
         self.assertEqual(request.full_url, "http://127.0.0.1:12080/launcher/sessions")

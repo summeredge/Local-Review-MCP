@@ -100,6 +100,59 @@ function preflightFailure(): GoalPreflightResult {
 }
 
 describe("PendingGoalSubmissionService", () => {
+  it("restores ACKed early evidence after runtime restart and starts a later Pending exactly once", async () => {
+    const root = await makeRoot();
+    const submitGoal = vi.fn(async () => result());
+    const first = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    await expect(first.receiveIdentityEvidence(evidence())).resolves.toEqual({ accepted: true, durable: true });
+    const correlations = new ConversationCorrelationRegistry(root);
+    const restarted = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    await restarted.recover();
+    expect(correlations.correlation(CORRELATION_A)).toBeNull();
+    await restarted.accept(input());
+    await waitFor(async () => (await restarted.get(CORRELATION_A))?.state === "started");
+    await Promise.all(Array.from({ length: 5 }, () => restarted.receiveIdentityEvidence(evidence())));
+    await restarted.resolve(CORRELATION_A);
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+    await expect(restarted.receiveIdentityEvidence({ ...evidence(), conversation_id: "conversation-b" }))
+      .rejects.toThrow("different conversation");
+    expect(correlations.correlation(CORRELATION_A)?.conversation_id).toBe("conversation-a");
+  });
+
+  it("recovers an existing Pending when the runtime stopped after Inbox save and before correlation observation", async () => {
+    const root = await makeRoot();
+    const submitGoal = vi.fn(async () => result());
+    const first = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    await first.accept(input());
+    await first.evidenceInbox.put(evidence());
+    const restored = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    await restored.recover();
+    await waitFor(async () => (await restored.get(CORRELATION_A))?.state === "started");
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+    const again = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    await again.recover();
+    await again.receiveIdentityEvidence(evidence());
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed for conflicting early evidence and never consumes expired Inbox entries", async () => {
+    const root = await makeRoot();
+    let now = Date.now();
+    const submitGoal = vi.fn(async () => result());
+    const correlations = new ConversationCorrelationRegistry(root);
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root, now: () => now });
+    await pending.receiveIdentityEvidence(evidence());
+    await expect(pending.receiveIdentityEvidence({ ...evidence(), conversation_id: "conversation-b" }))
+      .rejects.toThrow("different conversation");
+    now += 5 * 60 * 1000;
+    await pending.accept(input());
+    expect(correlations.correlation(CORRELATION_A)).toBeNull();
+    expect(submitGoal).not.toHaveBeenCalled();
+    now += PENDING_GOAL_SUBMISSION_TTL_MS;
+    await pending.expire(CORRELATION_A);
+    expect(await pending.get(CORRELATION_A)).toMatchObject({ state: "failed", error: "pending_identity_expired" });
+  });
+
   it("rejects an unavailable Browser channel before any pending side effect", async () => {
     vi.mocked(bridge.extensionDeliveryReadiness).mockRestore();
     const root = await makeRoot();

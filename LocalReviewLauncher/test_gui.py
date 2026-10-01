@@ -29,9 +29,11 @@ from PySide6.QtWidgets import (
 
 from config_manager import LauncherConfig
 from gui import (
+    BATCH_EVENT_EMPTY_TEXT,
     BUTTON_HEIGHT,
     BUTTON_WIDTH,
     DESKTOP_DOWN_FALLBACK_CAPABILITY_TEXT,
+    EXECUTION_DASHBOARD_COLUMNS,
     LauncherState,
     LauncherWindow,
 )
@@ -43,13 +45,15 @@ from status_checker import (
     DoctorCheckStatus,
     DoctorStatus,
     DesktopSyncStatus,
+    ExecutionViewModel,
     LauncherStatus,
     OAuthClientStatus,
     OAuthRegistryStatus,
+    PersistedCleanupResult,
     SessionViewModel,
     StatusChecker,
     StatusQueryError,
-    build_session_view_model,
+    build_execution_view_model,
 )
 
 
@@ -620,10 +624,10 @@ class LauncherLogTests(unittest.TestCase):
         self.assertTrue(window.session_viewer_content.isHidden())
         self.assertEqual(window.event_table.minimumHeight(), 270)
         self.assertLessEqual(
-            window.session_table.maximumHeight(),
-            window.session_table.horizontalHeader().sizeHint().height()
-            + window.session_table.verticalHeader().defaultSectionSize() * 5
-            + 2 * window.session_table.frameWidth(),
+            window.execution_table.maximumHeight(),
+            window.execution_table.horizontalHeader().sizeHint().height()
+            + window.execution_table.verticalHeader().defaultSectionSize() * 5
+            + 2 * window.execution_table.frameWidth(),
         )
 
         window.event_table.setRowCount(1)
@@ -635,11 +639,16 @@ class LauncherLogTests(unittest.TestCase):
     def test_clear_task_cache_hides_terminal_records_but_keeps_active_tasks_visible(self) -> None:
         manager = Mock()
         manager.load.return_value = LauncherConfig("", "config.production.json", False)
-        session = SessionViewModel(
-            "Goal", "Task", "completed", "codex_app_server", "model", "max",
-            "session-1", "thread-1", "2026-09-18T12:00:00+08:00", "goal-1", "task-1", None, (),
+        execution = ExecutionViewModel(
+            execution_id="execution-1",
+            name="Goal",
+            mode="batch",
+            backend="cli",
+            status="passed",
+            workspace_id="workspace-1",
+            task_id="task-1",
         )
-        status = LauncherStatus(True, True, True, sessions=(session,))
+        status = LauncherStatus(True, True, True, executions=(execution,))
         with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
             LauncherWindow, "_request_status_check"
         ), patch.object(LauncherWindow, "_render_runtime_info"):
@@ -648,29 +657,54 @@ class LauncherLogTests(unittest.TestCase):
             self.addCleanup(window.close)
 
         window._render_status(status)
-        self.assertEqual(window.session_table.rowCount(), 1)
+        self.assertEqual(window.execution_table.rowCount(), 1)
         window.clear_task_cache()
         window._render_status(status)
-        self.assertEqual(window.session_table.rowCount(), 0)
-        self.assertEqual(window._cleared_session_keys, {("session-1", None)})
+        self.assertEqual(window.execution_table.rowCount(), 0)
+        self.assertEqual(window._cleared_execution_ids, {"execution-1"})
 
-        active_session = replace(session, status="running_turn")
-        new_session = replace(active_session, session_id="session-2", task_id="task-2")
-        status_with_active_sessions = LauncherStatus(True, True, True, sessions=(active_session, new_session))
+        active_execution = replace(execution, status="running")
+        new_execution = replace(active_execution, execution_id="execution-2", task_id="task-2")
+        status_with_active = LauncherStatus(
+            True, True, True, executions=(active_execution, new_execution)
+        )
 
         with patch.object(window, "_request_status_check"), patch.object(window, "_render_runtime_info"):
             window._refresh_status_automatically()
-        window._render_status(status_with_active_sessions)
-        self.assertEqual(window.session_table.rowCount(), 2)
-        self.assertEqual(
-            [window.session_table.item(row, 5).text() for row in range(2)],
-            ["session-1", "session-2"],
-        )
+        window._render_status(status_with_active)
+        self.assertEqual(window.execution_table.rowCount(), 2)
 
         with patch.object(window, "_request_status_check"), patch.object(window, "_render_runtime_info"):
             window.refresh_button.click()
         window._render_status(status)
-        self.assertEqual(window.session_table.rowCount(), 1)
+        self.assertEqual(window.execution_table.rowCount(), 1)
+
+    def test_persisted_cleanup_reports_actual_record_counts(self) -> None:
+        manager = Mock()
+        manager.load.return_value = LauncherConfig("", "config.production.json", False)
+        checker = Mock()
+        checker.clear_persisted_task_records.return_value = PersistedCleanupResult(2, 1, 3, 1)
+        with patch("gui.ProductionProcessManager") as process, patch(
+            "gui.StatusChecker", return_value=checker
+        ), patch.object(LauncherWindow, "_request_status_check"), patch.object(
+            LauncherWindow, "_render_runtime_info"
+        ):
+            process.return_value.has_started = False
+            window = LauncherWindow(Path.cwd(), manager)
+            self.addCleanup(window.close)
+
+        window._last_status = LauncherStatus(True, True, True)
+        with patch(
+            "gui.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ), patch.object(window, "refresh_status"):
+            window.clear_persisted_task_records()
+
+        checker.clear_persisted_task_records.assert_called_once_with()
+        self.assertEqual(
+            window.message_label.text(),
+            "已清理 Execution 2 条、Session 1 条、Event 3 条、Task 1 条。",
+        )
 
     def test_clear_log_only_clears_display(self) -> None:
         window = self._window()
@@ -907,6 +941,7 @@ class LauncherLayoutAcceptanceTests(unittest.TestCase):
         texts = self._label_texts(window)
         self.assertIn("当前查询工作区：", texts)
         self.assertIn("线程信息", texts)
+        self.assertIn("Execution Dashboard", texts)
         self.assertIn("维护", texts)
         self.assertNotIn("会话所属工作区：", texts)
         self.assertNotIn("打开 Codex 任务", self._button_texts(window))
@@ -914,15 +949,52 @@ class LauncherLayoutAcceptanceTests(unittest.TestCase):
 
     def test_thread_info_dialog_shows_ids_only(self) -> None:
         window = self._window()
-        session = SimpleNamespace(session_id="session-1", thread_id="thread-1")
+        execution = ExecutionViewModel(
+            execution_id="execution-1",
+            name="Goal",
+            mode="interactive",
+            backend="desktop_codex_app",
+            status="running",
+            workspace_id="workspace-1",
+            task_id="task-1",
+            session=SessionViewModel(
+                session_id="session-1",
+                thread_id="thread-1",
+                backend_type="desktop_codex_app",
+            ),
+        )
         with patch("gui.QMessageBox.information") as information:
-            window._selected_session = Mock(return_value=session)  # type: ignore[method-assign]
+            window._selected_execution = Mock(return_value=execution)  # type: ignore[method-assign]
             window.open_codex_task()
         title, message = information.call_args.args[1], information.call_args.args[2]
         self.assertEqual(title, "线程信息")
         self.assertIn("线程 ID：thread-1", message)
         self.assertIn("会话 ID：session-1", message)
         self.assertNotIn("Codex Desktop", message)
+
+    def test_thread_info_dialog_stays_closed_without_a_desktop_thread(self) -> None:
+        window = self._window()
+        app_server = ExecutionViewModel(
+            execution_id="execution-2",
+            name="Goal",
+            mode="interactive",
+            backend="codex_app_server",
+            status="running",
+            workspace_id="workspace-1",
+            task_id="task-2",
+            session=SessionViewModel(
+                session_id="session-2",
+                thread_id="thread-2",
+                backend_type="codex_app_server",
+            ),
+        )
+        for execution in (None, app_server, replace(app_server, session=None)):
+            with self.subTest(execution=execution), patch(
+                "gui.QMessageBox.information"
+            ) as information:
+                window._selected_execution = Mock(return_value=execution)  # type: ignore[method-assign]
+                window.open_codex_task()
+                information.assert_not_called()
 
     def test_runtime_log_section_renamed(self) -> None:
         window = self._window()
@@ -946,44 +1018,62 @@ class LauncherDashboardTests(unittest.TestCase):
     @staticmethod
     def _window():
         window = LauncherWindow.__new__(LauncherWindow)
-        window.session_table = QTableWidget(0, 8)
-        window.session_empty_label = QLabel()
+        window.execution_table = QTableWidget(0, len(EXECUTION_DASHBOARD_COLUMNS))
+        window.execution_empty_label = QLabel("暂无执行记录")
         window.session_details_label = QLabel()
         window.execution_details_label = QLabel()
         window.event_table = QTableWidget(0, 3)
+        window.event_empty_label = QLabel(BATCH_EVENT_EMPTY_TEXT)
         window.open_codex_task_button = QPushButton()
-        window._session_view_models = ()
+        window._execution_view_models = ()
         return window
 
     @staticmethod
-    def _payloads() -> tuple[dict, dict, dict, dict]:
+    def _batch_summary() -> dict:
         timestamp = "2026-09-15T12:34:56+08:00"
-        session = {
-            "session_id": "session-1",
-            "goal_id": "goal-1",
-            "task_id": "task-1",
-            "backend_type": "codex_app_server",
-            "status": "running_turn",
-            "thread_id": "thread-1",
-            "model": "gpt-5.6-luna",
-            "reasoning_effort": "max",
-            "current_execution": {
-                "execution_id": "execution-1",
-                "status": "running",
-                "turn_id": "turn-1",
-            },
+        return {
+            "execution_id": "execution-batch",
+            "workspace_id": "workspace-1",
+            "task_id": "task-batch",
+            "goal_id": "goal-batch",
+            "name": "PCA WebUI",
+            "goal_name": "PCA WebUI",
+            "task_name": "Add the chart",
+            "execution_mode": "batch",
+            "backend": "cli",
+            "status": "passed",
+            "started_at": timestamp,
+            "finished_at": timestamp,
+            "summary": "Batch finished",
         }
-        execution = {
+
+    @staticmethod
+    def _interactive_summary() -> dict:
+        timestamp = "2026-09-15T12:34:56+08:00"
+        return {
             "execution_id": "execution-1",
             "workspace_id": "workspace-1",
             "task_id": "task-1",
+            "goal_id": "goal-1",
+            "name": "DataProject APC Analysis",
+            "goal_name": "DataProject APC Analysis",
+            "task_name": "Analyze APC",
+            "execution_mode": "interactive",
+            "backend": "desktop_codex_app",
+            "backend_type": "desktop_codex_app",
             "status": "running",
             "started_at": timestamp,
             "session_id": "session-1",
             "thread_id": "thread-1",
-            "turn_id": "turn-1",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "updated_at": timestamp,
         }
-        events = {
+
+    @staticmethod
+    def _events() -> dict:
+        timestamp = "2026-09-15T12:34:56+08:00"
+        return {
             "session_id": "session-1",
             "events": [
                 {
@@ -1028,36 +1118,37 @@ class LauncherDashboardTests(unittest.TestCase):
                 },
             ],
         }
-        summary = {
-            "session_id": "session-1",
-            "goal_name": "DataProject APC Analysis",
-            "task_name": "Analyze APC",
-            "updated_at": timestamp,
-        }
-        return session, execution, events, summary
 
-    def test_status_maps_to_dashboard_view_model(self) -> None:
-        session, execution, events, summary = self._payloads()
+    def test_execution_summary_maps_to_the_execution_view_model(self) -> None:
+        view = build_execution_view_model(self._interactive_summary(), self._events())
 
-        view = build_session_view_model(session, execution, events, summary=summary)
-
-        self.assertEqual(view, SessionViewModel(
+        self.assertEqual(view, ExecutionViewModel(
+            execution_id="execution-1",
+            name="DataProject APC Analysis",
+            mode="interactive",
+            backend="desktop_codex_app",
+            status="running",
+            workspace_id="workspace-1",
+            task_id="task-1",
+            goal_id="goal-1",
             goal_name="DataProject APC Analysis",
             task_name="Analyze APC",
-            status="running_turn",
-            backend_type="codex_app_server",
-            model="gpt-5.6-luna",
-            reasoning_effort="max",
-            session_id="session-1",
-            thread_id="thread-1",
-            updated_at="2026-09-15T12:34:56+08:00",
-            goal_id="goal-1",
-            task_id="task-1",
-            execution=view.execution,
+            started_at="2026-09-15T12:34:56+08:00",
+            session=view.session,
             events=view.events,
         ))
-        self.assertEqual(view.execution_id, "execution-1")
-        self.assertEqual(view.current_turn_id, "turn-1")
+        self.assertEqual(view.session, SessionViewModel(
+            session_id="session-1",
+            thread_id="thread-1",
+            backend_type="desktop_codex_app",
+            model="gpt-5.6-luna",
+            reasoning_effort="max",
+            updated_at="2026-09-15T12:34:56+08:00",
+        ))
+        self.assertEqual(view.session_id, "session-1")
+        self.assertEqual(view.thread_id, "thread-1")
+        self.assertEqual(view.backend_label, "Desktop")
+        self.assertTrue(view.can_open_codex_task)
         self.assertEqual([event.event_type for event in view.events], [
             "session_started",
             "turn_started",
@@ -1071,86 +1162,181 @@ class LauncherDashboardTests(unittest.TestCase):
                          datetime.fromisoformat(view.events[2].timestamp).astimezone().strftime("%H:%M:%S"))
 
     def test_dashboard_converts_utc_timestamps_to_local_time(self) -> None:
-        session, execution, events, summary = self._payloads()
         for timestamp in ("2026-09-17T04:34:19Z", "2026-09-17T20:34:19+00:00",
                           "2026-09-17T12:34:19+08:00"):
             with self.subTest(timestamp=timestamp):
                 expected = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone()
                 full_time = expected.strftime("%Y-%m-%d %H:%M:%S")
-                summary["updated_at"] = timestamp
-                execution["started_at"] = execution["finished_at"] = timestamp
-                for event in events["events"]:
-                    event["timestamp"] = timestamp
-                view = build_session_view_model(session, execution, events, summary=summary)
+                summary = {
+                    **self._interactive_summary(),
+                    "started_at": timestamp,
+                    "finished_at": timestamp,
+                    "updated_at": timestamp,
+                }
+                payload = {
+                    "session_id": "session-1",
+                    "events": [
+                        {**event, "timestamp": timestamp} for event in self._events()["events"]
+                    ],
+                }
+                view = build_execution_view_model(summary, payload)
                 window = self._window()
-                LauncherWindow._render_session_dashboard(window, (view,))
-                window.session_table.selectRow(0)
-                LauncherWindow._render_selected_session(window)
-                self.assertEqual(window.session_table.item(0, 7).text(), full_time)
-                self.assertIn(f"更新时间：{full_time}", window.session_details_label.text())
+                LauncherWindow._render_execution_dashboard(window, (view,))
+                window.execution_table.selectRow(0)
+                LauncherWindow._render_selected_execution(window)
+                self.assertEqual(window.execution_table.item(0, 5).text(), full_time)
+                self.assertEqual(window.execution_table.item(0, 6).text(), full_time)
                 self.assertIn(f"开始时间：{full_time}", window.execution_details_label.text())
                 self.assertIn(f"结束时间：{full_time}", window.execution_details_label.text())
+                self.assertIn(f"更新时间：{full_time}", window.session_details_label.text())
                 self.assertEqual(window.event_table.item(0, 0).text(), expected.strftime("%H:%M:%S"))
-                self.assertEqual(view.updated_at, timestamp)
+                self.assertEqual(view.session.updated_at, timestamp)
 
-    def test_execution_summary_matches_status_schema_and_survives_turn_fallback(self) -> None:
-        session, execution, events, summary = self._payloads()
-        execution.pop("turn_id")
+    def test_execution_summary_contract_keeps_the_dash_placeholder(self) -> None:
+        summary = self._interactive_summary()
         for text in ("", "  diagnostic\n", "x" * 4000, "😀" * 2000):
             with self.subTest(text_length=len(text)):
-                view = build_session_view_model(session, {**execution, "summary": text}, events)
-                self.assertEqual(view.execution.summary, text)
-                self.assertEqual(view.execution.turn_id, "turn-1")
+                self.assertEqual(
+                    build_execution_view_model({**summary, "summary": text}).summary, text
+                )
         for invalid in (None, 42, False, [], {}, "x" * 4001, "😀" * 2001):
             with self.subTest(invalid_type=type(invalid)), self.assertRaises(StatusQueryError):
-                build_session_view_model(session, {**execution, "summary": invalid}, events)
-        for payload in (execution, None):
-            view = build_session_view_model(session, payload, events)
-            self.assertIsNone(view.execution.summary)
-            window = self._window()
-            window._render_session_dashboard((view,))
-            window.session_table.selectRow(0)
-            window._render_selected_session()
-            self.assertIn("摘要：—", window.execution_details_label.text())
+                build_execution_view_model({**summary, "summary": invalid})
+        view = build_execution_view_model(summary)
+        self.assertIsNone(view.summary)
+        window = self._window()
+        window._render_execution_dashboard((view,))
+        window.execution_table.selectRow(0)
+        window._render_selected_execution()
+        self.assertIn("摘要：—", window.execution_details_label.text())
 
-    def test_empty_dashboard_shows_no_active_sessions(self) -> None:
+    def test_unknown_mode_and_backend_keep_the_dash_placeholder(self) -> None:
+        view = build_execution_view_model({
+            "execution_id": "execution-orphan",
+            "workspace_id": "workspace-1",
+            "task_id": "task-orphan",
+            "name": "task-orphan",
+            "task_name": "task-orphan",
+            "status": "running",
+            "started_at": "2026-09-15T12:34:56+08:00",
+        })
+
+        self.assertEqual((view.mode, view.display_mode), (None, "—"))
+        self.assertEqual((view.backend, view.backend_label), (None, "—"))
+        self.assertEqual((view.goal_id, view.session), (None, None))
+        self.assertFalse(view.can_open_codex_task)
+
+    def test_thread_locator_requires_a_desktop_interactive_execution(self) -> None:
+        batch_with_session = build_execution_view_model({
+            **self._interactive_summary(),
+            "execution_mode": "batch",
+        })
+
+        self.assertEqual(batch_with_session.backend, "desktop_codex_app")
+        self.assertFalse(batch_with_session.can_open_codex_task)
+
+    def test_empty_dashboard_shows_no_executions(self) -> None:
         window = self._window()
 
-        LauncherWindow._render_session_dashboard(window, ())  # type: ignore[arg-type]
+        LauncherWindow._render_execution_dashboard(window, ())  # type: ignore[arg-type]
 
-        self.assertEqual(window.session_empty_label.text(), "暂无活动会话")
-        self.assertTrue(window.session_empty_label.isVisible())
-        self.assertEqual(window.session_table.rowCount(), 0)
+        self.assertEqual(window.execution_empty_label.text(), "暂无执行记录")
+        self.assertTrue(window.execution_empty_label.isVisible())
+        self.assertEqual(window.execution_table.rowCount(), 0)
         self.assertFalse(window.open_codex_task_button.isEnabled())
+        self.assertFalse(window.event_empty_label.isVisible())
 
-    def test_failed_session_is_visible_with_status_and_event_reason(self) -> None:
-        session, execution, events, summary = self._payloads()
-        session["status"] = "failed"
-        session["current_execution"]["status"] = "failed"
-        execution["status"] = "failed"
-        execution["summary"] = "Events could not be saved. [code=EPERM syscall=rename errno=-4048]"
-        execution["finished_at"] = "2026-09-15T12:35:00+08:00"
-        events["events"][-1] = {
-            **events["events"][-1],
+    def test_failed_execution_is_visible_with_status_and_event_reason(self) -> None:
+        failure = "Events could not be saved. [code=EPERM syscall=rename errno=-4048]"
+        summary = {
+            **self._interactive_summary(),
+            "status": "failed",
+            "finished_at": "2026-09-15T12:35:00+08:00",
+            "summary": failure,
+        }
+        payload = self._events()
+        payload["events"][-1] = {
+            **payload["events"][-1],
             "event_type": "execution_failed",
             "payload": {"reason": "provider failed"},
         }
-        view = build_session_view_model(session, execution, events, summary=summary)
+        view = build_execution_view_model(summary, payload)
         window = self._window()
 
-        LauncherWindow._render_session_dashboard(window, (view,))  # type: ignore[arg-type]
-        window.session_table.selectRow(0)
-        LauncherWindow._render_selected_session(window)  # type: ignore[arg-type]
+        LauncherWindow._render_execution_dashboard(window, (view,))  # type: ignore[arg-type]
+        window.execution_table.selectRow(0)
+        LauncherWindow._render_selected_execution(window)  # type: ignore[arg-type]
 
-        self.assertEqual(window.session_table.item(0, 1).text(), "failed")
-        self.assertEqual(view.execution.summary, execution["summary"])
-        self.assertIn("摘要：" + execution["summary"], window.execution_details_label.text())
+        self.assertEqual(window.execution_table.item(0, 3).text(), "failed")
+        self.assertEqual(view.summary, failure)
+        self.assertIn("摘要：" + failure, window.execution_details_label.text())
         self.assertEqual(window.event_table.item(3, 1).text(), "execution_failed")
         self.assertEqual(window.event_table.item(3, 2).text(), "provider failed")
 
+    def test_batch_row_keeps_open_codex_task_disabled_and_shows_the_empty_event_state(self) -> None:
+        view = build_execution_view_model(self._batch_summary())
+        window = self._window()
+
+        window._render_execution_dashboard((view,))
+        window.execution_table.selectRow(0)
+        window._render_selected_execution()
+
+        self.assertEqual(window.execution_table.item(0, 1).text(), "batch")
+        self.assertEqual(window.execution_table.item(0, 2).text(), "CLI Batch")
+        self.assertEqual(window.execution_table.item(0, 3).text(), "passed")
+        self.assertEqual(window.execution_table.item(0, 4).text(), "workspace-1")
+        self.assertIn("模式：batch", window.execution_details_label.text())
+        self.assertIn("后端：CLI Batch（cli）", window.execution_details_label.text())
+        self.assertIn("摘要：Batch finished", window.execution_details_label.text())
+        self.assertEqual(window.session_details_label.text(), "Session：—\nThread：—")
+        self.assertFalse(window.open_codex_task_button.isEnabled())
+        self.assertEqual(window.event_table.rowCount(), 0)
+        self.assertEqual(window.event_empty_label.text(), "Batch Execution 无 Session 事件流")
+        self.assertTrue(window.event_empty_label.isVisible())
+
+    def test_dashboard_keeps_batch_and_interactive_rows_selectable_in_one_table(self) -> None:
+        batch = build_execution_view_model(self._batch_summary())
+        interactive = build_execution_view_model(self._interactive_summary(), self._events())
+        window = self._window()
+
+        window._render_execution_dashboard((batch, interactive))
+
+        self.assertEqual(window.execution_table.rowCount(), 2)
+        self.assertEqual(
+            [(window.execution_table.item(row, 1).text(),
+              window.execution_table.item(row, 2).text()) for row in range(2)],
+            [("batch", "CLI Batch"), ("interactive", "Desktop")],
+        )
+        self.assertFalse(window.execution_empty_label.isVisible())
+        self.assertFalse(window.open_codex_task_button.isEnabled())
+        self.assertEqual(window.event_table.rowCount(), 0)
+
+        # The interactive row keeps the Session details, the Codex Task locator, and its stream.
+        window.execution_table.selectRow(1)
+        window._render_selected_execution()
+        self.assertEqual(window._selected_execution().execution_id, "execution-1")
+        self.assertEqual(window.session_details_label.text().splitlines(), [
+            "Session：session-1",
+            "Thread：thread-1",
+            "Model：gpt-5.6-luna",
+            "Reasoning：max",
+            "更新时间：" + LauncherWindow._format_timestamp("2026-09-15T12:34:56+08:00"),
+        ])
+        self.assertTrue(window.open_codex_task_button.isEnabled())
+        self.assertFalse(window.event_empty_label.isVisible())
+        self.assertEqual(window.event_table.rowCount(), 4)
+        self.assertIn("模式：interactive", window.execution_details_label.text())
+        self.assertIn("后端：Desktop（desktop_codex_app）", window.execution_details_label.text())
+
+        window.execution_table.selectRow(0)
+        window._render_selected_execution()
+        self.assertEqual(window._selected_execution().execution_id, "execution-batch")
+        self.assertFalse(window.open_codex_task_button.isEnabled())
+        self.assertEqual(window.event_table.rowCount(), 0)
+        self.assertTrue(window.event_empty_label.isVisible())
+
     def test_event_stream_identity_completion_boundaries_and_latest_500(self) -> None:
-        session, execution, events, summary = self._payloads()
-        view = build_session_view_model(session, execution, events, summary=summary)
+        view = build_execution_view_model(self._interactive_summary(), self._events())
         window = self._window()
         raw = tuple(replace(view.events[2], sequence=i + 1, event_type=kind, content=content)
                     for i, (kind, content) in enumerate([
@@ -1202,21 +1388,22 @@ class LauncherDashboardTests(unittest.TestCase):
                 source = tuple(replace(event, sequence=i + 1) for i, event in enumerate(source))
                 snapshot = tuple(replace(event) for event in source)
                 current = replace(view, events=source)
-                window._render_session_dashboard((current,))
-                window.session_table.selectRow(0)
-                window._render_selected_session()
+                window._render_execution_dashboard((current,))
+                window.execution_table.selectRow(0)
+                window._render_selected_execution()
                 self.assertEqual(window.event_table.rowCount(), len(expected))
                 self.assertEqual([(window.event_table.item(i, 1).text(),
                                    window.event_table.item(i, 2).text())
                                   for i in range(len(expected))], expected)
-                window._render_session_dashboard((current,))
+                window._render_execution_dashboard((current,))
                 self.assertEqual(window.event_table.rowCount(), len(expected))
                 self.assertIs(current.events, source)
                 self.assertEqual(current.events, snapshot)
-                self.assertEqual(current.execution, view.execution)
+                self.assertEqual(current.session, view.session)
 
     def test_event_identity_is_required_and_foreign_or_unknown_events_are_rejected(self) -> None:
-        session, execution, payload, summary = self._payloads()
+        summary = self._interactive_summary()
+        payload = self._events()
         delta = payload["events"][2]
         invalid = [{**delta, "event_type": kind} for kind in ("execution_completed", "agent_message_stream", "unknown")]
         invalid.append({**delta, "session_id": "other-session"})
@@ -1225,10 +1412,11 @@ class LauncherDashboardTests(unittest.TestCase):
                 invalid.append({key: value for key, value in {**delta, "event_type": kind}.items() if key != field})
         for event in invalid:
             with self.subTest(event=event), self.assertRaises(StatusQueryError):
-                build_session_view_model(session, execution, {**payload, "events": [event]}, summary=summary)
+                build_execution_view_model(summary, {**payload, "events": [event]})
 
     def test_paginated_text_preserves_whitespace_and_rejects_stalled_or_foreign_pages(self) -> None:
-        session, execution, payload, summary = self._payloads()
+        summary = self._interactive_summary()
+        payload = self._events()
         delta = payload["events"][2]
         pages = [
             {"session_id": "session-1", "has_more": True, "events": [
@@ -1242,14 +1430,14 @@ class LauncherDashboardTests(unittest.TestCase):
         ]
         checker = StatusChecker(workspace_id="workspace-1")
         with patch.object(checker, "_call_tool", side_effect=pages) as query:
-            events = checker._session_events(session)
+            events = checker._session_events("session-1", "thread-1")
         self.assertEqual([call.args[1]["after_sequence"] for call in query.call_args_list], [0, 2])
         self.assertTrue(all(call.args[1]["workspace_id"] == "workspace-1" for call in query.call_args_list))
-        view = build_session_view_model(session, execution, events, summary=summary)
+        view = build_execution_view_model(summary, events)
         window = self._window()
-        window._render_session_dashboard((view,))
-        window.session_table.selectRow(0)
-        window._render_selected_session()
+        window._render_execution_dashboard((view,))
+        window.execution_table.selectRow(0)
+        window._render_selected_execution()
         self.assertEqual(window.event_table.item(0, 2).text(), "Hello world\n")
         self.assertEqual(window.event_table.item(1, 1).text(), "turn_completed")
         self.assertEqual(len(view.events), 4)
@@ -1257,7 +1445,7 @@ class LauncherDashboardTests(unittest.TestCase):
                         {**pages[0], "events": []}):
             with self.subTest(page=invalid), patch.object(checker, "_call_tool", side_effect=[pages[0], invalid]):
                 with self.assertRaises(StatusQueryError):
-                    checker._session_events(session)
+                    checker._session_events("session-1", "thread-1")
 
 
 class SingleInstanceAndTrayTests(unittest.TestCase):

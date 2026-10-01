@@ -1,28 +1,38 @@
-# LocalReviewLauncher Task Dashboard
+# LocalReviewLauncher Execution Dashboard
 
-Phase 5 exposes the existing interactive Session state in the PySide6 launcher.
-It does not submit, stop, resume, approve, or otherwise control a Goal,
-Execution, Codex Thread, or Turn. Task records can be cleared from the
-dedicated task tab; running Sessions are retained.
+The PySide6 launcher shows one row per Execution: batch Executions and
+interactive Executions appear in the same table. It does not submit, stop,
+resume, approve, or otherwise control a Goal, Execution, Codex Thread, or Turn.
+Task records can be cleared from the dedicated task tab; running Sessions are
+retained.
 
 ## Data source
 
-The launcher uses the local MCP runtime's authenticated, loopback-only Session
-catalog endpoint to discover interactive Session IDs. It then reads each
-record through the existing Status Query tools:
+The launcher uses the local MCP runtime's authenticated, loopback-only
+Execution catalog endpoint (`/launcher/executions`) as the dashboard data
+source:
 
 ```text
-get_session_status
+Execution catalog (execution_id, task_id, goal_id, name, execution_mode,
+                   backend, status, started_at, finished_at, summary,
+                   and the optional Session extension)
         |
-get_execution_status
-        |
-list_session_events
+list_session_events          (interactive Executions with a Session only)
 ```
 
+The catalog is built from the durable Execution records, so an Execution is
+listed whether or not it owns a Session. Goal and Session links are optional
+enrichment: a missing or damaged link degrades that one row (the launcher
+renders `—`) and never fails the whole dashboard query. A workspace that is not
+registered on the runtime can never appear in the catalog, and the endpoint
+adds no MCP tool, so the MCP tool list and the existing execution chain remain
+unchanged.
+
 The launcher never reads `.codex`, rollout files, app-server files, provider
-JSON-RPC payloads, or Codex transcripts directly. The catalog endpoint is only
-for discovering IDs and is not an additional MCP tool, so the MCP tool list and
-the existing execution chain remain unchanged.
+JSON-RPC payloads, or Codex transcripts directly. Batch Execution routing and
+interactive routing are untouched: an interactive Execution is created by
+desktop_codex_app or codex_app_server, and a batch Execution is created by the
+CLI backend and creates no Session.
 
 ## Desktop Sync status
 
@@ -99,32 +109,46 @@ items, and preserved failure reasons.
 
 ## Dashboard
 
-The Task Dashboard shows interactive (`codex_app_server`) Sessions with:
+The Execution Dashboard shows one row per Execution with:
 
-- Goal / Task name. The current query contract supplies the stored phase and
-  task labels; their stable `goal_id` and `task_id` are used as fallback.
-- Session status, backend, model, reasoning effort, Session ID, Thread ID, and
-  last update time.
+- Name. The Goal phase objective and the planned Task goal are used when the
+  Goal link resolves; the stable `task_id` and `execution_id` are the fallback.
+- Mode (`interactive` or `batch`) and backend. The mode comes from the persisted
+  Goal `execution_mode`; the backend keeps the internal identity
+  (`desktop_codex_app`, `codex_app_server`, `cli`) and is displayed as Desktop,
+  AppServer, or CLI Batch.
+- Status, Workspace, start time, and finish time. The status is the stored
+  Execution status: Running, Passed, or Failed, colored with the launcher's
+  existing green / amber / red status colors.
 
 The launcher keeps the persisted model and effort. It does not query a model
 catalog or select a provider default. The normal `submit_goal` default remains
-`execution_mode: batch`; batch executions are not shown as interactive
-Sessions.
+`execution_mode: batch`, and a batch Execution is shown as a first-class row
+without creating a Session for it.
 
-When there are no discoverable interactive Sessions, the dashboard shows:
+When no Execution is discoverable, the dashboard shows:
 
 ```text
-No active sessions
+暂无执行记录
 ```
 
-## Session Viewer and events
+## Execution details and events
 
-Select a dashboard row to view the Session and its current Execution:
+Select a dashboard row to view its Execution, and its Session when one exists:
 
 ```text
-Session: session_id, goal_id, task_id, backend_type, thread_id, model,
-         reasoning_effort, status
-Execution: execution_id, status, current turn, started_at, finished_at
+Execution: execution_id, Goal / Task, Workspace, mode, backend, status,
+           started_at, finished_at, summary
+Session:   session_id, thread_id, backend_type, model, reasoning_effort,
+           updated_at
+```
+
+A batch Execution has no Session and no event stream, which is a normal state:
+
+```text
+Session：—
+Thread：—
+Batch Execution 无 Session 事件流
 ```
 
 The Event Stream table displays the normalized events from
@@ -143,17 +167,23 @@ refresh.
 The task tab provides two separate cleanup actions:
 
 - **清理界面缓存** clears the current launcher display without touching
-  persisted records. Automatic refreshes keep cleared terminal records hidden,
-  while active or new Sessions remain visible; manual **刷新状态** reloads all.
-- **清理持久化任务记录** removes completed, failed, or terminated Session,
-  Event, Execution, and corresponding Task records for the active Workspace.
-  Running Sessions and their records are retained. The action uses the
-  existing authenticated loopback launcher endpoint and asks for confirmation.
+  persisted records. Automatic refreshes keep cleared terminal Executions hidden,
+  while active or new Executions remain visible; manual **刷新状态** reloads all.
+- **清理持久化任务记录** removes `passed` / `failed` Executions for the active
+  Workspace, including batch Executions that have no Session. It also removes
+  Events and completed, failed, or terminated Sessions linked to those terminal
+  interactive Executions. Running Executions and Sessions are retained; a Task
+  is removed only when no Execution or Session still needs it. The existing
+  authenticated loopback endpoint reports each deleted record count and asks
+  for confirmation.
 
 ## Opening a Codex Task
 
-**Open Codex Task** is a locator entry point. This launcher does not automate
-Codex Desktop or a browser. When direct opening is unavailable, it displays:
+**线程信息** is a locator entry point. This launcher does not automate Codex
+Desktop or a browser. It is enabled only for an interactive Execution that is
+backed by `desktop_codex_app` and has a Thread ID; an AppServer Session, a
+batch Execution, or a missing Thread ID keeps it disabled. When it is
+available, it displays:
 
 ```text
 thread_id: ...
@@ -169,16 +199,17 @@ with the LRM event stream.
 LRM Goal / Task
       |
       v
-LRM Session  -------- provider Thread ID
+LRM Execution --------------- provider Turn ID / status / summary
+      |
+      +-- optional LRM Session  -- provider Thread ID (interactive only)
       |
       v
-LRM Execution -------- provider Turn ID
-      |
-      v
-normalized Event Store
+normalized Event Store (interactive Executions)
 ```
 
-Session is the long-lived interactive context. Execution is one run within
-that context, and a Turn is the provider-level unit for that run. The launcher
-only observes their lifecycle. Cleanup removes terminal dashboard records but
-does not change the lifecycle of a running Session.
+The Execution is the primary object the launcher observes: every batch and
+interactive run is one row. A Session is the long-lived interactive context of
+one Execution, and a Turn is the provider-level unit for that run. The launcher
+only observes their lifecycle, and it never creates a Session for a batch
+Execution. Cleanup removes terminal dashboard records but does not change the
+lifecycle of a running Session.

@@ -5,7 +5,8 @@
   "description": "Captures exact ChatGPT identity and reliably delivers control-plane messages.",
   "minimum_chrome_version": "106",
   "permissions": [
-    "storage"
+    "storage",
+    "alarms"
   ],
   "host_permissions": [
     "https://chatgpt.com/*",

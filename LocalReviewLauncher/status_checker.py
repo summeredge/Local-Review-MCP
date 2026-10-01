@@ -18,6 +18,7 @@ LOCAL_HEALTH_URL = "http://127.0.0.1:12080/health"
 LOCAL_OAUTH_CLIENTS_URL = "http://127.0.0.1:12080/oauth/clients"
 LOCAL_MCP_URL = "http://127.0.0.1:12080/mcp"
 LOCAL_SESSION_CATALOG_URL = "http://127.0.0.1:12080/launcher/sessions"
+LOCAL_EXECUTION_CATALOG_URL = "http://127.0.0.1:12080/launcher/executions"
 LOCAL_BROWSER_READINESS_URL = "http://127.0.0.1:12080/launcher/readiness"
 LOCAL_DESKTOP_SYNC_URL = "http://127.0.0.1:12080/launcher/desktop-sync"
 LOCAL_DESKTOP_INTERACTIVE_URL = "http://127.0.0.1:12080/launcher/desktop-interactive"
@@ -27,17 +28,16 @@ LOCAL_DOCTOR_URL = "http://127.0.0.1:12080/launcher/doctor"
 REMOTE_STATUS_URL = "https://review.syqiu.kdns.fr/.well-known/oauth-protected-resource"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 MAX_STATUS_RESPONSE_BYTES = 2 * 1024 * 1024
-SESSION_STATUSES = frozenset({
-    "created",
-    "starting",
-    "active",
-    "running_turn",
-    "waiting_input",
-    "completed",
-    "failed",
-    "terminated",
-})
 EXECUTION_STATUSES = frozenset({"running", "passed", "failed"})
+EXECUTION_MODES = frozenset({"batch", "interactive"})
+# Internal backend identities. The dashboard shows the friendly label and keeps the identity in
+# the details view, so UI wording never replaces the value stored by the Control Plane.
+EXECUTION_BACKENDS = frozenset({"cli", "codex_app_server", "desktop_codex_app"})
+BACKEND_LABELS = {
+    "desktop_codex_app": "Desktop",
+    "codex_app_server": "AppServer",
+    "cli": "CLI Batch",
+}
 EVENT_TYPES = frozenset({
     "session_started",
     "turn_started",
@@ -76,38 +76,70 @@ class SessionEventViewModel:
 
 
 @dataclass(frozen=True)
-class ExecutionViewModel:
-    execution_id: str
-    status: str
-    started_at: str | None = None
-    finished_at: str | None = None
-    turn_id: str | None = None
-    summary: str | None = None
+class SessionViewModel:
+    """Optional interactive Session of one Execution. A batch Execution has none."""
+
+    session_id: str
+    thread_id: str | None = None
+    backend_type: str | None = None
+    model: str | None = None
+    reasoning_effort: str | None = None
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True)
-class SessionViewModel:
-    goal_name: str
-    task_name: str
+class PersistedCleanupResult:
+    deleted_executions: int
+    deleted_sessions: int
+    deleted_events: int
+    deleted_tasks: int
+
+
+@dataclass(frozen=True)
+class ExecutionViewModel:
+    """One dashboard row. The Execution is the primary object; the Session is enrichment."""
+
+    execution_id: str
+    name: str
+    mode: str | None
+    backend: str | None
     status: str
-    backend_type: str
-    model: str | None
-    reasoning_effort: str | None
-    session_id: str
-    thread_id: str | None
-    updated_at: str | None
-    goal_id: str
+    workspace_id: str
     task_id: str
-    execution: ExecutionViewModel | None
-    events: tuple[SessionEventViewModel, ...]
+    goal_id: str | None = None
+    goal_name: str | None = None
+    task_name: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    summary: str | None = None
+    session: SessionViewModel | None = None
+    events: tuple[SessionEventViewModel, ...] = ()
 
     @property
-    def execution_id(self) -> str | None:
-        return self.execution.execution_id if self.execution is not None else None
+    def backend_label(self) -> str:
+        return BACKEND_LABELS.get(self.backend or "", "—")
 
     @property
-    def current_turn_id(self) -> str | None:
-        return self.execution.turn_id if self.execution is not None else None
+    def display_mode(self) -> str:
+        return self.mode or "—"
+
+    @property
+    def session_id(self) -> str | None:
+        return self.session.session_id if self.session is not None else None
+
+    @property
+    def thread_id(self) -> str | None:
+        return self.session.thread_id if self.session is not None else None
+
+    @property
+    def can_open_codex_task(self) -> bool:
+        """Only a Desktop interactive Execution owns a Codex Task this launcher can locate."""
+        return (
+            self.mode == "interactive"
+            and self.session is not None
+            and self.session.backend_type == "desktop_codex_app"
+            and bool(self.session.thread_id)
+        )
 
 
 @dataclass(frozen=True)
@@ -224,7 +256,7 @@ class LauncherStatus:
     remote_online: bool
     cloudflared_version: str = "unavailable"
     oauth_registry: OAuthRegistryStatus | None = None
-    sessions: tuple[SessionViewModel, ...] = ()
+    executions: tuple[ExecutionViewModel, ...] = ()
     browser: BrowserReadiness = BrowserReadiness()
     desktop_sync: DesktopSyncStatus = DesktopSyncStatus()
     desktop_capability: DesktopCapabilityStatus = DesktopCapabilityStatus()
@@ -255,6 +287,12 @@ def _optional_text(value: object, label: str, maximum: int = 256) -> str | None:
     if value is None:
         return None
     return _text(value, label, maximum)
+
+
+def _optional_identifier(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    return _identifier(value, label)
 
 
 def _timestamp(value: object, label: str) -> str:
@@ -290,61 +328,19 @@ def _status(value: object, label: str, allowed: frozenset[str]) -> str:
     return text
 
 
-def _parse_session_status(payload: object) -> dict[str, object]:
-    document = _object(payload, "Session status")
-    current_value = document.get("current_execution")
-    current: dict[str, object] | None = None
-    if current_value is not None:
-        current_document = _object(current_value, "current_execution")
-        current = {
-            "execution_id": _identifier(current_document.get("execution_id"), "current_execution.execution_id"),
-            "status": _status(current_document.get("status"), "current_execution.status", EXECUTION_STATUSES),
-            "turn_id": _optional_text(current_document.get("turn_id"), "current_execution.turn_id"),
-        }
-    return {
-        "session_id": _identifier(document.get("session_id"), "session_id"),
-        "goal_id": _identifier(document.get("goal_id"), "goal_id"),
-        "task_id": _identifier(document.get("task_id"), "task_id"),
-        "backend_type": _status(document.get("backend_type"), "backend_type", frozenset({"cli", "codex_app_server"})),
-        "status": _status(document.get("status"), "status", SESSION_STATUSES),
-        "thread_id": _optional_text(document.get("thread_id"), "thread_id"),
-        "model": _optional_text(document.get("model"), "model"),
-        "reasoning_effort": _optional_text(document.get("reasoning_effort"), "reasoning_effort", 64),
-        "current_execution": current,
-    }
+def _optional_status(value: object, label: str, allowed: frozenset[str]) -> str | None:
+    if value is None:
+        return None
+    return _status(value, label, allowed)
 
 
-def _parse_execution_status(
-    payload: object,
-    session: Mapping[str, object],
-) -> ExecutionViewModel:
-    document = _object(payload, "Execution status")
-    execution_id = _identifier(document.get("execution_id"), "execution_id")
-    expected_execution_id = session.get("current_execution_id")
-    if expected_execution_id is not None and execution_id != expected_execution_id:
-        raise StatusQueryError("Execution does not match the Session")
-    if _identifier(document.get("task_id"), "task_id") != session["task_id"]:
-        raise StatusQueryError("Execution task does not match the Session")
-    session_id = document.get("session_id")
-    if session_id is not None and _identifier(session_id, "session_id") != session["session_id"]:
-        raise StatusQueryError("Execution Session does not match")
-    thread_id = _optional_text(document.get("thread_id"), "thread_id")
-    if thread_id is not None and session.get("thread_id") is not None and thread_id != session["thread_id"]:
-        raise StatusQueryError("Execution Thread does not match the Session")
-    summary = document.get("summary")
-    if "summary" in document and (
-        not isinstance(summary, str)
-        or len(summary.encode("utf-16-le", errors="surrogatepass")) // 2 > 4_000
-    ):
+def _summary_text(document: Mapping[str, object]) -> str | None:
+    if "summary" not in document:
+        return None
+    value = document["summary"]
+    if not isinstance(value, str) or len(value.encode("utf-16-le", errors="surrogatepass")) // 2 > 4_000:
         raise StatusQueryError("summary must be a string of at most 4000 UTF-16 code units")
-    return ExecutionViewModel(
-        execution_id=execution_id,
-        status=_status(document.get("status"), "status", EXECUTION_STATUSES),
-        started_at=_timestamp(document.get("started_at"), "started_at"),
-        finished_at=None if document.get("finished_at") is None else _timestamp(document.get("finished_at"), "finished_at"),
-        turn_id=_optional_text(document.get("turn_id"), "turn_id"),
-        summary=summary,
-    )
+    return value
 
 
 def _parse_events(payload: object, session: Mapping[str, object]) -> tuple[SessionEventViewModel, ...]:
@@ -393,63 +389,57 @@ def _parse_events(payload: object, session: Mapping[str, object]) -> tuple[Sessi
     return tuple(sorted(events, key=lambda event: event.sequence))
 
 
-def build_session_view_model(
-    session_status: object,
-    execution_status: object | None = None,
-    session_events: object | None = None,
-    *,
-    summary: Mapping[str, object] | None = None,
-) -> SessionViewModel:
-    session = _parse_session_status(session_status)
-    current = session["current_execution"]
-    current_execution_id = current["execution_id"] if isinstance(current, dict) else None
-    session_for_execution = {
-        **session,
-        "current_execution_id": current_execution_id,
-    }
-    execution: ExecutionViewModel | None = None
-    if execution_status is not None:
-        execution = _parse_execution_status(execution_status, session_for_execution)
-        if execution.turn_id is None and isinstance(current, dict):
-            execution = ExecutionViewModel(
-                execution_id=execution.execution_id,
-                status=execution.status,
-                started_at=execution.started_at,
-                finished_at=execution.finished_at,
-                turn_id=current["turn_id"],
-                summary=execution.summary,
-            )
-    elif isinstance(current, dict):
-        execution = ExecutionViewModel(
-            execution_id=current["execution_id"],
-            status=current["status"],
-            turn_id=current["turn_id"],
-        )
-    events = () if session_events is None else _parse_events(session_events, session_for_execution)
-    summary_document = {} if summary is None else _object(summary, "Session summary")
-    summary_session_id = summary_document.get("session_id")
-    if summary_session_id is not None and _identifier(summary_session_id, "summary.session_id") != session["session_id"]:
-        raise StatusQueryError("Session summary does not match the Session")
-    goal_name = _optional_text(summary_document.get("goal_name"), "summary.goal_name", 256) or session["goal_id"]
-    task_name = _optional_text(summary_document.get("task_name"), "summary.task_name", 256) or session["task_id"]
-    updated_at = None
-    if summary_document.get("updated_at") is not None:
-        updated_at = _timestamp(summary_document.get("updated_at"), "summary.updated_at")
-    elif events:
-        updated_at = events[-1].timestamp
+def _execution_session(document: Mapping[str, object]) -> SessionViewModel | None:
+    """The optional interactive Session of an Execution. A batch Execution has none."""
+
+    if document.get("session_id") is None:
+        return None
     return SessionViewModel(
-        goal_name=goal_name,
+        session_id=_identifier(document.get("session_id"), "session_id"),
+        thread_id=_optional_text(document.get("thread_id"), "thread_id"),
+        backend_type=_optional_status(document.get("backend_type"), "backend_type", EXECUTION_BACKENDS),
+        model=_optional_text(document.get("model"), "model"),
+        reasoning_effort=_optional_text(document.get("reasoning_effort"), "reasoning_effort", 64),
+        updated_at=_optional_rfc3339_timestamp(document.get("updated_at"), "updated_at"),
+    )
+
+
+def build_execution_view_model(
+    summary: object,
+    session_events: object | None = None,
+) -> ExecutionViewModel:
+    """Build one dashboard row from an Execution catalog summary.
+
+    The Execution owns the row identity and status. Goal, Session, and event evidence are optional:
+    an Execution without a Session is a normal batch row, and it keeps the `—` fallbacks instead of
+    inventing a Session. Event payloads are only read for a row that already has one.
+    """
+
+    document = _object(summary, "Execution summary")
+    session = _execution_session(document)
+    events: tuple[SessionEventViewModel, ...] = ()
+    if session_events is not None and session is not None:
+        events = _parse_events(session_events, {
+            "session_id": session.session_id,
+            "thread_id": session.thread_id,
+        })
+    task_id = _identifier(document.get("task_id"), "task_id")
+    task_name = _optional_text(document.get("task_name"), "task_name") or task_id
+    return ExecutionViewModel(
+        execution_id=_identifier(document.get("execution_id"), "execution_id"),
+        name=_optional_text(document.get("name"), "name") or task_name,
+        mode=_optional_status(document.get("execution_mode"), "execution_mode", EXECUTION_MODES),
+        backend=_optional_status(document.get("backend"), "backend", EXECUTION_BACKENDS),
+        status=_status(document.get("status"), "status", EXECUTION_STATUSES),
+        workspace_id=_identifier(document.get("workspace_id"), "workspace_id"),
+        task_id=task_id,
+        goal_id=_optional_identifier(document.get("goal_id"), "goal_id"),
+        goal_name=_optional_text(document.get("goal_name"), "goal_name"),
         task_name=task_name,
-        status=session["status"],
-        backend_type=session["backend_type"],
-        model=session["model"],
-        reasoning_effort=session["reasoning_effort"],
-        session_id=session["session_id"],
-        thread_id=session["thread_id"],
-        updated_at=updated_at,
-        goal_id=session["goal_id"],
-        task_id=session["task_id"],
-        execution=execution,
+        started_at=_optional_rfc3339_timestamp(document.get("started_at"), "started_at"),
+        finished_at=_optional_rfc3339_timestamp(document.get("finished_at"), "finished_at"),
+        summary=_summary_text(document),
+        session=session,
         events=events,
     )
 
@@ -474,6 +464,7 @@ class StatusChecker:
         oauth_clients_url: str = LOCAL_OAUTH_CLIENTS_URL,
         mcp_url: str = LOCAL_MCP_URL,
         session_catalog_url: str = LOCAL_SESSION_CATALOG_URL,
+        execution_catalog_url: str = LOCAL_EXECUTION_CATALOG_URL,
         workspace_id: str | None = None,
         browser_readiness_url: str = LOCAL_BROWSER_READINESS_URL,
         desktop_sync_url: str = LOCAL_DESKTOP_SYNC_URL,
@@ -486,6 +477,7 @@ class StatusChecker:
         self.oauth_clients_url = oauth_clients_url
         self.mcp_url = mcp_url
         self.session_catalog_url = session_catalog_url
+        self.execution_catalog_url = execution_catalog_url
         self.workspace_id = workspace_id
         self.browser_readiness_url = browser_readiness_url
         self.desktop_sync_url = desktop_sync_url
@@ -922,64 +914,54 @@ class StatusChecker:
         except (HTTPError, URLError, OSError, TimeoutError):
             return False
 
-    def clear_persisted_task_records(self) -> int | None:
+    def clear_persisted_task_records(self) -> PersistedCleanupResult | None:
         try:
             payload = self._request_json(self.session_catalog_url, method="DELETE")
         except StatusQueryError:
             return None
         if not isinstance(payload, dict):
             return None
-        deleted = payload.get("deleted_sessions")
-        return deleted if isinstance(deleted, int) and not isinstance(deleted, bool) and deleted >= 0 else None
+        counts = tuple(payload.get(key) for key in (
+            "deleted_executions",
+            "deleted_sessions",
+            "deleted_events",
+            "deleted_tasks",
+        ))
+        if any(type(count) is not int or count < 0 for count in counts):
+            return None
+        return PersistedCleanupResult(*counts)
 
-    def dashboard_sessions(self) -> tuple[SessionViewModel, ...]:
-        catalog = self._session_catalog()
-        sessions: list[SessionViewModel] = []
-        for summary in catalog:
-            try:
-                session_status = self._call_tool("get_session_status", {
-                    "session_id": summary["session_id"],
-                    **({"workspace_id": self.workspace_id} if self.workspace_id else {}),
-                })
-            except StatusQueryError:
-                continue
-            if session_status.get("backend_type") != "codex_app_server":
-                continue
+    def dashboard_executions(self) -> tuple[ExecutionViewModel, ...]:
+        """Every visible Execution, batch or interactive, in one dashboard read.
 
-            current = session_status.get("current_execution")
-            execution_status = None
-            if isinstance(current, dict) and isinstance(current.get("execution_id"), str):
+        A damaged catalog entry is dropped on its own, and an Execution whose event stream cannot
+        be read keeps its row without events. No step turns one bad record into an empty dashboard.
+        """
+
+        executions: list[ExecutionViewModel] = []
+        for summary in self._execution_catalog():
+            session_events = None
+            if summary.get("session_id") is not None:
                 try:
-                    execution_status = self._call_tool("get_execution_status", {
-                        "execution_id": current["execution_id"],
-                        "session_id": summary["session_id"],
-                        **({"workspace_id": self.workspace_id} if self.workspace_id else {}),
-                    })
+                    session_events = self._session_events(
+                        _identifier(summary.get("session_id"), "session_id"),
+                        _optional_text(summary.get("thread_id"), "thread_id"),
+                    )
                 except StatusQueryError:
-                    execution_status = None
-
+                    session_events = None
             try:
-                session_events = self._session_events(session_status)
-            except StatusQueryError:
-                session_events = None
-
-            try:
-                sessions.append(build_session_view_model(
-                    session_status,
-                    execution_status,
-                    session_events,
-                    summary=summary,
-                ))
+                executions.append(build_execution_view_model(summary, session_events))
             except StatusQueryError:
                 continue
-        return tuple(sessions)
+        return tuple(executions)
 
-    def _session_events(self, session: Mapping[str, object]) -> dict[str, object]:
+    def _session_events(self, session_id: str, thread_id: str | None) -> dict[str, object]:
         events: list[object] = []
         after_sequence = 0
+        session = {"session_id": session_id, "thread_id": thread_id}
         while True:
             page = self._call_tool("list_session_events", {
-                "session_id": session["session_id"],
+                "session_id": session_id,
                 "after_sequence": after_sequence,
                 **({"workspace_id": self.workspace_id} if self.workspace_id else {}),
             })
@@ -991,26 +973,23 @@ class StatusChecker:
             if not isinstance(has_more, bool):
                 raise StatusQueryError("has_more must be a boolean")
             if not has_more:
-                return {"session_id": session["session_id"], "events": events}
+                return {"session_id": session_id, "events": events}
             if not parsed:
                 raise StatusQueryError("Event pagination returned an empty continuation")
             after_sequence = parsed[-1].sequence
 
-    def _session_catalog(self) -> tuple[dict[str, object], ...]:
-        payload = self._request_json(self.session_catalog_url)
-        document = _object(payload, "Session catalog")
-        values = document.get("sessions")
+    def _execution_catalog(self) -> tuple[dict[str, object], ...]:
+        document = _object(self._request_json(self.execution_catalog_url), "Execution catalog")
+        values = document.get("executions")
         if not isinstance(values, list):
-            raise StatusQueryError("Session catalog sessions must be an array")
+            raise StatusQueryError("Execution catalog executions must be an array")
         summaries: list[dict[str, object]] = []
         for value in values:
-            summary = _object(value, "Session catalog entry")
-            summaries.append({
-                "session_id": _identifier(summary.get("session_id"), "session_id"),
-                "goal_name": _text(summary.get("goal_name"), "goal_name"),
-                "task_name": _text(summary.get("task_name"), "task_name"),
-                "updated_at": _timestamp(summary.get("updated_at"), "updated_at"),
-            })
+            # One damaged record must not hide the rest of the Execution Dashboard.
+            try:
+                summaries.append(_object(value, "Execution catalog entry"))
+            except StatusQueryError:
+                continue
         return tuple(summaries)
 
     def _call_tool(self, name: str, arguments: Mapping[str, object]) -> dict[str, object]:

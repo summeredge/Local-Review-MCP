@@ -123,6 +123,55 @@ afterEach(async () => {
 });
 
 describe("Local Control Bridge protocol", () => {
+  it("returns 503 when no durable identity consumer has taken responsibility", async () => {
+    const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+    expect(await request("/identity-evidence", { method: "POST", token, body: {
+      request_id: "request-no-consumer", conversation_id: "conversation-a", document_id: "document-a", navigation_epoch: 0,
+    } })).toEqual({ status: 503, body: { error: "identity_evidence_unavailable" } });
+  });
+
+  it("waits for the durable Inbox write before ACK and returns 503 on write failure", async () => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "lrm-bridge-durable-ack-"));
+    const pending = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), {
+      submitGoal: vi.fn(),
+    }, { storageRoot: root });
+    const originalPut = pending.evidenceInbox.put.bind(pending.evidenceInbox);
+    let writeStarted!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>(resolve => { writeStarted = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const put = vi.spyOn(pending.evidenceInbox, "put").mockImplementation(async evidence => {
+      writeStarted();
+      await gate;
+      await originalPut(evidence);
+    });
+    await startBridge({ ports: [0], onIdentityEvidence: evidence => pending.receiveIdentityEvidence(evidence) });
+    try {
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+      const evidence = { request_id: "request-durable", conversation_id: "conversation-a", document_id: "document-a", navigation_epoch: 0 };
+      let replied = false;
+      const posted = request("/identity-evidence", { method: "POST", token, body: evidence }).then(result => { replied = true; return result; });
+      await started;
+      expect(replied).toBe(false);
+      await expect(readFile(pending.evidenceInbox.file)).rejects.toMatchObject({ code: "ENOENT" });
+      release();
+      expect(await posted).toEqual({ status: 202, body: { accepted: true, durable: true } });
+      expect(JSON.parse(await readFile(pending.evidenceInbox.file, "utf8")).entries[0]).toMatchObject(evidence);
+      put.mockRejectedValueOnce(new Error("disk unavailable"));
+      expect((await request("/identity-evidence", { method: "POST", token,
+        body: { ...evidence, request_id: "request-write-fails" } })).status).toBe(503);
+      put.mockRestore();
+      expect((await request("/identity-evidence", { method: "POST", token,
+        body: { ...evidence, request_id: "request-write-fails" } })).status).toBe(202);
+    } finally {
+      release();
+      put.mockRestore();
+      await stopBridge();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses its own loopback discovery range and serves safe discovery metadata", async () => {
     expect(LOCAL_CONTROL_BRIDGE_PORTS).toEqual([12081, 12082, 12083, 12084, 12085]);
     expect(LOCAL_CONTROL_BRIDGE_PORTS.some((port) => [8765, 8766, 8767, 8768, 8769].includes(port))).toBe(false);
@@ -252,7 +301,7 @@ describe("Local Control Bridge protocol", () => {
 
   it("authenticates identity evidence and delivers the exact payload to the sink", async () => {
     await stopBridge();
-    const sink = vi.fn();
+    const sink = vi.fn(() => ({ accepted: true, durable: true } as const));
     await expect(startBridge({ ports: [0], onIdentityEvidence: sink })).resolves.toBeGreaterThan(0);
     const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
     const evidence = {
@@ -287,11 +336,11 @@ describe("Local Control Bridge protocol", () => {
     })).status).toBe(400);
     expect(await request("/identity-evidence", { method: "POST", token, body: evidence })).toEqual({
       status: 202,
-      body: { accepted: true },
+      body: { accepted: true, durable: true },
     });
     expect(await request("/identity-evidence", { method: "POST", token, body: wfrEvidence })).toEqual({
       status: 202,
-      body: { accepted: true },
+      body: { accepted: true, durable: true },
     });
     expect(sink).toHaveBeenCalledTimes(2);
     expect(sink).toHaveBeenNthCalledWith(1, evidence);
@@ -329,8 +378,7 @@ describe("Local Control Bridge protocol", () => {
     await expect(startBridge({
       ports: [0],
       onIdentityEvidence: async (evidence) => {
-        const observation = await correlations.observe(evidence);
-        if (observation !== "refused") pending.scheduleResolve(evidence.request_id);
+        return pending.receiveIdentityEvidence(evidence);
       },
     })).resolves.toBeGreaterThan(0);
     const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
@@ -349,7 +397,7 @@ describe("Local Control Bridge protocol", () => {
         }),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Bridge response timed out")), 500)),
       ]);
-      expect(response).toEqual({ status: 202, body: { accepted: true } });
+      expect(response).toEqual({ status: 202, body: { accepted: true, durable: true } });
       const deadline = Date.now() + 1_000;
       while (submitGoal.mock.calls.length === 0 && Date.now() < deadline) {
         await new Promise<void>((resolve) => setTimeout(resolve, 5));
@@ -596,6 +644,32 @@ describe("Local Control Bridge protocol", () => {
 });
 
 describe("Local Control Bridge app lifecycle", () => {
+  it.each(["identity-evidence-inbox.json", "pending-goal-submissions.json"])(
+    "keeps MCP running but refuses successful evidence ACKs when %s is corrupt", async stateFile => {
+    await stopBridge();
+    const root = await mkdtemp(join(tmpdir(), "lrm-app-inbox-corrupt-"));
+    const runtime = createAppContext(settings());
+    const pending = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal: vi.fn() }, { storageRoot: root });
+    await mkdir(join(root, "control-plane"), { recursive: true });
+    const file = join(root, "control-plane", stateFile);
+    await writeFile(file, "{broken");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let server: Server | null = null;
+    try {
+      server = await startApp(settings(), { ...runtime, pendingGoalSubmission: pending }, { bridgePorts: [0] });
+      expect(server.listening).toBe(true);
+      const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+      expect((await request("/identity-evidence", { method: "POST", token, body: {
+        request_id: "request-corrupt", conversation_id: "conversation-a", document_id: "document-a", navigation_epoch: 0,
+      } })).status).toBe(503);
+      expect(await readFile(file, "utf8")).toBe("{broken");
+    } finally {
+      warning.mockRestore();
+      if (server !== null) await close(server);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   function settings(): ResolvedSettings {
     return {
       host: "127.0.0.1",
@@ -779,99 +853,45 @@ describe("Local Control Bridge app lifecycle", () => {
     }
   });
 
-  it("routes accepted identity evidence into the production correlation registry", async () => {
+  it("durably accepts evidence and only binds identity after a matching Pending", async () => {
     await stopBridge();
     const root = await mkdtemp(join(tmpdir(), "local-review-mcp-app-correlation-"));
-    const workspaceB = join(root, "workspace-b");
-    await mkdir(workspaceB, { recursive: true });
-    await mkdir(join(root, "control-plane"), { recursive: true });
-    await writeFile(join(root, "control-plane", "request-correlations.json"), "{broken", "utf8");
-    const runtimeSettings: ResolvedSettings = {
-      ...settings(),
-      workspaceIdentity: { id: "workspace-a", name: "Workspace A", path: process.cwd() },
-      workspaces: [
-        { id: "workspace-a", name: "Workspace A", path: process.cwd() },
-        { id: "workspace-b", name: "Workspace B", path: workspaceB },
-      ],
-    };
-    const runtime = createAppContext(runtimeSettings);
-    const context = {
-      ...runtime,
-      correlations: new ConversationCorrelationRegistry(root),
-    };
-    vi.spyOn(runtime.pendingGoalSubmission!, "get").mockImplementation(async (requestId) =>
-      requestId === "wfr_app_integration" ? { workspace_id: "workspace-b" } as never : null);
-    const diagnose = vi.spyOn(runtime.pendingGoalSubmission!, "diagnoseEvidence").mockResolvedValue();
-    const scheduleResolve = vi.spyOn(runtime.pendingGoalSubmission!, "scheduleResolve");
-    const trace = vi.spyOn(runtime.identityTrace!, "record");
-    const transportTrace = vi.spyOn(runtime.evidenceTransportTrace!, "record");
+    const runtime = createAppContext(settings());
+    const correlations = new ConversationCorrelationRegistry(root);
+    const submitGoal = vi.fn(async () => ({ goal_id: "goal", phase_id: "phase", task_id: "task",
+      execution_id: "execution", status: "running" as const }));
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {
+      storageRoot: root, browserReadiness: () => ({ ready: true }), identityTrace: runtime.identityTrace,
+    });
+    const context = { ...runtime, correlations, pendingGoalSubmission: pending };
     const observer = vi.fn();
-    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     let server: Server | null = null;
     try {
-      server = await startApp(runtimeSettings, context, {
-        bridgePorts: [0],
-        onIdentityEvidence: observer,
-        evidencePendingGraceMs: 20,
-        evidencePendingPollMs: 5,
-      });
+      server = await startApp(settings(), context, { bridgePorts: [0], onIdentityEvidence: observer });
       const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
-      const evidence = {
-        request_id: "wfr_app_integration",
-        conversation_id: "conversation-app",
-        document_id: "document-app",
-        navigation_epoch: 3,
-      };
-
-      expect(await request("/identity-evidence", { method: "POST", token, body: evidence })).toEqual({
-        status: 202,
-        body: { accepted: true },
-      });
-      expect(context.correlations.correlation(evidence.request_id)?.conversation_id).toBe(
-        evidence.conversation_id,
-      );
-      expect(trace).toHaveBeenCalledWith(expect.objectContaining({
-        event: "extension_evidence_received",
-        correlation_key: evidence.request_id,
-        conversation_id: evidence.conversation_id,
-        workspace_id: "workspace-b",
-      }));
-      expect(diagnose).toHaveBeenCalledWith(evidence, "workspace-b");
-      expect(transportTrace).toHaveBeenCalledWith(expect.objectContaining({
-        event: "connector_evidence_received",
-        correlation_key: evidence.request_id,
-        conversation_id: evidence.conversation_id,
-      }));
-      expect(transportTrace).toHaveBeenCalledWith(expect.objectContaining({
-        event: "extension_evidence_received",
-        correlation_key: evidence.request_id,
-        conversation_id: evidence.conversation_id,
-      }));
+      const evidence = { request_id: "00000000-0000-4000-8000-000000000009",
+        conversation_id: "conversation-app", document_id: "document-app", navigation_epoch: 3 };
+      await pending.accept({ correlation_key: evidence.request_id, workspace_id: "workspace-a", title: "Goal",
+        goal: "Bind only the exact key", requirements: ["Exact key"], acceptance_criteria: ["Starts once"], max_iterations: 1 });
+      expect(await request("/identity-evidence", { method: "POST", token, body: evidence }))
+        .toEqual({ status: 202, body: { accepted: true, durable: true } });
+      await waitForCondition(async () => (await pending.get(evidence.request_id))?.state === "started");
+      expect(correlations.correlation(evidence.request_id)?.conversation_id).toBe(evidence.conversation_id);
       expect(observer).toHaveBeenCalledWith(evidence);
-      const unboundEvidence = {
-        ...evidence,
-        request_id: "wfr_without_pending",
-        conversation_id: "conversation-unbound",
-      };
-      expect(await request("/identity-evidence", { method: "POST", token, body: unboundEvidence }))
-        .toMatchObject({ status: 202 });
-      expect(context.correlations.correlation(unboundEvidence.request_id)).toBeNull();
-      expect(trace).not.toHaveBeenCalledWith(expect.objectContaining({
-        correlation_key: unboundEvidence.request_id,
-      }));
-      expect(diagnose).toHaveBeenCalledTimes(1);
-      expect(scheduleResolve).toHaveBeenCalledTimes(1);
-      expect(scheduleResolve).not.toHaveBeenCalledWith(unboundEvidence.request_id);
-      expect(warning).toHaveBeenCalledWith(
-        "Conversation correlation state could not be restored; starting without restored proof",
-      );
+      expect((await request("/identity-evidence", { method: "POST", token,
+        body: { ...evidence, conversation_id: "conversation-other" } })).status).toBe(409);
+      const unbound = { ...evidence, request_id: "wfr_without_pending" };
+      expect((await request("/identity-evidence", { method: "POST", token, body: unbound })).status).toBe(202);
+      expect(correlations.correlation(unbound.request_id)).toBeNull();
+      expect(await pending.evidenceInbox.get(unbound.request_id)).toEqual(unbound);
+      expect(submitGoal).toHaveBeenCalledTimes(1);
     } finally {
       if (server !== null) await close(server);
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it("does not let Evidence received before a Goal create correlation authority", async () => {
+  it("uses pre-Pending evidence only after the exact Pending is durably created", async () => {
     await stopBridge();
     const root = await mkdtemp(join(tmpdir(), "local-review-mcp-app-evidence-before-goal-"));
     const correlationKey = "00000000-0000-4000-8000-000000000004";
@@ -900,8 +920,6 @@ describe("Local Control Bridge app lifecycle", () => {
     try {
       server = await startApp(runtimeSettings, context, {
         bridgePorts: [0],
-        evidencePendingGraceMs: 20,
-        evidencePendingPollMs: 5,
       });
       const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
       const evidence = {
@@ -920,17 +938,12 @@ describe("Local Control Bridge app lifecycle", () => {
         correlation_key: correlationKey,
         workspace_id: "workspace-a",
         title: "Evidence before Goal",
-        goal: "Wait for a new authorized identity evidence event.",
-        requirements: ["Do not consume pre-goal evidence."],
-        acceptance_criteria: ["The Goal starts only after post-goal evidence."],
+        goal: "Consume the durable Inbox evidence.",
+        requirements: ["Require an exact Pending before binding identity."],
+        acceptance_criteria: ["The Goal starts from retained evidence."],
         max_iterations: 1,
       });
-      await expect(pending.get(correlationKey)).resolves.toMatchObject({ state: "pending_identity" });
-      expect(correlations.correlation(correlationKey)).toBeNull();
-      expect(submitGoal).not.toHaveBeenCalled();
-
-      expect(await request("/identity-evidence", { method: "POST", token, body: evidence }))
-        .toMatchObject({ status: 202 });
+      // No second POST: the already ACKed evidence is consumed by accept().
       await waitForCondition(() => submitGoal.mock.calls.length === 1);
       expect(correlations.correlation(correlationKey)?.conversation_id).toBe(evidence.conversation_id);
       expect(scheduleResolve).toHaveBeenCalledWith(correlationKey);
@@ -961,16 +974,6 @@ describe("Local Control Bridge app lifecycle", () => {
       environment: { LRM_PENDING_IDENTITY_TIMEOUT_MS: "5000" },
     });
     const context = { ...runtime, correlations, pendingGoalSubmission: pending };
-    // The first lookup must miss, exactly like the real sub-second Evidence/Pending race.
-    const realGet = pending.get.bind(pending);
-    let firstLookup = true;
-    vi.spyOn(pending, "get").mockImplementation(async (key) => {
-      if (firstLookup) {
-        firstLookup = false;
-        return null;
-      }
-      return realGet(key);
-    });
     const diagnose = vi.spyOn(pending, "diagnoseEvidence");
     const scheduleResolve = vi.spyOn(pending, "scheduleResolve");
     const transportTrace = vi.spyOn(runtime.evidenceTransportTrace!, "record");
@@ -978,8 +981,6 @@ describe("Local Control Bridge app lifecycle", () => {
     try {
       server = await startApp(runtimeSettings, context, {
         bridgePorts: [0],
-        evidencePendingGraceMs: 1_000,
-        evidencePendingPollMs: 5,
       });
       const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
       const evidence = {
@@ -989,9 +990,9 @@ describe("Local Control Bridge app lifecycle", () => {
         navigation_epoch: 1,
       };
 
-      // Evidence is posted first; the pending Goal only exists while the Bridge is still waiting.
-      const posted = request("/identity-evidence", { method: "POST", token, body: evidence });
-      await waitForCondition(() => firstLookup === false);
+      const posted = await request("/identity-evidence", { method: "POST", token, body: evidence });
+      expect(posted).toEqual({ status: 202, body: { accepted: true, durable: true } });
+      await new Promise(resolve => setTimeout(resolve, 3000));
       await pending.accept({
         correlation_key: correlationKey,
         workspace_id: "workspace-a",
@@ -1022,7 +1023,7 @@ describe("Local Control Bridge app lifecycle", () => {
     }
   });
 
-  it("keeps Evidence without a matching Pending fail-closed after the grace window", async () => {
+  it("keeps unmatched Inbox evidence from authorizing an unrelated Pending", async () => {
     await stopBridge();
     const root = await mkdtemp(join(tmpdir(), "local-review-mcp-app-grace-expired-"));
     const correlationKey = "00000000-0000-4000-8000-000000000006";
@@ -1050,8 +1051,6 @@ describe("Local Control Bridge app lifecycle", () => {
     try {
       server = await startApp(runtimeSettings, context, {
         bridgePorts: [0],
-        evidencePendingGraceMs: 20,
-        evidencePendingPollMs: 5,
       });
       const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
       // A different correlation key must never be consumed by unrelated Evidence.
@@ -1100,9 +1099,7 @@ describe("Local Control Bridge app lifecycle", () => {
       correlations: new ConversationCorrelationRegistry(root),
       extensionDeliveries: new ExtensionDeliveryService(root),
     };
-    vi.spyOn(runtime.pendingGoalSubmission!, "get").mockResolvedValue({
-      workspace_id: runtime.registry.active.id,
-    } as never);
+
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     let server: Server | null = null;
     try {
@@ -1120,9 +1117,10 @@ describe("Local Control Bridge app lifecycle", () => {
       };
       expect(await request("/identity-evidence", { method: "POST", token, body: evidence })).toEqual({
         status: 202,
-        body: { accepted: true },
+        body: { accepted: true, durable: true },
       });
-      expect(context.correlations.correlation(evidence.request_id)?.conversation_id).toBe(evidence.conversation_id);
+      expect(context.correlations.correlation(evidence.request_id)).toBeNull();
+      expect(await runtime.pendingGoalSubmission!.evidenceInbox.get(evidence.request_id)).toEqual(evidence);
 
       const owner = {
         conversation_id: evidence.conversation_id,

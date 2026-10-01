@@ -22,6 +22,7 @@ import {
 } from "./goal-preflight.js";
 import type { ConversationCorrelationRegistry } from "./conversation-correlation.js";
 import type { ExtensionIdentityEvidence } from "./extension-identity.js";
+import { IdentityEvidenceInbox, IdentityEvidenceConflictError, identityEvidenceAck, type IdentityEvidenceAck } from "./identity-evidence-inbox.js";
 import { executionModeSchema } from "./execution-service.js";
 import type {
   IdentityTraceRecordInput,
@@ -213,7 +214,8 @@ function prune(records: Map<string, PendingGoalSubmission>, now: number): void {
 export class PendingGoalSubmissionService {
   public readonly storageRoot: string;
   private readonly file: string;
-  private readonly correlations: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">;
+  private readonly correlations: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation" | "observe">;
+  public readonly evidenceInbox: IdentityEvidenceInbox;
   private readonly goalSubmission: Pick<GoalSubmissionService, "submitGoal">;
   private readonly now: () => number;
   private readonly identityTimeoutMs: number;
@@ -228,7 +230,7 @@ export class PendingGoalSubmissionService {
   private readonly scheduled = new Map<string, Promise<void>>();
 
   public constructor(
-    correlations: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">,
+    correlations: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation" | "observe">,
     goalSubmission: Pick<GoalSubmissionService, "submitGoal">,
     options: PendingGoalSubmissionServiceOptions = {},
   ) {
@@ -237,6 +239,7 @@ export class PendingGoalSubmissionService {
     this.correlations = correlations;
     this.goalSubmission = goalSubmission;
     this.now = options.now ?? Date.now;
+    this.evidenceInbox = new IdentityEvidenceInbox(this.storageRoot, this.now);
     this.browserReadiness = options.browserReadiness ?? extensionDeliveryReadiness;
     this.identityTimeoutMs = pendingIdentityTimeoutMs(options.environment ?? process.env);
     this.identityTrace = options.identityTrace;
@@ -315,6 +318,7 @@ export class PendingGoalSubmissionService {
     const stored = this.submissions.get(parsed.correlation_key);
     if (stored?.state === "pending_identity") {
       this.scheduleExpiry(stored);
+      await this.replayEvidence(stored.correlation_key);
       this.scheduleIdentityResolution(stored);
     }
     return receipt;
@@ -359,6 +363,39 @@ export class PendingGoalSubmissionService {
         this.scheduled.delete(parsed.data);
       });
     this.scheduled.set(parsed.data, work);
+  }
+
+  public async receiveIdentityEvidence(evidence: ExtensionIdentityEvidence): Promise<IdentityEvidenceAck> {
+    await this.restore();
+    await this.exclusive(async () => {
+      const previous = this.correlations.correlation(evidence.request_id);
+      if (previous !== null && previous.conversation_id !== evidence.conversation_id) {
+        const pending = this.submissions.get(evidence.request_id);
+        this.trace({ event: "evidence_match_failed", correlation_key: evidence.request_id,
+          conversation_id: evidence.conversation_id, workspace_id: pending?.workspace_id ?? "unknown",
+          reason: "conversation_mismatch", expected_conversation_id: previous.conversation_id });
+        throw new IdentityEvidenceConflictError("correlation_key already targets a different conversation");
+      }
+      await this.evidenceInbox.put(evidence);
+    });
+    await this.replayEvidence(evidence.request_id);
+    const pending = this.submissions.get(evidence.request_id);
+    if (pending?.state === "pending_identity") this.scheduleResolve(evidence.request_id);
+    return identityEvidenceAck;
+  }
+
+  private async replayEvidence(key: string): Promise<void> {
+    await this.exclusive(async () => {
+      const pending = this.submissions.get(key);
+      if (pending === undefined) return;
+      const evidence = await this.evidenceInbox.get(key);
+      if (evidence === null) return;
+      this.trace({ event: "extension_evidence_received", correlation_key: key,
+        conversation_id: evidence.conversation_id, workspace_id: pending.workspace_id });
+      const observed = await this.correlations.observe(evidence);
+      if (observed === "refused") throw new IdentityEvidenceConflictError("conversation evidence conflict");
+      void this.diagnoseEvidence(evidence, pending.workspace_id).catch(() => undefined);
+    });
   }
 
   public async resolve(correlationKey: string): Promise<void> {
@@ -493,7 +530,10 @@ export class PendingGoalSubmissionService {
         .filter((record): record is Extract<PendingGoalSubmission, { state: "pending_identity" }> =>
           record.state === "pending_identity");
     });
-    for (const record of pending) this.scheduleIdentityResolution(record);
+    for (const record of pending) {
+      await this.replayEvidence(record.correlation_key);
+      this.scheduleIdentityResolution(record);
+    }
   }
 
   public async get(correlationKey: string): Promise<PendingGoalSubmission | null> {
@@ -554,32 +594,22 @@ export class PendingGoalSubmissionService {
   }
 
   private async restoreOnce(): Promise<void> {
+    await this.evidenceInbox.restore();
     let raw: string;
     try {
       raw = await readFile(this.file, "utf8");
     } catch (error: unknown) {
       if (errorCode(error) === "ENOENT") return;
-      console.warn("Pending Goal submission state could not be restored; starting without restored pending work");
-      return;
+      throw error;
     }
 
-    let state: z.infer<typeof stateSchema>;
-    try {
-      state = stateSchema.parse(JSON.parse(raw));
-    } catch {
-      console.warn("Pending Goal submission state could not be restored; starting without restored pending work");
-      return;
-    }
+    const state = stateSchema.parse(JSON.parse(raw));
 
     const restored = new Map<string, PendingGoalSubmission>();
-    let invalid = false;
     for (const entry of state.submissions) {
-      const parsed = pendingGoalSubmissionSchema.safeParse(entry);
-      if (!parsed.success || restored.has(parsed.success ? parsed.data.correlation_key : "")) {
-        invalid = true;
-        continue;
-      }
-      restored.set(parsed.data.correlation_key, parsed.data);
+      const parsed = pendingGoalSubmissionSchema.parse(entry);
+      if (restored.has(parsed.correlation_key)) throw new Error("duplicate pending Goal submission keys");
+      restored.set(parsed.correlation_key, parsed);
     }
     this.submissions = restored;
 
@@ -613,7 +643,6 @@ export class PendingGoalSubmissionService {
     for (const record of this.submissions.values()) {
       if (record.state === "pending_identity") this.scheduleExpiry(record);
     }
-    if (invalid) console.warn("Invalid pending Goal submission entries were ignored");
   }
 
   private failedRecord(

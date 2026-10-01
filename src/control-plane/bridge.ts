@@ -33,6 +33,7 @@ import type {
   EvidenceTransportTraceService,
 } from "./evidence-transport-trace.js";
 import { browserIdentityDiagnosticSchema } from "./evidence-transport-trace.js";
+import { IdentityEvidenceConflictError, type IdentityEvidenceAck } from "./identity-evidence-inbox.js";
 import {
   BRIDGE_PROTOCOL_HEADER,
   EVIDENCE_TRANSPORT_EVENT_HEADER,
@@ -49,7 +50,7 @@ import {
 
 export interface BridgeStartOptions {
   readonly ports?: readonly number[];
-  readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => void | Promise<void>;
+  readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => IdentityEvidenceAck | void | Promise<IdentityEvidenceAck | void>;
   readonly evidenceTransportTrace?: Pick<EvidenceTransportTraceService, "record">;
   readonly claimExtensionDelivery?: (
     claim: ExtensionDeliveryClaim,
@@ -91,7 +92,7 @@ let activePort: number | null = null;
 let pairedOrigin: string | null = null;
 let bearerToken: string | null = null;
 let lastExtensionSeenAt: number | null = null;
-let onIdentityEvidence: (evidence: ExtensionIdentityEvidence) => void | Promise<void> = () => undefined;
+let onIdentityEvidence: NonNullable<BridgeStartOptions["onIdentityEvidence"]> = () => undefined;
 let evidenceTransportTrace: Pick<EvidenceTransportTraceService, "record"> | undefined;
 let claimExtensionDelivery: NonNullable<BridgeStartOptions["claimExtensionDelivery"]> = () => null;
 let ackExtensionDelivery: NonNullable<BridgeStartOptions["ackExtensionDelivery"]> = () => {
@@ -331,8 +332,14 @@ async function receiveIdentityEvidence(
     correlation_key: parsed.data.request_id,
     conversation_id: parsed.data.conversation_id,
   });
-  await onIdentityEvidence(parsed.data);
-  json(response, 202, { accepted: true }, origin);
+  try {
+    const ack = await onIdentityEvidence(parsed.data);
+    if (ack?.accepted !== true || ack.durable !== true) throw new Error("identity evidence was not durably accepted");
+    json(response, 202, ack, origin);
+  } catch (error) {
+    json(response, error instanceof IdentityEvidenceConflictError ? 409 : 503,
+      { error: error instanceof IdentityEvidenceConflictError ? "identity_evidence_conflict" : "identity_evidence_unavailable" }, origin);
+  }
 }
 
 async function receiveDeliveryClaim(

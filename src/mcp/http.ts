@@ -45,12 +45,14 @@ import {
 } from "../config/settings.js";
 import type { TunnelProvider, TunnelStatus } from "../tunnel/types.js";
 import { executionIdSchema } from "../context/schema.js";
+import type { LauncherExecutionSummary } from "../control-plane/status-query.js";
 import { requestIdFromHeader, withInboundRequestOrigin } from "./inbound.js";
 import { createMcpServer, registeredMcpToolsMessage, type McpRuntimeContext } from "./server.js";
 
 export const MAX_MCP_REQUEST_BYTES = 1024 * 1024;
 export const OAUTH_CLIENTS_PATH = "/oauth/clients";
 export const LAUNCHER_SESSION_CATALOG_PATH = "/launcher/sessions";
+export const LAUNCHER_EXECUTION_CATALOG_PATH = "/launcher/executions";
 export const LAUNCHER_DESKTOP_SYNC_PATH = "/launcher/desktop-sync";
 export const LAUNCHER_DESKTOP_INTERACTIVE_PREFLIGHT_PATH = "/launcher/desktop-interactive";
 export const LAUNCHER_CAPABILITY_PATH = "/launcher/capability";
@@ -60,7 +62,10 @@ const SAFE_OAUTH_STORAGE_PATH = "oauth/clients.json";
 
 type HttpStatusQuery = NonNullable<McpRuntimeContext["statusQuery"]> & {
   readonly listSessionSummaries: (workspaceId?: string) => Promise<readonly unknown[]>;
+  readonly listExecutionSummaries?: (workspaceId?: string) =>
+    Promise<readonly LauncherExecutionSummary[]>;
   readonly clearSessionRecords?: (workspaceId?: string) => Promise<{
+    readonly deleted_executions: number;
     readonly deleted_sessions: number;
     readonly deleted_events: number;
     readonly deleted_tasks: number;
@@ -244,6 +249,49 @@ async function handleLauncherSessionCatalogRequest(
     sendJson(response, 200, { deleted: true, ...result });
   } catch {
     sendJson(response, 500, { error: "task_record_cleanup_failed" });
+  }
+}
+
+async function handleLauncherExecutionCatalogRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: HttpRuntimeContext,
+  authToken: string,
+): Promise<void> {
+  if (!isDirectLoopbackRequest(request)) {
+    request.resume();
+    sendJson(response, 404, { error: "not_found" });
+    return;
+  }
+  if (!isAuthenticated(request, authToken)) {
+    request.resume();
+    sendUnauthorized(response);
+    return;
+  }
+  if (request.method !== "GET") {
+    request.resume();
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+  const listExecutions = context.statusQuery?.listExecutionSummaries;
+  if (listExecutions === undefined) {
+    request.resume();
+    sendJson(response, 503, { error: "execution_catalog_unavailable" });
+    return;
+  }
+  // Workspace scope is the registry, not the storage root: a workspace this runtime does not
+  // serve can never leak its Executions into the Launcher dashboard.
+  const registered = new Set(context.registry.list().map((record) => record.id));
+  try {
+    const executions = await listExecutions.call(context.statusQuery);
+    sendJson(
+      response,
+      200,
+      { executions: executions.filter((execution) => registered.has(execution.workspace_id)) },
+      { "cache-control": "no-store" },
+    );
+  } catch {
+    sendJson(response, 500, { error: "execution_catalog_unavailable" });
   }
 }
 
@@ -1257,6 +1305,11 @@ export function createHttpServer(
 
       if (path === LAUNCHER_SESSION_CATALOG_PATH) {
         await handleLauncherSessionCatalogRequest(request, response, context, settings.auth.token);
+        return;
+      }
+
+      if (path === LAUNCHER_EXECUTION_CATALOG_PATH) {
+        await handleLauncherExecutionCatalogRequest(request, response, context, settings.auth.token);
         return;
       }
 

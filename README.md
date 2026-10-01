@@ -1,555 +1,189 @@
-# Local Review MCP
+# Local Review MCP｜ChatGPT 网页端与本地 Codex 协作
 
-## Current version
+Local Review MCP 将 ChatGPT 网页端、本地项目和本地 Codex 任务执行连接起来。ChatGPT 可以在授权范围内查看本机文件和已有改动；当你明确提出目标与验收条件后，也可以把任务交给本地 Codex 执行，并在完成后回到网页对话中检查结果。
 
-V0.1 / P6 Production Hardening
+## 项目解决什么问题
 
-## Current capabilities
+ChatGPT 网页端的对话和本地项目彼此分开，通常看不到电脑上的源文件和改动。Codex 虽然能在本地项目中执行任务，但网页对话里的需求、约束和 Review 结论需要经过明确交接。手动复制文件、反复解释背景、再把执行结果贴回网页，会增加遗漏和误解。
 
-- MCP Streamable HTTP runtime
-- nineteen read-only tools, including the workspace registry, review context, and
-  interactive Session status tools
-- `submit_goal` Control Plane entry point with asynchronous exact-current-conversation binding
-- batch CLI and interactive Codex app-server Execution backends
-- normalized interactive Session events with read-only Session/Execution status queries
-- schema-validated MCP structured outputs and schema-v1 ReviewVerdict parsing
-- durable Extension delivery and review-completion channels with identity-bound receipts
-- MV3 Browser Extension/Fiber identity evidence and loopback Local Control Bridge
-- fixed loopback host
-- configurable fixed port
-- startup port conflict detection
-- Bearer-token authentication for all MCP HTTP requests
-- OAuth 2.1-compatible discovery, public-client registration, PKCE, and Bearer tokens
-- safe `GET /health` endpoint
-- Cloudflare Tunnel provider with managed lifecycle
-- a registry of authorized workspaces with legacy single-workspace compatibility
-- bounded workspace metadata, directory listing, and text-file reading
-- bounded literal or regular-expression search with ripgrep and Node fallback
-- read-only structured Git status and bounded diff review
-- optional Windows Supervisor with health monitoring and bounded recovery
-- optional Windows Tray status/actions and per-user startup registration
-- Remote MCP protocol, authentication, workspace-review, and restart E2E tests
+Local Review MCP 让这两部分围绕同一个授权项目协作：
 
-## Architecture
+- ChatGPT 网页端查看本地项目内容、相关文件和已有改动，完成理解、规划和 Review。
+- 你在网页对话中明确提交任务目标、要求和验收条件后，本地 Codex 执行相应工作。
+- 执行状态和产生的改动可以回到 Review 流程中，由 ChatGPT 检查结果；需要时继续下一轮。
 
-The Local MCP Server keeps the MCP Data Plane and the Control Plane separate:
+它适合在提交改动前做代码 Review、调查项目中的具体问题、从网页对话委派本地编码任务，以及复查 Codex 完成的改动。重点是把网页端的计划与本地执行、结果复查连成一条可跟进的流程。
 
-```text
-MCP Read-only Data Plane
-  Workspace / Git / Review Context / status / hash-only diagnostics
+## 首次配置与快速开始
 
-MCP Control Plane entry
-  submit_goal
-        |
-        v
-Pending Goal identity gate -> Goal -> Phase -> Task
-        |
-        v
-Controlled Actuation -> Execution
-```
+下面按 Windows 主机、Cloudflare 命名隧道和 ChatGPT 网页连接说明。首次配置通常由管理员完成；普通使用者完成后只需在 ChatGPT 中选择连接并发起 Review。
 
-The MCP server exposes nineteen read-only tools and the reviewed `submit_goal`
-entry point. Browser Extension/Fiber, Local Control Bridge, Dispatcher, Codex
-execution, and Review Loop work remain Control Plane capabilities; MCP does not
-provide general file-write, shell, commit, push, or agent-control operations.
+### 开始前准备
 
-Execution and review use these current paths:
+- 一台能够访问目标项目文件夹的 Windows 电脑。
+- 已安装 Node.js 和 npm。
+- 已安装 cloudflared，并已准备可用的 Cloudflare 命名隧道、隧道凭据和稳定的 HTTPS 公网域名。公网域名需已转发到本机服务（默认 http://127.0.0.1:12080）。Local Review MCP 会启动已有隧道，不会替你创建隧道或域名。
+- ChatGPT 账号或工作区允许添加自定义连接。开发者模式是否可用可能受账号和工作区策略限制；可参考[OpenAI 官方连接说明](https://developers.openai.com/plugins/deploy/connect-chatgpt)。
 
-```text
-batch:        Task -> Execution                 (Codex CLI)
-interactive: Task -> Session -> provider Thread -> Turn -> Execution -> normalized Events
+### 1. 安装依赖并创建配置文件
 
-passed Execution -> Review Request -> Conversation Routing -> Review Delivery
-                 -> Extension Delivery -> Extension Review Completion -> ReviewResult
-                 -> ReviewVerdict -> AutoIteration -> complete | next Execution | human required
-```
+在 PowerShell 中进入 Local Review MCP 仓库根目录，然后执行：
 
-Request correlation (`correlation_key -> conversation_id`) is identity evidence
-only; `ConversationRouting.conversation_id` remains the authoritative Review
-Delivery target.
-
-`Session` is the long-lived interactive context and stores the provider Thread
-ID. `Turn` is the provider-level unit for one interactive Execution. Batch
-execution continues through `codex exec --json -` and does not automatically
-create a Session. The Playwright Browser Worker remains an independent automation
-path for explicit diagnostics and compatibility; current integrated delivery and
-completion use the Extension/Bridge path, and the Worker is not an MCP Data Plane
-capability.
-
-Completed ReviewResults are parsed as schema-v1 `ReviewVerdict` values; the
-integrated `AutoIteration` path handles `APPROVE`, `ITERATE`, and
-`HUMAN_REQUIRED` outcomes.
-
-### Interactive Execution and status
-
-`submit_goal` supports `execution_mode: "batch" | "interactive"`, defaulting to
-`batch`, plus optional provider `model` and `reasoning_effort`. Interactive
-Execution uses the Codex app-server backend, discovers the provider catalog with
-`model/list`, creates a Session and Thread, starts a Turn, and persists only
-normalized LRM events. It does not silently select the first model.
-
-The Session status model is `created`, `starting`, `active`, `running_turn`,
-`waiting_input`, `completed`, `failed`, or `terminated`. The currently wired
-interactive path uses `created -> starting -> active -> running_turn ->
-completed|failed`; approval, user input, pause, and resume scheduling are not
-implemented. The compatible Execution status remains `running`, `passed`, or
-`failed`.
-
-The read-only status tools are:
-
-- `get_session_status` by `session_id` or `goal_id`, including Session, Thread,
-  model/effort, Goal, and current Execution status;
-- `get_execution_status` by `execution_id`, including proven Session/Thread/Turn
-  association and bounded agent output;
-- `list_session_events` with ordered, paginated normalized events. Provider
-  JSON-RPC payloads are not exposed.
-
-## Default endpoint
-
-`http://127.0.0.1:12080/mcp`
-
-Start the server with:
-
-```text
+~~~powershell
 npm install
-npm start -- --workspace <path> --token <token>
-```
+Copy-Item .\config.production.example.json .\config.production.json
+notepad .\config.production.json
+~~~
 
-The port can be overridden with `--port <number>`. The token can also be
-provided through `LOCAL_REVIEW_MCP_TOKEN`. Token precedence is CLI, environment,
-then config file. A JSON config file can be provided with `--config <path>`:
+只需安装一次依赖。若 config.production.json 已经存在，不要再次复制覆盖；直接用文本编辑器打开现有文件。
 
-```json
+### 2. 填写本地项目与连接信息
+
+配置文件至少需要填写目标项目、访问令牌和公网连接信息。单项目配置可以参考下面的结构：
+
+~~~json
 {
   "port": 12080,
   "workspace": {
-    "id": "project",
-    "name": "Project",
-    "path": "C:\\path\\to\\project"
+    "id": "sample-project",
+    "name": "示例项目",
+    "path": "C:\\Projects\\sample-project"
   },
   "workspaces": [
     {
-      "id": "project",
-      "name": "Project",
-      "path": "C:\\path\\to\\project"
+      "id": "sample-project",
+      "name": "示例项目",
+      "path": "C:\\Projects\\sample-project"
     }
   ],
-  "auth": { "token": "<token>" },
-  "remote": { "enabled": false, "endpoint": "" },
+  "auth": {
+    "token": ""
+  },
+  "remote": {
+    "enabled": true,
+    "provider": "cloudflare",
+    "tunnelName": "替换为现有隧道名称或 UUID",
+    "endpoint": "https://review.example.com/mcp"
+  },
   "supervisor": {
-    "enabled": false,
+    "enabled": true,
     "healthIntervalSeconds": 30,
     "maxRestartAttempts": 3
   }
 }
-```
+~~~
 
-`workspaces` is optional for legacy configurations. When present, its entries
-are the only workspaces that MCP can select; the top-level `workspace` identity
-selects the active entry and is checked against the registry. A legacy string
-`workspace` remains supported for direct single-workspace startup.
+请按下面说明替换示例值：
 
-Set `supervisor.enabled` to `true` to run the MCP runtime under the Windows
-Supervisor. It checks `/health` at the configured interval, performs at most
-`maxRestartAttempts` automatic restarts, and exposes Start, Stop, Restart,
-Open Log Folder, startup registration, and Exit from the Tray menu. Supervisor
-logs are stored under the user's local application data directory and contain
-only fixed lifecycle events.
+| 配置项 | 填写内容 |
+| --- | --- |
+| workspace.id | 项目的唯一短标识，例如 sample-project；同一项目后续保持不变。 |
+| workspace.name | ChatGPT 中便于识别的项目名称。 |
+| workspace.path | 本机现有项目文件夹的绝对路径。JSON 中 Windows 路径的反斜杠要写成双反斜杠。 |
+| workspaces | 可访问项目清单。单项目时保留与 workspace 相同的条目；多个项目时在此添加其他项目。 |
+| auth.token | 建议留空，在启动窗口中设置访问令牌，避免把令牌写入配置文件。 |
+| remote.enabled | 通过 ChatGPT 网页连接时设为 true。 |
+| remote.provider | 保持 cloudflare。 |
+| remote.tunnelName | 已创建且可用的 Cloudflare 命名隧道名称或 UUID。 |
+| remote.endpoint | 该隧道对应的稳定 HTTPS 地址，末尾保留 /mcp。 |
+| supervisor | 首次使用可保留示例中的值。 |
 
-## Production Deployment
+如果配置了多个项目，workspaces 中每一项都要有不同的 id、显示名称和本机路径；顶层 workspace 应与清单中的一个项目相对应。项目路径必须已存在，并且运行服务的 Windows 用户能够访问。
 
-The supported deployment path is Windows → Local Review MCP → Cloudflare Tunnel
-→ ChatGPT Web custom MCP connector.
+### 3. 设置访问令牌并启动
 
-### Windows requirements
+使用密码管理器生成一个长随机令牌（建议至少 32 个字符），在同一个 PowerShell 窗口中替换下方示例值，然后启动服务：
 
-- Windows PowerShell 5.1 or PowerShell 7.
-- Node.js with npm available as `node --version` and `npm --version`.
-- `cloudflared` on `PATH` when `remote.enabled` is `true`. Install it from the
-  [Cloudflare tunnel documentation](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
-- A workspace directory that already exists and is readable. The deployment
-  scripts never create it.
-
-From the repository root, install dependencies and build the release runtime:
-
-```powershell
-npm install
-npm run build
-```
-
-Prepare the local production configuration. The example contains no real token,
-endpoint, or workspace:
-
-```powershell
-Copy-Item .\config.production.example.json .\config.production.json
-```
-
-Edit `config.production.json` and set `workspace` to the project directory the
-connector may review. Set `remote.tunnelName` to the existing Cloudflare Named
-Tunnel name or UUID and `remote.endpoint` to its stable public HTTPS `/mcp`
-endpoint. Keep `config.production.json` local; `.gitignore` excludes it.
-
-Set the bearer token in the process environment before starting. It is not
-stored in the repository:
-
-```powershell
-$env:LOCAL_REVIEW_MCP_TOKEN = "<long-random-review-token>"
-```
-
-Make sure `cloudflared` is installed. The production Supervisor runs the
-configured Named Tunnel with its local credentials file. If the installation
-uses a tunnel token instead, set `CLOUDFLARE_TUNNEL_TOKEN` for that same
-configured tunnel. Do not put either token in source control.
-
-Run the standard startup entry point:
-
-```powershell
+~~~powershell
+$env:LOCAL_REVIEW_MCP_TOKEN = "替换为自己生成的长随机令牌"
 .\scripts\start-production.ps1 -Config ".\config.production.json"
-```
+~~~
 
-With the runtime already running, use the read-only capability doctor:
+令牌不要提交到 Git、粘贴到公开聊天或分享给无关人员。这个令牌用于本机服务的访问保护；ChatGPT 连接时仍需在连接页面选择 OAuth 并完成授权，两者用途不同。
 
-```powershell
-npm run build
-node .\dist\src\cli.js doctor --config .\config.production.json
-node .\dist\src\cli.js doctor --config .\config.production.json --json
-```
+启动脚本会先检查配置和运行条件，再构建并启动服务。成功后保持该 PowerShell 窗口运行；关闭窗口会停止当前服务。若提示端口 12080 已被占用，可先关闭占用该端口的旧服务，或修改配置中的 port；修改端口时也要同步调整隧道指向的本机端口。
 
-The `lrm doctor` command (and the existing `local-review-mcp doctor` alias)
-calls the authenticated loopback `/launcher/doctor` endpoint. It reports MCP
-Runtime, Desktop IPC, Desktop Handoff, Desktop Trampoline, Standalone Backend,
-and Codex App Server checks. It does not create an Execution, alter the
-`CapabilityNegotiator` snapshot, acquire a handoff, send a Goal, or select a
-fallback provider.
+### 4. 在 ChatGPT 中添加连接
 
-The entry point reads the configuration, runs `preflight-check.ps1`, then
-starts the existing Local Review MCP runtime. The runtime starts the Windows
-Supervisor when `supervisor.enabled` is `true` and starts the Cloudflare Tunnel
-when `remote.enabled` is `true`. It prints the local health endpoint and any
-ready remote endpoint without printing credentials.
+1. 在 ChatGPT 设置中开启开发者模式（若账号或工作区提供此选项）。
+2. 打开 ChatGPT 的插件或连接管理页面，选择添加自定义连接。
+3. 填写连接名称，例如 Local Review MCP；服务器地址使用配置中的 remote.endpoint，确保包含 /mcp。
+4. 认证方式选择 OAuth，保存并完成连接授权。
+5. 新建一段对话，从工具菜单中选择 Local Review MCP。
 
-The preflight check verifies Node/npm, installed dependencies, required config
-sections, workspace access, and port availability. A missing `cloudflared` is
-fatal only when remote access is enabled. It reports an occupied port and asks
-you to change `port`; it never auto-installs dependencies, creates a workspace,
-or selects another port.
+界面名称可能随 ChatGPT 账号、工作区和版本变化。若找不到添加自定义连接的入口，请联系工作区管理员确认相关权限。
 
-### Remote verification
+### 5. 启用网页端 Codex 任务（只做 Review 可跳过）
 
-After the tunnel reports a public endpoint, verify the deployment from a PowerShell
-process that has the remote URL and token:
+ChatGPT 连接完成后即可读取项目并做 Review。若要从网页对话提交任务给本地 Codex，还需加载仓库自带的浏览器扩展：
 
-```powershell
-$env:LOCAL_REVIEW_MCP_REMOTE_URL = "https://<public-hostname>/mcp"
-$env:LOCAL_REVIEW_MCP_REMOTE_TOKEN = $env:LOCAL_REVIEW_MCP_TOKEN
-.\scripts\verify-remote.ps1
-```
+1. 在 Chrome 或 Edge 打开扩展管理页面，开启浏览器扩展的开发者模式，选择“加载已解压的扩展程序”。
+2. 选择本仓库中的 extension 文件夹。该扩展可直接加载，无需额外构建。
+3. 扩展加载或重新加载后，刷新 ChatGPT 页面。
+4. 保持 Local Review MCP 服务运行，并在一条已经打开的具体 ChatGPT 对话中选择 Local Review MCP，再提交任务。
 
-`verify-remote.ps1` checks that unauthenticated and wrong-token health requests
-return HTTP 401, the correct token returns `status=ok`, MCP `initialize` works,
-and `tools/list` matches the registered tool surface. That expected list is read
-from the built `dist/src/mcp/server.js` module (`REGISTERED_TOOL_NAMES`), so the
-verifier and the runtime share one definition; run `npm run build` first. The
-current runtime advertises nineteen read-only tools plus `submit_goal`
-(20 registered tools).
+不要从 ChatGPT 首页或空白的新聊天页面提交 Codex 任务；任务需要关联到当前具体对话。只做文件读取和 Review 时不需要加载此扩展。
 
-## Remote MCP Setup
+### 6. 确认连接正确
 
-Remote access is disabled by default. Enable the Cloudflare provider with:
+连接后，先让 ChatGPT 确认可用项目名称，并核对是否与配置中的 workspace.name 一致。若项目不符或没有可用项目，先检查项目路径和项目清单，再开始 Review。
 
-```json
-{
-  "remote": {
-    "enabled": true,
-    "provider": "cloudflare",
-    "tunnelName": "<tunnel-name-or-uuid>",
-    "endpoint": "https://<public-hostname>/mcp"
-  }
-}
-```
+确认成功后，可以直接提出请求，例如：
 
-Start the local runtime with an explicit workspace and token:
+> 请对当前项目做一次 Review，检查尚未提交的改动，重点关注功能错误、安全问题和数据丢失风险。只报告有代码依据的问题，并说明位置、影响和建议。
 
-```powershell
-$env:LOCAL_REVIEW_MCP_TOKEN = "<long-random-review-token>"
-npm start -- --workspace "C:\path\to\project" --config "settings.json"
-```
+### 常见问题
 
-Install `cloudflared` and configure an existing Named Tunnel. `remote.tunnelName`
-must contain its name or UUID, and `remote.endpoint` must contain the stable
-public HTTPS `/mcp` URL. The Supervisor runs `cloudflared tunnel run` for that
-tunnel and never creates a tunnel, changes DNS, or requests a temporary URL.
+- **项目路径找不到**：确认 path 是本机真实存在的项目文件夹，并按 JSON 格式写双反斜杠。
+- **启动时提示缺少令牌**：确认在启动脚本前，已在同一个 PowerShell 窗口设置 LOCAL_REVIEW_MCP_TOKEN，且令牌中没有空格。
+- **远程连接无法启动**：确认 cloudflared 已安装、隧道名称正确、隧道凭据可用，remote.endpoint 使用可访问的 HTTPS 公网域名并以 /mcp 结尾。
+- **ChatGPT 无法连接**：核对 ChatGPT 中填写的地址与 remote.endpoint 完全一致，检查公网隧道正在运行，并确认已完成 OAuth 授权。
+- **任务显示已接收但尚未执行**：确认 Local Review MCP 服务仍在运行、浏览器扩展已加载，并在刷新后的具体 ChatGPT 对话中提交任务。“已接收”不代表执行已经完成。
+- **多个项目显示错误**：核对顶层 workspace 是否与 workspaces 清单中的目标项目一致。
 
-```powershell
-$env:LOCAL_REVIEW_MCP_TOKEN = "<long-random-review-token>"
-# Optional when using token-based credentials for the configured Named Tunnel.
-$env:CLOUDFLARE_TUNNEL_TOKEN = "<cloudflare-tunnel-token>"
-npm start -- --workspace "C:\path\to\project" --config "settings.json"
-```
+## 在 ChatGPT 网页端完成协作
 
-The Cloudflare provider invokes only the installed `cloudflared` executable,
-does not upload configuration, and never logs credentials.
-The live endpoint is returned by the provider and owned by `TunnelManager`;
-`remote.tunnelName` and `remote.endpoint` are configuration inputs. No module
-hardcodes a tunnel hostname.
+### 只做本地项目 Review
 
-### ChatGPT Web connector
+1. 在 ChatGPT 对话中选择 Local Review MCP，并确认目标项目名称正确。
+2. 说明 Review 范围：例如当前尚未提交的改动、指定文件、目录或某个问题。
+3. 说明关注点：例如功能正确性、安全、错误处理、边界情况或数据完整性。
+4. 要求结论附上具体位置、代码依据、触发条件、实际影响和建议。
+5. 针对结论继续追问；项目有新改动后，再检查最新内容。
 
-1. In ChatGPT Web, enable the workspace's developer/custom-app capability if
-   the plan requires it, then open the Apps/Connectors settings and create a
-   custom MCP app.
-2. Enter the HTTPS endpoint reported by `TunnelManager` or the authenticated
-   `/health` response, using the `/mcp` path.
-3. Select the connector's OAuth authentication option. The server publishes
-   MCP protected-resource metadata, authorization-server metadata, dynamic
-   client registration, and PKCE endpoints under the same public origin.
-4. Scan the tools, confirm the read-only actions plus `submit_goal`, save the draft app, and
-   select it from a new chat. Ask for a code review; ChatGPT should call
-   `workspace_list` first, then `review_summary`, `execution_output`,
-   `workspace_info`, `git_status`, `git_diff`, `read_file`, and `search_text`
-   with a `workspace_id` when selecting a registered workspace.
+### 需要本地 Codex 执行任务时（先完成首次配置第 5 步）
 
-### Connector and browser readiness
+1. 在已选择 Local Review MCP 的 ChatGPT 对话中，写清要实现的目标、修改范围、不能改变的行为和验收条件。
+2. 明确要求 ChatGPT 将任务提交给本地 Codex 执行。重要背景应写进目标和要求，不要假设 Codex 会自动获得网页对话中的全部背景。
+3. 等待本地 Codex 完成任务和必要检查，再让 ChatGPT 查看执行结果及最新改动。
+4. 如果结果未达到验收条件，指出差距并提交下一轮目标；符合要求后再由你决定是否接受。
 
-For a real `submit_goal` handoff, keep the runtime, Tunnel (when remote access
-is enabled), Bridge, and the exact ChatGPT connector available. Run the local
-diagnostic after startup:
+## 可直接使用的提问示例
 
-```powershell
-npm run diagnose:chatgpt-connector -- --config <config>
-```
+### 检查当前改动
 
-If the exact connector has just been created or adopted, call `workspace_info`
-through that exact OAuth connector and confirm it with the returned request ID:
+> 请对当前项目做一次 Review，检查尚未提交的改动，重点关注功能错误、安全问题、边界情况和可能造成的数据丢失。只报告有实际代码依据且值得处理的问题，按严重程度排序。每条说明具体位置、触发条件、影响、判断依据和建议。如果没有发现明确问题，请直接说明；不要把单纯的风格偏好列为缺陷。
 
-```powershell
-npm run confirm:chatgpt-connector -- --config <config> --request-id <workspace_info.request_id>
-```
+### 检查指定文件及其影响
 
-Continue only when the diagnostic reports `ok=true`, `connector.status=verified`,
-`connector.action=none`, and ready remote/OAuth checks. The connector workflow
-in [`docs/chatgpt-connector-workflow.md`](docs/chatgpt-connector-workflow.md)
-covers exact-name checking, reauthorization, and adoption of an existing
-ChatGPT connector. Confirmation evidence is OAuth-authenticated `workspace_info`
-evidence for the current workspace and expires after ten minutes.
+> 请查看【文件路径】中的改动，并检查它对相关功能的影响。重点关注【关心的问题】。如果结论需要参考其他文件，请一并查看必要的相关内容，并说明判断依据。请把已确认的问题与仍需验证的猜测分开。
 
-The unpacked MV3 extension is in `extension/`; it needs to be loaded manually
-in Chrome or Edge and has no build step. After reloading the extension, refresh
-the ChatGPT page so its content scripts are replaced, then use a concrete
-conversation route rather than the New Chat root:
+### 调查一个具体疑问
 
-```text
-https://chatgpt.com/c/<conversation_id>
-https://chatgpt.com/g/<project>/c/<conversation_id>
-```
+> 我担心【描述现象或疑问】。请从【入口、文件或功能】开始查看项目中的相关实现，判断这种情况是否可能发生。请给出涉及的位置、成立条件、实际影响和依据；如果现有内容不足以确认，请指出缺少什么信息。
 
-The supported Project form is the one-segment route
-`/g/<project>/c/<conversation_id>`. `fiber.js` runs in the MAIN world and emits
-only bounded evidence from the current turn. For direct `submit_goal`, it
-accepts only the exact assistant tool request for `api_tool.call_tool` or
-`Local_MCP_Connector.submit_goal` whose `args` or `arguments` contains the
-strict UUID v4 `correlation_key`. It never substitutes assistant text, tool
-results, or `message.metadata.request_id` for that direct key. The content and
-background scripts additionally require Fiber/URL conversation equality,
-Chrome `MessageSender.documentId`, and the current `navigation_epoch`; stale,
-conflicting, and new-chat identities produce no canonical evidence. A raw
-`WEB:*` value is provisional and never becomes a canonical owner; only a valid
-same-model `serverId$()` result can resolve it to a canonical conversation ID.
+### 把任务交给本地 Codex
 
-The Local Control Bridge is a separate loopback Control Plane server on
-`127.0.0.1`, discovered on ports `12081` through `12085`, using protocol `3`.
-It pairs one validated Extension Origin and authenticates protected identity,
-delivery, and completion transport with a process-local bearer token.
-`GET /hello` is discovery; protected identity evidence is posted to
-`/identity-evidence`. If the Bridge is unavailable, the MCP Data Plane can still
-start, but `submit_goal` cannot pass its Browser identity-channel readiness gate.
+> 请把以下任务交给当前项目的本地 Codex 执行：实现【目标】。修改范围是【文件或功能范围】，必须保留【现有行为或兼容要求】，验收条件是【可检查的结果】。完成后检查改动，并把执行结果和仍未解决的问题带回当前对话供我复查。
 
-`GET http://127.0.0.1:<port>/launcher/readiness` is a loopback,
-static-token-protected status endpoint also shown by the Launcher. `ready` means
-the Bridge is available, the Extension is paired, and Extension presence was
-seen within the ten-second presence window. Presence is only channel
-readiness, not conversation proof. The Launcher may briefly retain a recent
-READY display during its presentation grace period, but `submit_goal` still
-checks live readiness and requires the exact Fiber/URL/document/epoch evidence
-above.
+### 修改完成后复查
 
-`submit_goal` does not accept `conversation_id`. The model must generate a fresh
-UUID v4 `correlation_key` for every call. The call first returns a durable
-acceptance receipt while a `PendingGoalSubmission` waits for matching canonical
-evidence (default TTL: two minutes); only then does Goal startup happen
-asynchronously. `accepted` is not Goal, Session, Execution, or review
-completion. If the key is not matched before expiry, no Goal is created. The
-read-only `get_identity_trace` and `get_evidence_transport_trace` tools expose
-hash-only, correlation-key-scoped diagnostics and never return raw payloads,
-tokens, cookies, or message text.
+> 请检查【本次修改范围】的最新改动，确认是否满足以下要求：【列出验收条件】。重点指出未满足的条件、可能引入的回归和仍需人工确认的风险。不要重复已经解决的问题。
 
-After identity matching, Goal preflight still checks runtime readiness, the
-requested registered workspace identity, and verified Connector/OAuth/remote
-readiness; Browser presence alone never authorizes a Goal.
+## 两端分工与执行边界
 
-The exact ChatGPT Web menu labels and availability depend on the workspace
-plan. The MCP endpoint itself is `/mcp`; `/health` is an authenticated
-readiness check. OpenAI's current [MCP and Connectors guide](https://developers.openai.com/api/docs/guides/tools-connectors-mcp)
-describes remote MCP server URLs and tool approval configuration.
+- ChatGPT 网页端负责理解需求、查看本地项目、制定计划和 Review 结果。
+- 本地 Codex 负责按明确提交的目标执行代码修改及必要检查。
+- Local Review MCP 提供授权项目内容，并关联任务、执行状态和 Review 上下文。
 
-At least one workspace is required. With a registry, the first entry is the
-legacy active workspace unless the top-level `workspace` matches another
-registered path. Without `workspace_id`, tools use that active workspace.
-One LRM instance may serve multiple registered workspaces: an explicit
-`workspace_id` selects that workspace, while omission keeps the active workspace
-as the default. For an interactive Goal, the immutable `workspace_id` resolves
-its canonical root, the matching Codex Desktop Project, and a new target Thread
-for that Goal. Changing the Launcher active workspace affects only later default
-queries and presentation; it does not move an existing Goal, Session, Execution,
-Review, Project, or target Thread. The workspaces share LRM, MCP, Bridge, and
-Desktop IPC infrastructure, not execution or review ownership.
-
-The current nineteen read-only tools are `workspace_info`, `list_files`,
-`read_file`, `search_text`, `git_status`, `git_diff`, `workspace_get_info`,
-`workspace_list_files`, `workspace_read_file`, `workspace_search`,
-`workspace_review_context`, `workspace_list`, `review_summary`,
-`execution_output`, `get_session_status`, `get_execution_status`,
-`list_session_events`, `get_identity_trace`, and `get_evidence_transport_trace`.
-The Control Plane tool `submit_goal` durably accepts a Goal and starts it after
-canonical Extension evidence proves the conversation. The five explicitly
-scoped `workspace_*` review tools require `workspace_id`; the other
-workspace-scoped tools preserve optional active-workspace behavior, while
-`workspace_list` has no workspace selector.
-Git tools are bound to the selected registered workspace, do not expose Git
-command arguments, and never perform write operations. `workspace_list` returns
-only each workspace's stable `id` and display `name`, never its local path.
-`review_summary` combines workspace metadata with Git status and diff counts.
-`execution_output` only reads `.review/execution_output.json` and returns
-`{"available":false}` when that file is absent; it never runs the recorded
-command or accepts a file path.
-
-`submit_goal` requires a fresh `correlation_key` and accepts an optional
-`workspace_id`, `title`, `goal`,
-`requirements`, `acceptance_criteria`, `max_iterations` (default `2`),
-`execution_mode` (default `batch`), `model`, and `reasoning_effort`. Its
-`conversation_id` is resolved internally from the exact Extension evidence
-chain; it is not caller-supplied.
-
-The health endpoint requires the configured static `Authorization: Bearer <token>`
-even on localhost and through Cloudflare Tunnel. MCP requests accept either that
-legacy token or an OAuth access token. The health endpoint is
-`http://127.0.0.1:<port>/health`; it returns the status, stable workspace
-identifier, version, `remote_status`, `endpoint_status`, the public endpoint
-only when it is ready, and an `oauth_registry` summary. The health summary uses
-the relative `oauth/clients.json` location so it does not disclose local paths.
-The loopback-only, static-token-protected `GET /oauth/clients` endpoint returns
-the full registry path, load state, client count, and non-secret client summaries.
-`DELETE /oauth/clients/<client_id>` removes one registration and
-`DELETE /oauth/clients` clears registrations without deleting the registry file.
-The health endpoint never returns tokens, credentials, local IPs, or workspace
-absolute paths.
-
-`search_text` accepts an optional `workspace_id`, `query`, workspace-relative
-`path` and `glob`, `regex`, `case_sensitive`, and `limit`. Searches are
-restricted to allowed text files up to 2 MiB, with at most 200 returned results
-and 500 preview characters per result.
-
-## E2E verification
-
-The remote suite uses the same Streamable HTTP MCP client flow as a remote
-connector and covers `initialize`, `tools/list`, workspace registry selection,
-ordered workspace review,
-Bearer authentication, safe health metadata, sensitive-file denial, traversal/
-absolute/drive/symlink path denial, and tunnel stop/restart. It creates a
-temporary `sample-project` Git workspace and never commits review changes.
-
-Run the release-candidate checks locally:
-
-```text
-npm run typecheck
-npm test
-npm run build
-```
-
-### Current validation baseline
-
-Validation baseline recorded on 2026-09-29:
-
-```text
-Command                         Result
-npm run typecheck               PASS
-npm run build                   PASS
-npm test                        PASS
-```
-
-`npm test` result on this Windows host: 111 files passed, 1,189 tests passed,
-1 skipped, 0 failed. A first full run on a cold `%TEMP%` can report 5s test
-timeouts followed by `EBUSY` failures removing `%TEMP%\local-review-mcp-*`
-directories that the timed-out test still held open. Re-run a failing file on
-its own before treating it as a regression; do not modify test logic or product
-code to work around Windows temp-directory contention.
-
-The Browser Worker review-submission diagnostic drives the complete local
-Review Delivery chain with a mock Page and does not require a ChatGPT login:
-
-```powershell
-npm run diagnose:review-submission
-```
-
-The live Goal E2E diagnostic exercises the Extension-based Goal, delivery,
-review-completion, verdict, and terminal-state path for one concrete ChatGPT
-conversation:
-
-```powershell
-npm run diagnose:goal-e2e -- --config config.production.json --conversation-id <conversation_id>
-```
-
-It requires the exact connector, an open target conversation, and a paired and
-present Extension. The automated review-loop test uses an in-process app-server
-test double; it verifies LRM lifecycle and verdict parsing, not live
-ChatGPT/browser delivery.
-
-The interactive app-server smoke uses a temporary state root and requires the
-requested provider selection:
-
-```powershell
-$env:CODEX_INTERACTIVE_MODEL = "gpt-5.6-luna"
-$env:CODEX_INTERACTIVE_EFFORT = "max"
-npm run test:interactive-goal
-```
-
-To probe an already deployed HTTPS endpoint with the optional remote test,
-provide `LOCAL_REVIEW_MCP_REMOTE_URL` and
-`LOCAL_REVIEW_MCP_REMOTE_TOKEN` only in the process environment before running
-the remote test. No token or public URL is stored in the repository.
-
-## LocalReviewLauncher
-
-[`LocalReviewLauncher/README.md`](LocalReviewLauncher/README.md) describes the
-independent PySide6 Windows launcher. `start-launcher.cmd` starts the existing
-`scripts/start-production.ps1` entry point; the launcher does not replace or
-embed the MCP runtime. Its startup and status views cover Start/Stop/Refresh,
-Workspace Registry, configuration validation/open/backup, OAuth client status,
-MCP health, Tunnel/remote status, and Browser readiness through authenticated
-local HTTP checks.
-
-The read-only Task Dashboard lists only interactive `codex_app_server` Sessions
-and shows Goal/Task, Session/Thread, model/effort, status, current Execution,
-and last update. The Session Viewer shows the current Execution and the paginated
-normalized Event Stream; adjacent agent-message deltas are aggregated for display
-and the rendered stream is capped at 500 rows. It refreshes every five seconds
-and provides an Open Codex Task locator using the proven Thread/Session IDs. The Launcher only
-observes lifecycle state and does not submit, stop, resume, approve, or control
-a Goal, Execution, Thread, or Turn. Separate cleanup actions can clear the
-display or remove completed/failed/terminated persisted task records; running
-Sessions are retained.
-
-## Security Notes
-
-Local Review MCP provides `read`, `search`, `review`, and interactive status
-capabilities through its nineteen read-only tools, plus the reviewed `submit_goal` Control Plane entry
-point. It does not provide:
-
-- `modify` or `write_file` operations;
-- `execute` or shell operations;
-- direct `agent` or Codex/ChatGPT automation controls outside `submit_goal`.
-
-Keep `LOCAL_REVIEW_MCP_TOKEN`, `CLOUDFLARE_TUNNEL_TOKEN`, and
-`LOCAL_REVIEW_MCP_REMOTE_TOKEN` in the process environment or another local
-secret store. Never commit tokens, `.env` files, Cloudflare credentials,
-private keys, or `config.production.json`.
+网页端提交的是有明确目标、范围和验收条件的任务，由本地 Codex 执行；Local Review MCP 的项目读取和 Review 能力保持只读。执行结果出现“已接收”时，只表示请求已进入处理流程，不代表修改和检查已经完成。请等待结果返回后再复查。

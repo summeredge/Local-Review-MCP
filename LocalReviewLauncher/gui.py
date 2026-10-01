@@ -14,7 +14,7 @@ from pathlib import Path
 from time import monotonic
 
 from PySide6.QtCore import QEvent, QThreadPool, QTimer, Qt, Slot
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtGui import QAction, QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -53,9 +53,9 @@ from status_checker import (
     DoctorStatus,
     DesktopCapabilityStatus,
     DesktopSyncStatus,
+    ExecutionViewModel,
     LauncherStatus,
     OAuthRegistryStatus,
-    SessionViewModel,
     StatusChecker,
 )
 from status_worker import (
@@ -73,7 +73,26 @@ MAX_EVENT_STREAM_ROWS = 500
 MAX_DASHBOARD_ROWS = 5
 CAPABILITY_TIMELINE_LIMIT = 100
 EVENT_STREAM_MIN_HEIGHT = 270
-CLEARED_TERMINAL_SESSION_STATUSES = frozenset({"completed", "failed", "terminated"})
+# The Execution Dashboard is one row per Execution; the Session columns are gone because a batch
+# Execution has no Session and previously could not be shown at all.
+EXECUTION_DASHBOARD_COLUMNS = (
+    "名称",
+    "模式",
+    "后端",
+    "状态",
+    "Workspace",
+    "开始时间",
+    "结束时间",
+)
+CLEARED_TERMINAL_EXECUTION_STATUSES = frozenset({"passed", "failed"})
+EXECUTION_STATUS_COLORS = {
+    "running": "#946200",
+    "passed": "#16803c",
+    "failed": "#9b1c1c",
+}
+UNKNOWN_STATUS_COLOR = "#666666"
+BATCH_EVENT_EMPTY_TEXT = "Batch Execution 无 Session 事件流"
+NO_SESSION_TEXT = "\n".join(["Session：—", "Thread：—"])
 BUTTON_WIDTH = 136
 BUTTON_HEIGHT = 34
 BUTTON_SPACING = 6
@@ -123,7 +142,7 @@ class LauncherWindow(QMainWindow):
         self._browser_missing_since: float | None = None
         self._status_check_scheduler = StatusCheckScheduler()
         self._status_check_generation = 0
-        self._cleared_session_keys: set[tuple[str, str | None]] = set()
+        self._cleared_execution_ids: set[str] = set()
         self._status_thread_pool = QThreadPool(self)
         self._status_thread_pool.setMaxThreadCount(1)
         self._closing = False
@@ -199,32 +218,22 @@ class LauncherWindow(QMainWindow):
         self.workspace_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.workspace_table.horizontalHeader().setStretchLastSection(True)
         self.workspace_table.setMinimumHeight(120)
-        self.session_table = QTableWidget(0, 8)
-        self.session_table.setHorizontalHeaderLabels([
-            "目标 / 任务",
-            "状态",
-            "后端",
-            "模型",
-            "推理",
-            "会话 ID",
-            "线程 ID",
-            "更新时间",
-        ])
-        self.session_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.session_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.session_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.session_table.horizontalHeader().setStretchLastSection(True)
-        self.session_table.setMinimumHeight(160)
-        self.session_table.setMaximumHeight(
-            self.session_table.horizontalHeader().sizeHint().height()
-            + self.session_table.verticalHeader().defaultSectionSize() * MAX_DASHBOARD_ROWS
-            + 2 * self.session_table.frameWidth()
+        self.execution_table = QTableWidget(0, len(EXECUTION_DASHBOARD_COLUMNS))
+        self.execution_table.setHorizontalHeaderLabels(list(EXECUTION_DASHBOARD_COLUMNS))
+        self.execution_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.execution_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.execution_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.execution_table.horizontalHeader().setStretchLastSection(True)
+        self.execution_table.setMinimumHeight(160)
+        self.execution_table.setMaximumHeight(
+            self.execution_table.horizontalHeader().sizeHint().height()
+            + self.execution_table.verticalHeader().defaultSectionSize() * MAX_DASHBOARD_ROWS
+            + 2 * self.execution_table.frameWidth()
         )
-        self.session_empty_label = QLabel("暂无活动会话")
         self.query_workspace_label = QLabel()
         self.query_workspace_label.setWordWrap(True)
         self.query_workspace_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.session_details_label = QLabel("请选择会话查看详情。")
+        self.session_details_label = QLabel(NO_SESSION_TEXT)
         self.session_details_label.setWordWrap(True)
         self.execution_details_label = QLabel("执行：—")
         self.execution_details_label.setWordWrap(True)
@@ -236,7 +245,10 @@ class LauncherWindow(QMainWindow):
         self.event_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self.event_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.event_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self._session_view_models: tuple[SessionViewModel, ...] = ()
+        self.event_empty_label = QLabel(BATCH_EVENT_EMPTY_TEXT)
+        self.event_empty_label.setWordWrap(True)
+        self.event_empty_label.setVisible(False)
+        self._execution_view_models: tuple[ExecutionViewModel, ...] = ()
         self.message_label = QLabel()
         self.message_label.setWordWrap(True)
         self.log_output = QPlainTextEdit()
@@ -269,8 +281,13 @@ class LauncherWindow(QMainWindow):
         self.open_config_button = QPushButton("打开配置文件")
         self.backup_config_button = QPushButton("备份配置")
         self.validate_config_button = QPushButton("校验配置")
-        self.open_codex_task_button = QPushButton("线程信息")
+        self.open_codex_task_button = QToolButton()
+        self.open_codex_task_button.setText("线程信息")
+        self.open_codex_task_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.open_codex_task_button.setCheckable(True)
         self.open_codex_task_button.setEnabled(False)
+        self.session_viewer_toggle = self.open_codex_task_button
+        self.session_viewer_toggle.toggled.connect(self._set_session_viewer_expanded)
         self.copy_log_button = QPushButton("复制日志")
         self.clear_log_button = QPushButton("清空显示")
         self.save_log_button = QPushButton("保存日志")
@@ -294,8 +311,7 @@ class LauncherWindow(QMainWindow):
         self.open_config_button.clicked.connect(self.open_config)
         self.backup_config_button.clicked.connect(self.backup_config)
         self.validate_config_button.clicked.connect(self.validate_config)
-        self.open_codex_task_button.clicked.connect(self.open_codex_task)
-        self.session_table.itemSelectionChanged.connect(self._render_selected_session)
+        self.execution_table.itemSelectionChanged.connect(self._render_selected_execution)
         self.event_table.addAction(self._copy_event_stream_action())
         self.copy_log_button.clicked.connect(self.copy_log)
         self.clear_log_button.clicked.connect(self.clear_log)
@@ -406,34 +422,26 @@ class LauncherWindow(QMainWindow):
         task_layout.setContentsMargins(CONTENT_MARGIN, CONTENT_MARGIN, CONTENT_MARGIN, CONTENT_MARGIN)
         task_layout.setSpacing(CONTENT_SPACING)
         task_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        task_layout.addWidget(self._section_title("任务面板"))
-        task_layout.addWidget(self._section_title("Session Table"))
-        task_layout.addWidget(self.session_table)
-        task_layout.addWidget(self.session_empty_label)
-        task_layout.addWidget(self._section_title("线程信息"))
-        task_layout.addWidget(self._row("当前查询工作区：", self.query_workspace_label))
-        task_layout.addWidget(self.open_codex_task_button)
-        self.session_viewer_toggle = QToolButton()
-        self.session_viewer_toggle.setText("会话查看器")
-        self.session_viewer_toggle.setCheckable(True)
-        self.session_viewer_toggle.toggled.connect(self._set_session_viewer_expanded)
-        self.session_viewer_content = QWidget()
-        session_viewer_layout = QVBoxLayout(self.session_viewer_content)
-        session_viewer_layout.setContentsMargins(0, 0, 0, 0)
-        session_viewer_layout.addWidget(self.session_details_label)
-        session_viewer_layout.addWidget(self._section_title("Execution"))
-        session_viewer_layout.addWidget(self.execution_details_label)
-        task_layout.addWidget(self.session_viewer_toggle)
-        task_layout.addWidget(self.session_viewer_content)
-        task_layout.addWidget(self._section_title("Event Stream"))
-        task_layout.addWidget(self.event_table)
-        task_layout.addWidget(self._section_title("维护"))
         maintenance = QHBoxLayout()
         maintenance.setSpacing(BUTTON_SPACING)
         maintenance.setAlignment(Qt.AlignmentFlag.AlignLeft)
         maintenance.addWidget(self.clear_task_cache_button)
         maintenance.addWidget(self.clear_persisted_task_button)
         task_layout.addLayout(maintenance)
+        task_layout.addWidget(self.execution_table)
+        task_layout.addWidget(self._row("当前查询工作区：", self.query_workspace_label))
+        task_layout.addWidget(self.open_codex_task_button)
+        self.session_viewer_content = QWidget()
+        session_viewer_layout = QVBoxLayout(self.session_viewer_content)
+        session_viewer_layout.setContentsMargins(0, 0, 0, 0)
+        session_viewer_layout.addWidget(self._section_title("Execution"))
+        session_viewer_layout.addWidget(self.execution_details_label)
+        session_viewer_layout.addWidget(self._section_title("Session"))
+        session_viewer_layout.addWidget(self.session_details_label)
+        task_layout.addWidget(self.session_viewer_content)
+        task_layout.addWidget(self._section_title("Event Stream"))
+        task_layout.addWidget(self.event_table)
+        task_layout.addWidget(self.event_empty_label)
         self._set_session_viewer_expanded(False)
         self._set_capability_timeline_expanded(False)
 
@@ -462,7 +470,6 @@ class LauncherWindow(QMainWindow):
             self.copy_log_button,
             self.clear_log_button,
             self.save_log_button,
-            self.session_viewer_toggle,
         ):
             button.setFixedSize(BUTTON_WIDTH, BUTTON_HEIGHT)
 
@@ -511,7 +518,7 @@ class LauncherWindow(QMainWindow):
         self._set_state(LauncherState.STOPPED)
         self._render_workspace_registry()
         self._render_query_workspace()
-        self._render_session_dashboard(())
+        self._render_execution_dashboard(())
         self._render_runtime_info()
         self.refresh_status()
         if self.configuration.auto_start:
@@ -595,7 +602,7 @@ class LauncherWindow(QMainWindow):
         if self.state == LauncherState.STARTING:
             return
         if restore_task_cache:
-            self._cleared_session_keys.clear()
+            self._cleared_execution_ids.clear()
         self._render_runtime_info()
         self._request_status_check("normal")
 
@@ -625,15 +632,15 @@ class LauncherWindow(QMainWindow):
         self._apply_controls(status)
 
     def _render_status(self, status: LauncherStatus) -> None:
-        sessions = tuple(
-            session
-            for session in getattr(status, "sessions", ())
+        executions = tuple(
+            execution
+            for execution in getattr(status, "executions", ())
             if (
-                (session.session_id, session.execution_id) not in self._cleared_session_keys
-                or session.status not in CLEARED_TERMINAL_SESSION_STATUSES
+                execution.execution_id not in self._cleared_execution_ids
+                or execution.status not in CLEARED_TERMINAL_EXECUTION_STATUSES
             )
         )
-        self._last_status = replace(status, sessions=sessions)
+        self._last_status = replace(status, executions=executions)
         self._set_status(self.mcp_status, "运行中" if status.mcp_running else "未运行", status.mcp_running)
         self._set_status(
             self.tunnel_status,
@@ -781,7 +788,7 @@ class LauncherWindow(QMainWindow):
             )
             self._set_value(self.desktop_status, "已连接", "#16803c")
         self._render_oauth_status(status.oauth_registry)
-        self._render_session_dashboard(sessions)
+        self._render_execution_dashboard(executions)
 
     @staticmethod
     def _localize_browser_text(text: str) -> str:
@@ -1069,17 +1076,9 @@ class LauncherWindow(QMainWindow):
         item = self.workspace_table.item(row, 1) if row >= 0 else None
         return item.text() if item is not None else None
 
-    def _selected_session_id(self) -> str | None:
-        row = self.session_table.currentRow()
-        item = self.session_table.item(row, 5) if row >= 0 else None
-        return item.text() if item is not None else None
-
-    def _selected_session(self) -> SessionViewModel | None:
-        session_id = self._selected_session_id()
-        return next(
-            (session for session in self._session_view_models if session.session_id == session_id),
-            None,
-        )
+    def _selected_execution(self) -> ExecutionViewModel | None:
+        row = self.execution_table.currentRow()
+        return self._execution_view_models[row] if 0 <= row < len(self._execution_view_models) else None
 
     def _set_session_viewer_expanded(self, expanded: bool) -> None:
         self.session_viewer_toggle.setArrowType(
@@ -1108,75 +1107,78 @@ class LauncherWindow(QMainWindow):
         if contents:
             QApplication.clipboard().setText("\n".join(contents))
 
-    def _render_session_dashboard(self, sessions: tuple[SessionViewModel, ...]) -> None:
-        selected_id = self._selected_session_id()
-        self._session_view_models = tuple(sessions)
-        self.session_table.blockSignals(True)
+    def _render_execution_dashboard(self, executions: tuple[ExecutionViewModel, ...]) -> None:
+        selected = self._selected_execution()
+        selected_id = selected.execution_id if selected is not None else None
+        self._execution_view_models = tuple(executions)
+        self.execution_table.blockSignals(True)
         try:
-            self.session_table.setRowCount(0)
-            for row, session in enumerate(self._session_view_models):
-                self.session_table.insertRow(row)
+            self.execution_table.setRowCount(0)
+            for row, execution in enumerate(self._execution_view_models):
+                self.execution_table.insertRow(row)
                 values = (
-                    f"{session.goal_name} / {session.task_name}",
-                    session.status,
-                    session.backend_type,
-                    session.model or "—",
-                    session.reasoning_effort or "—",
-                    session.session_id,
-                    session.thread_id or "—",
-                    self._format_timestamp(session.updated_at),
+                    execution.name,
+                    execution.display_mode,
+                    execution.backend_label,
+                    execution.status,
+                    execution.workspace_id,
+                    self._format_timestamp(execution.started_at),
+                    self._format_timestamp(execution.finished_at),
                 )
                 for column, value in enumerate(values):
-                    self.session_table.setItem(row, column, QTableWidgetItem(value))
-            self.session_table.resizeColumnsToContents()
-            self.session_table.clearSelection()
-            self.session_table.setCurrentCell(-1, -1)
+                    self.execution_table.setItem(row, column, QTableWidgetItem(value))
+                status_item = self.execution_table.item(row, 3)
+                if status_item is not None:
+                    status_item.setForeground(QColor(
+                        EXECUTION_STATUS_COLORS.get(execution.status, UNKNOWN_STATUS_COLOR)
+                    ))
+            self.execution_table.resizeColumnsToContents()
+            self.execution_table.clearSelection()
+            self.execution_table.setCurrentCell(-1, -1)
             if selected_id is not None:
-                for row, session in enumerate(self._session_view_models):
-                    if session.session_id == selected_id:
-                        self.session_table.selectRow(row)
+                for row, execution in enumerate(self._execution_view_models):
+                    if execution.execution_id == selected_id:
+                        self.execution_table.selectRow(row)
                         break
         finally:
-            self.session_table.blockSignals(False)
-        self.session_empty_label.setText("暂无活动会话")
-        self.session_empty_label.setVisible(not self._session_view_models)
-        self._render_selected_session()
+            self.execution_table.blockSignals(False)
+        self._render_selected_execution()
 
-    def _render_selected_session(self) -> None:
-        session = self._selected_session()
-        if session is None:
-            self._clear_session_view()
+    def _render_selected_execution(self) -> None:
+        execution = self._selected_execution()
+        if execution is None:
+            self._clear_execution_view()
             return
 
         self.open_codex_task_button.setEnabled(True)
-        self.session_details_label.setText("\n".join([
-            f"会话 ID：{session.session_id}",
-            f"目标 ID：{session.goal_id}",
-            f"任务 ID：{session.task_id}",
-            f"后端类型：{session.backend_type}",
-            f"线程 ID：{session.thread_id or '—'}",
-            f"模型：{session.model or '—'}",
-            f"推理：{session.reasoning_effort or '—'}",
-            f"状态：{session.status}",
+        self.execution_details_label.setText("\n".join([
+            f"执行 ID：{execution.execution_id}",
+            f"目标：{execution.goal_name or '—'}（{execution.goal_id or '—'}）",
+            f"任务：{execution.task_name or '—'}（{execution.task_id}）",
+            f"工作区：{execution.workspace_id}",
+            f"模式：{execution.display_mode}",
+            f"后端：{execution.backend_label}（{execution.backend or '—'}）",
+            f"状态：{execution.status}",
+            f"开始时间：{self._format_timestamp(execution.started_at)}",
+            f"结束时间：{self._format_timestamp(execution.finished_at)}",
+            f"摘要：{execution.summary or '—'}",
+        ]))
+        session = execution.session
+        # A batch Execution has no Session and no event stream; both stay explicit instead of
+        # being rendered as an empty Session.
+        self.session_details_label.setText(NO_SESSION_TEXT if session is None else "\n".join([
+            f"Session：{session.session_id}",
+            f"Thread：{session.thread_id or '—'}",
+            f"Model：{session.model or '—'}",
+            f"Reasoning：{session.reasoning_effort or '—'}",
             f"更新时间：{self._format_timestamp(session.updated_at)}",
         ]))
-        execution = session.execution
-        if execution is None:
-            self.execution_details_label.setText("执行：—")
-        else:
-            self.execution_details_label.setText("\n".join([
-                f"执行 ID：{execution.execution_id}",
-                f"状态：{execution.status}",
-                f"摘要：{execution.summary or '—'}",
-                f"当前轮次：{execution.turn_id or '—'}",
-                f"开始时间：{self._format_timestamp(execution.started_at)}",
-                f"结束时间：{self._format_timestamp(execution.finished_at)}",
-            ]))
+        self.event_empty_label.setVisible(session is None)
 
         # Aggregate before limiting rows so a retained stream keeps all its text.
         rows = deque(maxlen=MAX_EVENT_STREAM_ROWS)
-        # Session identity is already validated when building session.events.
-        for identity, group in groupby(session.events, key=lambda event: (
+        # Session identity is already validated when building execution.events.
+        for identity, group in groupby(execution.events, key=lambda event: (
             (event.execution_id, event.turn_id, event.item_id)
             if event.event_type in {"agent_message_delta", "agent_message_completed"} else None
         )):
@@ -1207,24 +1209,22 @@ class LauncherWindow(QMainWindow):
         self.event_table.resizeRowsToContents()
         self.event_table.verticalScrollBar().setValue(scroll_position)
 
-    def _clear_session_view(self) -> None:
+    def _clear_execution_view(self) -> None:
         self.open_codex_task_button.setEnabled(False)
-        self.session_details_label.setText("请选择会话查看详情。")
+        self.session_details_label.setText("请选择执行查看详情。")
         self.execution_details_label.setText("执行：—")
+        self.event_empty_label.setVisible(False)
         self.event_table.setRowCount(0)
 
     def clear_task_cache(self) -> None:
-        self._cleared_session_keys.update(
-            (session.session_id, session.execution_id)
-            for session in self._session_view_models
+        self._cleared_execution_ids.update(
+            execution.execution_id for execution in self._execution_view_models
         )
         self._status_check_generation += 1
-        self._session_view_models = ()
-        self._last_status = replace(self._last_status, sessions=())
-        self.session_table.setRowCount(0)
-        self.session_empty_label.setText("暂无活动会话")
-        self.session_empty_label.setVisible(True)
-        self._clear_session_view()
+        self._execution_view_models = ()
+        self._last_status = replace(self._last_status, executions=())
+        self.execution_table.setRowCount(0)
+        self._clear_execution_view()
         self.message_label.setText("任务面板界面缓存已清理；活动任务和新任务仍会显示，请点击“刷新状态”重新加载全部内容。")
 
     def clear_persisted_task_records(self) -> None:
@@ -1236,19 +1236,22 @@ class LauncherWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "清理持久化任务记录",
-            "删除默认工作区中已结束的 Session、Event、Execution 和 Task 记录？\n"
-            "运行中的任务不会删除。\n\n继续吗？",
+            "删除当前工作区中已结束的 Execution，以及关联且已结束的 Session 和 Event？\n"
+            "没有其它需要保留的记录时会同时删除 Task。运行中的 Execution 和 Session 会保留。\n\n继续吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        deleted = self.status_checker.clear_persisted_task_records()
-        if deleted is None:
+        result = self.status_checker.clear_persisted_task_records()
+        if result is None:
             self._show_error("无法清理持久化任务记录。")
             return
         self.clear_task_cache()
-        self.message_label.setText(f"已清理 {deleted} 条持久化任务记录。")
+        self.message_label.setText(
+            f"已清理 Execution {result.deleted_executions} 条、Session {result.deleted_sessions} 条、"
+            f"Event {result.deleted_events} 条、Task {result.deleted_tasks} 条。"
+        )
         self.refresh_status()
 
     @staticmethod
@@ -1261,14 +1264,14 @@ class LauncherWindow(QMainWindow):
             return timestamp
 
     def open_codex_task(self) -> None:
-        session = self._selected_session()
-        if session is None:
+        execution = self._selected_execution()
+        if execution is None or not execution.can_open_codex_task:
             return
         QMessageBox.information(
             self,
             "线程信息",
-            f"线程 ID：{session.thread_id or '—'}\n"
-            f"会话 ID：{session.session_id}",
+            f"线程 ID：{execution.thread_id or '—'}\n"
+            f"会话 ID：{execution.session_id or '—'}",
         )
 
     def _render_runtime_info(self) -> None:

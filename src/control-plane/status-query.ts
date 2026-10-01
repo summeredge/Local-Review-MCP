@@ -1,5 +1,5 @@
-import { rm } from "node:fs/promises";
-import { resolve } from "node:path";
+import { readdir, rm, rmdir } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { z } from "zod";
 import {
   executionIdSchema,
@@ -12,12 +12,13 @@ import {
   workspaceIdSchema,
 } from "../context/schema.js";
 import { ExecutionContextService } from "../context/execution-service.js";
-import { taskExecutionsDirectory } from "../context/execution.js";
+import { executionFile, TASK_EXECUTIONS_DIRECTORY, taskExecutionsDirectory } from "../context/execution.js";
 import { SessionStore } from "../context/session-store.js";
 import { sessionFile } from "../context/session.js";
 import { defaultTaskContextStorageRoot, taskContextFile } from "../context/task.js";
 import { TaskContextService } from "../context/service.js";
-import type { ExecutionContext, Session } from "../context/types.js";
+import type { ExecutionContext, Session, SessionBackendType } from "../context/types.js";
+import type { ExecutionMode } from "./execution-service.js";
 import type { GoalOrchestrationService, GoalOrchestration } from "./goal-orchestration.js";
 import {
   lrmEventSchema,
@@ -118,6 +119,35 @@ export interface LauncherSessionSummary {
   readonly updated_at: string;
 }
 
+/**
+ * One Launcher dashboard row. The Execution is the primary object; Goal and Session are optional
+ * associations, so a batch Execution with no Session is a complete row rather than a gap.
+ * `backend` keeps the internal identity ("cli", "codex_app_server", "desktop_codex_app") and
+ * `backend_type` repeats the matched Session's identity, which is where `backend` comes from when
+ * a Session exists.
+ */
+export interface LauncherExecutionSummary {
+  readonly execution_id: string;
+  readonly workspace_id: string;
+  readonly task_id: string;
+  readonly goal_id?: string;
+  readonly name: string;
+  readonly goal_name?: string;
+  readonly task_name: string;
+  readonly execution_mode?: ExecutionMode;
+  readonly backend?: SessionBackendType;
+  readonly status: ExecutionContext["status"];
+  readonly started_at: string;
+  readonly finished_at?: string;
+  readonly summary?: string;
+  readonly session_id?: string;
+  readonly thread_id?: string;
+  readonly backend_type?: SessionBackendType;
+  readonly model?: string;
+  readonly reasoning_effort?: string;
+  readonly updated_at: string;
+}
+
 type GoalReader = Pick<GoalOrchestrationService, "getGoal"> & {
   readonly listGoals?: GoalOrchestrationService["listGoals"];
 };
@@ -150,6 +180,14 @@ interface ExecutionMatch {
 
 function unique<T>(values: readonly T[]): T[] {
   return [...new Set(values)];
+}
+
+function plannedTask(goal: GoalOrchestration, taskId: string) {
+  for (const phase of goal.phases) {
+    const task = phase.tasks.find((candidate) => candidate.task_id === taskId);
+    if (task !== undefined) return { phase, task };
+  }
+  return undefined;
 }
 
 function latestEvent(
@@ -368,47 +406,265 @@ export class StatusQueryService {
     return summaries.sort((left, right) => right.updated_at.localeCompare(left.updated_at));
   }
 
+  /**
+   * Unified Execution catalog for the Launcher task dashboard. Executions are read from their own
+   * durable records, so a batch Execution stays observable without a Session; Goal and Session are
+   * optional associations, and a missing or damaged one only degrades its own row.
+   */
+  public async listExecutionSummaries(workspaceId?: string): Promise<LauncherExecutionSummary[]> {
+    const goals = await this.availableGoals();
+    const sessions = await this.availableSessions();
+    const summaries: LauncherExecutionSummary[] = [];
+    for (const target of await this.executionTargets(workspaceId)) {
+      let executions: ExecutionContext[];
+      try {
+        executions = await this.executions.listExecutions(target.workspace_id, target.task_id);
+      } catch {
+        continue;
+      }
+      for (const execution of executions) {
+        try {
+          summaries.push(await this.executionSummary(execution, goals, sessions));
+        } catch {
+          continue;
+        }
+      }
+    }
+    return summaries.sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+  }
+
+  private async executionSummary(
+    execution: ExecutionContext,
+    goals: readonly GoalOrchestration[],
+    sessions: readonly Session[],
+  ): Promise<LauncherExecutionSummary> {
+    const goal = await this.goalForExecution(execution, goals);
+    const session = this.sessionFor(execution, goal, sessions);
+    const plan = goal === undefined ? undefined : plannedTask(goal, execution.task_id);
+    const goalName = goal === undefined
+      ? undefined
+      : (plan?.phase.objective.slice(0, 256) || goal.goal_id);
+    const taskName = plan?.task.goal.slice(0, 256) || execution.task_id;
+    // Backend evidence, not Session presence: the fixed route only ever sends a batch Execution to
+    // the CLI backend, so a batch row keeps its identity even without a Session record. Anything
+    // else stays unresolved instead of being guessed.
+    const backend = session?.backend_type ?? (goal?.execution_mode === "batch" ? "cli" : undefined);
+    return {
+      execution_id: execution.execution_id,
+      workspace_id: execution.workspace_id,
+      task_id: execution.task_id,
+      ...(goal === undefined ? {} : {
+        goal_id: goal.goal_id,
+        execution_mode: goal.execution_mode,
+      }),
+      name: goalName ?? taskName,
+      ...(goalName === undefined ? {} : { goal_name: goalName }),
+      task_name: taskName,
+      ...(backend === undefined ? {} : { backend }),
+      status: execution.status,
+      started_at: execution.started_at,
+      ...(execution.finished_at === undefined ? {} : { finished_at: execution.finished_at }),
+      ...(execution.summary === undefined ? {} : { summary: execution.summary }),
+      ...(session === undefined ? {} : {
+        session_id: session.session_id,
+        backend_type: session.backend_type,
+        ...(session.thread_id === undefined ? {} : { thread_id: session.thread_id }),
+        ...(session.model === undefined ? {} : { model: session.model }),
+        ...(session.reasoning_effort === undefined
+          ? {}
+          : { reasoning_effort: session.reasoning_effort }),
+      }),
+      updated_at: session?.updated_at ?? execution.finished_at ?? execution.started_at,
+    };
+  }
+
+  /**
+   * Sessions are matched by Task identity and, when the Goal is known, by Goal identity. Provider
+   * event evidence is deliberately left out so polling the dashboard stays a bounded read.
+   */
+  private sessionFor(
+    execution: ExecutionContext,
+    goal: GoalOrchestration | undefined,
+    sessions: readonly Session[],
+  ): Session | undefined {
+    const matches = sessions.filter((session) => session.task_id === execution.task_id
+      && (goal === undefined || session.goal_id === goal.goal_id));
+    return matches.reduce<Session | undefined>(
+      (latest, candidate) => latest === undefined || candidate.updated_at > latest.updated_at
+        ? candidate
+        : latest,
+      undefined,
+    );
+  }
+
+  /** Damaged Goal state degrades the Execution catalog; it never fails the whole query. */
+  private async availableGoals(): Promise<GoalOrchestration[]> {
+    try {
+      return await this.listGoals();
+    } catch {
+      return [];
+    }
+  }
+
+  private async availableSessions(): Promise<readonly Session[]> {
+    try {
+      return await this.sessions.listSessions();
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Executions are enumerated from their own directory layout instead of from Task records, so an
+   * Execution whose TaskContext was cleaned up or never stored stays visible.
+   */
+  private async executionTargets(
+    workspaceId?: string,
+  ): Promise<Array<{ readonly workspace_id: string; readonly task_id: string }>> {
+    const root = join(this.storageRoot, TASK_EXECUTIONS_DIRECTORY);
+    const targets = new Map<string, { readonly workspace_id: string; readonly task_id: string }>();
+    for (const workspace of await this.directories(root)) {
+      if (!workspaceIdSchema.safeParse(workspace).success) continue;
+      if (workspaceId !== undefined && workspace !== workspaceId) continue;
+      for (const task of await this.directories(join(root, workspace))) {
+        if (!taskIdSchema.safeParse(task).success) continue;
+        targets.set(`${workspace}\0${task}`, { workspace_id: workspace, task_id: task });
+      }
+    }
+    return [...targets.values()];
+  }
+
+  private async directories(directory: string): Promise<string[]> {
+    try {
+      return (await readdir(directory, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+        .sort();
+    } catch {
+      return [];
+    }
+  }
+
   public async clearSessionRecords(workspaceId?: string): Promise<{
+    readonly deleted_executions: number;
     readonly deleted_sessions: number;
     readonly deleted_events: number;
     readonly deleted_tasks: number;
   }> {
+    if (workspaceId === undefined || !workspaceIdSchema.safeParse(workspaceId).success) {
+      throw new Error("Workspace scope is required to clear persisted task records.");
+    }
+
     const sessions = await this.sessions.listSessions();
-    const terminal = new Set(["completed", "failed", "terminated"]);
-    const candidates: Array<{ readonly session: Session; readonly workspace_id: string }> = [];
-    for (const session of sessions) {
-      if (session.backend_type !== "codex_app_server") continue;
-      const goal = await this.optionalGoal(session.goal_id);
-      if (goal === undefined || (workspaceId !== undefined && goal.workspace_id !== workspaceId)) continue;
-      // A Session can stay non-terminal after its Execution already failed, so the Session
-      // status alone leaves dead records behind. The Execution decides in that case.
-      if (terminal.has(session.status) || await this.executionFailed(session, goal)) {
-        candidates.push({ session, workspace_id: goal.workspace_id });
+    const terminalExecutions = new Set(["passed", "failed"]);
+    const terminalSessions = new Set(["completed", "failed", "terminated"]);
+    const interactiveBackends = new Set(["codex_app_server", "desktop_codex_app"]);
+    const sessionsToDelete = new Map<string, {
+      readonly session: Session;
+      readonly events: StoredLrmEvent[];
+      readonly workspace_id: string;
+    }>();
+    const emptyTaskTargets: Array<{ readonly workspace_id: string; readonly task_id: string }> = [];
+    let deletedExecutions = 0;
+    let deletedEvents = 0;
+
+    for (const target of await this.executionTargets(workspaceId)) {
+      let executions: ExecutionContext[];
+      try {
+        executions = await this.executions.listExecutions(target.workspace_id, target.task_id);
+      } catch {
+        continue;
+      }
+      const byId = new Map(executions.map((execution) => [execution.execution_id, execution]));
+      const terminalIds = new Set(executions
+        .filter((execution) => terminalExecutions.has(execution.status))
+        .map((execution) => execution.execution_id));
+      if (terminalIds.size === 0) continue;
+
+      for (const session of sessions) {
+        if (session.task_id !== target.task_id
+          || !interactiveBackends.has(session.backend_type)
+          || !terminalSessions.has(session.status)
+          || sessionsToDelete.has(session.session_id)) continue;
+        let goal: GoalOrchestration | undefined;
+        let sessionEvents: StoredLrmEvent[];
+        try {
+          goal = await this.optionalGoal(session.goal_id);
+          if (goal?.workspace_id !== target.workspace_id) continue;
+          sessionEvents = await this.events.listEvents(session.session_id);
+        } catch {
+          continue;
+        }
+
+        const relatedIds = unique([
+          ...sessionEvents.map((event) => event.execution_id),
+          ...(goal.current_task_id === target.task_id && goal.execution_id !== undefined
+            ? [goal.execution_id]
+            : []),
+        ]);
+        if (!relatedIds.some((id) => terminalIds.has(id))) continue;
+        // Unknown or running associations keep the whole Session and its event stream intact.
+        if (relatedIds.some((id) => !byId.has(id) || byId.get(id)?.status === "running")) continue;
+        sessionsToDelete.set(session.session_id, {
+          session,
+          events: sessionEvents,
+          workspace_id: target.workspace_id,
+        });
+      }
+
+      for (const [sessionId, candidate] of sessionsToDelete) {
+        if (candidate.workspace_id !== target.workspace_id || candidate.session.task_id !== target.task_id) continue;
+        await rm(eventsFile(this.storageRoot, sessionId), { force: true });
+        await rm(sessionFile(this.storageRoot, sessionId), { force: true });
+        deletedEvents += candidate.events.length;
+      }
+      for (const executionId of terminalIds) {
+        await rm(executionFile(this.storageRoot, target.workspace_id, target.task_id, executionId), {
+          force: true,
+        });
+        deletedExecutions += 1;
+      }
+      if (executions.every((execution) => terminalIds.has(execution.execution_id))) {
+        emptyTaskTargets.push(target);
       }
     }
 
-    const candidateIds = new Set(candidates.map(({ session }) => session.session_id));
-    const retainedTasks = new Set(sessions
-      .filter((session) => !candidateIds.has(session.session_id))
+    const remainingSessions = new Set(sessions
+      .filter((session) => !sessionsToDelete.has(session.session_id))
       .map((session) => session.task_id));
-    const deletedTasks = new Set<string>();
-    for (const { session, workspace_id } of candidates) {
-      await rm(sessionFile(this.storageRoot, session.session_id), { force: true });
-      await rm(eventsFile(this.storageRoot, session.session_id), { force: true });
-      const taskKey = `${workspace_id}\0${session.task_id}`;
-      if (!retainedTasks.has(session.task_id) && !deletedTasks.has(taskKey)) {
-        await rm(taskContextFile(this.storageRoot, session.task_id), { force: true });
-        await rm(taskExecutionsDirectory(this.storageRoot, workspace_id, session.task_id), {
-          recursive: true,
-          force: true,
-        });
-        deletedTasks.add(taskKey);
-      }
+    let taskContexts: Awaited<ReturnType<TaskReader["listTaskContexts"]>> | undefined;
+    try {
+      taskContexts = await this.tasks.listTaskContexts();
+    } catch {
+      taskContexts = undefined;
     }
+    let goalsForCleanup: GoalOrchestration[] | undefined;
+    try {
+      if (this.goals?.listGoals !== undefined) goalsForCleanup = await this.goals.listGoals();
+    } catch {
+      goalsForCleanup = undefined;
+    }
+    let deletedTasks = 0;
+    for (const target of emptyTaskTargets) {
+      if (remainingSessions.has(target.task_id) || goalsForCleanup === undefined
+        || goalsForCleanup.some((goal) => goal.status !== "completed" && goal.status !== "failed"
+          && goal.phases.some((phase) => phase.tasks.some((task) => task.task_id === target.task_id)))) continue;
+      try {
+        await rmdir(taskExecutionsDirectory(this.storageRoot, target.workspace_id, target.task_id));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+      }
+      const task = taskContexts?.find((candidate) => candidate.task_id === target.task_id);
+      if (task === undefined || task.workspace_id !== target.workspace_id) continue;
+      await rm(taskContextFile(this.storageRoot, task.task_id), { force: true });
+      deletedTasks += 1;
+    }
+
     return {
-      deleted_sessions: candidates.length,
-      deleted_events: candidates.length,
-      deleted_tasks: deletedTasks.size,
+      deleted_executions: deletedExecutions,
+      deleted_sessions: sessionsToDelete.size,
+      deleted_events: deletedEvents,
+      deleted_tasks: deletedTasks,
     };
   }
 
@@ -509,13 +765,21 @@ export class StatusQueryService {
     return matches[0];
   }
 
-  private async goalForExecution(execution: ExecutionContext): Promise<GoalOrchestration | undefined> {
-    for (const goal of await this.listGoals()) {
-      if (goal.execution_id === execution.execution_id
-        && goal.workspace_id === execution.workspace_id
-        && goal.current_task_id === execution.task_id) return goal;
-    }
-    return undefined;
+  private async goalForExecution(
+    execution: ExecutionContext,
+    goals?: readonly GoalOrchestration[],
+  ): Promise<GoalOrchestration | undefined> {
+    const candidates = goals ?? await this.listGoals();
+    const checkpoint = candidates.find((goal) => goal.execution_id === execution.execution_id
+      && goal.workspace_id === execution.workspace_id
+      && goal.current_task_id === execution.task_id);
+    if (checkpoint !== undefined) return checkpoint;
+    // A Goal only checkpoints its active Execution, so an earlier Execution of the same Goal is
+    // linked back through the planned Task identity instead of being reported as unassociated.
+    const planned = candidates.filter((goal) => goal.workspace_id === execution.workspace_id
+      && goal.phases.some((phase) =>
+        phase.tasks.some((task) => task.task_id === execution.task_id)));
+    return planned.length === 1 ? planned[0] : undefined;
   }
 
   private async findTask(taskId: string, workspaceId?: string) {
@@ -539,19 +803,6 @@ export class StatusQueryService {
 
   private async optionalGoal(goalId: string): Promise<GoalOrchestration | undefined> {
     return this.goals === undefined ? undefined : (await this.goals.getGoal(goalId)) ?? undefined;
-  }
-
-  private async executionFailed(session: Session, goal: GoalOrchestration): Promise<boolean> {
-    const events = await this.events.listEvents(session.session_id);
-    const executionId = this.executionIdFor(session, goal, events);
-    if (executionId === undefined) return false;
-    const execution = await this.executions.getExecutionContext(
-      goal.workspace_id,
-      session.task_id,
-      executionId,
-    );
-    // A missing Execution record only lets the trailing event speak; running is never cleanable.
-    return (execution?.status ?? eventStatus(latestEvent(events, executionId))) === "failed";
   }
 
   private async requiredGoal(goalId: string): Promise<GoalOrchestration> {

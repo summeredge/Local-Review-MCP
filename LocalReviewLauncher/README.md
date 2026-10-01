@@ -29,8 +29,9 @@ Run the launcher-only configuration check with:
 & "C:\Users\shaoy\Documents\PythonEnvs\local-review-launcher\Scripts\python.exe" .\LocalReviewLauncher\test_config_manager.py
 ```
 
-The read-only Task Dashboard, Session Viewer, Event Stream, and Codex Task
-locator are documented in [`docs/launcher-dashboard.md`](../docs/launcher-dashboard.md).
+The read-only Execution Dashboard, Execution details, Event Stream, and Codex
+Task locator are documented in
+[`docs/launcher-dashboard.md`](../docs/launcher-dashboard.md).
 
 The startup overview includes a read-only Desktop Sync Status supplied by the
 local runtime's `DesktopSyncManager` through the authenticated loopback

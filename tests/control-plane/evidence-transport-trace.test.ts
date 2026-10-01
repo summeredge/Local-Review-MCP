@@ -149,8 +149,7 @@ describe("EvidenceTransportTraceService", () => {
           correlation_key: received.request_id,
           conversation_id: received.conversation_id,
         });
-        const observation = await correlations.observe(received);
-        if (observation !== "refused") pending.scheduleResolve(received.request_id);
+        return pending.receiveIdentityEvidence(received);
       },
     });
     const token = await pair();
@@ -160,7 +159,7 @@ describe("EvidenceTransportTraceService", () => {
       body: evidence(),
       extensionEvidenceCreated: true,
     });
-    expect(posted).toEqual({ status: 202, body: { accepted: true } });
+    expect(posted).toEqual({ status: 202, body: { accepted: true, durable: true } });
 
     await waitFor(async () => (await pending.get(KEY_A))?.state === "started");
     await expect(trace.getEvidenceTransportTrace(KEY_A)).resolves.toEqual({

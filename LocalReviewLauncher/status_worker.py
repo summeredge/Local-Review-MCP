@@ -141,20 +141,20 @@ class StatusCheckWorker(QRunnable):
                 oauth_registry = oauth_status()
             except Exception:
                 oauth_registry = None
-        sessions = ()
-        dashboard_sessions = getattr(self.status_checker, "dashboard_sessions", None)
-        if status.mcp_running and callable(dashboard_sessions):
+        executions = ()
+        dashboard_executions = getattr(self.status_checker, "dashboard_executions", None)
+        if status.mcp_running and callable(dashboard_executions):
             try:
-                sessions = dashboard_sessions()
+                executions = dashboard_executions()
             except Exception:
-                sessions = ()
+                executions = ()
         status = LauncherStatus(
             mcp_running=status.mcp_running,
             tunnel_connected=status.tunnel_connected,
             remote_online=status.remote_online,
             cloudflared_version=version if isinstance(version, str) else "unavailable",
             oauth_registry=oauth_registry,
-            sessions=sessions,
+            executions=executions,
             browser=browser,
             desktop_sync=desktop_sync,
             desktop_capability=desktop_capability,

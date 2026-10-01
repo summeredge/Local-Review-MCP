@@ -129,7 +129,7 @@ describe("MAIN-world Fiber identity evidence", () => {
   it("is directly loadable as one minimal Chrome/Edge MV3 extension", () => {
     expect(manifest.manifest_version).toBe(3);
     expect(manifest.background).toEqual({ service_worker: "background.js" });
-    expect(manifest.permissions).toEqual(["storage"]);
+    expect(manifest.permissions).toEqual(["storage", "alarms"]);
     expect(manifest.host_permissions).toEqual([
       "https://chatgpt.com/*",
       "https://chat.openai.com/*",
@@ -499,17 +499,23 @@ function response(status: number, body: unknown): Record<string, unknown> {
 function loadBackground(
   storage: Storage,
   responder: (url: URL, init: Record<string, unknown>) => Promise<Record<string, unknown>>,
+  enableAlarms = false,
 ): { calls: FetchCall[]; send: (
   message: Record<string, unknown>,
   documentId: string,
   tabId?: number,
   url?: string,
-) => Promise<Record<string, unknown>> } {
+) => Promise<Record<string, unknown>>; alarm: () => void } {
   let listener: ((message: Record<string, unknown>, sender: Record<string, unknown>, sendResponse: (value: Record<string, unknown>) => void) => boolean) | null = null;
   const calls: FetchCall[] = [];
+  let alarmListener: ((alarm: { name: string }) => void) | undefined;
   const chrome = {
     storage: { local: storage },
     runtime: { onMessage: { addListener: (fn: typeof listener) => { listener = fn; } } },
+    ...(enableAlarms ? { alarms: {
+      create: vi.fn(async () => undefined),
+      onAlarm: { addListener: (fn: typeof alarmListener) => { alarmListener = fn; } },
+    } } : {}),
   };
   const fetch = async (input: string, init: Record<string, unknown> = {}) => {
     calls.push({ input, init });
@@ -529,6 +535,7 @@ function loadBackground(
   if (!listener) throw new Error("background listener was not registered");
   return {
     calls,
+    alarm: () => alarmListener?.({ name: "identity-evidence-retry" }),
     send: (message, documentId, tabId = 7, url) => new Promise((resolve, reject) => {
       try {
         const keep = listener!(message, { tab: { id: tabId }, documentId, frameId: 0, url }, resolve);
@@ -549,6 +556,154 @@ const evidenceMessage = (conversationId: string, navigation_epoch: number, extra
   ...extra,
 });
 
+async function waitForEvidence(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1000;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("Evidence outbox did not flush");
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
+
+describe("Extension durable identity evidence Outbox", () => {
+  it("writes verified evidence before POST, then retries from an alarm after Fiber disappears", async () => {
+    const storage = new Storage({ port: 12081, token: "paired-token" });
+    let available = false;
+    const worker = loadBackground(storage, async (url, init) => {
+      if (url.pathname === "/hello") return response(200, bridgeHello);
+      if (url.pathname === "/identity-evidence") {
+        expect(storage.data.identityEvidenceOutbox).toEqual([expect.objectContaining(JSON.parse(String(init.body)))]);
+        return available ? response(202, { accepted: true, durable: true }) : response(503, {});
+      }
+      return response(200, {});
+    }, true);
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    await expect(worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1"))
+      .resolves.toMatchObject({ ok: false, status: 503 });
+    const saved = structuredClone(storage.data.identityEvidenceOutbox);
+    // The source tab navigated away and produces no new Fiber messages.
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-new", 7, `${ORIGIN}/c/${CONVERSATION_B}`);
+    available = true;
+    worker.alarm();
+    await waitForEvidence(() => (storage.data.identityEvidenceOutbox as unknown[]).length === 0);
+    const posted = worker.calls.filter(call => new URL(call.input).pathname === "/identity-evidence");
+    expect(posted).toHaveLength(2);
+    expect(JSON.parse(String(posted[1]!.init.body))).toMatchObject({ document_id: "document-1", conversation_id: CONVERSATION_A });
+    expect((saved as unknown[])).toHaveLength(1);
+  });
+
+  it("restores the Outbox on worker startup and resends lost ACKs without another content message", async () => {
+    const storage = new Storage({ port: 12081, token: "paired-token" });
+    const accepted = new Set<string>();
+    const first = loadBackground(storage, async (url, init) => {
+      if (url.pathname === "/hello") return response(200, bridgeHello);
+      if (url.pathname === "/pair") return response(200, { token: "paired-token" });
+      accepted.add(JSON.parse(String(init.body)).request_id);
+      throw new Error("ACK response lost after durable acceptance");
+    });
+    await first.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    await first.send(evidenceMessage(CONVERSATION_A, 0), "document-1");
+    const saved = structuredClone(storage.data.identityEvidenceOutbox);
+    const restored = loadBackground(storage, async (url, init) => {
+      if (url.pathname === "/hello") return response(200, bridgeHello);
+      if (url.pathname === "/pair") return response(200, { token: "paired-token" });
+      const { received_at, expires_at, ...expected } = (saved as Record<string, unknown>[])[0]!;
+      expect(JSON.parse(String(init.body))).toEqual(expected);
+      accepted.add(JSON.parse(String(init.body)).request_id);
+      return response(202, { accepted: true, durable: true });
+    }, true);
+    // No register_document, no identity_evidence, no Fiber rescan after restart.
+    await waitForEvidence(() => (storage.data.identityEvidenceOutbox as unknown[]).length === 0);
+    expect(restored.calls.filter(call => new URL(call.input).pathname === "/identity-evidence")).toHaveLength(1);
+    expect(accepted.size).toBe(1);
+  });
+
+  it.each([response(202, { accepted: true }), response(200, { accepted: true, durable: true })])(
+    "retains evidence until an explicit durable 202 ACK", async invalidAck => {
+      const storage = new Storage({ port: 12081, token: "paired-token" });
+      let durable = false;
+      const worker = loadBackground(storage, async url => url.pathname === "/hello" ? response(200, bridgeHello)
+        : durable ? response(202, { accepted: true, durable: true }) : invalidAck);
+      await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+      await expect(worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1"))
+        .resolves.toMatchObject({ ok: false, error: "identity_evidence_ack_not_durable" });
+      expect(storage.data.identityEvidenceOutbox).toHaveLength(1);
+      durable = true;
+      await expect(worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1")).resolves.toMatchObject({ ok: true });
+      expect(storage.data.identityEvidenceOutbox).toEqual([]);
+    });
+
+  it("never POSTs if Outbox storage fails", async () => {
+    class FailingEvidenceStorage extends Storage {
+      public override async set(values: Record<string, unknown>): Promise<void> {
+        if ("identityEvidenceOutbox" in values) throw new Error("disk unavailable");
+        await super.set(values);
+      }
+    }
+    const worker = loadBackground(new FailingEvidenceStorage(), async () => response(200, bridgeHello));
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    expect(await worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1")).toMatchObject({ ok: false });
+    expect(worker.calls.some(call => new URL(call.input).pathname === "/identity-evidence")).toBe(false);
+  });
+
+  it("rejects conflicting queued conversations without replacing proof", async () => {
+    const storage = new Storage({ port: 12081, token: "paired-token" });
+    const worker = loadBackground(storage, async url => url.pathname === "/hello" ? response(200, bridgeHello) : response(503, {}));
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    await worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1");
+    const saved = structuredClone(storage.data.identityEvidenceOutbox);
+    await expect(worker.send(evidenceMessage(CONVERSATION_B, 1), "document-1"))
+      .resolves.toMatchObject({ ok: false, error: "identity_evidence_conflict" });
+    expect(storage.data.identityEvidenceOutbox).toEqual(saved);
+  });
+
+  it("expires stale Outbox evidence on startup without POST or a Fiber scan", async () => {
+    const now = Date.now();
+    const storage = new Storage({ identityEvidenceOutbox: [{ request_id: UUID_REQUEST_ID,
+      conversation_id: CONVERSATION_A, document_id: "document-1", navigation_epoch: 0,
+      received_at: now - 5 * 60 * 1000 - 1, expires_at: now - 1 }] });
+    const worker = loadBackground(storage, async () => { throw new Error("must not send expired evidence"); }, true);
+    await waitForEvidence(() => (storage.data.identityEvidenceOutbox as unknown[]).length === 0);
+    expect(worker.calls).toEqual([]);
+  });
+
+  it("keeps a conflicting key queued without blocking an unrelated key", async () => {
+    const now = Date.now();
+    const storedEvidence = { conversation_id: CONVERSATION_A, document_id: "document-1",
+      navigation_epoch: 0, received_at: now, expires_at: now + 5 * 60 * 1000 };
+    const storage = new Storage({ port: 12081, token: "paired-token", identityEvidenceOutbox: [
+      { ...storedEvidence, request_id: "request-conflict" }, { ...storedEvidence, request_id: "request-valid" },
+    ] });
+    loadBackground(storage, async (url, init) => url.pathname === "/hello" ? response(200, bridgeHello)
+      : JSON.parse(String(init.body)).request_id === "request-conflict" ? response(409, {})
+        : response(202, { accepted: true, durable: true }), true);
+    await waitForEvidence(() => (storage.data.identityEvidenceOutbox as unknown[]).length === 1);
+    expect(storage.data.identityEvidenceOutbox).toEqual([{ ...storedEvidence, request_id: "request-conflict" }]);
+  });
+
+  it.each([null, [{ request_id: "malformed" }]])("does not overwrite a corrupt Outbox", async malformed => {
+    const storage = new Storage({ identityEvidenceOutbox: malformed });
+    const worker = loadBackground(storage, async () => { throw new Error("must not send"); });
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    expect(await worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1")).toMatchObject({ ok: false });
+    expect(storage.data.identityEvidenceOutbox).toEqual(malformed);
+    expect(worker.calls).toEqual([]);
+  });
+
+  it("rejects new evidence when full instead of evicting queued proof", async () => {
+    const now = Date.now();
+    const entries = Array.from({ length: 1000 }, (_, i) => ({ request_id: `request-${i}`,
+      conversation_id: CONVERSATION_A, document_id: "document-1", navigation_epoch: 0,
+      received_at: now, expires_at: now + 5 * 60 * 1000 }));
+    const storage = new Storage({ identityEvidenceOutbox: entries });
+    const worker = loadBackground(storage, async () => { throw new Error("must not send"); });
+    await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
+    await expect(worker.send(evidenceMessage(CONVERSATION_A, 0), "document-1"))
+      .resolves.toMatchObject({ ok: false, error: "identity_evidence_outbox_full" });
+    expect(storage.data.identityEvidenceOutbox).toEqual(entries);
+    expect(worker.calls).toEqual([]);
+  });
+});
+
 describe("Extension background identity authority", () => {
   it("retains diagnostics without credentials and flushes after normal delivery pairing", async () => {
     const storage = new Storage({ port: null, token: null });
@@ -558,7 +713,7 @@ describe("Extension background identity authority", () => {
       if (endpoint.pathname === '/hello') return response(200, { ...bridgeHello, paired: false });
       if (endpoint.pathname === '/pair') return response(200, { token: 'paired-token' });
       if (endpoint.pathname === '/delivery/claim') return response(200, { command: null });
-      if (endpoint.pathname === '/identity-diagnostic') return response(202, { accepted: true });
+      if (endpoint.pathname === '/identity-diagnostic') return response(202, { accepted: true, durable: true });
       throw new Error(`unexpected request: ${endpoint.pathname}`);
     });
     expect(await worker.send(sample, 'document-1', 7, url)).toMatchObject({ ok: true });
@@ -595,7 +750,7 @@ describe("Extension background identity authority", () => {
     const restarted = loadBackground(storage, async (_url, init) => {
       expect((storage.data.identityDiagnosticOutbox as unknown[]).length).toBeGreaterThan(0);
       expect(JSON.parse(String(init.body))).toHaveProperty('document_id_hash');
-      return response(202, { accepted: true });
+      return response(202, { accepted: true, durable: true });
     });
     await restarted.send({ ...sample, scan_id: 8 }, 'document-1', 7, url);
     await new Promise(resolve => setTimeout(resolve, 80));
@@ -623,7 +778,7 @@ describe("Extension background identity authority", () => {
       calls.push(`${url.port}${url.pathname}`);
       if (url.pathname === "/hello" && url.port === "12083") return response(200, bridgeHello);
       if (url.pathname === "/pair" && url.port === "12083") return response(200, { token: "paired-token" });
-      if (url.pathname === "/identity-evidence") return response(202, { accepted: true });
+      if (url.pathname === "/identity-evidence") return response(202, { accepted: true, durable: true });
       return response(503, {});
     });
 
@@ -645,7 +800,7 @@ describe("Extension background identity authority", () => {
     const worker = loadBackground(storage, async (url) => {
       if (url.pathname === "/hello") return response(200, bridgeHello);
       if (url.pathname === "/pair") return response(200, { token: "paired-token" });
-      return response(202, { accepted: true });
+      return response(202, { accepted: true, durable: true });
     });
     const doc1 = "document-1";
     const doc2 = "document-2";
@@ -676,7 +831,7 @@ describe("Extension background identity authority", () => {
         paired = true;
         return response(200, { token: "fresh-token" });
       }
-      return response(202, { accepted: true });
+      return response(202, { accepted: true, durable: true });
     });
 
     await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
@@ -705,7 +860,7 @@ describe("Extension background identity authority", () => {
       if (!available) throw new Error("bridge unavailable");
       if (url.pathname === "/hello") return response(200, { ...bridgeHello, paired: false });
       if (url.pathname === "/pair") return response(200, { token: "fresh-token" });
-      return response(202, { accepted: true });
+      return response(202, { accepted: true, durable: true });
     };
     const first = loadBackground(storage, responder);
 
@@ -729,7 +884,7 @@ describe("Extension background identity authority", () => {
     const worker = loadBackground(storage, async (url) => {
       if (url.pathname === "/hello") return response(200, { ...bridgeHello, paired: false });
       if (url.pathname === "/pair") return response(200, { token: "fresh-token" });
-      return response(202, { accepted: true });
+      return response(202, { accepted: true, durable: true });
     });
 
     await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
@@ -750,7 +905,7 @@ describe("Extension background identity authority", () => {
         return response(200, { token: "fresh-token" });
       }
       evidenceAttempts += 1;
-      return evidenceAttempts === 1 ? response(401, { error: "unauthorized" }) : response(202, { accepted: true });
+      return evidenceAttempts === 1 ? response(401, { error: "unauthorized" }) : response(202, { accepted: true, durable: true });
     });
 
     await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
@@ -811,7 +966,7 @@ describe("Extension background identity authority", () => {
         await gate;
         return response(200, { token: "fresh-token" });
       }
-      return response(202, { accepted: true });
+      return response(202, { accepted: true, durable: true });
     });
 
     await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-1");
@@ -825,7 +980,7 @@ describe("Extension background identity authority", () => {
     expect(await deliveries).toEqual([expect.objectContaining({ ok: true }), expect.objectContaining({ ok: true })]);
     expect(pairAttempts).toBe(1);
     expect(worker.calls.filter((call) => new URL(call.input).pathname === "/identity-evidence"))
-      .toHaveLength(2);
+      .toHaveLength(1);
   });
 
   it("serializes same-conversation claims so only one tab owns the delivery", async () => {
@@ -983,7 +1138,7 @@ describe("Extension background identity authority", () => {
           claimCalls += 1;
           return response(200, { command: null });
         }
-        return response(202, { accepted: true });
+        return response(202, { accepted: true, durable: true });
       });
       const url = `${ORIGIN}/c/${CONVERSATION_A}`;
       await expect(worker.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url))
@@ -1019,7 +1174,7 @@ describe("Extension background identity authority", () => {
       if (url.pathname === "/hello") return response(200, bridgeHello);
       if (url.pathname === "/pair") return response(200, { token: "paired-token" });
       if (url.pathname === "/delivery/claim") return response(200, { command: null });
-      return response(202, { accepted: true });
+      return response(202, { accepted: true, durable: true });
     });
     const url = `${ORIGIN}/c/${CONVERSATION_A}`;
     await worker.send({ type: "register_document", navigation_epoch: 0 }, "document-one", 7, url);

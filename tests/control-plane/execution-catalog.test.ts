@@ -1,0 +1,563 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { taskExecutionsDirectory } from "../../src/context/execution.js";
+import { ExecutionContextService } from "../../src/context/execution-service.js";
+import { SessionStore } from "../../src/context/session-store.js";
+import { TaskContextService } from "../../src/context/service.js";
+import { EventStore } from "../../src/control-plane/events/store.js";
+import {
+  goalOrchestrationSchema,
+  type GoalOrchestration,
+} from "../../src/control-plane/goal-orchestration.js";
+import { StatusQueryService } from "../../src/control-plane/status-query.js";
+
+const temporaryDirectories: string[] = [];
+const timestamp = "2026-09-15T00:00:00.000Z";
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {
+    recursive: true,
+    force: true,
+  })));
+});
+
+async function storageRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "local-review-mcp-execution-catalog-"));
+  temporaryDirectories.push(root);
+  return root;
+}
+
+function plannedGoal(options: {
+  readonly goalId: string;
+  readonly workspaceId: string;
+  readonly taskId: string;
+  readonly executionId: string;
+  readonly executionMode?: "batch" | "interactive";
+  readonly objective?: string;
+  readonly taskGoal?: string;
+}): GoalOrchestration {
+  return goalOrchestrationSchema.parse({
+    goal_id: options.goalId,
+    workspace_id: options.workspaceId,
+    conversation_id: "conversation-1",
+    execution_mode: options.executionMode ?? "batch",
+    phases: [{
+      phase_id: "phase-1",
+      objective: options.objective ?? "Phase",
+      tasks: [{
+        task_id: options.taskId,
+        goal: options.taskGoal ?? "Task",
+        requirements: ["Requirement"],
+        acceptance_criteria: ["Criterion"],
+        max_iterations: 1,
+      }],
+      status: "running",
+    }],
+    status: "running",
+    current_phase_id: "phase-1",
+    current_task_id: options.taskId,
+    execution_id: options.executionId,
+    actuation_id: "actuation-1",
+    loop_id: "loop-1",
+    created_at: timestamp,
+    updated_at: timestamp,
+  });
+}
+
+function queryFor(root: string, goals: readonly GoalOrchestration[]): StatusQueryService {
+  return new StatusQueryService({
+    storageRoot: root,
+    goals: {
+      getGoal: async (goalId) => goals.find((goal) => goal.goal_id === goalId) ?? null,
+      listGoals: async () => [...goals],
+    },
+  });
+}
+
+async function seedExecution(root: string, options: {
+  readonly workspaceId: string;
+  readonly taskId: string;
+  readonly executionId: string;
+  readonly status?: "running" | "passed" | "failed";
+  readonly command?: string;
+  readonly summary?: string;
+}): Promise<void> {
+  const tasks = new TaskContextService(root);
+  if (await tasks.getTaskContext(options.taskId) === null) {
+    await tasks.createTaskContext({
+      task_id: options.taskId,
+      workspace_id: options.workspaceId,
+      conversation_id: "conversation-1",
+    });
+  }
+  const executions = new ExecutionContextService(root);
+  await executions.createExecutionContext({
+    execution_id: options.executionId,
+    task_id: options.taskId,
+    workspace_id: options.workspaceId,
+    command: options.command ?? "codex exec --json -",
+    ...(options.summary === undefined ? {} : { summary: options.summary }),
+  });
+  if (options.status !== undefined && options.status !== "running") {
+    await executions.updateExecutionContext(
+      options.workspaceId,
+      options.taskId,
+      options.executionId,
+      { status: options.status },
+    );
+  }
+}
+
+async function seedSession(root: string, options: {
+  readonly sessionId: string;
+  readonly goalId: string;
+  readonly taskId: string;
+  readonly backendType: "codex_app_server" | "desktop_codex_app";
+  readonly threadId?: string;
+  readonly model?: string;
+  readonly reasoningEffort?: string;
+  readonly status?: "created" | "starting" | "active" | "running_turn" | "waiting_input" | "completed" | "failed" | "terminated";
+}): Promise<void> {
+  await new SessionStore(root).createSession({
+    session_id: options.sessionId,
+    goal_id: options.goalId,
+    task_id: options.taskId,
+    backend_type: options.backendType,
+    status: options.status ?? "active",
+    workspace: "C:\\workspace",
+    ...(options.threadId === undefined ? {} : { thread_id: options.threadId }),
+    ...(options.model === undefined ? {} : { model: options.model }),
+    ...(options.reasoningEffort === undefined ? {} : { reasoning_effort: options.reasoningEffort }),
+  });
+}
+
+describe("Launcher Execution catalog", () => {
+  it("lists a batch Execution that owns no Session", async () => {
+    const root = await storageRoot();
+    const goal = plannedGoal({
+      goalId: "goal-batch",
+      workspaceId: "workspace-1",
+      taskId: "task-batch",
+      executionId: "execution-batch",
+      objective: "PCA WebUI chart",
+      taskGoal: "Add the time coloring",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-batch",
+      executionId: "execution-batch",
+      status: "passed",
+      summary: "Batch finished",
+    });
+
+    const summaries = await queryFor(root, [goal]).listExecutionSummaries();
+
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]).toEqual({
+      execution_id: "execution-batch",
+      workspace_id: "workspace-1",
+      task_id: "task-batch",
+      goal_id: "goal-batch",
+      execution_mode: "batch",
+      name: "PCA WebUI chart",
+      goal_name: "PCA WebUI chart",
+      task_name: "Add the time coloring",
+      backend: "cli",
+      status: "passed",
+      started_at: expect.any(String),
+      finished_at: expect.any(String),
+      summary: "Batch finished",
+      updated_at: expect.any(String),
+    });
+  });
+
+  it("keeps the Desktop Session, model, and reasoning of an interactive Execution", async () => {
+    const root = await storageRoot();
+    const goal = plannedGoal({
+      goalId: "goal-desktop",
+      workspaceId: "workspace-1",
+      taskId: "task-desktop",
+      executionId: "execution-desktop",
+      executionMode: "interactive",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-desktop",
+      executionId: "execution-desktop",
+      command: "desktop codex_app",
+    });
+    await seedSession(root, {
+      sessionId: "session-desktop",
+      goalId: "goal-desktop",
+      taskId: "task-desktop",
+      backendType: "desktop_codex_app",
+      threadId: "thread-1",
+      model: "gpt-5.6-luna",
+      reasoningEffort: "max",
+    });
+
+    const summaries = await queryFor(root, [goal]).listExecutionSummaries();
+
+    expect(summaries[0]).toMatchObject({
+      execution_id: "execution-desktop",
+      execution_mode: "interactive",
+      backend: "desktop_codex_app",
+      backend_type: "desktop_codex_app",
+      session_id: "session-desktop",
+      thread_id: "thread-1",
+      model: "gpt-5.6-luna",
+      reasoning_effort: "max",
+      status: "running",
+    });
+  });
+
+  it("reports the app-server backend of an interactive Execution", async () => {
+    const root = await storageRoot();
+    const goal = plannedGoal({
+      goalId: "goal-app-server",
+      workspaceId: "workspace-1",
+      taskId: "task-app-server",
+      executionId: "execution-app-server",
+      executionMode: "interactive",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-app-server",
+      executionId: "execution-app-server",
+      command: "codex app-server --listen stdio://",
+    });
+    await seedSession(root, {
+      sessionId: "session-app-server",
+      goalId: "goal-app-server",
+      taskId: "task-app-server",
+      backendType: "codex_app_server",
+      threadId: "thread-2",
+    });
+
+    const summaries = await queryFor(root, [goal]).listExecutionSummaries();
+
+    expect(summaries[0]).toMatchObject({
+      execution_mode: "interactive",
+      backend: "codex_app_server",
+      backend_type: "codex_app_server",
+      session_id: "session-app-server",
+      thread_id: "thread-2",
+    });
+    expect(summaries[0]!.model).toBeUndefined();
+    expect(summaries[0]!.reasoning_effort).toBeUndefined();
+  });
+
+  it("shows batch and interactive Executions in one table", async () => {
+    const root = await storageRoot();
+    const batch = plannedGoal({
+      goalId: "goal-batch",
+      workspaceId: "workspace-1",
+      taskId: "task-batch",
+      executionId: "execution-batch",
+    });
+    const interactive = plannedGoal({
+      goalId: "goal-desktop",
+      workspaceId: "workspace-1",
+      taskId: "task-desktop",
+      executionId: "execution-desktop",
+      executionMode: "interactive",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-batch",
+      executionId: "execution-batch",
+      status: "passed",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-desktop",
+      executionId: "execution-desktop",
+      command: "desktop codex_app",
+    });
+    await seedSession(root, {
+      sessionId: "session-desktop",
+      goalId: "goal-desktop",
+      taskId: "task-desktop",
+      backendType: "desktop_codex_app",
+      threadId: "thread-1",
+    });
+
+    const summaries = await queryFor(root, [batch, interactive]).listExecutionSummaries();
+
+    expect(summaries.map((summary) => [
+      summary.execution_id,
+      summary.execution_mode,
+      summary.backend,
+      summary.status,
+    ]).sort()).toEqual([
+      ["execution-batch", "batch", "cli", "passed"],
+      ["execution-desktop", "interactive", "desktop_codex_app", "running"],
+    ]);
+  });
+
+  it("reports the stored Execution status without rewriting it", async () => {
+    const root = await storageRoot();
+    const goals = [
+      plannedGoal({
+        goalId: "goal-running",
+        workspaceId: "workspace-1",
+        taskId: "task-running",
+        executionId: "execution-running",
+      }),
+      plannedGoal({
+        goalId: "goal-failed",
+        workspaceId: "workspace-1",
+        taskId: "task-failed",
+        executionId: "execution-failed",
+      }),
+    ];
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-running",
+      executionId: "execution-running",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-failed",
+      executionId: "execution-failed",
+      status: "failed",
+    });
+
+    const summaries = await queryFor(root, goals).listExecutionSummaries();
+
+    expect(new Map(summaries.map((summary) => [summary.execution_id, summary.status]))).toEqual(
+      new Map([["execution-running", "running"], ["execution-failed", "failed"]]),
+    );
+  });
+
+  it("scopes the catalog to the requested workspace", async () => {
+    const root = await storageRoot();
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-1",
+      executionId: "execution-1",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-2",
+      taskId: "task-2",
+      executionId: "execution-2",
+    });
+
+    const scoped = await queryFor(root, []).listExecutionSummaries("workspace-1");
+    const all = await queryFor(root, []).listExecutionSummaries();
+
+    expect(scoped.map((summary) => summary.execution_id)).toEqual(["execution-1"]);
+    expect(all.map((summary) => summary.execution_id).sort()).toEqual([
+      "execution-1",
+      "execution-2",
+    ]);
+  });
+
+  it("degrades a damaged or unassociated Execution without losing the rest", async () => {
+    const root = await storageRoot();
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-intact",
+      executionId: "execution-intact",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-orphan",
+      executionId: "execution-orphan",
+    });
+    const brokenDirectory = taskExecutionsDirectory(root, "workspace-1", "task-broken");
+    await mkdir(brokenDirectory, { recursive: true });
+    await writeFile(join(brokenDirectory, "execution-broken.json"), "{ not json", "utf8");
+
+    const summaries = await queryFor(root, []).listExecutionSummaries();
+
+    expect(summaries.map((summary) => summary.execution_id).sort()).toEqual([
+      "execution-intact",
+      "execution-orphan",
+    ]);
+    expect(summaries[0]).toMatchObject({
+      name: expect.any(String),
+      status: "running",
+    });
+    const orphan = summaries.find((summary) => summary.execution_id === "execution-orphan")!;
+    expect(orphan).toEqual({
+      execution_id: "execution-orphan",
+      workspace_id: "workspace-1",
+      task_id: "task-orphan",
+      name: "task-orphan",
+      task_name: "task-orphan",
+      status: "running",
+      started_at: expect.any(String),
+      updated_at: expect.any(String),
+    });
+  });
+
+  it("clears terminal batch Executions in one Workspace and keeps running or shared records", async () => {
+    const root = await storageRoot();
+    const tasks = new TaskContextService(root);
+    const executions = new ExecutionContextService(root);
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-terminal-batch",
+      executionId: "execution-terminal-batch",
+      status: "passed",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-shared",
+      executionId: "execution-terminal-shared",
+      status: "failed",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-shared",
+      executionId: "execution-running-shared",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-running-batch",
+      executionId: "execution-running-batch",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-2",
+      taskId: "task-other-workspace",
+      executionId: "execution-other-workspace",
+      status: "passed",
+    });
+    const query = queryFor(root, []);
+
+    await expect(query.clearSessionRecords("workspace-1")).resolves.toEqual({
+      deleted_executions: 2,
+      deleted_sessions: 0,
+      deleted_events: 0,
+      deleted_tasks: 1,
+    });
+    await expect(tasks.getTaskContext("task-terminal-batch")).resolves.toBeNull();
+    await expect(tasks.getTaskContext("task-shared")).resolves.toMatchObject({ task_id: "task-shared" });
+    await expect(executions.getExecutionContext(
+      "workspace-1", "task-shared", "execution-terminal-shared",
+    )).resolves.toBeNull();
+    await expect(executions.getExecutionContext(
+      "workspace-1", "task-shared", "execution-running-shared",
+    )).resolves.toMatchObject({ status: "running" });
+    await expect(executions.getExecutionContext(
+      "workspace-1", "task-running-batch", "execution-running-batch",
+    )).resolves.toMatchObject({ status: "running" });
+    await expect(executions.getExecutionContext(
+      "workspace-2", "task-other-workspace", "execution-other-workspace",
+    )).resolves.toMatchObject({ status: "passed" });
+
+    await expect(query.listExecutionSummaries("workspace-1")).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ execution_id: "execution-running-shared", status: "running" }),
+      expect.objectContaining({ execution_id: "execution-running-batch", status: "running" }),
+    ]));
+    await expect(query.listExecutionSummaries("workspace-1")).resolves.toEqual(expect.not.arrayContaining([
+      expect.objectContaining({ execution_id: "execution-terminal-batch" }),
+      expect.objectContaining({ execution_id: "execution-terminal-shared" }),
+    ]));
+    await expect(query.listExecutionSummaries("workspace-2")).resolves.toEqual([
+      expect.objectContaining({ execution_id: "execution-other-workspace", status: "passed" }),
+    ]);
+  });
+
+  it("clears a terminal interactive Execution, Session, and its Events", async () => {
+    const root = await storageRoot();
+    const goal = plannedGoal({
+      goalId: "goal-terminal-interactive",
+      workspaceId: "workspace-1",
+      taskId: "task-terminal-interactive",
+      executionId: "execution-terminal-interactive",
+      executionMode: "interactive",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-terminal-interactive",
+      executionId: "execution-terminal-interactive",
+      status: "passed",
+    });
+    await seedSession(root, {
+      sessionId: "session-terminal-interactive",
+      goalId: goal.goal_id,
+      taskId: "task-terminal-interactive",
+      backendType: "desktop_codex_app",
+      threadId: "thread-terminal-interactive",
+      status: "completed",
+    });
+    const events = new EventStore(root);
+    await events.appendEvent({
+      session_id: "session-terminal-interactive",
+      execution_id: "execution-terminal-interactive",
+      thread_id: "thread-terminal-interactive",
+      timestamp,
+      event_type: "session_started",
+      payload: {},
+    });
+    const query = queryFor(root, [goal]);
+
+    await expect(query.clearSessionRecords("workspace-1")).resolves.toEqual({
+      deleted_executions: 1,
+      deleted_sessions: 1,
+      deleted_events: 1,
+      deleted_tasks: 0,
+    });
+    await expect(new SessionStore(root).getSession("session-terminal-interactive")).resolves.toBeNull();
+    await expect(events.listEvents("session-terminal-interactive")).resolves.toEqual([]);
+    await expect(new ExecutionContextService(root).getExecutionContext(
+      "workspace-1", "task-terminal-interactive", "execution-terminal-interactive",
+    )).resolves.toBeNull();
+    await expect(query.listExecutionSummaries("workspace-1")).resolves.toEqual([]);
+  });
+
+  it("retains a running interactive Execution, Session, and Events", async () => {
+    const root = await storageRoot();
+    const goal = plannedGoal({
+      goalId: "goal-running-interactive",
+      workspaceId: "workspace-1",
+      taskId: "task-running-interactive",
+      executionId: "execution-running-interactive",
+      executionMode: "interactive",
+    });
+    await seedExecution(root, {
+      workspaceId: "workspace-1",
+      taskId: "task-running-interactive",
+      executionId: "execution-running-interactive",
+    });
+    await seedSession(root, {
+      sessionId: "session-running-interactive",
+      goalId: goal.goal_id,
+      taskId: "task-running-interactive",
+      backendType: "codex_app_server",
+      threadId: "thread-running-interactive",
+      status: "running_turn",
+    });
+    const events = new EventStore(root);
+    await events.appendEvent({
+      session_id: "session-running-interactive",
+      execution_id: "execution-running-interactive",
+      thread_id: "thread-running-interactive",
+      timestamp,
+      event_type: "session_started",
+      payload: {},
+    });
+    const query = queryFor(root, [goal]);
+
+    await expect(query.clearSessionRecords("workspace-1")).resolves.toEqual({
+      deleted_executions: 0,
+      deleted_sessions: 0,
+      deleted_events: 0,
+      deleted_tasks: 0,
+    });
+    await expect(new SessionStore(root).getSession("session-running-interactive"))
+      .resolves.toMatchObject({ status: "running_turn" });
+    await expect(events.listEvents("session-running-interactive")).resolves.toHaveLength(1);
+    await expect(query.listExecutionSummaries("workspace-1")).resolves.toMatchObject([
+      expect.objectContaining({
+        execution_id: "execution-running-interactive",
+        execution_mode: "interactive",
+        backend: "codex_app_server",
+      }),
+    ]);
+  });
+});
