@@ -40,8 +40,9 @@ globalThis.LRM_DOM = (() => {
   const sameText = (actual, expected) => canonicalText(actual) === canonicalText(expected);
 
   function composer() {
-    return document.querySelector('#prompt-textarea')
-      || document.querySelector('[data-composer-markdown][role="textbox"][contenteditable="true"]');
+    return [document.querySelector('#prompt-textarea'),
+      ...document.querySelectorAll('[data-composer-markdown][role="textbox"][contenteditable="true"]')]
+      .find(box => box && box.getClientRects().length > 0) || null;
   }
 
   function stopButton() {

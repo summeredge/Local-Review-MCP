@@ -65,7 +65,8 @@ function contentHarness(
         listener({
           source: window,
           origin: ORIGIN,
-          data: { source: "lrm-extension-identity-reply", version: 1, nonce: record.nonce, evidence: [] },
+          data: { source: "lrm-extension-identity-reply", version: 1, nonce: record.nonce,
+            conversation_id: new URL(location.href).pathname.split('/').pop(), evidence: [] },
         });
       }
     },
@@ -238,6 +239,7 @@ interface FakeNode {
   closest(selector: string): FakeNode | null;
   querySelector(selector: string): FakeNode | null;
   querySelectorAll(selector: string): FakeNode[];
+  getClientRects(): object[];
   hasAttribute(name: string): boolean;
   getAttribute(name: string): string | null;
   focus(): void;
@@ -251,6 +253,7 @@ function domHarness(options: {
   normalizeAsync?: boolean;
   message?: string;
   timeline?: boolean;
+  hiddenComposer?: boolean;
 } = {}): {
   dom: {
     ready(): boolean;
@@ -278,6 +281,9 @@ function domHarness(options: {
   const users: FakeNode[] = [];
   const form = node();
   const composer = node();
+  const hiddenComposer = node();
+  hiddenComposer.isConnected = true;
+  hiddenComposer.getClientRects = () => [];
   composer.isConnected = true;
   composer.parentElement = form;
   composer.closest = (selector) => selector === "form" ? form : null;
@@ -330,12 +336,17 @@ function domHarness(options: {
     documentElement: {},
     querySelector(selector: string) {
       if (selector === "#prompt-textarea") return options.timeline ? null : composer;
-      if (selector === '[data-composer-markdown][role="textbox"][contenteditable="true"]') return options.timeline ? composer : null;
+      if (selector === '[data-composer-markdown][role="textbox"][contenteditable="true"]') {
+        return options.timeline ? options.hiddenComposer ? hiddenComposer : composer : null;
+      }
       if (selector.includes("stop-button")) return stop ? node() : null;
       if (selector.includes("send-button")) return options.timeline ? null : button;
       return null;
     },
     querySelectorAll(selector: string) {
+      if (selector === '[data-composer-markdown][role="textbox"][contenteditable="true"]') {
+        return options.timeline ? options.hiddenComposer ? [hiddenComposer, composer] : [composer] : [];
+      }
       return selector === (options.timeline
         ? '[data-chatgpt-search-unit-key$=":user"][data-chatgpt-search-message-ids]'
         : '[data-message-author-role="user"]') ? users : [];
@@ -382,6 +393,7 @@ function node(textContent = "", nodeName = "", childNodes?: FakeNode[]): FakeNod
     closest: () => null,
     querySelector: () => null,
     querySelectorAll: () => [],
+    getClientRects: () => [{}],
     hasAttribute: () => false,
     getAttribute: (name) => name === "contenteditable" ? "true" : null,
     focus: () => undefined,
@@ -399,6 +411,19 @@ function paragraph(value: string, children = [textNode(value)]): FakeNode {
 }
 
 describe("ChatGPT DOM delivery adapter", () => {
+  it("skips the hidden timeline composer and preserves drafts in the visible editor", async () => {
+    const h = domHarness({ timeline: true, hiddenComposer: true, blockComposer: true,
+      emptyComposerBlock: true, message: REVIEW_REQUEST });
+    expect(h.dom.ready()).toBe(true);
+    await expect(h.dom.insertPrompt(REVIEW_REQUEST)).resolves.toBe(true);
+    h.setClickReceipt("visible-composer-receipt");
+    await expect(h.dom.send(REVIEW_REQUEST, () => true, 50)).resolves.toEqual({
+      clicked: true, message_id: "visible-composer-receipt" });
+    expect(h.clickCount()).toBe(1);
+    h.setComposerText("user draft");
+    expect(h.dom.ready()).toBe(false);
+    await expect(h.dom.insertPrompt(REVIEW_REQUEST)).resolves.toBe(false);
+  });
   it('delivers through the production timeline composer and proves the exact stable user receipt', async () => {
     const h = domHarness({ timeline: true, blockComposer: true, emptyComposerBlock: true, message: REVIEW_REQUEST });
     expect(h.dom.ready()).toBe(true);

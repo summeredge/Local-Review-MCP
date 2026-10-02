@@ -10,6 +10,13 @@ export const EXTENSION_DELIVERY_LEASE_MS = 90_000;
 const ID = /^[A-Za-z0-9_-]+$/u;
 const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const logicalDeliveryIdSchema = z.string().min(1).max(128);
+export const conversationRecoveryFailureSchema = z.object({
+  delivery_id: z.string().uuid(),
+  conversation_id: z.string().min(1).max(256).regex(CONVERSATION_ID),
+  code: z.enum(["TARGET_CONVERSATION_NAVIGATION_FAILED", "TARGET_CONVERSATION_NOT_FOUND",
+    "TARGET_CONVERSATION_AUTH_REQUIRED"]),
+}).strict();
+export type ConversationRecoveryFailure = z.infer<typeof conversationRecoveryFailureSchema>;
 
 const enqueueSchema = z.object({
   conversation_id: z.string().min(1).max(256).regex(CONVERSATION_ID),
@@ -76,6 +83,7 @@ export interface ExtensionDelivery {
   readonly claim_time?: number;
   readonly ack_time?: number;
   readonly timeout_reason?: string;
+  readonly recovery_error?: ConversationRecoveryFailure["code"];
   readonly phase: ExtensionDeliveryPhase;
   readonly lease?: ExtensionDeliveryLease;
   readonly receipt?: ExtensionDeliveryReceipt;
@@ -96,7 +104,8 @@ export interface ExtensionDeliveryReadiness {
   readonly extension_present?: boolean;
   readonly action?: string;
   readonly last_seen_at?: number | null;
-  readonly readiness_state?: "bridge_unavailable" | "extension_not_paired" | "extension_not_present" | "ready";
+  readonly readiness_state?: "bridge_unavailable" | "extension_not_paired" | "extension_not_present"
+    | "target_conversation_not_present" | "ready";
 }
 
 export interface ExtensionDeliveryDiagnostics {
@@ -144,6 +153,7 @@ const deliverySchema = z.object({
   claim_time: z.number().int().nonnegative().refine(Number.isSafeInteger).optional(),
   ack_time: z.number().int().nonnegative().refine(Number.isSafeInteger).optional(),
   timeout_reason: z.string().min(1).max(500).optional(),
+  recovery_error: conversationRecoveryFailureSchema.shape.code.optional(),
   phase: z.enum(["queued", "leased", "delivered", "failed", "ambiguous"]),
   lease: leaseSchema.optional(),
   receipt: receiptSchema.optional(),
@@ -251,6 +261,17 @@ export class ExtensionDeliveryConflictError extends Error {}
 export class ExtensionDeliveryNotFoundError extends Error {}
 export class ExtensionDeliveryNotReadyError extends Error {}
 export class ExtensionDeliveryUnavailableError extends Error {}
+export class TargetConversationDeliveryError extends Error {
+  public constructor(public readonly code: string, public readonly retryable: boolean) {
+    super(({
+      TARGET_CONVERSATION_NOT_PRESENT: "Target conversation stopped claiming the delivery before submission.",
+      TARGET_CONVERSATION_EXTENSION_NOT_READY: "Target conversation Extension did not become ready before the delivery timeout.",
+      TARGET_CONVERSATION_NAVIGATION_FAILED: "Target conversation navigation failed.",
+      TARGET_CONVERSATION_NOT_FOUND: "Target conversation was not found.",
+      TARGET_CONVERSATION_AUTH_REQUIRED: "Target conversation requires ChatGPT authentication.",
+    } as Record<string, string>)[code] ?? code);
+  }
+}
 
 export class ExtensionDeliveryService {
   public readonly storageRoot: string;
@@ -355,7 +376,8 @@ export class ExtensionDeliveryService {
         }
       }
       const delivery = [...next.values()].find((candidate) =>
-        candidate.phase === "queued" && candidate.conversation_id === owner.conversation_id);
+        candidate.phase === "queued" && candidate.recovery_error === undefined
+        && candidate.conversation_id === owner.conversation_id);
       if (!delivery) {
         if (changed) {
           await this.persist(next);
@@ -431,6 +453,34 @@ export class ExtensionDeliveryService {
     await this.restore();
     const delivery = this.deliveries.get(z.string().uuid().parse(deliveryId));
     return delivery ? clone(delivery) : null;
+  }
+
+  public async recoveryTargets(): Promise<Array<{ delivery_id: string; conversation_id: string }>> {
+    await this.restore();
+    return [...this.deliveries.values()]
+      .filter((delivery) => (delivery.phase === "queued"
+        || (delivery.phase === "leased" && delivery.lease !== undefined && delivery.lease.deadline <= Date.now()))
+        && delivery.logical_delivery_id !== undefined
+        && delivery.recovery_error === undefined)
+      .map(({ delivery_id, conversation_id }) => ({ delivery_id, conversation_id }));
+  }
+
+  public async reportRecoveryFailure(input: ConversationRecoveryFailure): Promise<void> {
+    await this.restore();
+    const failure = conversationRecoveryFailureSchema.parse(input);
+    await this.exclusive(async () => {
+      const current = this.deliveries.get(failure.delivery_id);
+      if (!current) return;
+      if (current.conversation_id !== failure.conversation_id) {
+        throw new ExtensionDeliveryConflictError("recovery conversation does not match delivery");
+      }
+      if (current.phase !== "queued" || (current.recovery_error !== undefined
+        && current.recovery_error !== "TARGET_CONVERSATION_NAVIGATION_FAILED")) return;
+      const next = new Map(this.deliveries);
+      next.set(current.delivery_id, { ...current, recovery_error: failure.code });
+      await this.persist(next);
+      this.deliveries = next;
+    });
   }
 
   public async getByLogicalDeliveryId(logicalDeliveryId: string): Promise<ExtensionDelivery | null> {

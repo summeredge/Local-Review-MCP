@@ -4,6 +4,7 @@ import {
   ExtensionDeliveryNotFoundError,
   ExtensionDeliveryNotReadyError,
   ExtensionDeliveryUnavailableError,
+  TargetConversationDeliveryError,
   retryableNotSent,
   type ExtensionDeliveryReceipt,
 } from "../control-plane/extension-delivery.js";
@@ -27,6 +28,10 @@ function receiptError(receipt: ExtensionDeliveryReceipt, fallback: string): Revi
 }
 
 function brokerFailure(error: unknown): ReviewDeliveryResult {
+  if (error instanceof TargetConversationDeliveryError) {
+    return { status: "failed", retryable: error.retryable,
+      error: { code: error.code, message: error.message } };
+  }
   const code = error instanceof ExtensionDeliveryConflictError
     ? "EXTENSION_DELIVERY_CONFLICT"
     : error instanceof ExtensionDeliveryNotFoundError

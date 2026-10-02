@@ -6,7 +6,9 @@
   "minimum_chrome_version": "106",
   "permissions": [
     "storage",
-    "alarms"
+    "alarms",
+    "tabs",
+    "webRequest"
   ],
   "host_permissions": [
     "https://chatgpt.com/*",

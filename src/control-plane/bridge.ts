@@ -7,6 +7,8 @@ import {
   ExtensionDeliveryUnavailableError,
   extensionDeliveryAckSchema,
   extensionDeliveryClaimSchema,
+  conversationRecoveryFailureSchema,
+  type ConversationRecoveryFailure,
   type ExtensionDeliveryReadiness,
   type ExtensionDeliveryAck,
   type ExtensionDeliveryClaim,
@@ -49,6 +51,8 @@ import {
 } from "./bridge-protocol.js";
 
 export interface BridgeStartOptions {
+  readonly conversationRecoveryTargets?: () => Promise<Array<{ delivery_id: string; conversation_id: string }>>;
+  readonly reportConversationRecoveryFailure?: (failure: ConversationRecoveryFailure) => Promise<void>;
   readonly ports?: readonly number[];
   readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => IdentityEvidenceAck | void | Promise<IdentityEvidenceAck | void>;
   readonly evidenceTransportTrace?: Pick<EvidenceTransportTraceService, "record">;
@@ -92,6 +96,9 @@ let activePort: number | null = null;
 let pairedOrigin: string | null = null;
 let bearerToken: string | null = null;
 let lastExtensionSeenAt: number | null = null;
+const conversationPresence = new Map<string, { conversationId: string; seenAt: number }>();
+let conversationRecoveryTargets: BridgeStartOptions["conversationRecoveryTargets"];
+let reportConversationRecoveryFailure: BridgeStartOptions["reportConversationRecoveryFailure"];
 let onIdentityEvidence: NonNullable<BridgeStartOptions["onIdentityEvidence"]> = () => undefined;
 let evidenceTransportTrace: Pick<EvidenceTransportTraceService, "record"> | undefined;
 let claimExtensionDelivery: NonNullable<BridgeStartOptions["claimExtensionDelivery"]> = () => null;
@@ -189,6 +196,7 @@ function noteExtensionSeen(): void {
 
 function clearExtensionPresence(): void {
   lastExtensionSeenAt = null;
+  conversationPresence.clear();
 }
 
 function traceEvidenceTransport(input: EvidenceTransportTraceRecordInput): void {
@@ -363,6 +371,13 @@ async function receiveDeliveryClaim(
   }
   try {
     const command = await claimExtensionDelivery(parsed.data);
+    const now = Date.now();
+    for (const [key, presence] of conversationPresence) {
+      if (now - presence.seenAt >= EXTENSION_PRESENCE_TIMEOUT_MS) conversationPresence.delete(key);
+    }
+    conversationPresence.set(`${parsed.data.client_id}\0${parsed.data.document_id}`, {
+      conversationId: parsed.data.conversation_id, seenAt: now,
+    });
     json(response, 200, { command }, origin);
   } catch (error: unknown) {
     if (error instanceof ExtensionDeliveryUnavailableError) {
@@ -506,6 +521,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   }
 
   if (route !== "/pair" && route !== "/status" && route !== "/identity-evidence" && route !== "/identity-diagnostic"
+    && route !== "/delivery/recovery-targets" && route !== "/delivery/recovery-failure"
     && route !== "/delivery/claim" && route !== "/delivery/ack"
     && route !== "/completion/claim" && route !== "/completion/ack") {
     request.resume();
@@ -536,6 +552,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     return;
   }
   if ((route === "/delivery/claim" || route === "/delivery/ack"
+    || route === "/delivery/recovery-targets" || route === "/delivery/recovery-failure"
     || route === "/completion/claim" || route === "/completion/ack")
     && request.method !== "POST") {
     methodNotAllowed(request, response);
@@ -577,6 +594,32 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     return;
   }
   noteExtensionSeen();
+  if (route === "/delivery/recovery-targets" || route === "/delivery/recovery-failure") {
+    try {
+      const body = await readJson(request);
+      if (route === "/delivery/recovery-targets") {
+        if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 0) {
+          json(response, 400, { error: "invalid_recovery_request" }, origin); return;
+        }
+        if (!conversationRecoveryTargets) {
+          json(response, 503, { error: "recovery_unavailable" }, origin); return;
+        }
+        json(response, 200, { targets: await conversationRecoveryTargets() }, origin);
+      } else {
+        const parsed = conversationRecoveryFailureSchema.safeParse(body);
+        if (!parsed.success) { json(response, 400, { error: "invalid_recovery_failure" }, origin); return; }
+        if (!reportConversationRecoveryFailure) {
+          json(response, 503, { error: "recovery_unavailable" }, origin); return;
+        }
+        await reportConversationRecoveryFailure(parsed.data);
+        json(response, 200, { accepted: true }, origin);
+      }
+    } catch (error: unknown) {
+      json(response, error instanceof RequestBodyTooLargeError ? 413
+        : error instanceof ExtensionDeliveryConflictError ? 409 : 503, { error: "recovery_failed" }, origin);
+    }
+    return;
+  }
   if (route === "/identity-evidence") {
     await receiveIdentityEvidence(request, response, origin);
     return;
@@ -682,6 +725,8 @@ async function startBridgeOnce(options: BridgeStartOptions): Promise<number | nu
 }
 
 export function startBridge(options: BridgeStartOptions = {}): Promise<number | null> {
+  conversationRecoveryTargets = options.conversationRecoveryTargets;
+  reportConversationRecoveryFailure = options.reportConversationRecoveryFailure;
   onIdentityEvidence = options.onIdentityEvidence ?? (() => undefined);
   evidenceTransportTrace = options.evidenceTransportTrace;
   claimExtensionDelivery = options.claimExtensionDelivery ?? (() => null);
@@ -705,6 +750,8 @@ export function stopBridge(): Promise<void> {
     pairedOrigin = null;
     bearerToken = null;
     clearExtensionPresence();
+    conversationRecoveryTargets = undefined;
+    reportConversationRecoveryFailure = undefined;
     onIdentityEvidence = () => undefined;
     evidenceTransportTrace = undefined;
     claimExtensionDelivery = () => null;
@@ -757,4 +804,16 @@ export function extensionDeliveryReadiness(): ExtensionDeliveryReadiness {
       action: "Refresh the ChatGPT page and wait for the extension to reconnect. Reload/更新扩展后，请刷新 ChatGPT 页面并等待扩展重新连接。", ...details };
   }
   return { ready: true, readiness_state: "ready", ...details };
+}
+
+export function conversationDeliveryReadiness(conversationId: string): ExtensionDeliveryReadiness {
+  const readiness = extensionDeliveryReadiness();
+  if (!readiness.ready) return readiness;
+  if (![...conversationPresence.values()].some((presence) =>
+    presence.conversationId === conversationId
+    && Date.now() - presence.seenAt < EXTENSION_PRESENCE_TIMEOUT_MS)) {
+    return { ...readiness, ready: false, reason: "Target conversation has no live delivery claimant.",
+      readiness_state: "target_conversation_not_present" };
+  }
+  return readiness;
 }

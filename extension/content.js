@@ -26,6 +26,8 @@
   let scanInFlight = null;
   let nonceCounter = 0;
   let deliveryInFlight = null;
+  let currentConversation = null;
+  let identityScan = null;
   let completionInFlight = null;
   let completionScanTimer = null;
   const sent = new Set();
@@ -34,12 +36,12 @@
   function identityDiagnostic(stage, scanId, details = {}) {
     // State changes plus a thirty-second heartbeat; no text or arbitrary objects.
     try {
-      const signature = JSON.stringify([navigationEpoch, routeConversation(), details]);
+      const signature = JSON.stringify([navigationEpoch, currentConversation, details]);
       const prior = diagnosticStates.get(stage);
       if (prior?.signature === signature && Date.now() - prior.at < 30000) return;
       diagnosticStates.set(stage, { signature, at: Date.now() });
       void sendToWorker({ type: 'identity_diagnostic', stage, scan_id: scanId,
-        navigation_epoch: navigationEpoch, conversation_id: routeConversation(), ...details });
+        navigation_epoch: navigationEpoch, ...identityFields(), ...details });
     } catch { /* Observations must not affect scanning. */ }
   }
 
@@ -75,6 +77,32 @@
     });
   }
 
+  function identityFields() {
+    return { conversation_id: currentConversation, identity_source: 'fiber' };
+  }
+
+  async function resolveConversation(scan = null) {
+    const epoch = navigationEpoch;
+    const href = location.href;
+    if (!scan) {
+      if (!identityScan) identityScan = fiberScan().finally(() => { identityScan = null; });
+      scan = await identityScan;
+    }
+    if (epoch !== navigationEpoch || href !== location.href) return null;
+    const route = routeConversation(href);
+    const canonical = scan.conversation_id;
+    const url = new URL(href);
+    const allowed = ['https://chatgpt.com', 'https://chat.openai.com'].includes(url.origin)
+      && (route || url.pathname === '/' || /^\/g\/[^/]+\/?$/u.test(url.pathname));
+    const next = allowed && canonical && (!route || canonical === route) ? canonical : null;
+    if (currentConversation && next !== currentConversation) {
+      navigationEpoch += 1;
+      sent.clear();
+    }
+    currentConversation = next;
+    return currentConversation;
+  }
+
   async function registerDocument() {
     if (registeredEpoch >= navigationEpoch) return true;
     if (registration) {
@@ -82,7 +110,7 @@
       return previous && registeredEpoch < navigationEpoch ? registerDocument() : previous;
     }
     const requestedEpoch = navigationEpoch;
-    registration = sendToWorker({ type: 'register_document', navigation_epoch: requestedEpoch })
+    registration = sendToWorker({ type: 'register_document', navigation_epoch: requestedEpoch, ...identityFields() })
       .then((reply) => {
         if (reply?.ok !== true) return false;
         registeredDocumentId = typeof reply.document_id === 'string' ? reply.document_id : null;
@@ -98,19 +126,20 @@
 
   async function pollDelivery() {
     if (!alive || deliveryInFlight || !globalThis.LRM_DOM?.ready?.()) return;
-    const epoch = navigationEpoch;
-    const href = location.href;
-    const conversationId = routeConversation(href);
-    if (!conversationId || !(await registerDocument())) return;
-    const stillCurrent = () => alive
-      && navigationEpoch === epoch
-      && location.href === href
-      && routeConversation() === conversationId;
-    if (!stillCurrent() || !LRM_DOM.ready()) return;
     deliveryInFlight = (async () => {
+      const epoch = navigationEpoch;
+      const href = location.href;
+      const conversationId = await resolveConversation();
+      if (!conversationId || !(await registerDocument())) return;
+      const stillCurrent = () => alive
+        && navigationEpoch === epoch
+        && location.href === href
+        && currentConversation === conversationId;
+      if (!stillCurrent() || !LRM_DOM.ready()) return;
       const claimed = await sendToWorker({
         type: 'delivery_claim',
         conversation_id: conversationId,
+        identity_source: 'fiber',
         navigation_epoch: epoch
       });
       const command = claimed?.ok === true ? claimed.command : null;
@@ -120,6 +149,7 @@
         delivery_id: command.delivery_id,
         navigation_epoch: epoch,
         status,
+        ...identityFields(),
         ...details
       });
       if (command.conversation_id !== conversationId || !stillCurrent()) {
@@ -137,13 +167,14 @@
       const armed = await sendToWorker({
         type: 'delivery_submit_started',
         delivery_id: command.delivery_id,
+        ...identityFields(),
         navigation_epoch: epoch
       });
       if (armed?.ok !== true) {
         LRM_DOM.clearPromptExact(command.message);
         return;
       }
-      if (!stillCurrent()) {
+      if (await resolveConversation() !== conversationId || !stillCurrent()) {
         LRM_DOM.clearPromptExact(command.message);
         await acknowledge('not_sent', { error: 'document identity changed before submit' });
         return;
@@ -210,15 +241,18 @@
         if (Number.isSafeInteger(count) && count >= 0 && count <= 100000) diagnostic.assistant_tool_calls_found = count;
         const key = data.scan_diagnostic?.correlation_key;
         if (typeof key === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(key)) diagnostic.correlation_key = key;
-        finish({ diagnostic, fiber_reply_received: true, evidence: [...byRequest].filter(([requestId]) => !conflicts.has(requestId))
+        const canonical = data.conversation_id;
+        finish({ diagnostic, fiber_reply_received: true,
+          conversation_id: typeof canonical === 'string' && CONVERSATION_ID.test(canonical) ? canonical : null,
+          evidence: [...byRequest].filter(([requestId]) => !conflicts.has(requestId))
           .map(([request_id, fiber_conversation_id]) => ({ request_id, fiber_conversation_id })) });
       };
-      timer = setTimeout(() => finish({ evidence: [], fiber_reply_received: false }), FIBER_TIMEOUT_MS);
+      timer = setTimeout(() => finish({ evidence: [], conversation_id: null, fiber_reply_received: false }), FIBER_TIMEOUT_MS);
       window.addEventListener('message', listener);
       try {
         window.postMessage({ source: FIBER_ASK, nonce }, location.origin);
       } catch {
-        finish({ evidence: [] });
+        finish({ evidence: [], conversation_id: null });
       }
     });
   }
@@ -327,15 +361,16 @@
     completionInFlight = (async () => {
       const epoch = navigationEpoch;
       const href = location.href;
-      const conversationId = routeConversation(href);
+      const conversationId = await resolveConversation();
       if (!conversationId || !(await registerDocument())) return;
       const stillCurrent = () => alive
         && navigationEpoch === epoch
         && location.href === href
-        && routeConversation() === conversationId;
+        && currentConversation === conversationId;
       if (!stillCurrent()) return;
       const claimed = await sendToWorker({
         type: 'completion_claim',
+        ...identityFields(),
         conversation_id: conversationId,
         navigation_epoch: epoch,
       });
@@ -359,6 +394,7 @@
         : { error: result.error };
       await sendToWorker({
         type: 'completion_ack',
+        ...identityFields(),
         completion_id: watch.completion_id,
         conversation_id: conversationId,
         navigation_epoch: epoch,
@@ -380,16 +416,17 @@
     scanInFlight = (async () => {
       const askedEpoch = navigationEpoch;
       const askedUrl = location.href;
-      const conversationId = routeConversation(askedUrl);
-      identityDiagnostic('scan_started', scanId, { route_conversation_present: Boolean(conversationId) });
+      identityDiagnostic('scan_started', scanId, { route_conversation_present: Boolean(routeConversation(askedUrl)) });
+      const scan = await fiberScan();
+      if (askedEpoch !== navigationEpoch || askedUrl !== location.href) return;
+      const conversationId = await resolveConversation(scan);
       if (!conversationId) return;
       const registered = await registerDocument();
       identityDiagnostic('document_registered', scanId, { register_document_ok: registered });
       if (!registered) return;
-      const scan = await fiberScan();
       const stillCurrent = () => askedEpoch === navigationEpoch
         && askedUrl === location.href
-        && routeConversation() === conversationId;
+        && currentConversation === conversationId;
       const observation = { ...scan.diagnostic, fiber_reply_received: scan.fiber_reply_received === true,
         fiber_evidence_count: scan.evidence.length, evidence_generated: scan.evidence.length > 0,
         navigation_epoch_unchanged: stillCurrent() };
@@ -405,6 +442,7 @@
         identityDiagnostic('worker_send_attempted', scanId, details);
         const reply = await sendToWorker({
           type: 'identity_evidence',
+          ...identityFields(),
           request_id: entry.request_id,
           conversation_id: conversationId,
           navigation_epoch: askedEpoch
@@ -439,6 +477,7 @@
     if (nextUrl === lastUrl) return;
     lastUrl = nextUrl;
     navigationEpoch += 1;
+    currentConversation = null;
     sent.clear();
     void registerDocument();
     scheduleScan();
@@ -472,6 +511,15 @@
     }).observe(document.documentElement, { childList: true, subtree: true });
   }
   void registerDocument();
+  chrome.runtime.onMessage?.addListener((message, _sender, respond) => {
+    if (message?.type !== 'delivery_probe') return false;
+    resolveConversation().then(async conversationId => {
+      const registered = await registerDocument();
+      respond({ ok: registered, conversation_id: conversationId });
+      void pollDelivery();
+    }, () => respond({ ok: false }));
+    return true;
+  });
   scheduleScan();
   void pollDelivery();
   void pollCompletion();

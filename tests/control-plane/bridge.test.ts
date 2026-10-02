@@ -11,6 +11,7 @@ import {
   bridgePort,
   bridgeStatus,
   extensionDeliveryReadiness,
+  conversationDeliveryReadiness,
   startBridge,
   stopBridge,
 } from "../../src/control-plane/bridge.js";
@@ -123,6 +124,29 @@ afterEach(async () => {
 });
 
 describe("Local Control Bridge protocol", () => {
+  it("requires a fresh claim from the exact conversation, not another page or background status", async () => {
+    const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
+    const claim = { client_id: "client-a", document_id: "document-a", navigation_epoch: 0,
+      conversation_id: "conversation-other" };
+    await request("/delivery/claim", { method: "POST", token, body: claim });
+    expect(extensionDeliveryReadiness()).toMatchObject({ ready: true });
+    expect(conversationDeliveryReadiness("conversation-target")).toMatchObject({
+      ready: false, extension_present: true, readiness_state: "target_conversation_not_present" });
+    await request("/delivery/claim", { method: "POST", token,
+      body: { ...claim, navigation_epoch: 1, conversation_id: "conversation-target" } });
+    expect(conversationDeliveryReadiness("conversation-target")).toMatchObject({ ready: true });
+    expect(conversationDeliveryReadiness("conversation-other").ready).toBe(false);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + EXTENSION_PRESENCE_TIMEOUT_MS);
+    try {
+      await request("/status", { token });
+      expect(conversationDeliveryReadiness("conversation-target")).toMatchObject({
+        ready: false, readiness_state: "target_conversation_not_present" });
+    } finally { clock.mockRestore(); }
+    await stopBridge();
+    await startBridge({ ports: [0] });
+    await request("/pair", { method: "POST", body: {} });
+    expect(conversationDeliveryReadiness("conversation-target").ready).toBe(false);
+  });
   it("returns 503 when no durable identity consumer has taken responsibility", async () => {
     const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
     expect(await request("/identity-evidence", { method: "POST", token, body: {

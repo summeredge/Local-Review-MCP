@@ -3,6 +3,7 @@ import {
   ExtensionDeliveryNotReadyError,
   ExtensionDeliveryConflictError,
   ExtensionDeliveryService,
+  TargetConversationDeliveryError,
   type ExtensionDeliveryReceipt,
   type ExtensionDeliveryReadinessCheck,
 } from "./extension-delivery.js";
@@ -22,7 +23,7 @@ export class DispatchCommandBroker {
 
   public constructor(
     private readonly extensionDeliveries: Pick<ExtensionDeliveryService, "enqueue" | "awaitResult">
-      & Partial<Pick<ExtensionDeliveryService, "expire" | "getByLogicalDeliveryId">> = new ExtensionDeliveryService(),
+      & Partial<Pick<ExtensionDeliveryService, "expire" | "getByLogicalDeliveryId" | "get">> = new ExtensionDeliveryService(),
     options: DispatchCommandBrokerOptions = {},
   ) {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_DISPATCH_COMMAND_TIMEOUT_MS;
@@ -52,7 +53,11 @@ export class DispatchCommandBroker {
       });
     }
     const ready = typeof readiness === "boolean" ? readiness : readiness.ready;
-    if (!ready) {
+    // Queue before page recovery: the authenticated MV3 worker can discover this durable
+    // target even when every ChatGPT content document has been closed.
+    const recoverable = typeof readiness !== "boolean" && ["extension_not_present",
+      "target_conversation_not_present"].includes(readiness.readiness_state ?? "");
+    if (!ready && !recoverable) {
       const reason = typeof readiness === "boolean" ? undefined : readiness.reason;
       throw new ExtensionDeliveryNotReadyError(
         reason === undefined ? "Extension Delivery is not ready." : `Extension Delivery is not ready: ${reason}`,
@@ -72,8 +77,20 @@ export class DispatchCommandBroker {
     );
     const receipt = await this.extensionDeliveries.awaitResult(command.delivery_id, this.timeoutMs);
     if (receipt !== null) return receipt;
-    return this.extensionDeliveries.expire === undefined
+    const current = await this.extensionDeliveries.get?.(command.delivery_id);
+    const expired = this.extensionDeliveries.expire === undefined
       ? null
-      : this.extensionDeliveries.expire(command.delivery_id);
+      : await this.extensionDeliveries.expire(command.delivery_id);
+    if (expired !== null) return expired;
+    // A claim can acquire the service lock between the snapshot and expire. Its
+    // retained ambiguous command must keep the ACK path, not become a page error.
+    const retained = await this.extensionDeliveries.get?.(command.delivery_id);
+    if (current?.phase === "queued" && (retained === null || retained?.phase === "queued")) {
+      const code = current.recovery_error ?? (recoverable
+        ? "TARGET_CONVERSATION_EXTENSION_NOT_READY" : "TARGET_CONVERSATION_NOT_PRESENT");
+      throw new TargetConversationDeliveryError(code,
+        code !== "TARGET_CONVERSATION_NOT_FOUND" && code !== "TARGET_CONVERSATION_AUTH_REQUIRED");
+    }
+    return null;
   }
 }

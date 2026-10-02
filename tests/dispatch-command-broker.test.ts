@@ -169,7 +169,7 @@ describe("DispatchCommandBroker", () => {
     await expect(deliveries.getByLogicalDeliveryId(review.delivery_id)).resolves.toBeNull();
   });
 
-  it("uses EXTENSION_DELIVERY_TIMEOUT only after readiness and retires the command", async () => {
+  it("reports a vanished target after readiness and retires the unclaimed command", async () => {
     const root = await makeStorageRoot();
     const deliveries = new ExtensionDeliveryService(root);
     const review = request("delivery-timeout", "conversation-timeout");
@@ -183,8 +183,8 @@ describe("DispatchCommandBroker", () => {
       status: "failed",
       retryable: true,
       error: {
-        code: "EXTENSION_DELIVERY_TIMEOUT",
-        message: "Extension Delivery did not produce a durable result before the timeout.",
+        code: "TARGET_CONVERSATION_NOT_PRESENT",
+        message: "Target conversation stopped claiming the delivery before submission.",
       },
     });
     await expect(deliveries.getByLogicalDeliveryId(review.delivery_id)).resolves.toBeNull();
@@ -228,6 +228,22 @@ describe("DispatchCommandBroker", () => {
     await expect(resumed.deliver(review)).resolves.toMatchObject({ status: 'delivered' });
     await expect(deliveries.getByLogicalDeliveryId(review.delivery_id)).resolves.toMatchObject({ delivery_id: command.delivery_id });
     await expect(deliveries.claim(claim)).resolves.toBeNull();
+  });
+
+  it("keeps the ACK timeout when a claim races the queued timeout snapshot", async () => {
+    const deliveries = new ExtensionDeliveryService(await makeStorageRoot());
+    const review = request("delivery-claim-race", "conversation-claim-race");
+    const get = deliveries.get.bind(deliveries);
+    vi.spyOn(deliveries, "get").mockImplementationOnce(async id => {
+      const snapshot = await get(id);
+      await deliveries.claim(owner(review.conversation_id, "race"));
+      return snapshot;
+    });
+    await expect(new ExtensionDeliveryAdapter(new DispatchCommandBroker(deliveries, {
+      timeoutMs: 10,
+    })).deliver(review)).resolves.toMatchObject({ status: "failed",
+      error: { code: "EXTENSION_DELIVERY_TIMEOUT" } });
+    expect((await deliveries.getByLogicalDeliveryId(review.delivery_id))?.phase).toBe("ambiguous");
   });
 
   it("keeps a not-ready ReviewDelivery failed until a later explicit retry is ready", async () => {

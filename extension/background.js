@@ -143,9 +143,17 @@
       loading = chrome.storage.local.get([
         'port', 'token', 'tabDocuments', 'tabEpochs', 'tabConversations', 'retiredDocuments',
         'extensionClientId', 'deliveryAckOutbox', 'deliveryInFlight',
-        'completionAckOutbox', 'completionInFlight'
+        'completionAckOutbox', 'completionInFlight', 'conversationRecoveryTabs'
       ])
         .then((stored) => {
+          for (const [tabId, entry] of Object.entries(stored.conversationRecoveryTabs || {})) {
+            if (/^\d+$/u.test(tabId) && entry && Array.isArray(entry.targets)
+              && entry.targets.every(target => DELIVERY_ID.test(target?.delivery_id)
+                && CONVERSATION_ID.test(target?.conversation_id))) {
+              recoveryTabs.set(Number(tabId), entry.targets);
+              recoveryReloads.set(Number(tabId), entry.reload_at || 0);
+            }
+          }
           const hasStoredPort = Object.prototype.hasOwnProperty.call(stored, 'port');
           const hasStoredToken = Object.prototype.hasOwnProperty.call(stored, 'token');
           const storedPort = PORTS.includes(stored.port) ? stored.port : null;
@@ -283,12 +291,27 @@
 
   function senderConversation(sender) {
     try {
-      const url = new URL(sender?.url || '');
+      // sender.url is the document's initial URL on SPA navigation. tab.url is current.
+      const url = new URL(sender?.tab?.url || sender?.url || '');
       if (url.origin !== 'https://chatgpt.com' && url.origin !== 'https://chat.openai.com') return null;
       return /^\/(?:g\/[^/]+\/)?c\/([A-Za-z0-9][A-Za-z0-9_-]{0,255})\/?$/.exec(url.pathname)?.[1] || null;
     } catch {
       return null;
     }
+  }
+
+  function documentConversation(message, sender) {
+    try {
+      const url = new URL(sender?.tab?.url || sender?.url || '');
+      if (!['https://chatgpt.com', 'https://chat.openai.com'].includes(url.origin)
+        || /^\/(?:auth|login|log-in)(?:\/|$)/u.test(url.pathname)) return null;
+      const route = senderConversation(sender);
+      if (message.identity_source !== 'fiber') return route;
+      const canonical = message.conversation_id;
+      return (route || url.pathname === '/' || /^\/g\/[^/]+\/?$/u.test(url.pathname))
+        && typeof canonical === 'string' && CONVERSATION_ID.test(canonical)
+        && (!route || canonical === route) ? canonical : null;
+    } catch { return null; }
   }
 
   function requestedEpoch(message) {
@@ -310,13 +333,13 @@
         const currentEpoch = Number.isSafeInteger(epochs[key]) ? epochs[key] : 0;
         if (requested < currentEpoch) return { ok: false, error: 'stale_navigation' };
         epochs[key] = requested;
-        conversations[key] = senderConversation(sender);
+        conversations[key] = documentConversation(message, sender);
       } else {
         if (requested !== 0) return { ok: false, error: 'invalid_navigation_epoch' };
         if (previous !== null) retired[key] = [...new Set([...oldDocuments, previous])].slice(-8);
         documents[key] = source.documentId;
         epochs[key] = requested;
-        conversations[key] = senderConversation(sender);
+        conversations[key] = documentConversation(message, sender);
       }
       await persistState();
       return { ok: true, document_id: source.documentId, navigation_epoch: epochs[key] };
@@ -336,7 +359,7 @@
       const currentEpoch = Number.isSafeInteger(epochs[key]) ? epochs[key] : 0;
       if (requested < currentEpoch) return { ok: false, error: 'stale_navigation' };
       const currentConversation = conversations[key];
-      const senderConversationId = senderConversation(sender);
+      const senderConversationId = documentConversation(message, sender);
       if (requested === currentEpoch && currentConversation !== undefined
         && currentConversation !== null && currentConversation !== senderConversationId) {
         return { ok: false, error: 'conversation_changed' };
@@ -646,7 +669,7 @@
         correlation_key_hash: await diagnosticHash(typeof message.correlation_key === 'string'
           && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(message.correlation_key)
           ? message.correlation_key : ''),
-        conversation_id_hash: await diagnosticHash(senderConversation(sender)),
+        conversation_id_hash: await diagnosticHash(documentConversation(message, sender)),
         document_id_hash: await diagnosticHash(source?.documentId), flags };
       for (const [key, limit] of [['assistant_tool_calls_found', 100000], ['fiber_evidence_count', 200]]) {
         if (Number.isSafeInteger(message[key]) && message[key] >= 0 && message[key] <= limit) entry[key] = message[key];
@@ -662,7 +685,8 @@
   }
   function evidenceDiagnostic(stage, message, sender, flags = {}) {
     void receiveDiagnostic({ stage, scan_id: 0, navigation_epoch: message.navigation_epoch,
-      correlation_key: message.request_id, ...flags }, sender);
+      correlation_key: message.request_id, conversation_id: message.conversation_id,
+      identity_source: message.identity_source, ...flags }, sender);
   }
 
   async function receiveNavigation(message, sender) {
@@ -675,9 +699,12 @@
     const requested = requestedEpoch(raw);
     evidenceDiagnostic('background_received', raw, sender);
     if (!source || requested === null) return { ok: false, error: 'invalid_evidence' };
-    const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
+    const authority = await authorizeDocument(raw, sender);
     evidenceDiagnostic('document_authorized', raw, sender, { document_authorized: authority.ok === true });
     if (!authority.ok) return authority;
+    if (raw.identity_source === 'fiber' && authority.conversation_id !== raw.conversation_id) {
+      return { ok: false, error: 'wrong_conversation' };
+    }
     const evidence = evidenceFromMessage(message, source.documentId, authority.navigation_epoch);
     if (!evidence) return { ok: false, error: 'invalid_evidence' };
     const queued = await queueEvidence(evidence);
@@ -761,13 +788,14 @@
   }
 
   async function claimDelivery(message, sender) {
+    void recoverConversations().catch(() => undefined);
     const source = senderSource(sender);
-    const conversationId = senderConversation(sender);
+    const conversationId = documentConversation(message, sender);
     const requested = requestedEpoch(message);
     if (!source || requested === null || !conversationId || message.conversation_id !== conversationId) {
       return { ok: false, error: 'wrong_conversation' };
     }
-    const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
+    const authority = await authorizeDocument(message, sender);
     if (!authority.ok || authority.conversation_id !== conversationId) return { ok: false, error: 'wrong_conversation' };
     return serialDeliveryState(async () => {
       if (deliveryRecoveryBlocked) return { ok: false, error: 'delivery_state_corrupt' };
@@ -802,10 +830,10 @@
 
   async function deliverySubmitStarted(message, sender) {
     const source = senderSource(sender);
-    const conversationId = senderConversation(sender);
+    const conversationId = documentConversation(message, sender);
     const requested = requestedEpoch(message);
     if (!source || requested === null || !conversationId) return { ok: false, error: 'wrong_conversation' };
-    const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
+    const authority = await authorizeDocument(message, sender);
     if (!authority.ok || authority.conversation_id !== conversationId) return { ok: false, error: 'wrong_conversation' };
     return serialDeliveryState(async () => {
       if (deliveryRecoveryBlocked) return { ok: false, error: 'delivery_state_corrupt' };
@@ -823,10 +851,10 @@
 
   async function receiveDeliveryAck(message, sender) {
     const source = senderSource(sender);
-    const conversationId = senderConversation(sender);
+    const conversationId = documentConversation(message, sender);
     const requested = requestedEpoch(message);
     if (!source || requested === null || !conversationId) return { ok: false, error: 'wrong_conversation' };
-    const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
+    const authority = await authorizeDocument(message, sender);
     if (!authority.ok || authority.conversation_id !== conversationId) return { ok: false, error: 'wrong_conversation' };
     return serialDeliveryState(async () => {
       if (deliveryRecoveryBlocked) return { ok: false, error: 'delivery_state_corrupt' };
@@ -941,12 +969,12 @@
 
   async function claimCompletion(message, sender) {
     const source = senderSource(sender);
-    const conversationId = senderConversation(sender);
+    const conversationId = documentConversation(message, sender);
     const requested = requestedEpoch(message);
     if (!source || requested === null || !conversationId || message.conversation_id !== conversationId) {
       return { ok: false, error: 'wrong_conversation' };
     }
-    const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
+    const authority = await authorizeDocument(message, sender);
     if (!authority.ok || authority.conversation_id !== conversationId) return { ok: false, error: 'wrong_conversation' };
     return serialCompletionState(async () => {
       if (completionRecoveryBlocked) return { ok: false, error: 'completion_state_corrupt' };
@@ -990,10 +1018,10 @@
 
   async function receiveCompletionAck(message, sender) {
     const source = senderSource(sender);
-    const conversationId = senderConversation(sender);
+    const conversationId = documentConversation(message, sender);
     const requested = requestedEpoch(message);
     if (!source || requested === null || !conversationId) return { ok: false, error: 'wrong_conversation' };
-    const authority = await authorizeDocument({ navigation_epoch: requested }, sender);
+    const authority = await authorizeDocument(message, sender);
     if (!authority.ok || authority.conversation_id !== conversationId) return { ok: false, error: 'wrong_conversation' };
     return serialCompletionState(async () => {
       if (completionRecoveryBlocked) return { ok: false, error: 'completion_state_corrupt' };
@@ -1048,6 +1076,137 @@
     completion_ack: receiveCompletionAck
   };
 
+  const DELIVERY_RECOVERY_ALARM = 'delivery-conversation-recovery';
+  let recoveryInFlight = null;
+  let lastRecoveryAt = 0;
+  const recoveryTabs = new Map();
+  const recoveryReloads = new Map();
+
+  function persistRecoveryTabs() {
+    return chrome.storage.local.set({ conversationRecoveryTabs: Object.fromEntries(
+      [...recoveryTabs].map(([tabId, targets]) => [tabId,
+        { targets, reload_at: recoveryReloads.get(tabId) || 0 }])) });
+  }
+
+  async function probeTab(tab) {
+    if (!chrome.tabs.sendMessage) return null;
+    let timer;
+    try {
+      return await Promise.race([
+        chrome.tabs.sendMessage(tab.id, { type: 'delivery_probe' }),
+        new Promise(resolve => { timer = setTimeout(() => resolve(null), FIBER_PROBE_TIMEOUT_MS); })
+      ]);
+    } catch { return null; }
+    finally { clearTimeout(timer); }
+  }
+  const FIBER_PROBE_TIMEOUT_MS = 3000;
+
+  async function recoveryFailure(tabId, code) {
+    await load();
+    const targets = recoveryTabs.get(tabId) || [];
+    return Promise.all(targets.map(async target => {
+      const result = await postBridge('/delivery/recovery-failure', { ...target, code });
+      if (!result.ok) console.warn('[LRM recovery] failure report rejected', result.error || result.status);
+      return result;
+    }));
+  }
+
+  function recoverConversations() {
+    if (!chrome.tabs?.query || !chrome.tabs?.create) return Promise.resolve();
+    if (recoveryInFlight) return recoveryInFlight;
+    if (Date.now() - lastRecoveryAt < 5000) return Promise.resolve();
+    lastRecoveryAt = Date.now();
+    recoveryInFlight = serialDeliveryState(async () => {
+      // ACKs take precedence: restoring a page must never cause a confirmed send to repeat.
+      const ready = await prepareDeliveryClaim();
+      if (!ready.ok || ready.blocked || deliveryRecoveryBlocked) return;
+      const result = await postBridge('/delivery/recovery-targets', {});
+      if (!result.ok || !Array.isArray(result.data?.targets)) {
+        console.warn('[LRM recovery] target discovery failed', result.error || result.status);
+        return;
+      }
+      const targets = result.data.targets;
+      if (!targets.every(target => target && Object.keys(target).length === 2
+        && typeof target.delivery_id === 'string' && DELIVERY_ID.test(target.delivery_id)
+        && typeof target.conversation_id === 'string' && CONVERSATION_ID.test(target.conversation_id))) {
+        console.warn('[LRM recovery] invalid target response');
+        return;
+      }
+      if (targets.length === 0) {
+        recoveryTabs.clear();
+        await persistRecoveryTabs();
+        return;
+      }
+      const tabs = await chrome.tabs.query({});
+      const probes = new Map();
+      await Promise.all(tabs.map(async tab => {
+        try {
+          if (['https://chatgpt.com', 'https://chat.openai.com'].includes(new URL(tab.url).origin)) {
+            probes.set(tab.id, await probeTab(tab));
+          }
+        } catch { /* Non-ChatGPT tabs are not delivery candidates. */ }
+      }));
+      recoveryTabs.clear();
+      for (const target of targets) {
+        let tab = tabs.find(candidate => probes.get(candidate.id)?.ok === true
+          && probes.get(candidate.id)?.conversation_id === target.conversation_id)
+          || tabs.find(candidate => senderConversation({ url: candidate.pendingUrl || candidate.url })
+            === target.conversation_id);
+        try {
+          if (!tab) {
+            tab = await chrome.tabs.create({ url: `https://chatgpt.com/c/${target.conversation_id}` });
+            tabs.push(tab);
+          }
+          if (!Number.isSafeInteger(tab?.id)) throw new Error('navigation did not return a tab');
+          const pending = recoveryTabs.get(tab.id) || [];
+          pending.push(target);
+          recoveryTabs.set(tab.id, pending);
+          await persistRecoveryTabs();
+          if (chrome.tabs.reload && (tab.discarded
+            || (tab.status === 'complete' && chrome.tabs.sendMessage
+              && (probes.get(tab.id)?.ok !== true
+                || probes.get(tab.id)?.conversation_id !== target.conversation_id)
+              && Date.now() - (recoveryReloads.get(tab.id) || 0) >= 60000))) {
+            recoveryReloads.set(tab.id, Date.now());
+            await persistRecoveryTabs();
+            await chrome.tabs.reload(tab.id);
+          }
+        } catch {
+          await postBridge('/delivery/recovery-failure', { ...target, code: 'TARGET_CONVERSATION_NAVIGATION_FAILED' });
+        }
+      }
+      await persistRecoveryTabs();
+    }).finally(() => { recoveryInFlight = null; });
+    return recoveryInFlight;
+  }
+
+  chrome.tabs?.onUpdated?.addListener((tabId, change) => {
+    if (typeof change.url !== 'string') return;
+    try {
+      const url = new URL(change.url);
+      if (url.hostname === 'auth.openai.com'
+        || (['chatgpt.com', 'chat.openai.com'].includes(url.hostname)
+          && /^\/(?:auth\/login|login|log-in)(?:\/|$)/u.test(url.pathname))) {
+        void recoveryFailure(tabId, 'TARGET_CONVERSATION_AUTH_REQUIRED').catch(() => undefined);
+      }
+    } catch { /* Only explicit authentication redirects are terminal. */ }
+  });
+  chrome.webRequest?.onCompleted?.addListener(details => {
+    if (![401, 403, 404].includes(details.statusCode)) return;
+    void (async () => {
+      await load();
+      const targets = recoveryTabs.get(details.tabId) || [];
+      const url = new URL(details.url);
+      const apiConversation = /^\/backend-api\/conversation\/([A-Za-z0-9_-]+)\/?$/u.exec(url.pathname)?.[1];
+      if (!targets.some(target => target.conversation_id === (apiConversation || senderConversation({ url: details.url })))) return;
+      await recoveryFailure(details.tabId, details.statusCode === 404
+        ? 'TARGET_CONVERSATION_NOT_FOUND' : 'TARGET_CONVERSATION_AUTH_REQUIRED');
+    })().catch(() => console.warn('[LRM recovery] response observation failed'));
+  }, { urls: ['https://chatgpt.com/*', 'https://chat.openai.com/*'], types: ['main_frame', 'xmlhttprequest'] });
+  chrome.webRequest?.onErrorOccurred?.addListener(details => {
+    void recoveryFailure(details.tabId, 'TARGET_CONVERSATION_NAVIGATION_FAILED').catch(() => undefined);
+  }, { urls: ['https://chatgpt.com/*', 'https://chat.openai.com/*'], types: ['main_frame'] });
+
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const handler = message && typeof message.type === 'string'
       && Object.prototype.hasOwnProperty.call(handlers, message.type)
@@ -1065,8 +1224,11 @@
   if (chrome.alarms) {
     chrome.alarms.onAlarm.addListener((alarm) => {
       if (alarm.name === EVIDENCE_RETRY_ALARM) void flushEvidenceOutbox().catch(() => undefined);
+      if (alarm.name === DELIVERY_RECOVERY_ALARM) void recoverConversations().catch(() => console.warn('[LRM recovery] worker recovery failed'));
     });
     void chrome.alarms.create(EVIDENCE_RETRY_ALARM, { periodInMinutes: 1 });
+    void chrome.alarms.create(DELIVERY_RECOVERY_ALARM, { periodInMinutes: 1 });
+    void recoverConversations().catch(() => console.warn('[LRM recovery] worker recovery failed'));
     void flushEvidenceOutbox().catch(() => undefined);
   }
 })();

@@ -56,6 +56,7 @@ const readinessStateSchema = z.enum([
   "bridge_unavailable",
   "extension_not_paired",
   "extension_not_present",
+  "target_conversation_not_present",
   "ready",
 ]);
 

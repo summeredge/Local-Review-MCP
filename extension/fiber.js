@@ -750,6 +750,17 @@
     }
 
     const turns = turnsOf(sections);
+    // Delivery also needs identity after the submit_goal tool turn disappears.
+    // Read the rendered conversation model with the same canonical-id resolver.
+    let deliveryConversationId = null;
+    let deliveryIdentityInvalid = false;
+    for (const section of Array.from(sections).slice(-MAX_TURNS)) {
+      const identity = conversationEvidenceDetailsOf(fiberOf(section));
+      if (!identity.conversationId || identity.conflict || identity.unreadable
+        || (deliveryConversationId && identity.conversationId
+          && deliveryConversationId !== identity.conversationId)) deliveryIdentityInvalid = true;
+      if (identity.conversationId) deliveryConversationId = identity.conversationId;
+    }
     let currentTool = { found: false, key: null };
     let currentTurnConversationId = null;
     let fiberRootDetected = false;
@@ -807,6 +818,7 @@
       nonce,
       version: VERSION,
       evidence,
+      conversation_id: deliveryIdentityInvalid ? null : deliveryConversationId,
       // Observation only: never used as identity evidence by the isolated world.
       scan_diagnostic: {
         current_turn_present: Boolean(currentTurn),
@@ -1284,7 +1296,7 @@
       scan(nonce);
     } catch {
       try {
-        post({ source: REPLY, nonce, version: VERSION, evidence: [] }, location.origin);
+        post({ source: REPLY, nonce, version: VERSION, evidence: [], conversation_id: null }, location.origin);
       } catch {
         // The isolated world will fail closed on timeout.
       }

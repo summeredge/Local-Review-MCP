@@ -33,7 +33,7 @@ import {
   ExtensionDeliveryService,
   type ExtensionDeliveryReadinessCheck,
 } from "./extension-delivery.js";
-import { extensionDeliveryReadiness } from "./bridge.js";
+import { conversationDeliveryReadiness } from "./bridge.js";
 import { ExtensionDeliveryAdapter } from "../delivery/extension-delivery-adapter.js";
 import { buildExecutionFailureMessage } from "../delivery/execution-failure-message.js";
 import type { ReviewDeliveryAdapter } from "../delivery/review-delivery-adapter.js";
@@ -406,7 +406,7 @@ export class AutoIterationService {
     this.results = options.reviewResultService ?? new ReviewResultService(this.storageRoot);
     this.extensionDeliveries = options.extensionDeliveries ?? new ExtensionDeliveryService(this.storageRoot);
     const broker = options.dispatchCommandBroker ?? new DispatchCommandBroker(this.extensionDeliveries, {
-      readiness: options.extensionDeliveryReadiness ?? extensionDeliveryReadiness,
+      readiness: options.extensionDeliveryReadiness ?? conversationDeliveryReadiness,
     });
     const adapter = options.reviewDeliveryAdapter ?? new ExtensionDeliveryAdapter(broker);
     this.browserRouter = options.browserRouter ?? new BrowserRouter(this.storageRoot, adapter);

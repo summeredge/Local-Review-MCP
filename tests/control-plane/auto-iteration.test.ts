@@ -20,6 +20,7 @@ import {
   codexExecutionLogPaths,
 } from "../../src/control-plane/codex-execution-completion.js";
 import { ExtensionDeliveryService } from "../../src/control-plane/extension-delivery.js";
+import { DispatchCommandBroker } from "../../src/control-plane/dispatch-command-broker.js";
 import { ExecutionContextService } from "../../src/context/execution-service.js";
 import { ConversationRoutingService } from "../../src/context/conversation-routing-service.js";
 import { ReviewDeliveryService } from "../../src/context/review-delivery-service.js";
@@ -233,6 +234,26 @@ function startInput(overrides: Partial<AutoIterationStartInput> = {}): AutoItera
 }
 
 describe("AutoIterationService", () => {
+  it("exhausts the real broker's unclaimed recovery budget instead of staying running", async () => {
+    const f = await fixture();
+    const deliveries = new ExtensionDeliveryService(f.root);
+    const auto = new AutoIterationService(f.registry, { storageRoot: f.root,
+      extensionDeliveries: deliveries,
+      dispatchCommandBroker: new DispatchCommandBroker(deliveries, {
+        timeoutMs: 5, readiness: () => ({ ready: false, readiness_state: "target_conversation_not_present" }),
+      }), completionRouter: f.completionRouter, retryDelayMs: 1 });
+    try {
+      await auto.start(startInput());
+      await vi.waitFor(async () => expect(await auto.getLoop("loop-001")).toMatchObject({
+        stage: "human_required", terminal_decision: "HUMAN_REQUIRED",
+        terminal_reason: "TARGET_CONVERSATION_EXTENSION_NOT_READY" }), { timeout: 5_000 });
+      const loop = (await auto.getLoop("loop-001"))!;
+      expect((await new ReviewDeliveryService(f.root).getDelivery("workspace-a", loop.delivery_id!))!
+        .attempt_count).toBe(REVIEW_DELIVERY_MAX_ATTEMPTS);
+      expect(await deliveries.recoveryTargets()).toEqual([]);
+      expect(f.completionCalls).not.toHaveBeenCalled();
+    } finally { auto.dispose(); }
+  });
   it('recovers a transient delivery after restart and a late completion without duplicating the review', async () => {
     const f = await fixture();
     f.deliveryCalls.mockImplementationOnce(async () => ({ status: 'failed' as const, retryable: true,

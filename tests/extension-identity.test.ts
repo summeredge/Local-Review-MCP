@@ -126,10 +126,24 @@ function submitGoalRequest(
 }
 
 describe("MAIN-world Fiber identity evidence", () => {
+  it("resolves delivery identity without a current submit_goal and rejects conflicting/unreadable models", () => {
+    const local = { conversation: { id: "WEB:32ca0d45-8b29-414a-bbe4-8e26c3aae911", serverId$: () => CONVERSATION_A } };
+    const reply = scanFiber([fiberSection(CONVERSATION_A, [], local)]);
+    expect(reply.conversation_id).toBe(CONVERSATION_A);
+    expect(reply.evidence).toEqual([]);
+    expect(scanFiber([]).conversation_id).toBeNull();
+    expect(scanFiber([fiberSection(CONVERSATION_A, []), fiberSection(CONVERSATION_B, [])])
+      .conversation_id).toBeNull();
+    expect(scanFiber([fiberSection(CONVERSATION_A, []), fiberSection(null, [])]).conversation_id).toBeNull();
+    expect(scanFiber([fiberSection(CONVERSATION_A, [], {
+      conversation: { id: "WEB:32ca0d45-8b29-414a-bbe4-8e26c3aae911", serverId$: () => { throw new Error("unreadable"); } },
+    })]).conversation_id).toBeNull();
+  });
+
   it("is directly loadable as one minimal Chrome/Edge MV3 extension", () => {
     expect(manifest.manifest_version).toBe(3);
     expect(manifest.background).toEqual({ service_worker: "background.js" });
-    expect(manifest.permissions).toEqual(["storage", "alarms"]);
+    expect(manifest.permissions).toEqual(["storage", "alarms", "tabs", "webRequest"]);
     expect(manifest.host_permissions).toEqual([
       "https://chatgpt.com/*",
       "https://chat.openai.com/*",
@@ -139,7 +153,7 @@ describe("MAIN-world Fiber identity evidence", () => {
       "http://127.0.0.1:12084/*",
       "http://127.0.0.1:12085/*",
     ]);
-    expect(JSON.stringify(manifest)).not.toMatch(/popup|scripting|webNavigation|activeTab|tabs/iu);
+    expect(JSON.stringify(manifest)).not.toMatch(/popup|scripting|webNavigation|activeTab/iu);
   });
 
   it("allowlists the current submit_goal correlation key and the matching Fiber conversation", () => {
@@ -183,6 +197,7 @@ describe("MAIN-world Fiber identity evidence", () => {
     await settleContent();
     expect(harness.messages.filter((message) => message.type === "identity_evidence")).toEqual([{
       type: "identity_evidence",
+      identity_source: "fiber",
       request_id: UUID_REQUEST_ID,
       conversation_id: CONVERSATION_A,
       navigation_epoch: 0,
@@ -281,6 +296,7 @@ function loadContent(
         source: "lrm-extension-identity-reply",
         nonce: (data as Record<string, unknown>).nonce,
         version: 1,
+        conversation_id: fiberConversation,
         evidence: [{ request_id: requestId, fiber_conversation_id: fiberConversation }, ...extraEvidence],
       };
       for (const listener of listeners.get("message") ?? []) {
@@ -340,17 +356,20 @@ describe("content route ownership and navigation epochs", () => {
 
     expect(harness.messages.filter((message) => message.type === "identity_evidence")).toEqual([{
       type: "identity_evidence",
+      identity_source: "fiber",
       request_id: UUID_REQUEST_ID_B,
       conversation_id: CONVERSATION_A,
       navigation_epoch: 0,
     }]);
   });
 
-  it("accepts only root and one-segment Project conversation routes", async () => {
+  it("accepts canonical Fiber identity on conversation and unassigned chat routes only", async () => {
     for (const path of [
       `/c/${CONVERSATION_A}`,
       `/g/g-p-xxxxxxxx/c/${CONVERSATION_A}`,
       `/g/g-xxxxxxxx/c/${CONVERSATION_A}`,
+      "/",
+      "/g/project/",
     ]) {
       const harness = loadContent(CONVERSATION_A, CONVERSATION_A, path);
       await settleContent();
@@ -359,11 +378,10 @@ describe("content route ownership and navigation epochs", () => {
     }
 
     for (const path of [
-      "/",
       "/c/",
       `/share/c/${CONVERSATION_A}`,
       `/foo/c/${CONVERSATION_A}`,
-      "/g/project/",
+      "/auth/login",
       `/g/project/foo/c/${CONVERSATION_A}`,
       "/g/project/c/",
     ]) {
@@ -767,8 +785,8 @@ describe("Extension background identity authority", () => {
       .toMatchObject({ ok: false, error: 'document_unregistered' });
     await new Promise(resolve => setTimeout(resolve, 60));
     const entries = storage.data.identityDiagnosticOutbox as Record<string, unknown>[];
-    expect(entries.map(entry => entry.stage)).toEqual(['background_received', 'document_authorized']);
-    expect(entries[1]).toMatchObject({ flags: { document_authorized: false } });
+    expect(entries.map(entry => entry.stage)).toEqual(expect.arrayContaining(['background_received', 'document_authorized']));
+    expect(entries.find(entry => entry.stage === 'document_authorized')).toMatchObject({ flags: { document_authorized: false } });
     expect(worker.calls.some(call => new URL(call.input).pathname === '/identity-evidence')).toBe(false);
   });
   it("discovers only the fixed Bridge ports, pairs, and stores the token", async () => {

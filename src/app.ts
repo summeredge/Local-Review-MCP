@@ -429,6 +429,14 @@ export async function startApp(
       }
       const bridgePort = await startBridge({
         ports: options.bridgePorts,
+        conversationRecoveryTargets: async () => {
+          if (!deliveryAvailable) throw new ExtensionDeliveryUnavailableError("extension delivery unavailable");
+          return extensionDeliveries.recoveryTargets();
+        },
+        reportConversationRecoveryFailure: async (failure) => {
+          if (!deliveryAvailable) throw new ExtensionDeliveryUnavailableError("extension delivery unavailable");
+          await extensionDeliveries.reportRecoveryFailure(failure);
+        },
         evidenceTransportTrace: context.evidenceTransportTrace,
         onIdentityEvidence: async (evidence) => {
           context.evidenceTransportTrace?.record({
