@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CodexEventAdapter,
@@ -24,6 +24,7 @@ import type {
 } from "../../src/backends/codex_app_server/models.js";
 import type { CodexAppServerEvent } from "../../src/backends/codex_app_server/events.js";
 import { ExecutionContextService } from "../../src/context/execution-service.js";
+import { CODEX_EXECUTION_COMMAND, codexExecutionLogPaths } from "../../src/control-plane/codex-execution-completion.js";
 import { SessionStore } from "../../src/context/session-store.js";
 import { TaskContextService } from "../../src/context/service.js";
 import { goalOrchestrationSchema, type GoalOrchestration } from "../../src/control-plane/goal-orchestration.js";
@@ -620,6 +621,63 @@ describe("Codex Event Adapter and LRM event stream", () => {
     });
     expect(eventsResult.isError).not.toBe(true);
     expect(eventsResult.structuredContent).toMatchObject({ returned: 2, has_more: true });
+  });
+
+  it("reads batch Execution events through the registered Workspace-scoped tool", async () => {
+    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-batch-events-"));
+    temporaryDirectories.push(root);
+    await new TaskContextService(root).createTaskContext({
+      task_id: "task-batch", workspace_id: "workspace-1", conversation_id: "conversation-1",
+    });
+    await new ExecutionContextService(root).createExecutionContext({
+      execution_id: "execution-batch",
+      workspace_id: "workspace-1",
+      task_id: "task-batch",
+      command: CODEX_EXECUTION_COMMAND,
+    });
+    const paths = codexExecutionLogPaths(root, "workspace-1", "task-batch", "execution-batch");
+    await fs.mkdir(dirname(paths.stdout), { recursive: true });
+    await fs.writeFile(paths.stdout, [
+      { type: "thread.started", thread_id: "private-thread" },
+      { type: "item.started", item: { id: "message-1", type: "agent_message" } },
+      { type: "item.delta", item_id: "message-1", delta: "live output" },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n", "utf8");
+
+    const server = createMcpServer({
+      registry: new WorkspaceRegistry([{ id: "workspace-1", name: "Workspace", path: root }]),
+      statusQuery: new StatusQueryService({ storageRoot: root }),
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "batch-event-stream-test", version: "0.1.0" });
+    clients.push(client);
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({
+      name: "list_execution_events",
+      arguments: {
+        execution_id: "execution-batch", workspace_id: "workspace-1", task_id: "task-batch",
+      },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      execution_id: "execution-batch",
+      workspace_id: "workspace-1",
+      task_id: "task-batch",
+      events: [
+        { event_type: "execution_started" },
+        { event_type: "agent_message", content: "live output" },
+      ],
+    });
+    expect(JSON.stringify(result.structuredContent)).not.toContain("private-thread");
+    await expect(new SessionStore(root).listSessions()).resolves.toEqual([]);
+
+    const unregistered = await client.callTool({
+      name: "list_execution_events",
+      arguments: {
+        execution_id: "execution-batch", workspace_id: "workspace-2", task_id: "task-batch",
+      },
+    });
+    expect(unregistered.isError).toBe(true);
   });
 
   it("clears terminal interactive records while retaining active Sessions", async () => {

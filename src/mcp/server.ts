@@ -10,6 +10,8 @@ import type { GitDiffResponse, GitStatusResponse } from "../git/types.js";
 import { ReviewContextService } from "../review/review-context.js";
 import type { ConversationCorrelationRegistry } from "../control-plane/conversation-correlation.js";
 import {
+  executionEventsOutputSchema,
+  executionEventsQueryInputSchema,
   executionStatusQueryInputSchema,
   executionStatusOutputSchema,
   sessionEventsOutputSchema,
@@ -85,7 +87,7 @@ export interface McpRuntimeContext {
   >;
   readonly statusQuery?: Pick<
     StatusQueryService,
-    "getSessionStatus" | "getExecutionStatus" | "listSessionEvents"
+    "getSessionStatus" | "getExecutionStatus" | "listSessionEvents" | "listExecutionEvents"
   >;
   readonly connectorEvidence?: {
     recordEvidence(input: {
@@ -123,6 +125,7 @@ export const STATUS_QUERY_TOOL_NAMES = [
   "get_session_status",
   "get_execution_status",
   "list_session_events",
+  "list_execution_events",
 ] as const;
 export const DIAGNOSTIC_TOOL_NAMES = ["get_identity_trace", "get_evidence_transport_trace"] as const;
 export const REGISTERED_TOOL_NAMES = [
@@ -1049,6 +1052,30 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
         }
         const selection = registry.resolve(input.workspace_id);
         return structuredResponse(sessionEventsOutputSchema, await context.statusQuery.listSessionEvents({
+          ...input,
+          workspace_id: selection.id,
+        }));
+      } catch (error: unknown) {
+        return toToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_execution_events",
+    {
+      description: "List bounded read-only Codex JSONL events for a CLI batch Execution.",
+      inputSchema: executionEventsQueryInputSchema,
+      outputSchema: executionEventsOutputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        if (context.statusQuery === undefined) {
+          return toToolError(new Error("Status query runtime is unavailable."));
+        }
+        const selection = registry.resolve(input.workspace_id);
+        return structuredResponse(executionEventsOutputSchema, await context.statusQuery.listExecutionEvents({
           ...input,
           workspace_id: selection.id,
         }));

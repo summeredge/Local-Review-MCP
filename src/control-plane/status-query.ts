@@ -25,6 +25,7 @@ import {
   type StoredLrmEvent,
 } from "./events/model.js";
 import { EventStore, eventsFile } from "./events/store.js";
+import { CODEX_EXECUTION_COMMAND, readCodexExecutionEvents } from "./codex-execution-completion.js";
 
 const providerIdSchema = z.string().min(1).max(256);
 const optionalModelSchema = z.string().min(1).max(256).optional();
@@ -51,6 +52,12 @@ export const sessionEventsQueryInputSchema = z.object({
   workspace_id: workspaceIdSchema.optional(),
   after_sequence: z.number().int().min(0).optional().default(0),
   limit: z.number().int().min(1).max(1_000).optional().default(200),
+}).strict();
+
+export const executionEventsQueryInputSchema = z.object({
+  execution_id: executionIdSchema,
+  workspace_id: workspaceIdSchema,
+  task_id: taskIdSchema,
 }).strict();
 
 const currentExecutionSchema = z.object({
@@ -96,12 +103,31 @@ export const sessionEventsOutputSchema = z.object({
   has_more: z.boolean(),
 }).strict();
 
+const executionEventOutputSchema = z.object({
+  sequence: z.number().int().positive(),
+  timestamp: z.string().datetime({ offset: true }),
+  event_type: z.string().min(1).max(64),
+  content: z.string().max(4_000),
+  execution_id: executionIdSchema,
+  turn_id: providerIdSchema.optional(),
+  item_id: providerIdSchema.optional(),
+}).strict();
+
+export const executionEventsOutputSchema = z.object({
+  execution_id: executionIdSchema,
+  workspace_id: workspaceIdSchema,
+  task_id: taskIdSchema,
+  events: z.array(executionEventOutputSchema).max(500),
+}).strict();
+
 export type SessionStatusQueryInput = z.input<typeof sessionStatusQueryInputSchema>;
 export type ExecutionStatusQueryInput = z.input<typeof executionStatusQueryInputSchema>;
 export type SessionEventsQueryInput = z.input<typeof sessionEventsQueryInputSchema>;
+export type ExecutionEventsQueryInput = z.input<typeof executionEventsQueryInputSchema>;
 export type SessionStatusOutput = z.infer<typeof sessionStatusOutputSchema>;
 export type ExecutionStatusOutput = z.infer<typeof executionStatusOutputSchema>;
 export type SessionEventsOutput = z.infer<typeof sessionEventsOutputSchema>;
+export type ExecutionEventsOutput = z.infer<typeof executionEventsOutputSchema>;
 
 export interface LauncherSessionSummary {
   readonly session_id: string;
@@ -374,6 +400,25 @@ export class StatusQueryService {
       events: selected,
       returned: selected.length,
       has_more: available.length > selected.length,
+    });
+  }
+
+  public async listExecutionEvents(input: ExecutionEventsQueryInput): Promise<ExecutionEventsOutput> {
+    const parsed = executionEventsQueryInputSchema.parse(input);
+    const execution = await this.executions.getExecutionContext(
+      parsed.workspace_id,
+      parsed.task_id,
+      parsed.execution_id,
+    );
+    if (execution === null) throw new Error(`Execution "${parsed.execution_id}" was not found.`);
+    if (execution.command !== CODEX_EXECUTION_COMMAND) {
+      throw new Error("Execution is not a Codex CLI batch.");
+    }
+    return executionEventsOutputSchema.parse({
+      execution_id: execution.execution_id,
+      workspace_id: execution.workspace_id,
+      task_id: execution.task_id,
+      events: await readCodexExecutionEvents(this.storageRoot, execution),
     });
   }
 

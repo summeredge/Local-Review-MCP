@@ -28,6 +28,7 @@ LOCAL_DOCTOR_URL = "http://127.0.0.1:12080/launcher/doctor"
 REMOTE_STATUS_URL = "https://review.syqiu.kdns.fr/.well-known/oauth-protected-resource"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 MAX_STATUS_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_EVENT_STREAM_ROWS = 500
 EXECUTION_STATUSES = frozenset({"running", "passed", "failed"})
 EXECUTION_MODES = frozenset({"batch", "interactive"})
 # Internal backend identities. The dashboard shows the friendly label and keeps the identity in
@@ -389,6 +390,42 @@ def _parse_events(payload: object, session: Mapping[str, object]) -> tuple[Sessi
     return tuple(sorted(events, key=lambda event: event.sequence))
 
 
+def _parse_execution_events(
+    payload: object,
+    identity: Mapping[str, str],
+) -> tuple[SessionEventViewModel, ...]:
+    document = _object(payload, "Execution events")
+    for key in ("execution_id", "workspace_id", "task_id"):
+        if _identifier(document.get(key), key) != identity[key]:
+            raise StatusQueryError("Events do not match the Execution")
+    events_value = document.get("events")
+    if not isinstance(events_value, list) or len(events_value) > MAX_EVENT_STREAM_ROWS:
+        raise StatusQueryError("Execution events must be a bounded array")
+    events: list[SessionEventViewModel] = []
+    previous_sequence = 0
+    for value in events_value:
+        event = _object(value, "Execution event")
+        sequence = event.get("sequence")
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= previous_sequence:
+            raise StatusQueryError("Execution event sequence must increase")
+        if _identifier(event.get("execution_id"), "event.execution_id") != identity["execution_id"]:
+            raise StatusQueryError("Event Execution does not match")
+        content = event.get("content")
+        if not isinstance(content, str) or len(content) > 4_000:
+            raise StatusQueryError("event.content must be a string of at most 4000 characters")
+        events.append(SessionEventViewModel(
+            sequence=sequence,
+            timestamp=_timestamp(event.get("timestamp"), "event.timestamp"),
+            event_type=_text(event.get("event_type"), "event.event_type", 64),
+            content=content,
+            execution_id=identity["execution_id"],
+            turn_id=_optional_text(event.get("turn_id"), "event.turn_id"),
+            item_id=_optional_text(event.get("item_id"), "event.item_id"),
+        ))
+        previous_sequence = sequence
+    return tuple(events)
+
+
 def _execution_session(document: Mapping[str, object]) -> SessionViewModel | None:
     """The optional interactive Session of an Execution. A batch Execution has none."""
 
@@ -407,12 +444,13 @@ def _execution_session(document: Mapping[str, object]) -> SessionViewModel | Non
 def build_execution_view_model(
     summary: object,
     session_events: object | None = None,
+    execution_events: tuple[SessionEventViewModel, ...] | None = None,
 ) -> ExecutionViewModel:
     """Build one dashboard row from an Execution catalog summary.
 
     The Execution owns the row identity and status. Goal, Session, and event evidence are optional:
     an Execution without a Session is a normal batch row, and it keeps the `—` fallbacks instead of
-    inventing a Session. Event payloads are only read for a row that already has one.
+    inventing a Session. Batch event evidence remains attached directly to its Execution.
     """
 
     document = _object(summary, "Execution summary")
@@ -423,6 +461,8 @@ def build_execution_view_model(
             "session_id": session.session_id,
             "thread_id": session.thread_id,
         })
+    elif session is None and execution_events is not None:
+        events = execution_events
     task_id = _identifier(document.get("task_id"), "task_id")
     task_name = _optional_text(document.get("task_name"), "task_name") or task_id
     return ExecutionViewModel(
@@ -916,7 +956,7 @@ class StatusChecker:
 
     def clear_persisted_task_records(self) -> PersistedCleanupResult | None:
         try:
-            payload = self._request_json(self.session_catalog_url, method="DELETE")
+            payload = self._request_json(self.execution_catalog_url, method="DELETE")
         except StatusQueryError:
             return None
         if not isinstance(payload, dict):
@@ -941,7 +981,21 @@ class StatusChecker:
         executions: list[ExecutionViewModel] = []
         for summary in self._execution_catalog():
             session_events = None
-            if summary.get("session_id") is not None:
+            execution_events = None
+            if summary.get("execution_mode") == "batch" and summary.get("backend") == "cli":
+                try:
+                    identity = {
+                        "execution_id": _identifier(summary.get("execution_id"), "execution_id"),
+                        "workspace_id": _identifier(summary.get("workspace_id"), "workspace_id"),
+                        "task_id": _identifier(summary.get("task_id"), "task_id"),
+                    }
+                    execution_events = _parse_execution_events(
+                        self._execution_events(**identity),
+                        identity,
+                    )
+                except StatusQueryError:
+                    execution_events = None
+            elif summary.get("session_id") is not None:
                 try:
                     session_events = self._session_events(
                         _identifier(summary.get("session_id"), "session_id"),
@@ -950,10 +1004,17 @@ class StatusChecker:
                 except StatusQueryError:
                     session_events = None
             try:
-                executions.append(build_execution_view_model(summary, session_events))
+                executions.append(build_execution_view_model(summary, session_events, execution_events))
             except StatusQueryError:
                 continue
         return tuple(executions)
+
+    def _execution_events(self, execution_id: str, workspace_id: str, task_id: str) -> dict[str, object]:
+        return self._call_tool("list_execution_events", {
+            "execution_id": execution_id,
+            "workspace_id": workspace_id,
+            "task_id": task_id,
+        })
 
     def _session_events(self, session_id: str, thread_id: str | None) -> dict[str, object]:
         events: list[object] = []

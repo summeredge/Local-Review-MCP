@@ -87,6 +87,29 @@ function clock() {
 }
 
 describe("P5.9.1 capability negotiation", () => {
+  it("ends Desktop execution failure without offering or starting fallback", async () => {
+    const error = Object.assign(new Error("create_thread failed: Project unavailable"), { code: "tool_call_failed" });
+    const desktop = provider("desktop", { ready: true }, async () => { throw error; });
+    const standalone = provider("standalone", { ready: true });
+    const wait = vi.fn(async () => undefined);
+    const negotiator = new CapabilityNegotiator({ desktop, standalone, wait });
+    await expect(negotiator.start(request)).rejects.toMatchObject({
+      provider: "desktop", code: "tool_call_failed", cause: error,
+    });
+    const snapshot = negotiator.snapshot(request.execution_id);
+    expect(snapshot).toMatchObject({
+      execution_id: request.execution_id, state: "desktop_failed", reason: "desktop_execution_failed",
+      actions: [], requestedAction: null, error_code: "tool_call_failed",
+      timestamps: { desktopDeadlineAt: null, fallbackDeadlineAt: null },
+    });
+    expect(negotiator.recheckDesktop(request.execution_id)).toEqual(snapshot);
+    expect(negotiator.selectStandalone(request.execution_id)).toEqual(snapshot);
+    expect(desktop.start).toHaveBeenCalledTimes(1);
+    expect(standalone.start).not.toHaveBeenCalled();
+    expect(standalone.prepare).not.toHaveBeenCalled();
+    expect(wait).not.toHaveBeenCalled();
+  });
+
   it("restores a bound Desktop capability without sending another handoff", async () => {
     const desktopState: DesktopSyncState = {
       connected: true,

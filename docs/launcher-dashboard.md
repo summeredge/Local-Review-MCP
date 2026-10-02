@@ -169,7 +169,7 @@ The task tab provides two separate cleanup actions:
 - **清理界面缓存** clears the current launcher display without touching
   persisted records. Automatic refreshes keep cleared terminal Executions hidden,
   while active or new Executions remain visible; manual **刷新状态** reloads all.
-- **清理持久化任务记录** removes `passed` / `failed` Executions for the active
+- **清理持久化任务记录** removes `passed` / `failed` / `terminated` Executions for all registered
   Workspace, including batch Executions that have no Session. It also removes
   Events and completed, failed, or terminated Sessions linked to those terminal
   interactive Executions. Running Executions and Sessions are retained; a Task

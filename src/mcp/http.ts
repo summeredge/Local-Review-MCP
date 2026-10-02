@@ -209,6 +209,7 @@ async function handleLauncherSessionCatalogRequest(
   response: ServerResponse,
   context: HttpRuntimeContext,
   authToken: string,
+  allWorkspaces = false,
 ): Promise<void> {
   if (!isDirectLoopbackRequest(request)) {
     request.resume();
@@ -245,7 +246,17 @@ async function handleLauncherSessionCatalogRequest(
     return;
   }
   try {
-    const result = await context.statusQuery.clearSessionRecords(context.registry.active.id);
+    const result = { deleted_executions: 0, deleted_sessions: 0, deleted_events: 0, deleted_tasks: 0 };
+    const workspaceIds = allWorkspaces
+      ? context.registry.list().map((record) => record.id)
+      : [context.registry.active.id];
+    for (const workspaceId of workspaceIds) {
+      const counts = await context.statusQuery.clearSessionRecords(workspaceId);
+      result.deleted_executions += counts.deleted_executions;
+      result.deleted_sessions += counts.deleted_sessions;
+      result.deleted_events += counts.deleted_events;
+      result.deleted_tasks += counts.deleted_tasks;
+    }
     sendJson(response, 200, { deleted: true, ...result });
   } catch {
     sendJson(response, 500, { error: "task_record_cleanup_failed" });
@@ -259,7 +270,7 @@ async function handleLauncherExecutionCatalogRequest(
   authToken: string,
 ): Promise<void> {
   if (request.method === "DELETE") {
-    await handleLauncherSessionCatalogRequest(request, response, context, authToken);
+    await handleLauncherSessionCatalogRequest(request, response, context, authToken, true);
     return;
   }
   if (!isDirectLoopbackRequest(request)) {

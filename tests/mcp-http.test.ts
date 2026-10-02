@@ -100,10 +100,14 @@ describe("MCP HTTP runtime", () => {
   it.each(["/launcher/sessions", LAUNCHER_EXECUTION_CATALOG_PATH])("clears persisted Executions through %s without adding an MCP tool", async (cleanupPath) => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-launcher-catalog-"));
     temporaryDirectories.push(workspace);
+    const secondary = join(workspace, "secondary");
+    await mkdir(secondary);
     const registry = new WorkspaceRegistry([{
       id: "catalog-workspace",
       name: "Catalog Workspace",
       path: workspace,
+    }, {
+      id: "secondary-workspace", name: "Secondary", path: secondary,
     }]);
     const tasks = new TaskContextService(workspace);
     const executions = new ExecutionContextService(workspace);
@@ -158,6 +162,13 @@ describe("MCP HTTP runtime", () => {
     await executions.updateExecutionContext(
       "other-workspace", "task-other-workspace", "execution-other-workspace", { status: "failed" },
     );
+    await tasks.createTaskContext({ task_id: "task-secondary", workspace_id: "secondary-workspace" });
+    await executions.createExecutionContext({
+      execution_id: "execution-secondary", task_id: "task-secondary", workspace_id: "secondary-workspace", status: "failed",
+    });
+    await executions.createExecutionContext({
+      execution_id: "execution-running", task_id: "task-secondary", workspace_id: "secondary-workspace",
+    });
     const server = createHttpServer({
       host: "127.0.0.1",
       port: 0,
@@ -186,7 +197,7 @@ describe("MCP HTTP runtime", () => {
     const beforeCleanup = await fetch(`http://127.0.0.1:${port}${LAUNCHER_EXECUTION_CATALOG_PATH}`, {
       headers: { authorization: "Bearer test-token" },
     });
-    expect((await beforeCleanup.json()).executions).toHaveLength(2);
+    expect((await beforeCleanup.json()).executions).toHaveLength(4);
 
     const readinessUrl = `http://127.0.0.1:${port}/launcher/readiness`;
     const headers = { authorization: "Bearer test-token" };
@@ -235,7 +246,7 @@ describe("MCP HTTP runtime", () => {
     expect(cleanup.status).toBe(200);
     await expect(cleanup.json()).resolves.toEqual({
       deleted: true,
-      deleted_executions: 2,
+      deleted_executions: cleanupPath === LAUNCHER_EXECUTION_CATALOG_PATH ? 3 : 2,
       deleted_sessions: 1,
       deleted_events: 1,
       deleted_tasks: 2,
@@ -243,7 +254,15 @@ describe("MCP HTTP runtime", () => {
     const dashboard = await fetch(`http://127.0.0.1:${port}${LAUNCHER_EXECUTION_CATALOG_PATH}`, {
       headers: { authorization: "Bearer test-token" },
     });
-    await expect(dashboard.json()).resolves.toEqual({ executions: [] });
+    const remaining = (await dashboard.json()).executions;
+    expect(remaining.map((execution: { execution_id: string }) => execution.execution_id).sort()).toEqual(
+      cleanupPath === LAUNCHER_EXECUTION_CATALOG_PATH
+        ? ["execution-running"] : ["execution-running", "execution-secondary"],
+    );
+    await expect(executions.getExecutionContext(
+      "secondary-workspace", "task-secondary", "execution-running",
+    )).resolves.toMatchObject({ status: "running" });
+    await expect(tasks.getTaskContext("task-secondary")).resolves.not.toBeNull();
     await expect(sessions.getSession("session-interactive")).resolves.toBeNull();
     await expect(events.listEvents("session-interactive")).resolves.toEqual([]);
     await expect(tasks.getTaskContext("task-interactive")).resolves.toBeNull();
@@ -533,7 +552,7 @@ describe("MCP HTTP runtime", () => {
 
     await client.connect(transport);
     const result = await client.listTools();
-    expect(result.tools).toHaveLength(20);
+    expect(result.tools).toHaveLength(21);
     expect(result.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
 
     const infoCall = await client.callTool({ name: "workspace_info", arguments: {} });

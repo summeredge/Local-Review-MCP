@@ -464,7 +464,7 @@ export class CapabilityNegotiator implements ExecutionBackend {
         return await this.desktop.start(request);
       } catch (error: unknown) {
         const wrapped = new CapabilityExecutionError("desktop", error);
-        this.setState(context, "desktop_failed", "desktop", errorReason("desktop"), ["recheck", "standalone"], wrapped);
+        this.setState(context, "desktop_failed", "desktop", errorReason("desktop"), [], wrapped);
         throw wrapped;
       }
     }

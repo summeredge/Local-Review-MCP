@@ -13,6 +13,13 @@ import { TaskContextService } from "../context/service.js";
 import type { ExecutionContext } from "../context/types.js";
 
 export const CODEX_EXECUTIONS_DIRECTORY = join("control-plane", "codex-executions");
+export const CODEX_EXECUTION_COMMAND = "codex exec --json -";
+
+// ponytail: 2 MiB tail per refresh; stream from a saved complete-line offset if this hides real events.
+const MAX_CODEX_EVENT_LOG_BYTES = 2 * 1024 * 1024;
+const MAX_CODEX_EXECUTION_EVENT_ROWS = 500;
+const CODEX_EVENT_TEXT_MAX_LENGTH = 4_000;
+const eventTimestampSchema = z.string().datetime({ offset: true });
 
 export interface CodexExecutionIdentity {
   readonly workspace_id: string;
@@ -24,6 +31,16 @@ export interface CodexExecutionLogPaths {
   readonly stdout: string;
   readonly stderr: string;
   readonly exit: string;
+}
+
+export interface CodexExecutionEvent {
+  readonly sequence: number;
+  readonly timestamp: string;
+  readonly event_type: string;
+  readonly content: string;
+  readonly execution_id: string;
+  readonly turn_id?: string;
+  readonly item_id?: string;
 }
 
 export interface CodexExecutionProcessExitObservation extends CodexExecutionIdentity {
@@ -153,6 +170,193 @@ function addCompletedPartialEvent(parsed: CodexJsonlParseResult): {
       malformedLineCount: parsed.malformedLineCount + 1,
     };
   }
+}
+
+interface CodexExecutionEventDraft {
+  readonly timestamp: string;
+  readonly event_type: string;
+  content: string;
+  readonly execution_id: string;
+  readonly turn_id?: string;
+  readonly item_id?: string;
+}
+
+function safeCodexEventText(value: string): string {
+  return value
+    .replace(/\b((?:proxy-)?authorization)\s*:\s*(?:bearer\s+)?[^\s,;]+/giu, "$1: [REDACTED]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/giu, "Bearer [REDACTED]")
+    .replace(/\b([A-Z_][A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*)\s*=\s*[^\s,;]+/giu, "$1=[REDACTED]")
+    .replace(/(["']?(?:access_token|refresh_token|api[_-]?key|client[_-]?secret|token|password)["']?\s*[:=]\s*["']?)[^"'\s,;}]+/giu, "$1[REDACTED]")
+    .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/gu, "[REDACTED]")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, "")
+    .slice(0, CODEX_EVENT_TEXT_MAX_LENGTH);
+}
+
+function codexEventTimestamp(event: JsonRecord, fallback: string): string {
+  return typeof event.timestamp === "string" && eventTimestampSchema.safeParse(event.timestamp).success
+    ? event.timestamp
+    : fallback;
+}
+
+function codexEventId(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" && value.length <= 256 ? value : undefined;
+}
+
+function mapCodexExecutionEvents(
+  events: readonly JsonRecord[],
+  execution: ExecutionContext,
+): CodexExecutionEventDraft[] {
+  const mapped: CodexExecutionEventDraft[] = [];
+  const itemTypes = new Map<string, string>();
+  const agentMessages = new Map<string, CodexExecutionEventDraft>();
+  const agentMessageText = new Map<string, string>();
+  const add = (
+    event: JsonRecord,
+    eventType: string,
+    content = "",
+    itemId?: string,
+  ): CodexExecutionEventDraft => {
+    const turnId = codexEventId(event.turn_id);
+    const row: CodexExecutionEventDraft = {
+      timestamp: codexEventTimestamp(event, execution.started_at),
+      event_type: eventType,
+      content: safeCodexEventText(content),
+      execution_id: execution.execution_id,
+      ...(turnId === undefined ? {} : { turn_id: turnId }),
+      ...(itemId === undefined ? {} : { item_id: itemId }),
+    };
+    mapped.push(row);
+    return row;
+  };
+  const updateAgentMessage = (event: JsonRecord, itemId: string | undefined, text: string): void => {
+    const row = itemId === undefined ? undefined : agentMessages.get(itemId);
+    const target = row ?? add(event, "agent_message", "", itemId);
+    if (itemId !== undefined) {
+      agentMessages.set(itemId, target);
+      agentMessageText.set(itemId, text);
+    }
+    target.content = safeCodexEventText(text);
+  };
+
+  for (const event of events) {
+    switch (event.type) {
+      case "thread.started":
+        add(event, "execution_started");
+        break;
+      case "turn.started":
+        add(event, "turn_started");
+        break;
+      case "item.started":
+      case "item.updated":
+      case "item.completed": {
+        const item = event.item;
+        if (!isRecord(item) || typeof item.type !== "string") {
+          if (event.type !== "item.updated") add(event, "codex_event", "Codex item activity.");
+          break;
+        }
+        const itemId = codexEventId(item.id);
+        if (itemId !== undefined) itemTypes.set(itemId, item.type);
+        if (item.type === "agent_message") {
+          if (typeof item.text === "string") updateAgentMessage(event, itemId, item.text);
+          break;
+        }
+        if (event.type !== "item.updated") {
+          const activity = item.type === "command_execution"
+            ? "command"
+            : (item.type === "mcp_tool_call" || item.type === "web_search" || item.type.endsWith("_tool_call"))
+              ? "tool"
+              : undefined;
+          if (activity === undefined) {
+            add(event, "codex_event", "Codex item activity.", itemId);
+            break;
+          }
+          const phase = event.type === "item.started" ? "started" : "completed";
+          add(event, `${activity}_${phase}`, `${activity === "command" ? "Command" : "Tool"} ${phase}.`, itemId);
+        }
+        break;
+      }
+      case "item.delta": {
+        const itemId = codexEventId(event.item_id);
+        if (typeof event.delta !== "string") break;
+        if (itemId === undefined) {
+          add(event, "codex_event", "Codex output delta.");
+          break;
+        }
+        if (itemTypes.get(itemId) !== "agent_message") {
+          add(event, "codex_event", "Codex output delta.", itemId);
+          break;
+        }
+        const nextText = (agentMessageText.get(itemId) ?? "") + event.delta;
+        updateAgentMessage(event, itemId, nextText);
+        break;
+      }
+      case "turn.completed":
+        add(event, "turn_completed");
+        break;
+      case "turn.failed":
+        add(event, "turn_failed", messageFrom(event.error) ?? "Codex turn failed.");
+        break;
+      case "error":
+        add(event, "codex_error", messageFrom(event.message) ?? "Codex reported an error.");
+        break;
+      default:
+        add(event, "codex_event", typeof event.type === "string" ? event.type : "Codex event");
+        break;
+    }
+  }
+  return mapped;
+}
+
+export async function readCodexExecutionEvents(
+  storageRoot: string,
+  execution: ExecutionContext,
+): Promise<CodexExecutionEvent[]> {
+  const paths = codexExecutionLogPaths(
+    storageRoot,
+    execution.workspace_id,
+    execution.task_id,
+    execution.execution_id,
+  );
+  let contents = "";
+  let file: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    file = await open(paths.stdout, "r");
+    const size = (await file.stat()).size;
+    const length = Math.min(size, MAX_CODEX_EVENT_LOG_BYTES);
+    const buffer = Buffer.alloc(length);
+    const start = Math.max(0, size - length);
+    const result = await file.read(buffer, 0, length, start);
+    contents = buffer.subarray(0, result.bytesRead).toString("utf8");
+  } catch (error: unknown) {
+    if (errorCode(error) !== "ENOENT") throw error;
+  } finally {
+    await file?.close().catch(() => undefined);
+  }
+
+  const parsed = parseCodexExecutionJsonl(contents);
+  const sourceEvents = execution.status === "running"
+    ? parsed.events
+    : addCompletedPartialEvent(parsed).events;
+  const mapped = mapCodexExecutionEvents(sourceEvents, execution);
+  const terminal = execution.status === "passed" || execution.status === "failed"
+    ? {
+        timestamp: execution.finished_at ?? execution.started_at,
+        event_type: execution.status === "passed" ? "execution_completed" : "execution_failed",
+        content: execution.status === "passed" ? "Execution completed." : "Execution failed.",
+        execution_id: execution.execution_id,
+      }
+    : undefined;
+  const start = mapped.find((event) => event.event_type === "execution_started");
+  const reserved = (start === undefined ? 0 : 1) + (terminal === undefined ? 0 : 1);
+  const retained = mapped
+    .filter((event) => event.event_type !== "execution_started")
+    .slice(-(MAX_CODEX_EXECUTION_EVENT_ROWS - reserved));
+  const selected = [
+    ...(start === undefined ? [] : [start]),
+    ...retained,
+    ...(terminal === undefined ? [] : [terminal]),
+  ];
+  return selected.map((event, index) => ({ ...event, sequence: index + 1 }));
 }
 
 function messageFrom(value: unknown): string | undefined {

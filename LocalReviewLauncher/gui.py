@@ -55,6 +55,7 @@ from status_checker import (
     DesktopSyncStatus,
     ExecutionViewModel,
     LauncherStatus,
+    MAX_EVENT_STREAM_ROWS,
     OAuthRegistryStatus,
     StatusChecker,
 )
@@ -69,7 +70,6 @@ from status_worker import (
 STARTUP_TIMEOUT_SECONDS = 60
 STARTUP_POLL_INTERVAL_MS = 2_000
 BROWSER_PRESENCE_GRACE_SECONDS = 15
-MAX_EVENT_STREAM_ROWS = 500
 MAX_DASHBOARD_ROWS = 5
 CAPABILITY_TIMELINE_LIMIT = 100
 EVENT_STREAM_MIN_HEIGHT = 270
@@ -91,7 +91,7 @@ EXECUTION_STATUS_COLORS = {
     "failed": "#9b1c1c",
 }
 UNKNOWN_STATUS_COLOR = "#666666"
-BATCH_EVENT_EMPTY_TEXT = "Batch Execution 无 Session 事件流"
+BATCH_EVENT_EMPTY_TEXT = "暂无执行事件"
 NO_SESSION_TEXT = "\n".join(["Session：—", "Thread：—"])
 BUTTON_WIDTH = 136
 BUTTON_HEIGHT = 34
@@ -353,7 +353,7 @@ class LauncherWindow(QMainWindow):
             ("Desktop 身份", self.desktop_identity_status),
             ("Tools Pipe", self.tools_pipe_status),
             ("PipeSource", self.pipe_source_status),
-            ("执行能力", self.execution_summary_status),
+            ("当前 Desktop 能力", self.execution_summary_status),
             ("OAuth", self.oauth_status_label),
         )):
             row, column = divmod(index, 3)
@@ -415,7 +415,7 @@ class LauncherWindow(QMainWindow):
         capability_layout.addWidget(self._row("诊断状态：", self.doctor_status))
         capability_layout.addWidget(self._row("浏览器详情：", self.browser_diagnostic_status))
         capability_layout.addWidget(self._row("Desktop 诊断：", self.desktop_sync_status))
-        capability_layout.addWidget(self._row("执行能力诊断：", self.capability_status))
+        capability_layout.addWidget(self._row("Execution 能力协商：", self.capability_status))
         capability_layout.addWidget(self.capability_timeline_content)
 
         task_layout = QVBoxLayout()
@@ -429,7 +429,8 @@ class LauncherWindow(QMainWindow):
         maintenance.addWidget(self.clear_persisted_task_button)
         task_layout.addLayout(maintenance)
         task_layout.addWidget(self.execution_table)
-        task_layout.addWidget(self._row("当前查询工作区：", self.query_workspace_label))
+        task_layout.addWidget(self._row("任务列表范围：", QLabel("所有已注册工作区")))
+        task_layout.addWidget(self._row("默认工作区：", self.query_workspace_label))
         task_layout.addWidget(self.open_codex_task_button)
         self.session_viewer_content = QWidget()
         session_viewer_layout = QVBoxLayout(self.session_viewer_content)
@@ -687,7 +688,7 @@ class LauncherWindow(QMainWindow):
         desktop_capability = getattr(status, "desktop_capability", DesktopCapabilityStatus())
         capability = getattr(status, "capability", CapabilityStatus())
         self._render_capability_status(capability, status.mcp_running)
-        self._set_value(self.execution_summary_status, *self._capability_summary(capability, status.mcp_running))
+        self._set_value(self.execution_summary_status, *self._capability_summary(desktop_capability, status.mcp_running))
         # A connected Desktop IPC observer says nothing about the Desktop codex_app capability, so
         # the handoff state is always rendered separately instead of being read as the same thing.
         identity_state = (
@@ -804,29 +805,15 @@ class LauncherWindow(QMainWindow):
         }.get(text, text)
 
     @staticmethod
-    def _capability_summary(capability: CapabilityStatus, mcp_running: bool) -> tuple[str, str]:
-        """Name the execution capability without downgrading a usable fallback path to "unavailable".
-
-        The fail-closed default, which no execution has established, is the only state without a
-        backend behind it, so it is the only one reported as a lost capability. A failed Desktop
-        primary path is degraded rather than lost, because the standalone app-server fallback can
-        still start an execution. A fallback state that failed on the standalone side is the one
-        case where no backend is left, so that is what is reported as a lost capability.
-        """
-
-        if capability == CapabilityStatus():
-            return ("当前空闲" if mcp_running else "MCP 已停止", "#666666")
-        if capability.state == "desktop_ready":
-            return "Desktop 可用", "#16803c"
-        if capability.state in {"fallback_ready", "fallback_running"}:
-            if capability.reason == "standalone_execution_failed":
-                return "不可用", UNAVAILABLE_CAPABILITY_COLOR
-            return "Standalone", DEGRADED_CAPABILITY_COLOR
-        if capability.state == "desktop_failed":
-            return DESKTOP_DOWN_FALLBACK_CAPABILITY_TEXT, DEGRADED_CAPABILITY_COLOR
-        if capability.state in {"initializing", "desktop_pending"}:
-            return "正在建立执行能力", DEGRADED_CAPABILITY_COLOR
-        return "不可用", UNAVAILABLE_CAPABILITY_COLOR
+    def _capability_summary(capability: DesktopCapabilityStatus, mcp_running: bool) -> tuple[str, str]:
+        """Report live Desktop preflight independently of any Execution negotiation."""
+        if not mcp_running:
+            return "MCP 已停止", "#666666"
+        if capability.ready:
+            return "Desktop 前置能力就绪，可优先尝试", "#16803c"
+        if capability.pipe_state == "pending":
+            return "Desktop 前置能力建立中", DEGRADED_CAPABILITY_COLOR
+        return "Desktop 前置能力未就绪", DEGRADED_CAPABILITY_COLOR
 
     @staticmethod
     def _capability_reason_text(reason: str | None) -> str:
@@ -901,7 +888,11 @@ class LauncherWindow(QMainWindow):
         }.get(capability.state, "执行能力状态未报告。")
         if capability.state == "fallback_ready" and capability.reason == "standalone_execution_failed":
             capability_hint = "Standalone 备用后端也不可用，当前没有可执行的执行路径。"
+        if capability.reason == "desktop_execution_failed":
+            capability_state = "本次 Execution 已失败"
+            capability_hint = "Desktop 执行已失败，请人工处理；不会切换后端或重跑任务。"
         capability_lines = [
+            "Execution capability negotiation（最近执行）",
             f"执行：{capability.execution_id or '—'}",
             f"来源：{capability_source}",
             f"状态：{capability_state}（{capability.state}）",
@@ -914,11 +905,15 @@ class LauncherWindow(QMainWindow):
             if capability.reason:
                 capability_lines.append(self._capability_reason_line(capability.reason))
         elif capability.state == "desktop_failed":
-            capability_lines.append("Desktop：失败（Standalone 备用后端仍可执行）")
+            capability_lines.append(
+                "Desktop：本次执行失败" if capability.reason == "desktop_execution_failed"
+                else "Desktop：失败（Standalone 备用后端仍可执行）"
+            )
             capability_lines.append(self._capability_reason_line(capability.reason))
             if capability.error_code:
                 capability_lines.append(f"错误代码：{capability.error_code}")
-            remaining = self._seconds_until(capability.fallback_deadline_at)
+            remaining = (self._seconds_until(capability.fallback_deadline_at)
+                         if "standalone" in capability.actions else None)
             if remaining is not None:
                 capability_lines.extend([
                     "",
@@ -939,10 +934,9 @@ class LauncherWindow(QMainWindow):
             if capability.error_code:
                 capability_lines.append(f"错误代码：{capability.error_code}")
         self.capability_status.setText("\n".join(capability_lines))
-        # A failed Desktop path and a failed standalone path are told apart on purpose: the first
-        # still has a backend to execute on, the second leaves nothing to start an execution with.
+        # Execution failures are terminal; preflight failures can still wait for fallback.
         no_usable_backend = (
-            capability.reason == "standalone_execution_failed"
+            capability.reason in {"desktop_execution_failed", "standalone_execution_failed"}
             or not capability.state.startswith(("initializing", "desktop_", "fallback_"))
         )
         self.capability_status.setStyleSheet(
@@ -1164,8 +1158,7 @@ class LauncherWindow(QMainWindow):
             f"摘要：{execution.summary or '—'}",
         ]))
         session = execution.session
-        # A batch Execution has no Session and no event stream; both stay explicit instead of
-        # being rendered as an empty Session.
+        # Batch details keep Session and Thread empty while the Execution event stream is independent.
         self.session_details_label.setText(NO_SESSION_TEXT if session is None else "\n".join([
             f"Session：{session.session_id}",
             f"Thread：{session.thread_id or '—'}",
@@ -1173,7 +1166,7 @@ class LauncherWindow(QMainWindow):
             f"Reasoning：{session.reasoning_effort or '—'}",
             f"更新时间：{self._format_timestamp(session.updated_at)}",
         ]))
-        self.event_empty_label.setVisible(session is None)
+        self.event_empty_label.setVisible(session is None and not execution.events)
 
         # Aggregate before limiting rows so a retained stream keeps all its text.
         rows = deque(maxlen=MAX_EVENT_STREAM_ROWS)
@@ -1236,7 +1229,7 @@ class LauncherWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "清理持久化任务记录",
-            "删除当前工作区中已结束的 Execution，以及关联且已结束的 Session 和 Event？\n"
+            "删除任务列表范围内所有已注册工作区中已结束的 Execution，以及关联且已结束的 Session 和 Event？\n"
             "没有其它需要保留的记录时会同时删除 Task。运行中的 Execution 和 Session 会保留。\n\n继续吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,

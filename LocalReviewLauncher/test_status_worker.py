@@ -115,6 +115,25 @@ class StatusCheckWorkerTests(unittest.TestCase):
         self.assertEqual(offline_results[-1].desktop_sync, DesktopSyncStatus())
         self.assertEqual(offline_results[-1].capability, CapabilityStatus())
 
+    def test_worker_keeps_live_desktop_and_historical_negotiation_separate(self) -> None:
+        desktop = DesktopCapabilityStatus(True, "handoff", "active")
+        negotiation = CapabilityStatus(
+            state="fallback_running", source="standalone", execution_id="old-execution",
+        )
+        probe = Mock(return_value=negotiation)
+        checker = SimpleNamespace(
+            check=lambda: LauncherStatus(True, True, True),
+            desktop_capability_status=lambda: desktop,
+            capability_status=probe,
+        )
+        results = []
+        worker = StatusCheckWorker(checker)
+        worker.signals.finished.connect(lambda _generation, status: results.append(status))
+        worker.run()
+        self.assertEqual(results[-1].desktop_capability, desktop)
+        self.assertEqual(results[-1].capability, negotiation)
+        probe.assert_called_once_with("current")
+
     def test_worker_includes_desktop_capability_only_when_mcp_is_running(self) -> None:
         capability = DesktopCapabilityStatus(ready=True, pipe_source="handoff", pipe_state="active")
         probe = Mock(return_value=capability)
@@ -812,6 +831,13 @@ class StatusCheckerTests(unittest.TestCase):
             checker, "_execution_catalog", return_value=(batch, desktop, app_server)
         ), patch.object(
             checker,
+            "_execution_events",
+            return_value={
+                "execution_id": "execution-batch", "workspace_id": "workspace-1",
+                "task_id": "task-batch", "events": [],
+            },
+        ) as execution_events, patch.object(
+            checker,
             "_session_events",
             side_effect=lambda session_id, thread_id: {"session_id": session_id, "events": []},
         ) as session_events:
@@ -827,7 +853,7 @@ class StatusCheckerTests(unittest.TestCase):
         self.assertEqual([execution.display_mode for execution in result],
                          ["batch", "interactive", "interactive"])
 
-        # A batch Execution owns no Session, no Thread, and no event stream.
+        # A batch Execution owns no Session or Thread; its own event source may be empty.
         self.assertIsNone(result[0].session)
         self.assertIsNone(result[0].session_id)
         self.assertIsNone(result[0].thread_id)
@@ -852,6 +878,40 @@ class StatusCheckerTests(unittest.TestCase):
             [call.args for call in session_events.call_args_list],
             [("session-1", "thread-1"), ("session-2", "thread-2")],
         )
+        execution_events.assert_called_once_with(
+            execution_id="execution-batch", workspace_id="workspace-1", task_id="task-batch",
+        )
+
+    def test_dashboard_refresh_reads_new_batch_events_with_full_execution_scope(self) -> None:
+        timestamp = "2026-09-15T12:34:56+08:00"
+        batch = {
+            "execution_id": "execution-batch", "workspace_id": "workspace-1",
+            "task_id": "task-batch", "execution_mode": "batch", "backend": "cli",
+            "status": "running", "started_at": timestamp,
+        }
+        responses = [
+            {"execution_id": "execution-batch", "workspace_id": "workspace-1", "task_id": "task-batch",
+             "events": [{"sequence": 1, "timestamp": timestamp, "event_type": "execution_started",
+                         "content": "", "execution_id": "execution-batch"}]},
+            {"execution_id": "execution-batch", "workspace_id": "workspace-1", "task_id": "task-batch",
+             "events": [{"sequence": 1, "timestamp": timestamp, "event_type": "execution_started",
+                         "content": "", "execution_id": "execution-batch"},
+                        {"sequence": 2, "timestamp": timestamp, "event_type": "agent_message",
+                         "content": "new output", "execution_id": "execution-batch"}]},
+        ]
+        checker = StatusChecker(workspace_id="workspace-default")
+        with patch.object(checker, "_execution_catalog", return_value=(batch,)), patch.object(
+            checker, "_execution_events", side_effect=responses,
+        ) as execution_events:
+            first = checker.dashboard_executions()[0]
+            refreshed = checker.dashboard_executions()[0]
+
+        self.assertEqual([event.event_type for event in first.events], ["execution_started"])
+        self.assertEqual(refreshed.events[-1].content, "new output")
+        self.assertEqual(execution_events.call_count, 2)
+        self.assertTrue(all(call.kwargs == {
+            "execution_id": "execution-batch", "workspace_id": "workspace-1", "task_id": "task-batch",
+        } for call in execution_events.call_args_list))
 
     def test_dashboard_drops_one_damaged_entry_and_keeps_rows_without_events(self) -> None:
         timestamp = "2026-09-15T12:34:56+08:00"
@@ -882,6 +942,8 @@ class StatusCheckerTests(unittest.TestCase):
         checker = StatusChecker()
         with patch.object(
             checker, "_execution_catalog", return_value=(damaged, batch, desktop)
+        ), patch.object(
+            checker, "_execution_events", side_effect=StatusQueryError("events unavailable"),
         ), patch.object(checker, "_session_events", side_effect=StatusQueryError("events unavailable")):
             result = checker.dashboard_executions()
 
@@ -975,7 +1037,7 @@ class StatusCheckerTests(unittest.TestCase):
             )
 
         request = open_url.call_args.args[0]
-        self.assertEqual(request.full_url, "http://127.0.0.1:12080/launcher/sessions")
+        self.assertEqual(request.full_url, "http://127.0.0.1:12080/launcher/executions")
         self.assertEqual(request.get_method(), "DELETE")
         self.assertEqual(request.get_header("Authorization"), "Bearer secret")
 

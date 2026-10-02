@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { taskExecutionsDirectory } from "../../src/context/execution.js";
 import { ExecutionContextService } from "../../src/context/execution-service.js";
@@ -8,6 +8,7 @@ import { SessionStore } from "../../src/context/session-store.js";
 import { sessionsDirectory } from "../../src/context/session.js";
 import { TaskContextService } from "../../src/context/service.js";
 import { EventStore } from "../../src/control-plane/events/store.js";
+import { CODEX_EXECUTION_COMMAND, codexExecutionLogPaths } from "../../src/control-plane/codex-execution-completion.js";
 import {
   goalOrchestrationSchema,
   type GoalOrchestration,
@@ -98,7 +99,7 @@ async function seedExecution(root: string, options: {
     execution_id: options.executionId,
     task_id: options.taskId,
     workspace_id: options.workspaceId,
-    command: options.command ?? "codex exec --json -",
+    command: options.command ?? CODEX_EXECUTION_COMMAND,
     ...(options.summary === undefined ? {} : { summary: options.summary }),
   });
   if (options.status !== undefined && options.status !== "running") {
@@ -218,6 +219,112 @@ describe("Launcher Execution catalog", () => {
       summary: "Batch finished",
       updated_at: expect.any(String),
     });
+  });
+
+  it("reads and refreshes bounded running batch events from only the requested Execution log", async () => {
+    const root = await storageRoot();
+    const query = queryFor(root, []);
+    await seedExecution(root, {
+      workspaceId: "workspace-1", taskId: "task-batch", executionId: "execution-batch",
+    });
+    const paths = codexExecutionLogPaths(root, "workspace-1", "task-batch", "execution-batch");
+    await mkdir(dirname(paths.stdout), { recursive: true });
+    const initialLines = [
+      { type: "thread.started", thread_id: "private-thread" },
+      { type: "item.started", item: { id: "message-1", type: "agent_message" } },
+      { type: "item.delta", item_id: "message-1", delta: "working Bearer " },
+      { type: "item.delta", item_id: "message-1", delta: "private-token-value API_TOKEN=private-value" },
+      { type: "item.started", item: { id: "command-1", type: "command_execution", command: "API_TOKEN=private" } },
+      { type: "future.event", token: "private-token-value" },
+    ].map((event) => JSON.stringify(event));
+    await writeFile(paths.stdout, `${initialLines.join("\n")}\n{"type":"item.delta","item_id":"message-1","delta":" now"`, "utf8");
+    const identity = {
+      execution_id: "execution-batch",
+      workspace_id: "workspace-1",
+      task_id: "task-batch",
+    };
+
+    const first = await query.listExecutionEvents(identity);
+    expect(first.events.map(({ event_type }) => event_type)).toEqual([
+      "execution_started", "agent_message", "command_started", "codex_event",
+    ]);
+    expect(first.events[1]?.content).toBe("working Bearer [REDACTED] API_TOKEN=[REDACTED]");
+    expect(first.events[2]?.content).toBe("Command started.");
+    expect(first.events[3]?.content).toBe("future.event");
+    expect(JSON.stringify(first)).not.toContain("private-token-value");
+    expect(JSON.stringify(first)).not.toContain("API_TOKEN=private");
+    expect(first.events[1]?.content).not.toContain("private-thread");
+
+    await writeFile(paths.stdout, "}\n", { encoding: "utf8", flag: "a" });
+    const refreshed = await query.listExecutionEvents(identity);
+    expect(refreshed.events.map(({ event_type }) => event_type)).toEqual([
+      "execution_started", "agent_message", "command_started", "codex_event",
+    ]);
+    expect(refreshed.events[1]?.content).toBe("working Bearer [REDACTED] API_TOKEN=[REDACTED] now");
+    await expect(query.listExecutionEvents({ ...identity, workspace_id: "workspace-2" }))
+      .rejects.toThrow("was not found");
+    await expect(query.listExecutionEvents({ ...identity, task_id: "task-other" }))
+      .rejects.toThrow("was not found");
+  });
+
+  it.each(["passed", "failed"] as const)("adds the persisted %s batch terminal event", async (status) => {
+    const root = await storageRoot();
+    await seedExecution(root, {
+      workspaceId: "workspace-1", taskId: "task-batch", executionId: "execution-batch",
+      status: "running",
+    });
+    const executions = new ExecutionContextService(root);
+    await executions.updateExecutionContext("workspace-1", "task-batch", "execution-batch", { status });
+    const paths = codexExecutionLogPaths(root, "workspace-1", "task-batch", "execution-batch");
+    await mkdir(dirname(paths.stdout), { recursive: true });
+    await writeFile(paths.stdout, '{"type":"thread.started"}', "utf8");
+
+    await expect(queryFor(root, []).listExecutionEvents({
+      execution_id: "execution-batch", workspace_id: "workspace-1", task_id: "task-batch",
+    })).resolves.toMatchObject({
+      events: [{ event_type: "execution_started" }, { event_type: status === "passed" ? "execution_completed" : "execution_failed" }],
+    });
+  });
+
+  it("ignores malformed and incomplete running JSONL records", async () => {
+    const root = await storageRoot();
+    await seedExecution(root, {
+      workspaceId: "workspace-1", taskId: "task-batch", executionId: "execution-batch",
+    });
+    const paths = codexExecutionLogPaths(root, "workspace-1", "task-batch", "execution-batch");
+    await mkdir(dirname(paths.stdout), { recursive: true });
+    await writeFile(paths.stdout, [
+      "not json",
+      JSON.stringify({ type: "thread.started" }),
+      "{broken json",
+      '{"type":"item.delta","item_id":"message-1","delta":"partial"',
+    ].join("\n"), "utf8");
+
+    await expect(queryFor(root, []).listExecutionEvents({
+      execution_id: "execution-batch", workspace_id: "workspace-1", task_id: "task-batch",
+    })).resolves.toMatchObject({ events: [{ event_type: "execution_started" }] });
+  });
+
+  it("caps a batch event snapshot at the latest 500 rows while retaining execution start", async () => {
+    const root = await storageRoot();
+    await seedExecution(root, {
+      workspaceId: "workspace-1", taskId: "task-batch", executionId: "execution-batch",
+    });
+    const paths = codexExecutionLogPaths(root, "workspace-1", "task-batch", "execution-batch");
+    await mkdir(dirname(paths.stdout), { recursive: true });
+    const contents = [
+      { type: "thread.started" },
+      ...Array.from({ length: 600 }, (_, index) => ({ type: `future.event.${index}` })),
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n";
+    await writeFile(paths.stdout, contents, "utf8");
+
+    const result = await queryFor(root, []).listExecutionEvents({
+      execution_id: "execution-batch", workspace_id: "workspace-1", task_id: "task-batch",
+    });
+    expect(result.events).toHaveLength(500);
+    expect(result.events[0]?.event_type).toBe("execution_started");
+    expect(result.events[1]?.content).toBe("future.event.101");
+    expect(result.events[499]?.content).toBe("future.event.599");
   });
 
   it("keeps the Desktop Session, model, and reasoning of an interactive Execution", async () => {

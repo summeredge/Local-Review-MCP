@@ -22,6 +22,7 @@ import { SessionStore } from "../src/context/session-store.js";
 import { TaskContextService } from "../src/context/service.js";
 import { EventStore } from "../src/control-plane/events/store.js";
 import { DesktopCodexBackend } from "../src/desktop-codex/desktop-codex-backend.js";
+import { CapabilityNegotiator } from "../src/control-plane/capability-negotiation.js";
 import { DesktopThreadBindingStore } from "../src/desktop-codex/desktop-thread-binding-store.js";
 import { DesktopToolsPipeHandoff } from "../src/desktop-codex/desktop-tools-pipe-handoff.js";
 import {
@@ -962,6 +963,43 @@ describe("P5.4.1 FIX executor identity is captured exactly once", () => {
 });
 
 describe("P5.4.1 FIX failure terminal projection", () => {
+  it.each([
+    ["Project unavailable", "create_thread failed: Project unavailable"],
+    ["", "create_thread returned an error."],
+  ])("persists create_thread provider error in failed Execution and Session: %s", async (text, summary) => {
+    const value = await fixture();
+    const original = value.desktop.runtime.mcpClient.callTool;
+    value.desktop.runtime.mcpClient.callTool = async (params: CallToolRequestParams) => {
+      if (params.name === "create_thread") {
+        value.desktop.calls.push(params);
+        return { isError: true, content: [{ type: "text", text }] };
+      }
+      return original(params);
+    };
+    await seedTask(value);
+    const standaloneStart = vi.fn();
+    const negotiator = new CapabilityNegotiator({
+      desktop: {
+        source: "desktop", prepare: async () => ({ ready: true }),
+        start: (request) => value.backend.start(request),
+      },
+      standalone: { source: "standalone", prepare: async () => ({ ready: true }), start: standaloneStart },
+    });
+    await expect(negotiator.start(interactiveRequest())).rejects.toMatchObject({
+      code: "tool_call_failed", message: summary,
+    });
+    const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
+    expect(execution).toMatchObject({ status: "failed", summary });
+    expect((await value.sessions.listSessions())[0]).toMatchObject({ status: "failed" });
+    expect(value.desktop.createThreadCount()).toBe(1);
+    expect(value.appServerStart).not.toHaveBeenCalled();
+    expect(value.cliStart).not.toHaveBeenCalled();
+    expect(standaloneStart).not.toHaveBeenCalled();
+    expect(negotiator.snapshot(EXECUTION_ID)).toMatchObject({
+      state: "desktop_failed", reason: "desktop_execution_failed", execution_id: EXECUTION_ID, actions: [],
+    });
+  });
+
   it("persists Execution, Session, and execution_failed before the listener for an authoritative turn failure", async () => {
     const value = await fixture();
     value.desktop.setTurns([{

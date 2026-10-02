@@ -64,8 +64,43 @@ function requiredPrompt(value: string): string {
 
 function throwToolResultError(result: CallToolResult, tool: string): void {
   if (result.isError === true) {
-    throw new CodexAppRuntimeError("tool_call_failed", `${tool} returned an error.`, { cause: result });
+    const summary = toolErrorSummary(result);
+    throw new CodexAppRuntimeError(
+      "tool_call_failed",
+      summary === undefined ? `${tool} returned an error.` : `${tool} failed: ${summary}`,
+      { cause: { isError: true, content: summary === undefined ? [] : [{ type: "text", text: summary }] } },
+    );
   }
+}
+
+// Only readable error fields cross into persisted Execution summaries, never the raw result.
+function toolErrorSummary(result: CallToolResult): string | undefined {
+  const candidates: unknown[] = result.content.slice(0, 8)
+    .filter((item) => item.type === "text")
+    .map((item) => item.text);
+  candidates.push(result.structuredContent, result.error);
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.length > 8_192) continue;
+    const parsed = typeof candidate === "string" ? parseJsonText(candidate) : candidate;
+    if (typeof candidate === "string" && /^[\s]*[\[{]/u.test(candidate) && parsed === undefined) continue;
+    const value = isRecord(parsed)
+      ? parsed.message ?? (isRecord(parsed.error) ? parsed.error.message : parsed.error)
+      : parsed === undefined ? candidate : undefined;
+    if (typeof value !== "string" || value.length > 8_192) continue;
+    const summary = value
+      // Keep the reason before an assignment; discard the rest, including multiline secret values.
+      .replace(/\b[\w.-]*(?:token|credential|password|secret|api[_-]?key|authorization|environment|env)[\w.-]*["']?\s*[:=][\s\S]*/giu, "[redacted]")
+      .replace(/\b[\w.-]+["']?\s*=[\s\S]*/gu, "[redacted]")
+      .replace(/\bBearer\s+\S+/giu, "[redacted]")
+      .replace(/(?:https?:\/\/|[A-Za-z]:[\\/]|\\\\|\/(?:[\w.-]+\/))[\s\S]*/gu, "[redacted path]")
+      .replace(/\b(?:sk-[\w-]+|[A-Za-z0-9_-]{40,}(?:\.[A-Za-z0-9_-]+)*)\b/gu, "[redacted]")
+      .replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
+      .replace(/\s+/gu, " ")
+      .trim()
+      .slice(0, 512);
+    if (summary !== "") return summary;
+  }
+  return undefined;
 }
 
 function parseJsonText(value: unknown): unknown {

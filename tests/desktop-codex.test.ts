@@ -5,6 +5,7 @@ import type { CallToolRequestParams, CallToolResult, Tool } from "@modelcontextp
 import { afterEach, describe, expect, it } from "vitest";
 import {
   CodexAppRuntime,
+  CodexAppRuntimeError,
   type CodexAppMcpTransport,
   type CodexAppMcpClient,
 } from "../src/desktop-codex/codex-app-runtime.js";
@@ -96,6 +97,52 @@ function project(
 }
 
 describe("desktop-codex command primitives", () => {
+  it.each<[Partial<CallToolResult>, string]>([
+    [{ content: [{ type: "text", text: "Project unavailable" }] }, "create_thread failed: Project unavailable"],
+    [{ content: [] }, "create_thread returned an error."],
+    [{ content: [{ type: "text", text: "  " }] }, "create_thread returned an error."],
+    [{ content: [], structuredContent: { error: { message: "Model unsupported", token: "private" }, payload: "private" } }, "create_thread failed: Model unsupported"],
+    [{ content: [{ type: "text", text: '{"error":{"message":"Quota exhausted"},"token":"private"}' }] }, "create_thread failed: Quota exhausted"],
+    [{ content: [{ type: "text", text: "x".repeat(9_000) }] }, "create_thread returned an error."],
+    [{ content: [{ type: "text", text: "Quota exhausted. ".repeat(100) }] }, `create_thread failed: ${"Quota exhausted. ".repeat(100).trim().slice(0, 512)}`],
+    [{ content: [{ type: "text", text: 'Quota exhausted. Token: "private-first\nprivate-second"' }] }, "create_thread failed: Quota exhausted. [redacted]"],
+    [{ content: [{ type: "text", text: 'Quota exhausted. "token": "private-token"' }] }, 'create_thread failed: Quota exhausted. "[redacted]'],
+    ...["\\\\.\\pipe\\private-pipe", "C:\\Users\\private user\\file", "/tmp/private/file", "https://private:private@example.com"].map((path): [Partial<CallToolResult>, string] => [
+      { content: [{ type: "text", text: `Project unavailable at ${path}` }] },
+      "create_thread failed: Project unavailable at [redacted path]",
+    ]),
+  ])("preserves bounded readable create_thread errors %#", async (payload, message) => {
+    const commands = new DesktopCodexThreadCommands({
+      client: { callTool: async () => ({ ...payload, isError: true } as CallToolResult) },
+      contracts: createCodexAppToolContracts(appTools()),
+    });
+    await expect(commands.createThread({
+      executorThreadId: EXECUTOR_THREAD, projectId: "project-one", prompt: "create",
+    })).rejects.toMatchObject({ code: "tool_call_failed", message });
+  });
+
+  it("filters provider secrets and paths before limiting the error summary", async () => {
+    const commands = new DesktopCodexThreadCommands({
+      client: { callTool: async () => ({ isError: true, content: [{ type: "text", text: [
+        "Project unavailable at \\\\.\\pipe\\private-pipe",
+        "token=private-token", "credential: private-credential", "API_KEY=private-key",
+        "environment: private-env", "Bearer private-bearer", "C:\\Users\\private-user\\file",
+        "/tmp/private-directory/file", "https://private-user:private-pass@example.com/path",
+        "The project is unavailable. ".repeat(50),
+      ].join("\n") }] }) },
+      contracts: createCodexAppToolContracts(appTools()),
+    });
+    const error = await commands.createThread({
+      executorThreadId: EXECUTOR_THREAD, projectId: "project-one", prompt: "create",
+    }).catch((error: unknown) => error) as CodexAppRuntimeError;
+    expect(error.code).toBe("tool_call_failed");
+    expect(error.message).toContain("create_thread failed: Project unavailable");
+    expect(error.message).not.toContain("private-");
+    expect(error.message.length).toBeLessThanOrEqual("create_thread failed: ".length + 512);
+    expect(error.cause).toEqual({ isError: true, content: [{ type: "text", text: error.message.slice("create_thread failed: ".length) }] });
+    expect(JSON.stringify(error.cause)).not.toContain("private-");
+  });
+
   it("keeps executor metadata separate from the created target thread", async () => {
     const workspacePath = resolve("C:/workspace/Local-Review-MCP");
     const calls: CallToolRequestParams[] = [];

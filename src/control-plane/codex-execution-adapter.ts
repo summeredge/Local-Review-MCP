@@ -16,19 +16,20 @@ import { TaskContextService } from "../context/service.js";
 import type { ExecutionContext } from "../context/types.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import {
+  CODEX_EXECUTION_COMMAND,
   CodexExecutionCompletionService,
   codexExecutionLogPaths,
 } from "./codex-execution-completion.js";
 import type { CodexExecutionLogPaths } from "./codex-execution-completion.js";
 
 export {
+  CODEX_EXECUTION_COMMAND,
   CODEX_EXECUTIONS_DIRECTORY,
   codexExecutionLogPaths,
 } from "./codex-execution-completion.js";
 export type { CodexExecutionLogPaths } from "./codex-execution-completion.js";
 
 const CODEX_ARGS = ["exec", "--json", "-"] as const;
-const CODEX_COMMAND = "codex exec --json -";
 
 export interface CodexExecutionStartRequest {
   readonly workspace_id: string;
@@ -339,7 +340,7 @@ export class CodexExecutionAdapter {
         task_id: request.task_id,
         workspace_id: request.workspace_id,
         status: "running",
-        command: CODEX_COMMAND,
+        command: CODEX_EXECUTION_COMMAND,
       });
     } catch (error: unknown) {
       const raced = await this.executions.getExecutionContext(

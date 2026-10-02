@@ -50,6 +50,7 @@ from status_checker import (
     OAuthClientStatus,
     OAuthRegistryStatus,
     PersistedCleanupResult,
+    SessionEventViewModel,
     SessionViewModel,
     StatusChecker,
     StatusQueryError,
@@ -429,7 +430,7 @@ class LauncherLogTests(unittest.TestCase):
         self.assertIn("执行：execution-1", window.capability_status.text())
         self.assertIn("状态：Desktop 已就绪（desktop_ready）", window.capability_status.text())
 
-    def test_execution_summary_separates_a_down_desktop_path_from_a_lost_capability(self) -> None:
+    def test_live_desktop_summary_is_independent_of_execution_negotiation(self) -> None:
         manager = Mock()
         manager.load.return_value = LauncherConfig("", "config.production.json", False)
         with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
@@ -439,92 +440,46 @@ class LauncherLogTests(unittest.TestCase):
             window = LauncherWindow(Path.cwd(), manager)
             self.addCleanup(window.close)
 
-        connected_desktop = DesktopSyncStatus(
-            connected=True,
-            owner_client_id="client-1",
-            current_conversation_id="conversation-1",
-            active_source="desktop_ipc",
-            association_status="matched",
-            fallback_reason=None,
-        )
-        disconnected_desktop = DesktopSyncStatus()
+        for state, reason in (
+            ("fallback_running", "afk_fallback_timeout"),
+            ("fallback_ready", "standalone_execution_failed"),
+            ("desktop_failed", "desktop_execution_failed"),
+        ):
+            with self.subTest(state=state):
+                window._render_status(LauncherStatus(
+                    True, True, True,
+                    desktop_capability=DesktopCapabilityStatus(True, "handoff", "active"),
+                    capability=CapabilityStatus(
+                        state=state, source="desktop" if state == "desktop_failed" else "standalone",
+                        reason=reason, execution_id="old-execution",
+                    ),
+                ))
+                self.assertEqual(window.execution_summary_status.text(), "Desktop 前置能力就绪，可优先尝试")
+                self.assertIn("#16803c", window.execution_summary_status.styleSheet())
+                self.assertIn("Execution capability negotiation", window.capability_status.text())
+                self.assertIn("执行：old-execution", window.capability_status.text())
+                self.assertIn(state, window.capability_status.text())
+                self.assertEqual(window.tools_pipe_status.text(), "活动")
+                self.assertEqual(window.pipe_source_status.text(), "handoff")
+                if reason == "desktop_execution_failed":
+                    self.assertIn("本次 Execution 已失败", window.capability_status.text())
+                    self.assertIn("请人工处理", window.capability_status.text())
+                    self.assertNotIn("请选择继续等待", window.capability_status.text())
+                    self.assertNotIn("备用后端仍可执行", window.capability_status.text())
+                    self.assertFalse(window.recheck_desktop_button.isEnabled())
+                    self.assertFalse(window.standalone_button.isEnabled())
 
-        # A: Desktop primary path healthy, AppServer standby.
-        window._render_status(LauncherStatus(
-            True, True, True,
-            desktop_sync=connected_desktop,
-            desktop_capability=DesktopCapabilityStatus(ready=True, pipe_source="handoff"),
-            capability=CapabilityStatus(state="desktop_ready", source="desktop", execution_id="execution-1"),
-        ))
-        self.assertEqual(window.execution_summary_status.text(), "Desktop 可用")
-        self.assertIn("#16803c", window.execution_summary_status.styleSheet())
-        self.assertNotIn("不可用", window.execution_summary_status.text())
-
-        # B: Desktop primary path down, AppServer fallback still usable. The summary must name the
-        # degraded primary path and must not claim the execution capability is unavailable.
-        for failed_state, reason in (
-            ("desktop_failed", "desktop_handoff_timeout"),
-            ("fallback_ready", "desktop_handoff_timeout"),
-            ("fallback_running", "desktop_handoff_timeout"),
+        for capability, text in (
+            (DesktopCapabilityStatus(), "Desktop 前置能力未就绪"),
+            (DesktopCapabilityStatus(pipe_state="pending"), "Desktop 前置能力建立中"),
         ):
             window._render_status(LauncherStatus(
-                True, True, True,
-                desktop_sync=disconnected_desktop,
-                capability=CapabilityStatus(
-                    state=failed_state,
-                    source="desktop" if failed_state == "desktop_failed" else "standalone",
-                    reason=reason,
-                    error_code=reason,
-                    execution_id="execution-1",
-                ),
+                True, True, True, desktop_capability=capability,
+                capability=CapabilityStatus(state="desktop_ready", source="desktop", execution_id="old-execution"),
             ))
-            self.assertNotEqual(window.execution_summary_status.text(), "不可用")
-            self.assertNotIn("执行能力不可用", window.capability_status.text())
-            self.assertNotIn("#9b1c1c", window.execution_summary_status.styleSheet())
-
-        self.assertIn("Desktop 不可用，可回退 AppServer", DESKTOP_DOWN_FALLBACK_CAPABILITY_TEXT)
-        window._render_status(LauncherStatus(
-            True, True, True,
-            desktop_sync=disconnected_desktop,
-            capability=CapabilityStatus(
-                state="desktop_failed",
-                source="desktop",
-                reason="desktop_handoff_timeout",
-                execution_id="execution-1",
-            ),
-        ))
-        self.assertEqual(window.execution_summary_status.text(), DESKTOP_DOWN_FALLBACK_CAPABILITY_TEXT)
-        self.assertIn("Standalone 备用后端仍可执行", window.capability_status.text())
-        self.assertIn("#946200", window.execution_summary_status.styleSheet())
-
-        # C: every executable backend down. The standalone path failing is what leaves no backend
-        # behind, so that is the one case reported as a lost capability.
-        window._render_status(LauncherStatus(
-            True, True, True,
-            desktop_sync=disconnected_desktop,
-            capability=CapabilityStatus(
-                state="fallback_ready",
-                source="standalone",
-                reason="standalone_execution_failed",
-                error_code="standalone_execution_failed",
-                execution_id="execution-1",
-            ),
-        ))
-        self.assertEqual(window.execution_summary_status.text(), "不可用")
-        self.assertIn("#9b1c1c", window.execution_summary_status.styleSheet())
-        self.assertIn("#9b1c1c", window.capability_status.styleSheet())
-        self.assertIn("Standalone 备用路径不可用", window.capability_status.text())
-        self.assertIn("当前没有可执行的执行路径", window.capability_status.text())
-
-        # D: Desktop reconnects, so the summary recovers the normal primary-path wording.
-        window._render_status(LauncherStatus(
-            True, True, True,
-            desktop_sync=connected_desktop,
-            desktop_capability=DesktopCapabilityStatus(ready=True, pipe_source="handoff"),
-            capability=CapabilityStatus(state="desktop_ready", source="desktop", execution_id="execution-1"),
-        ))
-        self.assertEqual(window.execution_summary_status.text(), "Desktop 可用")
-        self.assertIn("#16803c", window.execution_summary_status.styleSheet())
+            self.assertEqual(window.execution_summary_status.text(), text)
+        window._render_status(LauncherStatus(False, False, False))
+        self.assertEqual(window.execution_summary_status.text(), "MCP 已停止")
 
     def test_capability_timeline_renders_state_and_failure_fields(self) -> None:
         manager = Mock()
@@ -869,7 +824,7 @@ class LauncherLayoutAcceptanceTests(unittest.TestCase):
             (2, 1, "Desktop 身份"),
             (2, 2, "Tools Pipe"),
             (3, 0, "PipeSource"),
-            (3, 1, "执行能力"),
+            (3, 1, "当前 Desktop 能力"),
             (3, 2, "OAuth"),
         )
         for row, column, title in expected:
@@ -939,7 +894,9 @@ class LauncherLayoutAcceptanceTests(unittest.TestCase):
     def test_task_tab_uses_thread_info_and_query_workspace(self) -> None:
         window = self._window()
         texts = self._label_texts(window)
-        self.assertIn("当前查询工作区：", texts)
+        self.assertIn("任务列表范围：", texts)
+        self.assertIn("所有已注册工作区", texts)
+        self.assertIn("默认工作区：", texts)
         self.assertIn("线程信息", texts)
         self.assertIn("Execution Dashboard", texts)
         self.assertIn("维护", texts)
@@ -1192,6 +1149,17 @@ class LauncherDashboardTests(unittest.TestCase):
                 self.assertEqual(window.event_table.item(0, 0).text(), expected.strftime("%H:%M:%S"))
                 self.assertEqual(view.session.updated_at, timestamp)
 
+    def test_failed_execution_detail_preserves_provider_summary(self) -> None:
+        summary = "create_thread failed: Project unavailable"
+        view = build_execution_view_model({
+            **self._interactive_summary(), "status": "failed", "summary": summary,
+        })
+        window = self._window()
+        window._render_execution_dashboard((view,))
+        window.execution_table.selectRow(0)
+        window._render_selected_execution()
+        self.assertIn(f"摘要：{summary}", window.execution_details_label.text())
+
     def test_execution_summary_contract_keeps_the_dash_placeholder(self) -> None:
         summary = self._interactive_summary()
         for text in ("", "  diagnostic\n", "x" * 4000, "😀" * 2000):
@@ -1291,8 +1259,41 @@ class LauncherDashboardTests(unittest.TestCase):
         self.assertEqual(window.session_details_label.text(), "Session：—\nThread：—")
         self.assertFalse(window.open_codex_task_button.isEnabled())
         self.assertEqual(window.event_table.rowCount(), 0)
-        self.assertEqual(window.event_empty_label.text(), "Batch Execution 无 Session 事件流")
+        self.assertEqual(window.event_empty_label.text(), "暂无执行事件")
         self.assertTrue(window.event_empty_label.isVisible())
+
+    def test_batch_without_readable_events_shows_the_temporary_empty_state(self) -> None:
+        view = build_execution_view_model(self._batch_summary())
+        window = self._window()
+
+        window._render_execution_dashboard((view,))
+        window.execution_table.selectRow(0)
+        window._render_selected_execution()
+
+        self.assertEqual(window.session_details_label.text(), "Session：—\nThread：—")
+        self.assertEqual(window.event_table.rowCount(), 0)
+        self.assertEqual(window.event_empty_label.text(), "暂无执行事件")
+        self.assertTrue(window.event_empty_label.isVisible())
+
+    def test_batch_execution_events_use_the_shared_stream_table_without_a_session(self) -> None:
+        timestamp = "2026-09-15T12:34:56+08:00"
+        events = (
+            SessionEventViewModel(1, timestamp, "execution_started", "", "execution-batch"),
+            SessionEventViewModel(2, timestamp, "agent_message", "partial response", "execution-batch"),
+            SessionEventViewModel(3, timestamp, "command_started", "Command started.", "execution-batch"),
+        )
+        view = build_execution_view_model(self._batch_summary(), execution_events=events)
+        window = self._window()
+
+        window._render_execution_dashboard((view,))
+        window.execution_table.selectRow(0)
+        window._render_selected_execution()
+
+        self.assertEqual(window.session_details_label.text(), "Session：—\nThread：—")
+        self.assertEqual(window.event_table.rowCount(), 3)
+        self.assertEqual(window.event_table.item(1, 1).text(), "agent_message")
+        self.assertEqual(window.event_table.item(1, 2).text(), "partial response")
+        self.assertFalse(window.event_empty_label.isVisible())
 
     def test_dashboard_keeps_batch_and_interactive_rows_selectable_in_one_table(self) -> None:
         batch = build_execution_view_model(self._batch_summary())
