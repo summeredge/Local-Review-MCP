@@ -13,3 +13,7 @@ __pycache__/
 *.pyc
 deployment-test-*/
 LocalReviewLauncher/launcher.config.json
+/Microsoft/Windows/PowerShell/ModuleAnalysisCache
+/missing-cloudflared-home/
+/.review/p5-3-0-b-contract-probe/
+/.review/p5-4-1-first-turn-probe/

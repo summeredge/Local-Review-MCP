@@ -16,7 +16,7 @@ import { TunnelManager } from "../../src/tunnel/manager.js";
 import type { TunnelProvider, TunnelStatus } from "../../src/tunnel/types.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
-import { EXPECTED_REGISTERED_TOOL_NAMES } from "../fixtures/v01-tools.js";
+import { REGISTERED_TOOL_NAMES as EXPECTED_REGISTERED_TOOL_NAMES } from "../../src/mcp/server.js";
 
 const runProcess = promisify(execFile);
 const clients: Client[] = [];

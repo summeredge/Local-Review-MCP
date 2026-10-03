@@ -4,10 +4,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createMcpServer } from "../src/mcp/server.js";
+import { createMcpServer, REGISTERED_TOOL_NAMES as EXPECTED_REGISTERED_TOOL_NAMES } from "../src/mcp/server.js";
 import { WorkspaceManager } from "../src/workspace/manager.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
-import { EXPECTED_REGISTERED_TOOL_NAMES } from "./fixtures/v01-tools.js";
 
 const clients: Client[] = [];
 const temporaryDirectories: string[] = [];

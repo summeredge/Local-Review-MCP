@@ -20,7 +20,7 @@ import { inboundRequestId } from "../src/mcp/inbound.js";
 import { StatusQueryService } from "../src/control-plane/status-query.js";
 import type { DesktopSyncState } from "../src/desktop-sync/desktop-sync-state.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
-import { EXPECTED_REGISTERED_TOOL_NAMES } from "./fixtures/v01-tools.js";
+import { REGISTERED_TOOL_NAMES as EXPECTED_REGISTERED_TOOL_NAMES } from "../src/mcp/server.js";
 
 const runningServers: import("node:http").Server[] = [];
 const temporaryDirectories: string[] = [];

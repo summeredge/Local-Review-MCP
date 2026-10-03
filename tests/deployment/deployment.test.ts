@@ -89,7 +89,7 @@ async function writeConfig(
   return path;
 }
 
-function withoutCloudflared(): NodeJS.ProcessEnv {
+function withoutCloudflared(directory: string): NodeJS.ProcessEnv {
   const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
   const nodeDirectory = dirname(process.execPath);
   const pathValue = [
@@ -99,7 +99,7 @@ function withoutCloudflared(): NodeJS.ProcessEnv {
     join(systemRoot, "System32", "Wbem"),
     join(systemRoot, "System32", "WindowsPowerShell", "v1.0"),
   ].join(";");
-  const missingRoot = join(projectDirectory, "missing-cloudflared-home");
+  const missingRoot = join(directory, "missing-cloudflared-home");
   return {
     Path: pathValue,
     PATH: pathValue,
@@ -109,6 +109,7 @@ function withoutCloudflared(): NodeJS.ProcessEnv {
     "ProgramFiles(x86)": missingRoot,
     LOCALAPPDATA: missingRoot,
     USERPROFILE: missingRoot,
+    PSModuleAnalysisCachePath: join(directory, "ModuleAnalysisCache"),
   };
 }
 
@@ -239,7 +240,7 @@ describe("deployment scripts", () => {
       workspace: directory,
       remoteEnabled: true,
     });
-    const result = await runPowerShell(preflightScript, ["-Config", config], withoutCloudflared());
+    const result = await runPowerShell(preflightScript, ["-Config", config], withoutCloudflared(directory));
 
     expect(result.code).not.toBe(0);
     expect(result.output).toMatch(/cloudflared/i);
@@ -251,7 +252,7 @@ describe("deployment scripts", () => {
       workspace: directory,
       remoteEnabled: false,
     });
-    const result = await runPowerShell(preflightScript, ["-Config", config], withoutCloudflared());
+    const result = await runPowerShell(preflightScript, ["-Config", config], withoutCloudflared(directory));
 
     expect(result.code).toBe(0);
     expect(result.output).toMatch(/preflight passed/i);
