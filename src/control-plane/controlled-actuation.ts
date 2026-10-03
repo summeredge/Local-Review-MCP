@@ -317,6 +317,24 @@ export class ActuationAuthorizationStore {
     });
   }
 
+  public async getAuthorizationByExecution(
+    workspaceId: string,
+    taskId: string,
+    executionId: string,
+  ): Promise<ActuationAuthorization | null> {
+    await this.restore();
+    const workspace = workspaceIdSchema.parse(workspaceId);
+    const task = taskIdSchema.parse(taskId);
+    const execution = executionIdSchema.parse(executionId);
+    return this.exclusive(async () => {
+      const matches = this.state.authorizations.filter((candidate) =>
+        candidate.workspace_id === workspace && candidate.task_id === task
+        && candidate.execution_id === execution);
+      if (matches.length > 1) throw new ControlledActuationConflictError("Execution has multiple authorizations.");
+      return matches[0] === undefined ? null : clone(matches[0]);
+    });
+  }
+
   public async getActuation(actuationId: string): Promise<ControlledActuation | null> {
     await this.restore();
     const parsedId = actuationIdSchema.parse(actuationId);

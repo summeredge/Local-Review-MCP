@@ -320,6 +320,8 @@ describe("MCP HTTP runtime", () => {
     expect(catalog.executions.map((execution) => execution.execution_id)).toEqual(["execution-1"]);
     expect(catalog.executions[0]).toEqual({
       execution_id: "execution-1",
+      execution_mode: "batch",
+      backend: "cli",
       workspace_id: "catalog-workspace",
       task_id: "task-1",
       name: "task-1",

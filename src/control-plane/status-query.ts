@@ -26,6 +26,9 @@ import {
 } from "./events/model.js";
 import { EventStore, eventsFile } from "./events/store.js";
 import { CODEX_EXECUTION_COMMAND, readCodexExecutionEvents } from "./codex-execution-completion.js";
+import { ActuationAuthorizationStore } from "./controlled-actuation.js";
+import { DESKTOP_EXECUTION_COMMAND } from "../desktop-codex/desktop-codex-backend.js";
+import { APP_SERVER_COMMAND } from "../backends/codex_app_server/backend.js";
 
 const providerIdSchema = z.string().min(1).max(256);
 const optionalModelSchema = z.string().min(1).max(256).optional();
@@ -457,8 +460,19 @@ export class StatusQueryService {
    * optional associations, and a missing or damaged one only degrades its own row.
    */
   public async listExecutionSummaries(workspaceId?: string): Promise<LauncherExecutionSummary[]> {
+    const authorizations = new ActuationAuthorizationStore(this.storageRoot);
     const goals = await this.availableGoals();
     const sessions = await this.availableSessions();
+    const sessionExecutions = new Map<string, Set<string>>();
+    for (const session of sessions) {
+      try {
+        sessionExecutions.set(session.session_id, new Set(
+          (await this.events.listEvents(session.session_id)).map((event) => event.execution_id),
+        ));
+      } catch {
+        // Missing association evidence leaves only this Session unbound.
+      }
+    }
     const summaries: LauncherExecutionSummary[] = [];
     for (const target of await this.executionTargets(workspaceId)) {
       let executions: ExecutionContext[];
@@ -469,7 +483,7 @@ export class StatusQueryService {
       }
       for (const execution of executions) {
         try {
-          summaries.push(await this.executionSummary(execution, goals, sessions));
+          summaries.push(await this.executionSummary(execution, goals, sessions, sessionExecutions, authorizations));
         } catch {
           continue;
         }
@@ -482,26 +496,37 @@ export class StatusQueryService {
     execution: ExecutionContext,
     goals: readonly GoalOrchestration[],
     sessions: readonly Session[],
+    sessionExecutions: ReadonlyMap<string, ReadonlySet<string>>,
+    authorizations: ActuationAuthorizationStore,
   ): Promise<LauncherExecutionSummary> {
     const goal = await this.goalForExecution(execution, goals);
-    const session = this.sessionFor(execution, goal, sessions);
+    const session = execution.command === CODEX_EXECUTION_COMMAND
+      ? undefined : this.sessionFor(execution, goal, sessions, sessionExecutions);
+    const authorization = await authorizations.getAuthorizationByExecution(
+      execution.workspace_id, execution.task_id, execution.execution_id,
+    ).catch(() => null);
     const plan = goal === undefined ? undefined : plannedTask(goal, execution.task_id);
     const goalName = goal === undefined
       ? undefined
       : (plan?.phase.objective.slice(0, 256) || goal.goal_id);
     const taskName = plan?.task.goal.slice(0, 256) || execution.task_id;
-    // Backend evidence, not Session presence: the fixed route only ever sends a batch Execution to
-    // the CLI backend, so a batch row keeps its identity even without a Session record. Anything
-    // else stays unresolved instead of being guessed.
-    const backend = session?.backend_type ?? (goal?.execution_mode === "batch" ? "cli" : undefined);
+    const backend = execution.command === CODEX_EXECUTION_COMMAND ? "cli"
+      : execution.command === DESKTOP_EXECUTION_COMMAND ? "desktop_codex_app"
+      : execution.command === APP_SERVER_COMMAND ? "codex_app_server"
+      : session?.backend_type;
+    const mode = backend === undefined ? undefined : backend === "cli" ? "batch" : "interactive";
+    const model = session?.model ?? authorization?.model;
+    const effort = session?.reasoning_effort ?? authorization?.reasoning_effort;
     return {
       execution_id: execution.execution_id,
       workspace_id: execution.workspace_id,
       task_id: execution.task_id,
       ...(goal === undefined ? {} : {
         goal_id: goal.goal_id,
-        execution_mode: goal.execution_mode,
       }),
+      ...(mode === undefined ? {} : { execution_mode: mode }),
+      ...(model === undefined ? {} : { model }),
+      ...(effort === undefined ? {} : { reasoning_effort: effort }),
       name: goalName ?? taskName,
       ...(goalName === undefined ? {} : { goal_name: goalName }),
       task_name: taskName,
@@ -514,25 +539,22 @@ export class StatusQueryService {
         session_id: session.session_id,
         backend_type: session.backend_type,
         ...(session.thread_id === undefined ? {} : { thread_id: session.thread_id }),
-        ...(session.model === undefined ? {} : { model: session.model }),
-        ...(session.reasoning_effort === undefined
-          ? {}
-          : { reasoning_effort: session.reasoning_effort }),
       }),
       updated_at: session?.updated_at ?? execution.finished_at ?? execution.started_at,
     };
   }
 
   /**
-   * Sessions are matched by Task identity and, when the Goal is known, by Goal identity. Provider
-   * event evidence is deliberately left out so polling the dashboard stays a bounded read.
+   * A Session must have durable event evidence for this exact Execution, in addition to Task/Goal.
    */
   private sessionFor(
     execution: ExecutionContext,
     goal: GoalOrchestration | undefined,
     sessions: readonly Session[],
+    sessionExecutions: ReadonlyMap<string, ReadonlySet<string>>,
   ): Session | undefined {
     const matches = sessions.filter((session) => session.task_id === execution.task_id
+      && sessionExecutions.get(session.session_id)?.has(execution.execution_id)
       && (goal === undefined || session.goal_id === goal.goal_id));
     return matches.reduce<Session | undefined>(
       (latest, candidate) => latest === undefined || candidate.updated_at > latest.updated_at
@@ -798,11 +820,8 @@ export class StatusQueryService {
       const session = await this.requiredSession(requestedSessionId);
       const events = await this.events.listEvents(session.session_id);
       if (session.task_id !== execution.task_id
-        || (goal === undefined && !events.some((event) => event.execution_id === execution.execution_id))
-        || (goal !== undefined && session.goal_id !== goal.goal_id)
-        || (goal !== undefined
-          && goal.execution_id !== execution.execution_id
-          && !events.some((event) => event.execution_id === execution.execution_id))) {
+        || !events.some((event) => event.execution_id === execution.execution_id)
+        || (goal !== undefined && session.goal_id !== goal.goal_id)) {
         throw new Error("Session does not belong to the requested Execution.");
       }
       return session;
@@ -812,8 +831,7 @@ export class StatusQueryService {
       if (session.task_id !== execution.task_id) continue;
       if (goal !== undefined && session.goal_id !== goal.goal_id) continue;
       const events = await this.events.listEvents(session.session_id);
-      if (events.some((event) => event.execution_id === execution.execution_id)
-        || (goal !== undefined && goal.execution_id === execution.execution_id)) matches.push(session);
+      if (events.some((event) => event.execution_id === execution.execution_id)) matches.push(session);
     }
     if (matches.length > 1) throw new Error("More than one Session matches the requested Execution.");
     return matches[0];

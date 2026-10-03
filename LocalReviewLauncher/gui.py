@@ -69,7 +69,6 @@ from status_worker import (
 
 STARTUP_TIMEOUT_SECONDS = 60
 STARTUP_POLL_INTERVAL_MS = 2_000
-BROWSER_PRESENCE_GRACE_SECONDS = 15
 MAX_DASHBOARD_ROWS = 5
 CAPABILITY_TIMELINE_LIMIT = 100
 EVENT_STREAM_MIN_HEIGHT = 270
@@ -138,8 +137,6 @@ class LauncherWindow(QMainWindow):
         )
         self.state = LauncherState.STOPPED
         self._last_status = LauncherStatus(False, False, False)
-        self._browser_was_ready = False
-        self._browser_missing_since: float | None = None
         self._status_check_scheduler = StatusCheckScheduler()
         self._status_check_generation = 0
         self._cleared_execution_ids: set[str] = set()
@@ -650,36 +647,22 @@ class LauncherWindow(QMainWindow):
             warning=status.mcp_running and not status.tunnel_connected,
         )
         browser = status.browser
-        display_state = "READY" if browser.ready else "NOT READY"
-        if browser.ready:
-            self._browser_was_ready = True
-            self._browser_missing_since = None
-        elif (status.mcp_running and browser.bridge_available and browser.extension_paired
-              and browser.readiness_state == "extension_not_present" and self._browser_was_ready):
-            now = monotonic()
-            if self._browser_missing_since is None:
-                self._browser_missing_since = now
-            display_state = ("READY" if now - self._browser_missing_since < BROWSER_PRESENCE_GRACE_SECONDS
-                             else "DEGRADED")
-        else:
-            self._browser_was_ready = False
-            self._browser_missing_since = None
-        browser_label = "已连接" if display_state == "READY" else (
-            "未连接" if display_state == "DEGRADED" else {
-                "extension_not_paired": "未配对",
-                "extension_not_present": "未连接",
-            }.get(browser.readiness_state, "不可用")
-        )
-        browser_color = "#16803c" if display_state == "READY" else (
-            "#946200" if display_state == "DEGRADED" or browser.readiness_state in {
+        # Raw Control Plane readiness is authoritative for this refresh: no GUI-side state keeps a
+        # green "已连接" alive after the bridge already reported the extension as absent.
+        browser_label = "已连接" if browser.ready else {
+            "extension_not_paired": "未配对",
+            "extension_not_present": "未连接",
+        }.get(browser.readiness_state, "不可用")
+        browser_color = "#16803c" if browser.ready else (
+            "#946200" if browser.readiness_state in {
                 "extension_not_paired", "extension_not_present",
             } else "#666666"
         )
         self._set_value(self.browser_status, browser_label, browser_color)
         browser_reason = self._localize_browser_text(browser.reason)
         browser_action = self._localize_browser_text(browser.action)
-        browser_detail_label = {"READY": "已就绪", "DEGRADED": "降级", "NOT READY": "未就绪"}[display_state]
-        browser_detail = browser_detail_label if display_state == "READY" else (
+        browser_detail_label = "已就绪" if browser.ready else "未就绪"
+        browser_detail = browser_detail_label if browser.ready else (
             f"{browser_detail_label}\n原因：{browser_reason}\n操作：{browser_action}"
         )
         self._set_value(self.browser_diagnostic_status, browser_detail, browser_color)

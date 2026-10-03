@@ -114,6 +114,7 @@ async function seedExecution(root: string, options: {
 
 async function seedSession(root: string, options: {
   readonly sessionId: string;
+  readonly executionId?: string;
   readonly goalId: string;
   readonly taskId: string;
   readonly backendType: "codex_app_server" | "desktop_codex_app";
@@ -133,9 +134,60 @@ async function seedSession(root: string, options: {
     ...(options.model === undefined ? {} : { model: options.model }),
     ...(options.reasoningEffort === undefined ? {} : { reasoning_effort: options.reasoningEffort }),
   });
+  if (options.executionId !== undefined) {
+    await new EventStore(root).appendEvent({
+      session_id: options.sessionId,
+      execution_id: options.executionId,
+      thread_id: options.threadId ?? "thread-1",
+      timestamp,
+      event_type: "session_started",
+      payload: {},
+    });
+  }
 }
 
 describe("Launcher Execution catalog", () => {
+  it("binds each iteration by execution_id and shows an actual batch under an interactive Goal", async () => {
+    const root = await storageRoot();
+    const goal = plannedGoal({ goalId: "goal-1", workspaceId: "workspace-1", taskId: "task-1",
+      executionId: "execution-1", executionMode: "interactive" });
+    for (let round = 1; round <= 3; round += 1) {
+      await seedExecution(root, { workspaceId: "workspace-1", taskId: "task-1",
+        executionId: `execution-${round}`, command: "desktop codex_app" });
+      await seedSession(root, { sessionId: `session-${round}`, executionId: `execution-${round}`,
+        goalId: "goal-1", taskId: "task-1", backendType: "desktop_codex_app",
+        threadId: `thread-${round}`, model: `model-${round}`, reasoningEffort: "high" });
+    }
+    await seedExecution(root, { workspaceId: "workspace-1", taskId: "task-1", executionId: "execution-batch" });
+    await seedExecution(root, { workspaceId: "workspace-1", taskId: "task-1",
+      executionId: "execution-no-session", command: "desktop codex_app" });
+    // Task/Goal alone, or a matching Execution under another Goal, must never bind a Session.
+    await seedSession(root, { sessionId: "session-unbound", goalId: "goal-1", taskId: "task-1",
+      backendType: "desktop_codex_app" });
+    await seedSession(root, { sessionId: "session-wrong-goal", executionId: "execution-no-session",
+      goalId: "goal-other", taskId: "task-1", backendType: "desktop_codex_app" });
+    const query = queryFor(root, [goal]);
+    const rows = await query.listExecutionSummaries();
+    await expect(query.getExecutionStatus({ execution_id: "execution-1", workspace_id: "workspace-1" }))
+      .resolves.toMatchObject({ session_id: "session-1", thread_id: "thread-1" });
+    await expect(query.getExecutionStatus({ execution_id: "execution-1", workspace_id: "workspace-1",
+      session_id: "session-2" })).rejects.toThrow("Session does not belong to the requested Execution.");
+    for (let round = 1; round <= 3; round += 1) {
+      expect(rows.find((row) => row.execution_id === `execution-${round}`)).toMatchObject({
+        execution_mode: "interactive", backend: "desktop_codex_app", session_id: `session-${round}`,
+        thread_id: `thread-${round}`, model: `model-${round}`, reasoning_effort: "high",
+      });
+    }
+    const batch = rows.find((row) => row.execution_id === "execution-batch")!;
+    expect(batch).toMatchObject({ goal_id: "goal-1", execution_mode: "batch", backend: "cli" });
+    expect(batch.session_id).toBeUndefined();
+    expect(batch.backend_type).toBeUndefined();
+    const missing = rows.find((row) => row.execution_id === "execution-no-session")!;
+    expect(missing.session_id).toBeUndefined();
+    expect(missing.thread_id).toBeUndefined();
+    expect(missing.model).toBeUndefined();
+  });
+
   it.each(["passed", "failed", "terminated"] as const)("clears a %s batch Execution without creating a Session", async (status) => {
     const root = await storageRoot();
     await seedExecution(root, {
@@ -344,6 +396,7 @@ describe("Launcher Execution catalog", () => {
     });
     await seedSession(root, {
       sessionId: "session-desktop",
+      executionId: "execution-desktop",
       goalId: "goal-desktop",
       taskId: "task-desktop",
       backendType: "desktop_codex_app",
@@ -384,6 +437,7 @@ describe("Launcher Execution catalog", () => {
     });
     await seedSession(root, {
       sessionId: "session-app-server",
+      executionId: "execution-app-server",
       goalId: "goal-app-server",
       taskId: "task-app-server",
       backendType: "codex_app_server",
@@ -432,6 +486,7 @@ describe("Launcher Execution catalog", () => {
     });
     await seedSession(root, {
       sessionId: "session-desktop",
+      executionId: "execution-desktop",
       goalId: "goal-desktop",
       taskId: "task-desktop",
       backendType: "desktop_codex_app",
@@ -542,6 +597,8 @@ describe("Launcher Execution catalog", () => {
       task_id: "task-orphan",
       name: "task-orphan",
       task_name: "task-orphan",
+      execution_mode: "batch",
+      backend: "cli",
       status: "running",
       started_at: expect.any(String),
       updated_at: expect.any(String),
@@ -677,6 +734,7 @@ describe("Launcher Execution catalog", () => {
       workspaceId: "workspace-1",
       taskId: "task-running-interactive",
       executionId: "execution-running-interactive",
+      command: "codex app-server --listen stdio://",
     });
     await seedSession(root, {
       sessionId: "session-running-interactive",

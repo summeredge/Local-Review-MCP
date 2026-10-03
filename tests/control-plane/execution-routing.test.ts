@@ -411,7 +411,7 @@ describe("ExecutionRoutingService", () => {
     ["delivery failure", { delivery: "failed" as const }, "human_required" as const],
     ["review completion failure", { decision: "FAILED" as const }, "human_required" as const],
     ["HUMAN_REQUIRED verdict", { decision: "HUMAN_REQUIRED" as const }, "human_required" as const],
-    ["ITERATE verdict", { decision: "ITERATE" as const }, "running" as const],
+    ["ITERATE verdict without initial authorization", { decision: "ITERATE" as const }, "human_required" as const],
   ])("propagates %s through the existing Goal workflow", async (_name, options, expectedStatus) => {
     const h = await harness(options);
 
@@ -425,7 +425,10 @@ describe("ExecutionRoutingService", () => {
       .toHaveLength(1);
     if ("decision" in options && options.decision === "ITERATE") {
       expect(h.completions.requests).toHaveLength(1);
-      expect(await h.auto.getLoop(goal.loop_id!)).toMatchObject({ stage: "execution", iteration: 2 });
+      expect(await h.auto.getLoop(goal.loop_id!)).toMatchObject({
+        stage: "human_required", iteration: 2, terminal_reason: "INITIAL_AUTHORIZATION_MISSING",
+      });
+      expect(h.starts).toHaveLength(0);
     }
   });
 });

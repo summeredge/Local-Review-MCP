@@ -12,7 +12,9 @@ import {
   type AutoIterationStartInput,
 } from "../../src/control-plane/auto-iteration.js";
 import {
+  ActuationAuthorizationStore,
   ControlledActuationService,
+  type ActuationAuthorizationInput,
   controlledActuationStateFile,
 } from "../../src/control-plane/controlled-actuation.js";
 import {
@@ -63,6 +65,7 @@ function verdict(
 async function fixture(
   decisions: Array<"APPROVE" | "ITERATE" | "HUMAN_REQUIRED"> = ["APPROVE"],
   delivery: "delivered" | "failed" | "ambiguous" = "delivered",
+  initial: Pick<ActuationAuthorizationInput, "goal_id" | "execution_mode" | "model" | "reasoning_effort"> | null = { execution_mode: "batch" },
 ): Promise<{
   readonly root: string;
   readonly registry: WorkspaceRegistry;
@@ -90,6 +93,12 @@ async function fixture(
     workspace_id: "workspace-a",
     status: "passed",
   });
+  if (initial !== null) {
+    await new ActuationAuthorizationStore(root).createAuthorization({
+      actuation_id: "actuation-initial", workspace_id: "workspace-a", task_id: "task-001",
+      execution_id: "execution-001", instruction: "Initial instruction", ...initial,
+    });
+  }
 
   const starts: Array<{ execution_id: string; instruction: string }> = [];
   const controlled = new ControlledActuationService(registry, {
@@ -234,6 +243,69 @@ function startInput(overrides: Partial<AutoIterationStartInput> = {}): AutoItera
 }
 
 describe("AutoIterationService", () => {
+  it.each(["missing", "missing-mode", "missing-goal", "wrong-workspace", "wrong-task", "wrong-execution", "corrupt"])(
+    "fails closed after restart when the initial authorization is %s", async (fault) => {
+      const value = await fixture(["ITERATE"], "delivered", fault === "missing" ? null : {
+        goal_id: "goal-1", execution_mode: "interactive", model: "gpt-5.6-luna", reasoning_effort: "max",
+      });
+      await value.executionService.updateExecutionContext("workspace-a", "task-001", "execution-001", {
+        command: "desktop codex_app",
+      });
+      const file = controlledActuationStateFile(value.root);
+      if (fault !== "missing") {
+        const state = JSON.parse(await readFile(file, "utf8"));
+        const initial = state.authorizations[0];
+        if (fault === "missing-mode") delete initial.execution_mode;
+        if (fault === "missing-goal") delete initial.goal_id;
+        if (fault === "wrong-workspace") initial.workspace_id = "workspace-other";
+        if (fault === "wrong-task") initial.task_id = "task-other";
+        if (fault === "wrong-execution") initial.execution_id = "execution-other";
+        if (fault === "corrupt") initial.execution_mode = "invalid-mode";
+        await writeFile(file, JSON.stringify(state), "utf8");
+      }
+      const before = await optionalFile(file);
+      await persistLoop(value.root, checkpoint({ stage: "actuation", iteration: 2,
+        execution_id: "execution-next", actuation_id: "actuation-next", pending_iteration: {
+          goal: "Fix", requirements: ["Keep Desktop"], acceptance_criteria: ["Tests pass"],
+        } }));
+      const restarted = new AutoIterationService(value.registry, { storageRoot: value.root,
+        controlledActuation: value.auto.controlledActuation });
+      try {
+        await expect(restarted.advance("loop-checkpoint")).resolves.toMatchObject({
+          stage: "human_required", terminal_reason: fault === "corrupt" ? "INITIAL_AUTHORIZATION_UNAVAILABLE"
+            : fault === "missing-mode" || fault === "missing-goal" ? "INITIAL_AUTHORIZATION_IDENTITY_INVALID"
+            : "INITIAL_AUTHORIZATION_MISSING",
+        });
+        expect(value.starts).toHaveLength(0);
+        expect(await value.executionService.getExecutionContext("workspace-a", "task-001", "execution-next")).toBeNull();
+        expect(await optionalFile(file)).toBe(before);
+      } finally { restarted.dispose(); }
+    },
+  );
+
+  it("rejects a recovered iteration authorization that lost the initial interactive configuration", async () => {
+    const value = await fixture(["APPROVE"], "delivered", {
+      goal_id: "goal-1",
+      execution_mode: "interactive", model: "gpt-5.6-luna", reasoning_effort: "max",
+    });
+    const pending = { goal: "Fix", requirements: ["Preserve routing"], acceptance_criteria: ["Tests pass"] };
+    const authorization = await value.auto.controlledActuation.authorize({
+      actuation_id: "actuation-next", workspace_id: "workspace-a", task_id: "task-001",
+      execution_id: "execution-next", instruction: buildAutoIterationInstruction(pending),
+    });
+    await persistLoop(value.root, checkpoint({ stage: "actuation", iteration: 2,
+      execution_id: "execution-next", actuation_id: authorization.actuation_id,
+      authorization_id: authorization.authorization_id, pending_iteration: pending }));
+    const restarted = new AutoIterationService(value.registry, { storageRoot: value.root,
+      controlledActuation: value.auto.controlledActuation });
+    try {
+      await expect(restarted.advance("loop-checkpoint")).resolves.toMatchObject({
+        stage: "human_required", terminal_reason: "AUTHORIZATION_IDENTITY_INVALID",
+      });
+      expect(value.starts).toHaveLength(0);
+    } finally { restarted.dispose(); }
+  });
+
   it("exhausts the real broker's unclaimed recovery budget instead of staying running", async () => {
     const f = await fixture();
     const deliveries = new ExtensionDeliveryService(f.root);

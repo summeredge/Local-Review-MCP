@@ -23,7 +23,7 @@ import {
   type ExecutionTerminalListener,
 } from "../../control-plane/execution-service.js";
 
-const APP_SERVER_COMMAND = "codex app-server --listen stdio://";
+export const APP_SERVER_COMMAND = "codex app-server --listen stdio://";
 const SUMMARY_MAX_LENGTH = 4_000;
 /** Stable summary when the backend shuts down before a turn produced terminal evidence. */
 export const BACKEND_CLOSED_SUMMARY = "Codex AppServer backend closed before terminal turn evidence.";

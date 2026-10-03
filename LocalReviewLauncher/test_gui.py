@@ -354,31 +354,25 @@ class LauncherLogTests(unittest.TestCase):
             ready = BrowserReadiness(True, "ready", True, True, True, 123, "", "")
             window._render_status(LauncherStatus(True, True, True, browser=ready))
             self.assertEqual(window.browser_status.text(), "已连接")
-            missing = BrowserReadiness(False, "extension_not_present", True, True, False,
-                                       123, "Extension is not connected.", "Refresh ChatGPT page")
-            with patch("gui.monotonic", return_value=100) as clock:
-                window._render_status(LauncherStatus(True, True, True, browser=missing))
-                self.assertEqual(window.browser_status.text(), "已连接")
-                self.assertFalse(window._last_status.browser.ready)  # Raw readiness stays authoritative.
-                clock.return_value = 114.9
-                window._render_status(LauncherStatus(True, True, True, browser=missing))
-                self.assertEqual(window.browser_status.text(), "已连接")
-                clock.return_value = 115
-                window._render_status(LauncherStatus(True, True, True, browser=missing))
-                self.assertEqual(window.browser_status.text(), "未连接")
+            self.assertEqual(window.browser_status.styleSheet(), "color: #16803c")
+            # Raw readiness is authoritative: the very refresh that reports a lost extension must
+            # drop the green 已连接, with no GUI-side grace keeping the old state visible.
+            for degraded, label, color in (
+                (BrowserReadiness(False, "extension_not_present", True, True, False, 123,
+                                  "Extension is not connected.", "Refresh ChatGPT page"),
+                 "未连接", "color: #946200"),
+                (BrowserReadiness(False, "extension_not_paired", True, False, False, 123,
+                                  "Extension is not paired.", "Refresh ChatGPT page"),
+                 "未配对", "color: #946200"),
+                (BrowserReadiness(), "不可用", "color: #666666"),
+            ):
+                window._render_status(LauncherStatus(True, True, True, browser=degraded))
+                self.assertEqual(window.browser_status.text(), label)
+                self.assertEqual(window.browser_status.styleSheet(), color)
+                self.assertFalse(window._last_status.browser.ready)
                 window._render_status(LauncherStatus(True, True, True, browser=ready))
                 self.assertEqual(window.browser_status.text(), "已连接")
-                clock.return_value = 200
-                window._render_status(LauncherStatus(True, True, True, browser=missing))
-                self.assertEqual(window.browser_status.text(), "已连接")
-                for hard_failure in (BrowserReadiness(), BrowserReadiness(
-                    False, "extension_not_paired", True, False, False, None, "Not paired", "Refresh ChatGPT page"
-                )):
-                    window._render_status(LauncherStatus(True, True, True, browser=ready))
-                    window._render_status(LauncherStatus(True, True, True, browser=hard_failure))
-                    self.assertIn(window.browser_status.text(), {"不可用", "未配对", "未连接"})
-                    window._render_status(LauncherStatus(True, True, True, browser=missing))
-                    self.assertIn(window.browser_status.text(), {"不可用", "未配对", "未连接"})
+                self.assertEqual(window.browser_status.styleSheet(), "color: #16803c")
             initial_x = {button: button.mapTo(window, button.rect().topLeft()).x()
                          for button in window.findChildren(QPushButton) + [window.capability_timeline_toggle, window.session_viewer_toggle]}
             window.resize(window.width() + 400, window.height())

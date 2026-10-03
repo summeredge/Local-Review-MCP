@@ -33,6 +33,11 @@ import {
 import type { DesktopSyncState } from "../src/desktop-sync/desktop-sync-state.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
 import type { ExecutionContext } from "../src/context/types.js";
+import { AutoIterationService } from "../src/control-plane/auto-iteration.js";
+import { GoalOrchestrationService } from "../src/control-plane/goal-orchestration.js";
+import { StatusQueryService } from "../src/control-plane/status-query.js";
+import { BrowserRouter } from "../src/router/browser-router.js";
+import { ReviewCompletionRouter } from "../src/router/review-completion-router.js";
 
 /**
  * P5.4.1 acceptance tests for the Desktop codex_app production interactive route.
@@ -175,6 +180,7 @@ function fakeDesktop(options: {
   readonly hostId?: string;
   readonly turns?: readonly Turn[];
   readonly projectPath?: string;
+  readonly uniqueThreads?: boolean;
 } = {}): FakeDesktop {
   const threadId = options.threadId ?? "target-thread-1";
   const hostId = options.hostId ?? "local";
@@ -200,7 +206,8 @@ function fakeDesktop(options: {
             }],
           });
         case "create_thread":
-          return jsonResult({ threadId, hostId });
+          return jsonResult({ threadId: options.uniqueThreads
+            ? `${threadId}-${calls.filter((call) => call.name === "create_thread").length}` : threadId, hostId });
         case "send_message_to_thread":
           return jsonResult({ ok: true });
         case "read_thread":
@@ -209,7 +216,8 @@ function fakeDesktop(options: {
             return { isError: true, content: [{ type: "text", text: "thread is not visible yet" }] };
           }
           return jsonResult({
-            thread: { id: threadId, hostId, status: { type: "idle" } },
+            thread: { id: options.uniqueThreads ? params.arguments?.threadId : threadId,
+              hostId, status: { type: "idle" } },
             turns: turns.map((turn) => ({
               error: null,
               startedAt: 1,
@@ -442,6 +450,93 @@ async function waitForTerminalExecution(value: Fixture): Promise<void> {
 }
 
 describe("P5.4.1 route selection", () => {
+  it.each(["interactive", "batch"] as const)("preserves %s Goal routing across three rounds and restart", async (mode) => {
+    const desktop = fakeDesktop({ uniqueThreads: true });
+    const value = await fixture({ desktop });
+    desktop.setProjectPath(value.registry.active.manager.canonicalRoot);
+    let reviews = 0;
+    const browserRouter = new BrowserRouter(value.root, {
+      deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }),
+    });
+    const completionRouter = new ReviewCompletionRouter(value.root, {
+      collect: async (request) => {
+        const decision = ++reviews < 3 ? "ITERATE" : "APPROVE";
+        return { status: "COMPLETED", content: `<lrm-review-result>${JSON.stringify({
+          schema_version: 1, review_request_id: request.review_request_id, decision, summary: "Reviewed",
+          ...(decision === "ITERATE" ? { iteration: {
+            goal: "Fix the defect", requirements: ["Keep the route"], acceptance_criteria: ["Tests pass"],
+          } } : {}),
+        })}</lrm-review-result>` };
+      },
+    });
+    const makeAuto = () => new AutoIterationService(value.registry, { storageRoot: value.root,
+      browserRouter, completionRouter, controlledActuation: value.controlled });
+    let auto = makeAuto();
+    const makeGoals = () => new GoalOrchestrationService(value.registry, { storageRoot: value.root,
+      controlledActuation: value.controlled, authorizationStore: value.controlled.authorizationStore,
+      autoIteration: auto });
+    let goals = makeGoals();
+    const query = new StatusQueryService({ storageRoot: value.root, goals: {
+      getGoal: (id) => goals.getGoal(id), listGoals: () => goals.listGoals(),
+    } });
+    await goals.createGoal({ goal_id: GOAL_ID, workspace_id: "workspace-a", conversation_id: "conversation-1",
+      execution_mode: mode, model: "gpt-5.6-luna", reasoning_effort: "max", phases: [{
+        phase_id: "phase-1", objective: "Fix", tasks: [{ task_id: TASK_ID, goal: "Fix",
+          requirements: ["Keep it small"], acceptance_criteria: ["Tests pass"], max_iterations: 3 }],
+      }] });
+    try {
+      const first = await goals.startGoal({ goal_id: GOAL_ID });
+      expect(await query.listExecutionSummaries()).toHaveLength(1);
+      for (let round = 1; round <= 3; round += 1) {
+        desktop.setTurns([{ id: `turn-${round}`, status: "completed", completedAt: 1 }]);
+        await value.backend.whenIdle();
+        desktop.setTurns([]);
+        const loop = (await auto.getLoop(first.loop_id!))!;
+        expect(loop.iteration).toBe(round);
+        const authorization = await new ActuationAuthorizationStore(value.root).getAuthorizationByExecution(
+          "workspace-a", TASK_ID, loop.execution_id,
+        );
+        expect(authorization).toMatchObject({ goal_id: GOAL_ID, execution_mode: mode,
+          model: "gpt-5.6-luna", reasoning_effort: "max" });
+        if (mode === "batch") {
+          await value.executions.updateExecutionContext("workspace-a", TASK_ID, loop.execution_id, { status: "passed" });
+        }
+        // Reconstruct services before the second verdict to exercise durable inheritance.
+        if (round === 2) {
+          auto.dispose();
+          auto = makeAuto();
+          goals = makeGoals();
+        }
+        await goals.advanceGoal(GOAL_ID);
+      }
+      expect((await goals.getGoal(GOAL_ID))?.status).toBe("completed");
+      const sessions = await value.sessions.listSessions();
+      expect(sessions).toHaveLength(mode === "interactive" ? 3 : 0);
+      expect(desktop.createThreadCount()).toBe(mode === "interactive" ? 3 : 0);
+      expect(value.cliStart).toHaveBeenCalledTimes(mode === "batch" ? 3 : 0);
+      if (mode === "interactive") {
+        expect(new Set(sessions.map((session) => session.thread_id)).size).toBe(3);
+        for (const call of desktop.calls.filter((call) => call.name === "create_thread")) {
+          expect(call.arguments).toMatchObject({ model: "gpt-5.6-luna", thinking: "max" });
+        }
+      }
+      const rows = await query.listExecutionSummaries();
+      expect(rows).toHaveLength(3);
+      for (const row of rows) {
+        expect(row).toMatchObject({ execution_mode: mode, model: "gpt-5.6-luna", reasoning_effort: "max",
+          backend: mode === "interactive" ? "desktop_codex_app" : "cli" });
+        if (mode === "interactive") {
+          expect((await value.events.listEvents(row.session_id!)).some((event) =>
+            event.execution_id === row.execution_id && event.thread_id === row.thread_id)).toBe(true);
+        } else expect(row.session_id).toBeUndefined();
+      }
+      if (mode === "interactive") expect(new Set(rows.map((row) => row.session_id)).size).toBe(3);
+    } finally {
+      auto.dispose();
+      await value.service.close();
+    }
+  });
+
   it("keeps batch on the CLI backend and routes interactive to the Desktop backend", async () => {
     const batchValue = await fixture();
     const batch = await batchValue.service.start({

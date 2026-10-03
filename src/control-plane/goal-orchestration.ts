@@ -325,7 +325,7 @@ class GoalOrchestrationStore {
 
 type AuthorizationReader = Pick<
   ActuationAuthorizationStore,
-  "getAuthorization" | "getAuthorizationByActuation"
+  "getAuthorization" | "getAuthorizationByActuation" | "getAuthorizationByExecution"
 > & { readonly storageRoot?: string };
 type ControlledActuationPort = Pick<ControlledActuationService, "authorize" | "actuate" | "getActuation"> & {
   readonly authorizationStore?: AuthorizationReader;

@@ -327,7 +327,7 @@ class AutoIterationStore {
 
 type AuthorizationReader = Pick<
   ActuationAuthorizationStore,
-  "getAuthorization" | "getAuthorizationByActuation"
+  "getAuthorization" | "getAuthorizationByActuation" | "getAuthorizationByExecution"
 >;
 
 type ControlledActuationPort = Pick<
@@ -993,6 +993,34 @@ export class AutoIterationService {
         return;
       }
       const instruction = iterationInstruction(pendingIteration);
+      // The initial authorization is the durable routing baseline, even after a restart.
+      let initial: ActuationAuthorization | null;
+      try {
+        initial = await this.authorizationStore.getAuthorizationByExecution(
+          loop.workspace_id, loop.task_id, loop.initial_execution_id,
+        );
+      } catch (error: unknown) {
+        await this.humanRequired(loop, "INITIAL_AUTHORIZATION_UNAVAILABLE", errorMessage(error));
+        return;
+      }
+      if (initial === null) {
+        await this.humanRequired(loop, "INITIAL_AUTHORIZATION_MISSING");
+        return;
+      }
+      if (initial.workspace_id !== loop.workspace_id
+        || initial.task_id !== loop.task_id
+        || initial.execution_id !== loop.initial_execution_id
+        || initial.execution_mode === undefined
+        || (initial.execution_mode === "interactive" && initial.goal_id === undefined)) {
+        await this.humanRequired(loop, "INITIAL_AUTHORIZATION_IDENTITY_INVALID");
+        return;
+      }
+      const configuration = {
+        ...(initial.goal_id === undefined ? {} : { goal_id: initial.goal_id }),
+        execution_mode: initial.execution_mode,
+        ...(initial.model === undefined ? {} : { model: initial.model }),
+        ...(initial.reasoning_effort === undefined ? {} : { reasoning_effort: initial.reasoning_effort }),
+      };
       let authorization: ActuationAuthorization | null = loop.authorization_id === undefined
         ? await this.authorizationStore.getAuthorizationByActuation(actuationId)
         : await this.authorizationStore.getAuthorization(loop.authorization_id);
@@ -1003,6 +1031,7 @@ export class AutoIterationService {
       if (authorization === null) {
         try {
           authorization = await this.controlledActuation.authorize({
+            ...configuration,
             actuation_id: actuationId,
             workspace_id: loop.workspace_id,
             task_id: loop.task_id,
@@ -1019,7 +1048,11 @@ export class AutoIterationService {
         || authorization.workspace_id !== loop.workspace_id
         || authorization.task_id !== loop.task_id
         || authorization.execution_id !== loop.execution_id
-        || authorization.instruction !== instruction) {
+        || authorization.instruction !== instruction
+        || authorization.goal_id !== configuration.goal_id
+        || (authorization.execution_mode ?? "batch") !== configuration.execution_mode
+        || authorization.model !== configuration.model
+        || authorization.reasoning_effort !== configuration.reasoning_effort) {
         await this.humanRequired(loop, "AUTHORIZATION_IDENTITY_INVALID");
         return;
       }
