@@ -2,14 +2,12 @@
 
 ## Scope
 
-Task23.5 connects a persisted Review Delivery to the independent Browser
-Worker and submits the Review message. Browser DOM interaction remains inside
-the Browser Worker Interaction Layer.
-
-Step 9 adds an Extension-backed implementation behind the same adapter seam:
-`ReviewDelivery -> DispatchCommandBroker -> ExtensionDeliveryService`. The
-Playwright adapters remain available for explicit diagnostics, while production
-Review Completion is owned by the Extension-backed adapter.
+Production Review Delivery uses the shared adapter seam:
+`BrowserRouter -> ExtensionDeliveryAdapter -> DispatchCommandBroker -> ExtensionDeliveryService`.
+The live Extension submits the Review message and returns a durable receipt. The
+Playwright `BrowserWorkerDeliveryAdapter` remains available for explicit diagnostics;
+it is not the production default or an automatic fallback. Review Completion is
+handled separately by the Extension completion path.
 
 ```text
 Codex
@@ -30,23 +28,20 @@ Review Delivery
 Browser Router
   |
   v
-Browser Worker Delivery Adapter
+Extension Delivery Adapter
   |
   v
-Browser Worker Client
+Dispatch Command Broker
   |
   v
-Conversation Navigator
-        |
-        v
-ChatGPT Conversation Page
-        |
-        v
-ChatGPT Interaction Layer
-        |
-        v
-Confirmed Review Message Submission
+Extension Delivery Service / Local Control Bridge
+  |
+  v
+Extension -> ChatGPT conversation -> durable receipt
 ```
+
+The explicit Browser Worker diagnostic path is `BrowserWorkerDeliveryAdapter ->
+BrowserWorkerClient -> Browser Worker`.
 
 The responsibilities stay separate:
 
@@ -56,9 +51,9 @@ The responsibilities stay separate:
 | Review Delivery | Stores the state and attempt count for one logical delivery. |
 | Review Delivery Adapter | Abstracts delivery to an external target. |
 | Browser Router | Resolves routing and delivery, passes the routed request, and writes delivery state. |
-| Browser Worker Delivery Adapter | Builds the default Delivery message and maps confirmed `SUBMITTED` or typed Worker failures to Delivery state. |
-| Extension Delivery Adapter | Maps durable Extension receipts, including terminal `ambiguous`, to Review Delivery results. |
+| Extension Delivery Adapter | Production adapter; maps durable Extension receipts, including terminal `ambiguous`, to Review Delivery results. |
 | Dispatch Command Broker | Uses `ReviewDelivery.delivery_id` as the durable command idempotency key, enqueues through `ExtensionDeliveryService`, and awaits its receipt. |
+| Browser Worker Delivery Adapter | Explicit diagnostic adapter; maps confirmed `SUBMITTED` or typed Worker failures to Delivery state. |
 | Browser Worker Client | Sends `POST /conversation/deliver` to the configured Worker URL. |
 | Conversation Navigator | Runs inside Browser Worker, navigates to the Conversation URL, and returns the open Page to the Worker lifecycle. |
 | ChatGPT Interaction Layer | Locates the Composer, fills the Review message, clicks Send, and confirms submission. |
@@ -109,15 +104,19 @@ interface ReviewDeliveryAdapter {
 }
 ```
 
-The adapter knows only the contract and does not depend on Playwright.
-`BrowserWorkerDeliveryAdapter` calls `BrowserWorkerClient.deliver()` with
+The adapter contract is transport-neutral and does not depend on Playwright.
+Production `ExtensionDeliveryAdapter` sends the exact routed command through
+`DispatchCommandBroker`. `BrowserWorkerDeliveryAdapter` is used only when
+explicitly selected; it calls `BrowserWorkerClient.deliver()` with
 `request.conversation_id` and the supplied `request.message`, or builds the
 lightweight Delivery message when it is omitted. The client request contains
 only the HTTP payload and no DOM logic.
 
 ## Browser Router
 
-`src/router/browser-router.ts` exposes the internal entry point:
+`src/router/browser-router.ts` exposes the internal routing and state entry point.
+Production injects `ExtensionDeliveryAdapter`; diagnostics may explicitly inject
+`BrowserWorkerDeliveryAdapter`.
 
 ```text
 deliver(workspace_id, routing_id) -> ReviewDelivery
@@ -153,14 +152,14 @@ https://chatgpt.com/c/<conversation_id>
 Empty values, full URLs, external hosts, slashes, dots, query strings, and
 path traversal values are rejected. Calling the helper does not open the URL.
 
-The Router validates the ID before invoking the Adapter. The Browser Worker
-Client sends the logical `conversationId` to the Worker; only the Worker-side
-Conversation Navigator constructs the ChatGPT URL and navigates to it.
+The Router validates the ID before invoking the Adapter. In the explicit Worker
+diagnostic path, the client sends the logical `conversationId` to the Worker; only
+the Worker-side Conversation Navigator constructs the ChatGPT URL and navigates to it.
 
-## Browser Worker Client
+## Explicit Browser Worker diagnostic transport
 
 `src/browser-worker-client/browser-worker-client.ts` is the LRM-to-Worker
-communication boundary:
+communication boundary for this explicitly selected diagnostic transport:
 
 ```typescript
 interface BrowserWorkerClientConfig {
@@ -193,7 +192,8 @@ The Browser Worker failure codes and retry policy are:
 
 The Router does not run a retry loop or scheduler. A retryable failed Delivery
 can be attempted later through the same Router. A non-retryable failure is
-recorded and is not retried automatically.
+recorded and is not retried automatically. The production Extension path also
+does not fall back automatically to the Worker.
 
 The Delivery layer builds a lightweight message containing `workspace_id`,
 `task_id`, `execution_id` when present, `review_request_id`, and `routing_id`.
@@ -210,15 +210,15 @@ pending -> delivering -> delivered
                     \-> ambiguous (terminal; no resend)
 ```
 
-It never duplicates the state machine. Only a confirmed `SUBMITTED` adapter
-result or durable Extension `delivered` receipt writes
+It never duplicates the state machine. Only a confirmed `SUBMITTED` result from
+an explicitly selected Worker adapter or a durable Extension `delivered` receipt writes
 `ReviewDelivery.status = "delivered"`; a typed failure writes
 `ReviewDelivery.status = "failed"`, and an uncertain Extension receipt writes
 `ReviewDelivery.status = "ambiguous"`. It does not update
 `ReviewRequest.status`, because submission is not Review completion.
 
 ```text
-Browser Worker returned SUBMITTED
+Production Extension returned durable delivered receipt
         |
         v
 ReviewDelivery.status = delivered
@@ -237,7 +237,7 @@ response is not confirmed submission or completion.
 
 The existing `routing_id` association remains the logical Delivery key. A
 second Router call for a delivered record returns that record without calling
-the Adapter or Browser Worker. The Extension-backed adapter additionally uses
+the Adapter. The Extension-backed adapter additionally uses
 the exact `ReviewDelivery.delivery_id` as its durable command key;
 `conversation_id` is not used as an idempotency key.
 

@@ -1,15 +1,18 @@
 # Reliable Extension Delivery
 
-Reliable Extension Delivery is an independent Local Control Plane transport. It does not replace
-the existing Playwright `BrowserDeliveryAdapter` or add an MCP tool. The Control Plane
-`DispatchCommandBroker` composes it with `ReviewDelivery` through an injected adapter.
+Reliable Extension Delivery is the production Local Control Plane transport for Review Delivery.
+`ExtensionDeliveryAdapter` calls `DispatchCommandBroker`, which enqueues through the shared
+`ExtensionDeliveryService` and returns its durable receipt. The Playwright
+`BrowserWorkerDeliveryAdapter` remains available as an explicitly selected diagnostic transport;
+no MCP tool is added.
 
 The related identities have separate owners:
 
 - Conversation Correlation proves which ChatGPT conversation owns an MCP request.
-- Reliable Extension Delivery safely sends one physical command to that exact open conversation.
+- Reliable Extension Delivery safely sends one physical command to that exact conversation through
+  the live Extension.
 - ReviewDelivery remains the logical review-delivery record.
-- Browser Transport Gate remains the future choice between Extension and Playwright transports.
+- Browser Worker remains available for explicit diagnostics; it is not an automatic fallback.
 
 ## Durable command and lease
 

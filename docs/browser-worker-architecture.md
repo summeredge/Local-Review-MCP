@@ -1,13 +1,14 @@
 # Browser Worker Architecture
 
-The Browser Worker is a separate automation-layer process. Local Review MCP
-continues to own only data and review context; it does not launch Playwright
-or manage the worker lifecycle.
+The Browser Worker is a separate Playwright automation process available for
+explicit diagnostics. Production Review Delivery uses the Extension path through
+`ExtensionDeliveryAdapter` and `DispatchCommandBroker`; the Worker is not its
+default transport or automatic fallback.
 
 ```text
-MCP Runtime (data layer)
+Explicit diagnostic caller
         |
-Review Delivery Adapter
+BrowserWorkerDeliveryAdapter
         |
 Browser Worker Client
         |
@@ -23,6 +24,9 @@ Chromium
 ```
 
 ## Current service
+
+This service can be started and diagnosed independently. Its endpoints are used
+only when a diagnostic or other caller explicitly selects the Worker adapter.
 
 The worker is implemented under `src/browser-worker/` and can be run as its
 own Node process:

@@ -1,81 +1,47 @@
 # Step 8 — Browser Transport Decision Gate
 
-**Status:** decision recorded; PR-C completion ownership implemented
+**Status:** Extension transport decision implemented for production Review Delivery and Review Completion
 **Decision:** use Extension Reliable Delivery as the primary transport for outbound Review Delivery and control commands, and use the live Extension for production Review Completion. Keep the Playwright Browser Worker as a supported explicit/diagnostic transport. Do not add automatic fallback.
 
-This gate is based on the current source and tests in this checkout. It does not
-infer the call graph from earlier design documents.
+This document records the transport decision and its current implementation.
 
 ## A. Current capability baseline
 
-### A.1 Actual call graph
+### A.1 Current production call graph
 
-The requested shape is a useful target, but it is not yet a runtime fan-out in
-the current code. `ReviewDeliveryService` persists and validates the logical
-delivery; it does not invoke a browser. `BrowserRouter` is the current caller
-that invokes a `ReviewDeliveryAdapter`.
-
-The live Playwright path is:
+`AutoIterationService` supplies the production `BrowserRouter` with an
+`ExtensionDeliveryAdapter`. The Router owns logical Delivery validation and state
+writeback; the adapter delegates physical submission to the broker:
 
 ```text
-ReviewDelivery record
-        |
-        v
-BrowserRouter.deliver()
-        |
-        v
-ReviewDeliveryAdapter
-        |
-        v
-BrowserWorkerDeliveryAdapter (default)
-        |
-        v
-BrowserWorkerClient.deliver()
-        |
-        v
-POST /conversation/deliver
-        |
-        v
-BrowserWorker
-  -> ConversationNavigator
-  -> ChatGPTInteraction
-  -> confirmed SUBMITTED result
-        |
-        v
-ReviewDeliveryService.markDelivered() / markFailed()
+ReviewDelivery
+  -> BrowserRouter.deliver()
+  -> ExtensionDeliveryAdapter
+  -> DispatchCommandBroker
+  -> ExtensionDeliveryService / Local Control Bridge
+  -> Extension background and ChatGPT content document
+  -> durable Extension receipt
+  -> ReviewDeliveryService state writeback
 ```
 
-The current Extension path is separate:
+The Playwright path remains available only when a caller explicitly injects
+`BrowserWorkerDeliveryAdapter`:
 
 ```text
-Open ChatGPT tab
-        |
-        v
-extension/content.js
-  -> extension/background.js
-        |
-        v
-Local Control Bridge
-  -> ExtensionDeliveryService.claim()/acknowledge()
-        |
-        v
-durable claim / ACK / recovery
+BrowserWorkerDeliveryAdapter
+  -> BrowserWorkerClient
+  -> POST /conversation/deliver
+  -> Browser Worker / Playwright
+  -> SUBMITTED or typed diagnostic result
 ```
-
-The following source facts define the current boundary:
 
 | Fact | Current evidence |
 | --- | --- |
-| `BrowserDeliveryAdapter` is not transport-neutral yet | `src/delivery/browser-delivery-adapter.ts` aliases `BrowserWorkerDeliveryAdapter`. |
-| The default `BrowserRouter` transport is Playwright | `src/router/browser-router.ts` constructs `BrowserWorkerDeliveryAdapter(new BrowserWorkerClient())`. |
-| Extension delivery is not connected to `ReviewDelivery` | `src/app.ts` wires Extension Delivery into Bridge claim/ACK handlers, but there is no `extensionDeliveries.enqueue()` caller in `src/`. |
-| The MCP server does not expose browser control | `src/mcp/server.ts` registers read-only workspace, file, Git, and review-context tools only. |
-| Production completion is Extension-based | `createAppContext()` injects `ExtensionReviewCompletionAdapter`; the Worker completion adapter remains diagnostic/legacy. |
-
-Therefore, there is currently no production runtime branch of the form
-`ReviewDelivery -> Browser Delivery Layer -> {Worker, Extension}`. The next
-implementation phase must add that composition deliberately; this gate does not
-add it.
+| Production Review Delivery uses the Extension | `src/control-plane/auto-iteration.ts` wires `ExtensionDeliveryAdapter` through `DispatchCommandBroker` into `BrowserRouter`. |
+| Extension delivery is connected to logical `ReviewDelivery` | The adapter enqueues with `ReviewDelivery.delivery_id` and awaits the durable receipt. |
+| Browser Worker remains explicit/diagnostic | `BrowserWorkerDeliveryAdapter` is injected by diagnostics and tests; no production fallback selects it. |
+| MCP does not expose browser control | `src/mcp/server.ts` registers read-only workspace, file, Git, and review-context tools. |
+| Production Review Completion uses the Extension | `createAppContext()` injects `ExtensionReviewCompletionAdapter`; Worker completion is explicit diagnostic support. |
 
 ### A.2 Option A capability: Playwright Browser Worker
 
@@ -104,16 +70,15 @@ The completed capabilities are:
 - The Worker uses a persistent Chromium context and a managed profile. On
   Windows the default profile is under
   `%LOCALAPPDATA%\LocalReviewMCP\browser-worker\profiles`.
-- `ReviewDelivery` lifecycle and routing identity checks are already integrated
-  with the Worker adapter through `BrowserRouter`.
-- Completion collection is implemented independently through
-  `POST /conversation/completion`.
+- The Worker adapter can be explicitly injected into `BrowserRouter` for
+  diagnostics and tests; it is not the production Review Delivery transport.
+- Worker completion collection remains available through
+  `POST /conversation/completion` for explicit diagnostics.
 
-This is a confirmed submission path, not a durable command/receipt protocol.
-The Worker confirms the page-side result before returning, but the current
-Worker request has no durable `delivery_id` lease or ACK outbox. If ChatGPT
-accepts a message and the HTTP response is lost, the current Delivery can be
-marked failed and a later retry can submit the message again.
+This explicit diagnostic transport confirms a page-side result but does not
+provide the Extension's durable `delivery_id` lease or ACK outbox. If ChatGPT
+accepts a message and the HTTP response is lost, a later diagnostic retry can
+submit the message again. Production uses the Extension receipt path.
 
 ### A.3 Option B capability: Extension Reliable Delivery
 
@@ -160,9 +125,10 @@ The completed capabilities are:
   the Bridge handlers. A corrupt Extension Delivery file blocks delivery while
   keeping Bridge identity and the MCP Data Plane available.
 
-This path is already reliable at the physical-command boundary, but it is not
-yet a `ReviewDeliveryAdapter`: the current source has no logical Review
-Delivery enqueue/await composition for it.
+`ExtensionDeliveryAdapter` and `DispatchCommandBroker` connect this physical
+command path to the logical `ReviewDelivery`. The broker enqueues using the
+stable `delivery_id`, awaits the durable receipt, and preserves terminal
+`ambiguous` results.
 
 ### A.4 Identity and correlation boundary
 
@@ -196,8 +162,9 @@ modify `Task`, `Execution`, `ReviewRequest`, `ConversationRouting`, or
 `ReviewDelivery` records.
 
 `ConversationRouting.conversation_id` therefore remains the target for a
-Review Delivery. The future Extension adapter must not choose a tab by active
-tab, recent activity, tool name, time proximity, or correlation heuristics.
+Review Delivery. The production Extension adapter receives this exact target;
+tab ownership remains fenced by conversation, document, client, and navigation
+epoch checks.
 
 ### A.5 COS reference check
 
@@ -224,7 +191,7 @@ being copied.
 | Dimension | Option A — Playwright Worker | Option B — Extension Reliable Delivery | Option C — Hybrid |
 | --- | --- | --- | --- |
 | ChatGPT session | Separate managed Chromium profile | User's already-authenticated Chrome/Edge page | Two possible sessions and authorities |
-| Current LRM wiring | Already the `BrowserRouter` default | Bridge/Extension path complete but not wired to `ReviewDelivery` | No arbitration layer exists |
+| Current LRM wiring | Explicit diagnostics/tests only | Production `BrowserRouter` adapter and completion path | No arbitration layer exists |
 | Targeting many Conversations | Opens a fresh Worker page per request using the Conversation ID | Claims the exact open tab, document, Conversation, and epoch | Must coordinate both targeting systems |
 | Physical-send proof | Page-side confirmation returned over one HTTP request | Durable message receipt plus idempotent ACK | Requires a cross-transport receipt authority |
 | Crash/ACK behavior | No durable Worker-side command ACK | Durable app queue, Extension outbox, lease, and ambiguity terminal | Worst-case ambiguity exists in both paths |
@@ -236,12 +203,12 @@ being copied.
 
 **Advantages**
 
-- It is already the current `BrowserRouter` path and satisfies the existing
-  `ReviewDeliveryAdapter` contract.
+- It remains available behind the `ReviewDeliveryAdapter` contract when a
+  diagnostic explicitly selects it.
 - It can navigate directly to a known Conversation ID without requiring that
   the user's visible browser already has the Conversation open.
-- It provides one isolated profile and one explicit automation process, which is
-  useful for deterministic diagnostics and unattended Worker operation.
+- It provides one isolated profile and one explicit automation process, useful
+  for deterministic diagnostics.
 - The same Worker already exposes submission and completion operations.
 
 **Disadvantages**
@@ -285,19 +252,17 @@ diagnostics, and duplicate-send reconciliation.
   `conversation_id`, `document_id`, `navigation_epoch`, client identity, and
   exact route checks. A stale tab cannot claim or ACK a newer page's command.
 - Durable queue state, leases, ACK outbox recovery, idempotent settlement, and
-  terminal `ambiguous` handling address the lost-response window that remains
-  open in the current Worker path.
-- It matches the future Codex execution direction: ChatGPT Web, the Extension,
+   terminal `ambiguous` handling address the lost-response window that remains
+   open in the explicit Worker diagnostic path.
+- It matches the Codex execution direction: ChatGPT Web, the Extension,
   the Bridge, and the dispatcher remain in the Control Plane while MCP stays a
   read-only data source.
-- It supports root and Project Conversation routes in the live browser and
-  leaves visible evidence of the submitted message for the user.
+- It supports root and Project Conversation routes in the managed Worker profile.
 
 **Disadvantages**
 
-- The browser must be running, the Extension must be enabled, and the target
-  Conversation must have an open live document. The current Extension path does
-  not open a missing tab on behalf of a Review Delivery.
+- The browser and Extension must be available. Production recovery may open or
+  reload the exact target Conversation, but it cannot bypass login or identity checks.
 - MV3 service-worker suspension, background-tab throttling, Chrome/Edge
   differences, and ChatGPT DOM changes remain operational concerns.
 - Fiber and DOM access use undocumented page implementation details. The route,
@@ -314,14 +279,13 @@ diagnostics, and duplicate-send reconciliation.
 
 - Normal Windows use with a user-authenticated Chrome or Edge session.
 - Multiple live ChatGPT Conversations that must remain separate and auditable.
-- Future Codex/ChatGPT command dispatch where the browser page is the execution
-  surface and the local process is only the Control Plane broker.
+- Production Review Delivery and Control Plane command dispatch through the live
+  browser page.
 
 **Maintenance cost**
 
 Medium to high: MV3 lifecycle and browser compatibility, ChatGPT DOM/Fiber
-changes, Bridge protocol compatibility, tab/document recovery, and a remaining
-logical Review Delivery adapter. The delivery correctness model is already
+changes, Bridge protocol compatibility, and tab/document recovery. The delivery correctness model is
 stronger than the present Worker request model, which reduces duplicate-send
 reconciliation work.
 
@@ -368,18 +332,15 @@ cross-transport idempotency, diagnostics, and substantially more test cases.
 
 ### Selected direction
 
-Select **Option B — Extension Reliable Delivery** as the primary transport for
-future outbound Review Delivery and Dispatch Command Broker work.
+**Option B — Extension Reliable Delivery** is the production Review Delivery
+transport. `AutoIterationService` wires `ExtensionDeliveryAdapter` and
+`DispatchCommandBroker` into `BrowserRouter`, sharing the same
+`ExtensionDeliveryService` instance as the Bridge.
 
-The existing default compatibility paths remain available, while production
-AutoIteration Review Completion is now Extension-backed:
-
-- `BrowserRouter` still defaults to `BrowserWorkerDeliveryAdapter`.
-- `BrowserWorker` is not deleted; its completion adapter remains available for
-  explicit diagnostics and legacy compatibility.
-- `ExtensionDeliveryService`, Bridge protocol `2`, Extension identity, and
-  correlation behavior are not changed.
-- No automatic Hybrid fallback is introduced.
+Production Review Completion is also Extension-backed through its separate
+completion adapter. `BrowserWorkerDeliveryAdapter` and Worker completion remain
+available for explicit diagnostics; there is no automatic cross-transport
+fallback.
 
 ### Why this fits LRM
 
@@ -396,12 +357,12 @@ AutoIteration Review Completion is now Extension-backed:
    document, client, and epoch. This is the safer model for several live
    Conversations in one browser.
 4. **Reliability.** Extension Delivery has a durable claim/lease/ACK boundary
-   and a terminal answer for uncertain sends. The current Worker path has a
-   confirmed HTTP request but no equivalent durable command receipt.
-5. **Future Codex execution.** The next Dispatch Command Broker can dispatch
-   exact commands through the existing Control Plane boundary to the browser
-   page that will execute them. MCP remains the read-only source of Workspace,
-   Git, and Review Context data.
+   and a terminal answer for uncertain sends. The explicit Worker diagnostic
+   path has a confirmed HTTP request but no equivalent durable command receipt.
+5. **Control Plane dispatch.** `DispatchCommandBroker` sends exact commands
+   through the existing Control Plane boundary to the browser page that will
+   execute them. MCP remains the read-only source of Workspace, Git, and Review
+   Context data.
 
 ### Decision scope
 
@@ -411,41 +372,24 @@ durable `expected_user_message_id` and completion receipt chain. The Playwright
 Worker remains available for explicit diagnostics and is not an automatic
 fallback.
 
-## D. Architecture impact
+## D. Current architecture impact
 
-### Future interface changes required by the selected direction
+The implemented composition preserves the intended boundaries:
 
-These are implementation requirements for the next stages, not changes made by
-this gate:
-
-1. **Keep the transport-neutral adapter seam.** Reuse
-   `ReviewDeliveryAdapter.deliver(request)` as the logical boundary. Add an
-   Extension/Broker-backed implementation behind it rather than placing Bridge
-   calls in MCP code or in `ReviewDeliveryService`.
-2. **Connect logical Delivery to the durable command.** The future adapter or
-   Dispatch Command Broker must enqueue a command containing the existing
-   `delivery_id`, authoritative `conversation_id`, and exact Review message,
-   then await the durable Extension receipt. The mapping from logical Delivery
-   to broker command must be persisted or otherwise idempotent before the
-   command is offered to a page.
-3. **Preserve uncertain-send semantics.** The current
-   `ReviewDeliveryResult` only distinguishes `delivered` and `failed`, while
-   Extension Delivery also has terminal `ambiguous`. Before wiring it into the
-   main path, either extend the Review Delivery lifecycle with a terminal
-   ambiguous state or add an equivalent durable no-retry guard. Silently mapping
-   `ambiguous` to an ordinary retryable `failed` is not acceptable.
-4. **Keep Router state ownership in one place.** `BrowserRouter` may continue to
-   own `beginDeliveryAttempt()` and final Review Delivery writeback. The new
-   adapter must not duplicate the `ReviewDelivery` state machine.
-5. **Keep target ownership explicit.** `ConversationRouting` remains the
-   authority for the target Conversation. Request correlation remains evidence
-   for `request_id -> conversation_id`; it must not select a Review Delivery
-   target or replace routing metadata.
-6. **Reuse the existing Bridge contract.** `POST /delivery/claim` and
-   `POST /delivery/ack`, strict schemas, Origin/protocol/bearer checks, bounded
-   bodies, and restart recovery remain the low-level Extension transport. Any
-   new enqueue/await composition must be added in the Control Plane, not by
-   exposing Bridge operations as MCP tools.
+1. `ReviewDeliveryAdapter.deliver(request)` remains the transport-neutral
+   boundary; `ExtensionDeliveryAdapter` delegates to the broker.
+2. `DispatchCommandBroker` uses the stable `delivery_id`, exact routed
+   `conversation_id`, and Review message, then awaits the durable Extension
+   receipt.
+3. Terminal `ambiguous` is preserved through `ReviewDelivery`; it is never
+   mapped to an ordinary retryable failure.
+4. `BrowserRouter` owns delivery attempts and state writeback. The adapter does
+   not duplicate the state machine.
+5. `ConversationRouting` remains the target authority. Request correlation is
+   evidence for `request_id -> conversation_id`, not a routing override.
+6. Bridge claim/ACK schemas, Origin/protocol/bearer checks, bounded bodies, and
+   restart recovery remain in the Control Plane. No Bridge operation is exposed
+   as an MCP tool.
 
 ### Boundaries that remain unchanged
 
@@ -467,12 +411,12 @@ The selected direction preserves these rules:
   dispatcher or routing authority.
 - Existing Playwright Worker, Client, Interaction, Profile, and completion
   modules remain in place.
-- No protocol version change, Hybrid fallback, or ReviewDelivery main-chain
-  switch is part of Step 8.
+- Extension delivery uses the existing Bridge protocol; no automatic Hybrid
+  fallback or MCP browser-control surface is added.
 
-### Risks and controls
+### Risks and remaining operational checks
 
-| Risk | Control required before production use |
+| Risk | Control / remaining operational check |
 | --- | --- |
 | ChatGPT DOM, route, or Fiber shape changes | Keep strict allowlists and negative tests; run a real Chrome/Edge gate for identity, one send, receipt, and restart behavior. |
 | Target Conversation tab is closed or background-throttled | Return an explicit unavailable/pending result; do not guess another tab and do not transparently switch transports. |
@@ -489,8 +433,8 @@ readiness gate, not a reason to weaken the architecture decision.
 
 ## Step 9 — Dispatch Command Broker
 
-Step 9 implements the smallest Control Plane composition that turns the
-selected direction into a Review Delivery-capable transport:
+Step 9 implemented the Control Plane composition that connects the selected
+transport to Review Delivery:
 
 1. Define the durable logical-Delivery-to-command identity and its terminal
    outcomes, including `ambiguous`.
@@ -504,8 +448,8 @@ selected direction into a Review Delivery-capable transport:
    ambiguous sends, corrupt state, and repeated logical Delivery requests.
 
 The implementation is in `src/control-plane/dispatch-command-broker.ts` and
-`src/delivery/extension-delivery-adapter.ts`. The current Playwright
-`BrowserRouter` default remains available; an Extension-backed Router uses the
-injected adapter and the same `ExtensionDeliveryService` instance as the
-Bridge. Production completion is Extension-backed and no automatic Hybrid
-fallback is introduced.
+`src/delivery/extension-delivery-adapter.ts`. Production `AutoIterationService`
+injects this adapter into `BrowserRouter` and shares its
+`ExtensionDeliveryService` with the Bridge. Browser Worker delivery is explicitly
+selected for diagnostics, while production completion remains Extension-backed.
+No automatic Hybrid fallback is introduced.

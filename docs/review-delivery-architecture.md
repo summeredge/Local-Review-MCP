@@ -2,11 +2,11 @@
 
 ## Scope
 
-Review Delivery records the internal attempt to submit a Review request to the
-Conversation selected by Conversation Routing. The Browser Router invokes a
-delivery adapter, which calls the independent Browser Worker over HTTP. This
-task does not read the ChatGPT reply or decide whether the review itself is
-complete.
+Review Delivery records an attempt to submit a Review request to the Conversation
+selected by Conversation Routing. Production uses `ExtensionDeliveryAdapter` through
+`DispatchCommandBroker` and the live Extension. `BrowserWorkerDeliveryAdapter` remains
+available when explicitly selected for diagnostics. Submission does not read the
+ChatGPT reply or decide whether the Review itself is complete.
 
 ```text
 Codex completes a task
@@ -24,7 +24,28 @@ Conversation Routing
 Review Delivery
         |
         v
-Browser Worker Delivery Adapter
+BrowserRouter (routing validation and state writeback)
+        |
+        v
+ExtensionDeliveryAdapter
+        |
+        v
+DispatchCommandBroker
+        |
+        v
+ExtensionDeliveryService / Local Control Bridge
+        |
+        v
+Extension background + ChatGPT content document
+        |
+        v
+Durable Extension receipt
+```
+
+The explicit Browser Worker diagnostic path is:
+
+```text
+BrowserWorkerDeliveryAdapter
         |
         v
 Browser Worker Client
@@ -48,10 +69,12 @@ The boundaries are deliberately separate:
 * **Conversation Routing** says which Conversation should receive that request.
 * **Review Delivery** records whether that logical delivery is pending, in
   progress, delivered, or failed, including its attempts and last error.
-* **Delivery Adapter** maps the Browser Worker submission result to the
-  persisted Delivery state.
-* **Browser Worker Client** is the only LRM-to-Worker HTTP boundary; it has no
-  Playwright or DOM dependency.
+* **ExtensionDeliveryAdapter** maps the durable Extension receipt to the
+  persisted Delivery state; `DispatchCommandBroker` binds that command to the
+  logical `delivery_id`.
+* **BrowserWorkerDeliveryAdapter** is an explicitly selected diagnostic
+  transport. Its client is the LRM-to-Worker HTTP boundary and has no Playwright
+  or DOM dependency.
 
 `Workspace` is not a `Conversation`. The relationship is:
 
@@ -125,10 +148,10 @@ only valid from `delivering` and records the delivery timestamp.
 start another attempt and a repeated `createDelivery()` for its `routing_id`
 returns the existing record without sending anything again.
 
-Delivery success means only:
+Production Delivery success means only:
 
-> The Browser Worker confirmed that the Review message was accepted by the
-> target Conversation.
+> The Extension returned a durable receipt proving that the Review message was
+> accepted by the target Conversation.
 
 It does **not** mean that ChatGPT has finished reviewing the request. An
 Extension receipt without proof that the message was not sent is recorded as
@@ -204,14 +227,17 @@ Request, Routing, or Review Projection APIs.
 
 ## Review completion boundary
 
-The current submission flow is:
+The production submission flow is:
 
 ```text
-Browser Worker returned SUBMITTED
+Extension returned durable delivered receipt
         |
         v
 ReviewDelivery.status = delivered
 ```
+
+An explicitly selected Browser Worker diagnostic may instead confirm `SUBMITTED`;
+that path does not make Browser Worker the production default.
 
 Only a later Review completion signal may represent the actual review result:
 
@@ -229,28 +255,6 @@ Page navigation, composer fill, a Send click, or an HTTP success response must
 not be treated as confirmed submission or completion. This task does not
 update Review Request status.
 
-## C2C reference review
-
-Before implementation, the local C2C project was checked at
-`C:\Users\shaoy\Documents\Codex\codex-with-chatgpt`:
-
-* `src/session/state.ts` separates a saved conversation pointer from the
-  task/checkpoint metadata and resolves a stable conversation URL per
-  workspace.
-* `src/execution/records.ts` keeps execution records separate from the
-  conversation session, and `docs/protocol.md` distinguishes `EXECUTED`,
-  `REVIEW`, `DONE`, `BLOCKED`, and `HANDOFF`.
-* The local checkpoint uses `EXECUTED_SENT`/`GPT_REVIEW` to mean that review is
-  being awaited; it does not claim that the review is complete.
-* Browser/ChatGPT operation is described in the C2C skill and protocol, but
-  C2C has no reusable Review Delivery persistence service or adapter in its
-  TypeScript source.
-
-LRM reuses the useful separation of execution metadata, stable conversation
-identity, and explicit review/completion boundaries. It does not import C2C's
-Session, Project, Agent state machine, browser automation, or
-Workspace-to-Conversation long-term binding.
-
 ## Diagnostic command
 
 The Browser Worker integration diagnostic builds a temporary chain:
@@ -259,7 +263,8 @@ The Browser Worker integration diagnostic builds a temporary chain:
 Task -> Execution -> Review Request -> Conversation Routing -> Review Delivery
 ```
 
-and uses a local mock Browser Worker to print the final `delivered` JSON record:
+and explicitly injects a local mock Browser Worker to print the final `delivered`
+JSON record:
 
 ```powershell
 npm run diagnose:review-delivery-browser

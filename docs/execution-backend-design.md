@@ -1,14 +1,16 @@
-# Interactive Backend 架构约束（Phase 4）
+# Interactive Execution Backend
 
-状态：Phase 4 `submit_goal` interactive 路由已接入 Event Adapter、Session 状态
-同步、Event Store 和只读 Status Query；approval、user input、pause/resume 仍未实现。
+当前执行路径：`batch` 使用 `CliExecutionBackend`；`interactive` 先协商 Desktop
+`codex_app` capability，Desktop 不可用时通过 Launcher 操作或五分钟无人操作超时
+选择独立 app-server backend。Desktop pipe 由 trampoline handoff 引入并由 owner
+binding 验证。Approval、user input、pause/resume 尚不属于当前执行 contract。
 
-本阶段在 Phase 2 Session 类型、schema 和 filesystem Store 的基础上增加
-interactive backend 路由；默认 batch 执行行为保持不变。
+本页保留 Phase 4 建立的 Session、Execution 和事件模型；当前 Desktop capability
+启动、pipe handoff 与 interactive fallback 以第 10 节为准。
 
-## 1. 当前基线与目标结构
+## 1. 当前调用路径与结构
 
-当前仓库的真实调用链是：
+当前仓库的 interactive 调用链是：
 
 ```text
 MCP submit_goal
@@ -21,11 +23,16 @@ MCP submit_goal
        -> CliExecutionBackend            # batch
             -> CodexExecutionAdapter
                  -> codex exec --json -
-       -> CodexAppServerBackend           # interactive
-            -> SessionStore
-            -> thread/start -> turn/start
-            -> CodexEventAdapter -> LRM EventStore
-            -> Session / Execution status projection
+       -> CapabilityNegotiator            # interactive provider selection
+            -> DesktopCapabilityProvider  # normal production path
+                 -> DesktopCodexBackend
+                 -> Desktop thread commands / completion observer
+            -> StandaloneCapabilityProvider # selected or AFK fallback
+                 -> CodexAppServerBackend
+                 -> SessionStore
+                 -> thread/start -> turn/start
+                 -> CodexEventAdapter -> LRM EventStore
+       -> Session / Execution status projection
 ```
 
 Session record 的持久化路径是：
@@ -42,7 +49,7 @@ CLI 入口直接调用 `GoalSubmissionService`，但仍经过同一套 Goal、Ta
 Actuation 和 Execution 持久化逻辑。`ExecutionContextService` 目前只是
 Execution record 的读写服务，不是执行器，也不应被改名或改造成 Backend。
 
-冻结后的逻辑结构是：
+当前逻辑结构是：
 
 ```text
 submit_goal
@@ -51,11 +58,15 @@ submit_goal
 ExecutionService                    # LRM Control Plane application service
     |
     v
-ExecutionBackend                    # provider-neutral port
+ExecutionBackendRouter
     |
-    +-- CliBackend
+    +-- CliExecutionBackend           # batch
     |
-    +-- CodexAppServerBackend
+    +-- CapabilityNegotiator          # interactive
+          +-- DesktopCapabilityProvider
+          |     +-- DesktopCodexBackend
+          +-- StandaloneCapabilityProvider
+                +-- CodexAppServerBackend
 ```
 
 在现有系统中，`ControlledActuationService` 仍位于
@@ -76,6 +87,7 @@ submit_goal -> Goal / Task -> ControlledActuationService
 | `ControlledActuationService` | permission gate、authorization、reservation、重复调用保护 | 解释 CLI 或 app-server 的事件 |
 | `ExecutionService` | 选择 Backend、绑定 LRM identity、持久化生命周期、协调规范化事件、恢复和幂等 | 直接依赖某个 provider 的 wire payload |
 | `ExecutionBackend` | 启动环境、创建/恢复 Session、发送任务、读取并适配事件、停止/恢复 | 创建 Goal/Task、决定 LRM 权限、写入 LRM record |
+| `CapabilityNegotiator` | interactive 时优先检查 Desktop capability，并记录 Desktop/standalone 选择 | 创建 Goal/Task、绕过 Desktop owner binding、静默跨 provider 重试 |
 | `ExecutionContextService` | 校验并持久化 Execution record | 启动进程、连接 app-server、推断状态 |
 | LRM Core | Goal、Task、权限、Workspace、用户请求、状态持久化 | 把 provider 原始事件暴露给 MCP |
 
@@ -102,12 +114,12 @@ browser 或 agent 子系统。
 | `stopExecution` | 请求停止当前 Execution；停止确认不是成功完成 |
 | `listModels` | App-server 的 capability discovery；返回当前可用模型和 reasoning efforts |
 
-`CliBackend` 可以把 `startEnvironment`、`createSession` 和
+`CliExecutionBackend` 可以把 `startEnvironment`、`createSession` 和
 `startExecution` 合并为一次进程启动，但语义上仍返回同一套 neutral result。
 不支持的 `resumeSession` 必须明确返回 unsupported，不能伪造一个长期 Session。
 
-`CodexAppServerBackend` 必须把连接、Thread、Turn 三种对象分开，并把 provider
-event 交给 `CodexEventAdapter`：
+`CodexAppServerBackend`（standalone fallback）必须把连接、Thread、Turn 三种对象
+分开，并把 provider event 交给 `CodexEventAdapter`：
 
 ```text
 app-server process / JSON-RPC connection  !=  LRM Session
@@ -135,18 +147,18 @@ provider 返回的 `sessionId`、transport connection id 或 UI/window reference
 都是 provider metadata；只有经明确绑定的 provider `thread.id` 才能作为
 LRM Session 的外部 identity。窗口是否可见不能证明 Session 所属关系。
 
-## 4. CLI 与 App-server 的生命周期
+## 4. Batch、Desktop 与 standalone app-server 的生命周期
 
-| 维度 | `CliBackend` | `CodexAppServerBackend` |
-| --- | --- | --- |
-| 环境 | 一个 `codex exec --json -` 进程 | 长期 app-server 进程/连接，可承载多个 Thread |
-| LRM Session | 当前 CLI 链路不自动创建；显式保存时 `thread_id` 可为空 | 持久 Session，绑定一个 provider Thread |
-| 一次执行 | 进程 lifetime 是一个 Execution | 一个 `turn/start` 是一个 Execution |
-| 输入 | 通过 stdin 发送完整 instruction | 通过 `turn/start` 发送 input |
-| 事件 | CLI JSONL stdout/stderr，经现有 completion observer 解析 | JSON-RPC response/notification，经 Backend 转换 |
-| 停止 | 终止进程并观察退出 | `turn/interrupt` 或当前版本对应的停止方法 |
-| 恢复 | 不支持无证据恢复；沿用 process identity / exit evidence | 重连后 `thread/resume`，再按 provider history/event cursor 恢复 |
-| 用户等待 | 当前 batch contract 不进入交互等待 | approval/user-input request 映射为 `waiting_user` |
+| 维度 | `CliExecutionBackend` | `DesktopCodexBackend` | `CodexAppServerBackend`（standalone fallback） |
+| --- | --- | --- | --- |
+| 环境 | 一个 `codex exec --json -` 进程 | 当前 Desktop owner 的 `codex_app` tools pipe | LRM 管理的私有 app-server 进程/连接 |
+| LRM Session | batch 默认不创建 Session | 持久 Session 绑定 Desktop-owned target thread | 持久 Session 绑定 app-server thread |
+| 一次执行 | 进程 lifetime 是一个 Execution | `create_thread` 启动首 turn，completion observer 确认完成 | 一个 `turn/start` 是一个 Execution |
+| 输入 | 通过 stdin 发送完整 instruction | 通过 Desktop codex_app thread command 发送 | 通过 `turn/start` 发送 input |
+| 事件 | CLI JSONL stdout/stderr，经 completion observer 解析 | Desktop completion observer 和状态投影 | JSON-RPC response/notification，经 Backend 转换 |
+| 停止 | 终止进程并观察退出 | 由 Desktop execution contract 管理；LRM 不拥有其 OS process | `turn/interrupt` 或当前版本对应的停止方法 |
+| 恢复 | 不支持无证据恢复；沿用 process identity / exit evidence | 通过已验证的 Desktop thread binding 恢复关联 | 重连后 `thread/resume`，再按 provider history/event cursor 恢复 |
+| 用户等待 | batch contract 不进入交互等待 | Desktop capability 等待与 fallback 决策由 Launcher 协商 | approval/user-input request 尚不属于当前 contract |
 
 因此不能把 `Execution` 改成 Thread：CLI 的进程结束即结束一次运行，而
 app-server 的 Thread 仍然保存上下文，后续可拥有多个 Turn/Execution。
@@ -199,9 +211,10 @@ app-server 的 Thread 仍然保存上下文，后续可拥有多个 Turn/Executi
 规则：
 
 1. 字段可省略，默认值为 `"batch"`。
-2. 省略该字段的历史调用继续走 `CliBackend`，行为等价于当前
+2. 省略该字段的历史调用继续走 `CliExecutionBackend`，行为等价于当前
    `codex exec --json -`。
-3. `"interactive"` 才允许选择 `CodexAppServerBackend`。
+3. `"interactive"` 进入 `CapabilityNegotiator`：优先使用 Desktop，Desktop capability
+   不可用时按 Launcher 决策进入 `CodexAppServerBackend` standalone fallback。
 4. 字段从 MCP input 贯穿 pending submission、GoalSubmission、Goal checkpoint
    和 ExecutionService；不能只改入口 schema。
 5. `execution_mode` 不是 `session_id`、model name 或 reasoning effort；这些
@@ -212,12 +225,13 @@ app-server 的 Thread 仍然保存上下文，后续可拥有多个 Turn/Executi
 CLI 现有直接调用和 Connector 现有异步 identity gate 都必须保留。添加字段
 不能改变 `accepted` 的含义：它只表示请求已被 LRM durable save。
 
-## 6. 模型配置来源冻结
+## 6. Standalone app-server 模型配置来源
 
-模型名和 reasoning effort 不得在 LRM 中硬编码，也不得以静态常量替代
-provider catalog。
+Standalone app-server 的模型名和 reasoning effort 不得在 LRM 中硬编码，也不得以
+静态常量替代 provider catalog。Desktop provider 使用 Desktop 自己的执行环境与
+capability，不由此处的 app-server catalog 规则推断。
 
-Interactive Backend 启动/初始化时必须：
+Standalone app-server 启动/初始化时必须：
 
 1. 完成当前 app-server 版本要求的 `initialize` handshake；
 2. 调用 `model/list`，按 `nextCursor` 继续读取分页；
@@ -260,7 +274,10 @@ codex app-server generate-json-schema --out <temporary-directory>
 Schema、handshake 或必需方法不匹配时，Backend 必须 fail closed；不得通过
 字段猜测、未识别事件或 provider-specific fallback 继续执行。
 
-## 8. Phase 4 实现内容与非目标
+## 8. Phase 4 实现范围（历史阶段基线）
+
+以下记录 Phase 4 当时建立的 app-server/session 能力与阶段边界，不代表当前
+interactive production provider 的完整清单；当前路径见第 10 节。
 
 本阶段已经实现：
 
@@ -301,7 +318,7 @@ Backend 本身仍通过 `model/list` 校验实际 catalog，不硬编码模型�
 - [`session-model.md`](session-model.md)
 - [`event-model.md`](event-model.md)
 
-## 9. Phase 4 Event Flow 与 Status Query
+## 9. Standalone app-server Event Flow 与 Status Query
 
 ```text
 Codex app-server
@@ -325,7 +342,7 @@ Codex app-server
 agent output。它们不改变 `submit_goal` receipt，也不改变默认 `execution_mode=batch`
 或 CLI `codex exec --json -` 路径。
 
-## 10. P5.4.1 Desktop codex_app interactive route
+## 10. Current Desktop codex_app interactive route
 
 The production interactive route is now the Desktop codex_app backend:
 
@@ -335,20 +352,40 @@ submit_goal(execution_mode="interactive")
         -> ExecutionService (ExecutionBackendRouter)
         -> CapabilityNegotiator (Desktop first)
         -> DesktopCapabilityProvider
+        -> DesktopCodexBackend
         -> DesktopThreadCoordinator (DesktopThreadBindingStore)
         -> DesktopCodexThreadCommands -> create_thread
         -> DesktopCompletionObserver
         -> Session / Execution terminal projection
         -> EventStore (turn_completed)
         -> terminal listener -> ExecutionRoutingService
-
-On capability failure, the same negotiator waits for a recheck/standalone action or
-starts `StandaloneCapabilityProvider` with the existing private app-server.
 ```
 
-`CodexAppServerBackend` is retained but is no longer selected for the normal production
-interactive route. P5.9 keeps Desktop as the first provider and negotiates the existing private
-app-server backend as a bounded, user-selectable or automatic fallback.
+The production Launcher setup configures `CODEX_CLI_PATH` to the Desktop bootstrap
+trampoline. On Desktop cold start, the trampoline captures the inherited
+`CODEX_APP_TOOLS_PIPE_PATH` and offers it to the authenticated loopback handoff endpoint.
+LRM stages the handoff until the Desktop IPC observer establishes the owner identity;
+only then can the resolver return it as `pipeSource=handoff`. While the spawned
+`codex.exe` remains alive, the trampoline probes and re-offers the capability after an
+LRM runtime restart. The pipe path is not persisted or logged.
+
+`DesktopToolsPipeResolver` prefers a verified handoff. It accepts the current process's
+inherited `CODEX_APP_TOOLS_PIPE_PATH` only while Desktop IPC is connected and no accepted
+handoff has since become stale; otherwise it fails closed. It never enumerates or guesses
+pipe names. The inherited-environment source is compatibility behavior, not the normal
+Launcher-started production path.
+
+If Desktop capability fails, `CapabilityNegotiator` exposes **Retry Desktop** and
+**Use Standalone** through the authenticated Launcher endpoint. A user selection starts
+the existing private `CodexAppServerBackend`; without user action, the default five-minute
+AFK window selects that backend and records `afk_fallback_timeout`. A successful Desktop
+recheck cancels the pending fallback. Recheck reads existing capability; trampoline
+maintenance independently handles handoff recovery.
+
+P5.4.1 established the Desktop interactive backend; the former
+`BLOCKED_DESKTOP_PIPE_CAPABILITY` status is historical. P5.8 supplies the production
+trampoline/handoff bootstrap, and P5.9 supplies the bounded standalone fallback. The
+private app-server is the fallback provider, not the default interactive route.
 
 ### Backend identity
 
@@ -407,44 +444,35 @@ downgraded to the weaker `current_environment` source. `DesktopCodexRuntimeFacto
 launcher probe both consume this resolver, and the probe reports the source it actually connected
 with as `pipeSource` (`"handoff"` or `"current_environment"`) without echoing the pipe path.
 
-#### The two sources are not equivalent
+#### Pipe source semantics
 
-The two accepted sources have different production meanings and must not be conflated:
-
-- **trusted handoff** is the formal seam by which a standalone production LRM Host obtains a
-  Desktop-owned tools pipe capability. It is the only source a Launcher-started LRM Host can be
-  expected to acquire on its own, and it is bound to a verified Desktop owner.
-- **current_environment** is a compatibility path only. It is valid **only when the current LRM
-  process already holds** `CODEX_APP_TOOLS_PIPE_PATH` because some Desktop/Codex-owned execution
-  context exported it. It is **not** an automatic Desktop pipe acquisition for a
-  LocalReviewLauncher-started LRM Host, and it is never presented or tested as a production
-  fallback for that case.
-
-Historical success artifacts that recorded `pipeDiscovery = current_environment` came from a
-Desktop/Codex-owned execution context, not from an independent Launcher-started LRM Host. That is
-why a Launcher-started Host without an accepted handoff and without an inherited
-`CODEX_APP_TOOLS_PIPE_PATH` fails closed: there is no production pipe capability source yet.
+- **`handoff`** is the normal capability source for a Launcher-started production LRM Host. The
+  trampoline offers the captured pipe, and LRM exposes it only after binding it to the observed
+  Desktop owner.
+- **`current_environment`** remains a compatibility source when the LRM process itself inherited
+  `CODEX_APP_TOOLS_PIPE_PATH` and Desktop IPC is connected. It is not how the standalone Launcher
+  acquires the capability.
+- If an accepted handoff becomes stale after disconnect or owner change, resolution fails closed;
+  it never downgrades that stale evidence to `current_environment`.
 
 #### Interactive preflight observability
 
-Because that failure would otherwise only appear after a Goal already started, the interactive
-Desktop route is checked **before** any Goal, Task, or Execution is created. The preflight runs the
-same three conditions the Desktop backend enforces, in the same order:
+Before Goal creation, preflight records whether the Desktop route meets the same three conditions
+the backend enforces, in the same order:
 
 1. Desktop IPC connected;
 2. executor conversation identity available;
 3. the resolver can currently resolve a pipe.
 
-If the pipe is unavailable, the Goal submission fails closed with the existing
-`desktop_tools_pipe_unavailable` reason and no Session, Task, or Execution is created. The result
-is durable and queryable rather than a binary `failed`:
+When Desktop is unavailable, the current runtime records that result and lets the bound
+`CapabilityNegotiator` continue with its standalone provider. If no fallback provider is bound, the
+same condition fails closed before Goal, Task, or Execution creation. The readiness result remains
+durable and queryable:
 
 - `goalPreflightResultSchema.desktop` carries `{ ready, reason, pipe_source }`, and
   `failure_stage = "desktop"` identifies the blocked stage;
-- the reason is hashed into the identity trace with `failure_stage = "desktop"` on
-  `goal_start_failed`, and the preflight result is persisted on the pending Goal submission;
+- when preflight must fail closed, the reason is hashed into the identity trace with
+  `failure_stage = "desktop"` on `goal_start_failed`; the preflight result is persisted on the
+  pending Goal submission;
 - the read-only loopback endpoint `/launcher/desktop-interactive` reports
   `{ ready, reason, pipeSource, pipeState }` for the current evidence without ever returning a pipe path.
-
-Current live status is **P5.4.1 BLOCKED_DESKTOP_PIPE_CAPABILITY**: there is no real production pipe
-capability source for an independently started LRM Host yet, so P5.4.1 is not claimed as PASS.
