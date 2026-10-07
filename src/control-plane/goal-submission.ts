@@ -24,6 +24,8 @@ import type {
   GoalOrchestrationService,
 } from "./goal-orchestration.js";
 import { executionModeSchema } from "./execution-service.js";
+import { reasoningEffortSchema } from "../models/model-catalog.js";
+import { parseReasoningEffort, resolveModel } from "../models/model-resolver.js";
 
 export const DEFAULT_GOAL_MAX_ITERATIONS = 2;
 const submissionTextSchema = goalTaskPlanSchema.shape.goal;
@@ -48,6 +50,14 @@ export const goalSubmissionToolInputSchema = goalSubmissionRequestSchema
   .extend({ correlation_key: correlationKeySchema })
   .strict();
 
+export const resolvedGoalSubmissionRequestSchema = goalSubmissionRequestSchema
+  .omit({ model: true, reasoning_effort: true })
+  .extend({
+    model_id: z.string().min(1).max(256).optional(),
+    reasoning_effort: reasoningEffortSchema.optional(),
+  })
+  .strict();
+
 export const goalSubmissionResultSchema = z.object({
   goal_id: goalIdSchema,
   phase_id: phaseIdSchema,
@@ -66,6 +76,7 @@ export const goalSubmissionAcceptedSchema = z.object({
 }).strict();
 
 export type GoalSubmissionRequest = z.input<typeof goalSubmissionRequestSchema>;
+export type ResolvedGoalSubmissionRequest = z.input<typeof resolvedGoalSubmissionRequestSchema>;
 export type GoalSubmissionResult = z.infer<typeof goalSubmissionResultSchema>;
 export type GoalSubmissionAccepted = z.infer<typeof goalSubmissionAcceptedSchema>;
 export type GoalSubmissionOrchestration = Pick<
@@ -78,7 +89,24 @@ function generatedId(prefix: string): string {
   return `${prefix}-${randomUUID()}`;
 }
 
-function buildPlan(request: z.output<typeof goalSubmissionRequestSchema>): CreateGoalInput {
+export function resolveGoalModelFields(
+  model?: string,
+  reasoning_effort?: string,
+): Pick<ResolvedGoalSubmissionRequest, "model_id" | "reasoning_effort"> {
+  if (model === undefined) {
+    return reasoning_effort === undefined ? {} : { reasoning_effort: parseReasoningEffort(reasoning_effort) };
+  }
+  const resolved = resolveModel({
+    model,
+    ...(reasoning_effort === undefined ? {} : { reasoning_effort }),
+  });
+  return {
+    model_id: resolved.model_id,
+    ...(resolved.reasoning_effort === undefined ? {} : { reasoning_effort: resolved.reasoning_effort }),
+  };
+}
+
+function buildPlan(request: z.output<typeof resolvedGoalSubmissionRequestSchema>): CreateGoalInput {
   const phaseId = generatedId("phase");
   return createGoalInputSchema.parse({
     goal_id: generatedId("goal"),
@@ -96,7 +124,7 @@ function buildPlan(request: z.output<typeof goalSubmissionRequestSchema>): Creat
       }],
     }],
     execution_mode: request.execution_mode,
-    ...(request.model === undefined ? {} : { model: request.model }),
+    ...(request.model_id === undefined ? {} : { model_id: request.model_id }),
     ...(request.reasoning_effort === undefined ? {} : { reasoning_effort: request.reasoning_effort }),
   });
 }
@@ -107,11 +135,23 @@ export class GoalSubmissionService {
     private readonly preflight: GoalSubmissionPreflight,
   ) {}
 
-  public async submitGoal(
+  public async submitExternalGoal(
     request: GoalSubmissionRequest,
     connectorProvenance?: GoalConnectorProvenance,
   ): Promise<GoalSubmissionResult> {
     const parsed = goalSubmissionRequestSchema.parse(request);
+    const { model, reasoning_effort, ...base } = parsed;
+    return this.submitGoal({
+      ...base,
+      ...resolveGoalModelFields(model, reasoning_effort),
+    }, connectorProvenance);
+  }
+
+  public async submitGoal(
+    request: ResolvedGoalSubmissionRequest,
+    connectorProvenance?: GoalConnectorProvenance,
+  ): Promise<GoalSubmissionResult> {
+    const parsed = resolvedGoalSubmissionRequestSchema.parse(request);
     const preflightInput = {
       workspace_id: parsed.workspace_id,
       conversation_id: parsed.conversation_id,

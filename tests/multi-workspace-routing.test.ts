@@ -310,6 +310,7 @@ describe("multi-workspace execution routing", () => {
       settings: fixture.settings,
       registry: fixture.registry,
       runtimeReady: () => true,
+      desktopReadiness: () => ({ ready: true, pipe_source: "handoff" }),
       diagnoseConnector,
       extensionReadiness: async () => ({ ready: true }),
       extensionReadyTimeoutMs: 0,

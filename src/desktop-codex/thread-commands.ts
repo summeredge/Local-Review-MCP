@@ -1,4 +1,5 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { ReasoningEffort } from "../models/model-catalog.js";
 import {
   callCodexAppTool,
   CodexAppRuntimeError,
@@ -24,8 +25,8 @@ export interface DesktopCodexCommandOptions {
 export interface CreateThreadInput extends DesktopCodexCommandOptions {
   readonly projectId: string;
   readonly prompt: string;
-  readonly model?: string;
-  readonly reasoningEffort?: string;
+  readonly model_id?: string;
+  readonly reasoning_effort?: ReasoningEffort;
 }
 
 export interface SendMessageToThreadInput extends DesktopCodexCommandOptions {
@@ -198,8 +199,8 @@ export class DesktopCodexThreadCommands {
       requiredPrompt(input.prompt),
       projectId,
       {
-        ...(input.model === undefined ? {} : { model: input.model }),
-        ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
+        ...(input.model_id === undefined ? {} : { model_id: input.model_id }),
+        ...(input.reasoning_effort === undefined ? {} : { reasoning_effort: input.reasoning_effort }),
       },
     );
     const result = await callCodexAppTool(callInput(

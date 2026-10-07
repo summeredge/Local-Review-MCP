@@ -5,6 +5,7 @@ import { TaskContextService } from "../../context/service.js";
 import type { ExecutionContext, Session } from "../../context/types.js";
 import { defaultTaskContextStorageRoot } from "../../context/task.js";
 import type { WorkspaceRegistry } from "../../workspace/registry.js";
+import type { ReasoningEffort } from "../../models/model-catalog.js";
 import { EventStore } from "../../control-plane/events/store.js";
 import type { LrmEvent } from "../../control-plane/events/model.js";
 import { CodexEventAdapter } from "./event-adapter.js";
@@ -80,10 +81,10 @@ function selectedModel(
   request: ExecutionBackendStartRequest,
   models: readonly AppServerModel[],
 ): AppServerModel | undefined {
-  if (request.model !== undefined) {
-    const selected = models.find((model) => model.model === request.model);
+  if (request.model_id !== undefined) {
+    const selected = models.find((model) => model.model_id === request.model_id);
     if (selected === undefined) {
-      throw new Error(`Requested model was not returned by model/list: ${request.model}`);
+      throw new Error(`Requested model was not returned by model/list: ${request.model_id}`);
     }
     return selected;
   }
@@ -96,22 +97,22 @@ function selectedModel(
 function selectedEffort(
   request: ExecutionBackendStartRequest,
   model: AppServerModel | undefined,
-): string | undefined {
+): ReasoningEffort | undefined {
   if (request.reasoning_effort !== undefined) {
-    if (model === undefined || !model.efforts.includes(request.reasoning_effort)) {
+    if (model === undefined || !model.reasoning_efforts.includes(request.reasoning_effort)) {
       throw new Error(`Reasoning effort is not supported by the selected model: ${request.reasoning_effort}`);
     }
     return request.reasoning_effort;
   }
   if (model?.default_effort === undefined) return undefined;
-  if (!model.efforts.includes(model.default_effort)) {
+  if (!model.reasoning_efforts.includes(model.default_effort)) {
     throw new Error(`Codex app-server returned an unsupported default reasoning effort: ${model.default_effort}`);
   }
   return model.default_effort;
 }
 
 function threadInput(cwd: string, model: AppServerModel | undefined): StartThreadInput {
-  return model === undefined ? { cwd } : { cwd, model: model.model };
+  return model === undefined ? { cwd } : { cwd, model: model.model_id };
 }
 
 function turnInput(
@@ -123,7 +124,7 @@ function turnInput(
   return {
     threadId,
     text: instruction,
-    ...(model === undefined ? {} : { model: model.model }),
+    ...(model === undefined ? {} : { model: model.model_id }),
     ...(effort === undefined ? {} : { effort }),
   };
 }
@@ -257,7 +258,7 @@ export class CodexAppServerBackend implements ExecutionBackend {
       const model = selectedModel(request, models);
       const effort = selectedEffort(request, model);
       session = await this.sessions.updateSession(session.session_id, {
-        ...(model === undefined ? {} : { model: model.model }),
+        ...(model === undefined ? {} : { model_id: model.model_id }),
         ...(effort === undefined ? {} : { reasoning_effort: effort }),
       });
 

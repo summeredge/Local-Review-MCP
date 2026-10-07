@@ -143,7 +143,7 @@ describe("DesktopThreadCoordinator", () => {
       bindings: new DesktopThreadBindingStore(createRoot()),
     });
 
-    await coordinator.createOrReuseThread(input({ model: "gpt-6-astra", reasoningEffort: "high" }));
+    await coordinator.createOrReuseThread(input({ model_id: "gpt-6-astra", reasoning_effort: "high" }));
 
     expect(calls[0]?.name).toBe("create_thread");
     expect(calls[0]?.arguments).toEqual({

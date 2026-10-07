@@ -1145,7 +1145,7 @@ class LauncherWindow(QMainWindow):
         self.session_details_label.setText(NO_SESSION_TEXT if session is None else "\n".join([
             f"Session：{session.session_id}",
             f"Thread：{session.thread_id or '—'}",
-            f"Model：{session.model or '—'}",
+            f"Model：{session.display_name or session.model_id or '—'}",
             f"Reasoning：{session.reasoning_effort or '—'}",
             f"更新时间：{self._format_timestamp(session.updated_at)}",
         ]))

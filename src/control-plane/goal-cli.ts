@@ -197,7 +197,7 @@ export async function runGoalSubmissionCommand(
   let server: Server | undefined;
   try {
     server = await (dependencies.startApp ?? startApp)(settings, context, { silent: true });
-    const result = await context.goalSubmission.submitGoal(args.request);
+    const result = await context.goalSubmission.submitExternalGoal(args.request);
     if (result.status === "running") {
       if (dependencies.registerShutdown !== undefined) {
         const close = (): void => {

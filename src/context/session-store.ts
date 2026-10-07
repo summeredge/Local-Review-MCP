@@ -14,6 +14,7 @@ import {
   updateSessionInputSchema,
 } from "./schema.js";
 import { defaultTaskContextStorageRoot } from "./task.js";
+import { migrateLegacyModelIdFields } from "../models/model-resolver.js";
 import type {
   CreateSessionInput,
   Session,
@@ -89,7 +90,7 @@ export class SessionStore {
       status: parsed.status,
       workspace: parsed.workspace,
       ...(parsed.thread_id === undefined ? {} : { thread_id: parsed.thread_id }),
-      ...(parsed.model === undefined ? {} : { model: parsed.model }),
+      ...(parsed.model_id === undefined ? {} : { model_id: parsed.model_id }),
       ...(parsed.reasoning_effort === undefined ? {} : { reasoning_effort: parsed.reasoning_effort }),
       created_at: timestamp,
       updated_at: timestamp,
@@ -121,7 +122,7 @@ export class SessionStore {
     }
 
     try {
-      const session = sessionSchema.parse(JSON.parse(contents) as unknown);
+      const session = sessionSchema.parse(migrateLegacyModelIdFields(JSON.parse(contents) as unknown));
       if (session.session_id !== sessionId) {
         throw new Error("Session does not match the requested identity.");
       }
@@ -143,7 +144,7 @@ export class SessionStore {
       ...current,
       ...(parsed.status === undefined ? {} : { status: parsed.status }),
       ...(parsed.thread_id === undefined ? {} : { thread_id: parsed.thread_id }),
-      ...(parsed.model === undefined ? {} : { model: parsed.model }),
+      ...(parsed.model_id === undefined ? {} : { model_id: parsed.model_id }),
       ...(parsed.reasoning_effort === undefined ? {} : { reasoning_effort: parsed.reasoning_effort }),
       updated_at: new Date().toISOString(),
     });

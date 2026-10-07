@@ -512,7 +512,7 @@ describe("Codex Event Adapter and LRM event stream", () => {
       status: "running_turn",
       workspace: "C:\\workspace",
       thread_id: "thread-1",
-      model: "gpt-5.6-luna",
+      model_id: "gpt-5.6-luna",
       reasoning_effort: "max",
     });
     const executions = new ExecutionContextService(root);
@@ -553,6 +553,7 @@ describe("Codex Event Adapter and LRM event stream", () => {
       thread_id: "thread-1",
       status: "running_turn",
       model: "gpt-5.6-luna",
+      display_name: "GPT-5.6 Luna",
       reasoning_effort: "max",
       current_execution: {
         execution_id: "execution-1",
@@ -584,6 +585,7 @@ describe("Codex Event Adapter and LRM event stream", () => {
       task_name: "Reply",
       backend_type: "codex_app_server",
       model: "gpt-5.6-luna",
+      display_name: "GPT-5.6 Luna",
       reasoning_effort: "max",
       updated_at: expect.any(String),
     }]);
@@ -604,6 +606,8 @@ describe("Codex Event Adapter and LRM event stream", () => {
     expect(mcpResult.structuredContent).toMatchObject({
       session_id: "session-1",
       status: "running_turn",
+      model: "gpt-5.6-luna",
+      display_name: "GPT-5.6 Luna",
       current_execution: { execution_id: "execution-1" },
     });
     const executionResult = await client.callTool({

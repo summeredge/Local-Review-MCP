@@ -7,6 +7,7 @@ import {
   type DesktopThreadBindingStore,
 } from "./desktop-thread-binding-store.js";
 import type { DesktopThreadBinding } from "./desktop-thread-binding.js";
+import type { ReasoningEffort } from "../models/model-catalog.js";
 
 export type DesktopThreadCoordinatorErrorCode =
   | "binding_not_found"
@@ -35,8 +36,8 @@ export interface CreateOrReuseThreadInput extends DesktopCodexCommandOptions {
   readonly session_id: string;
   readonly projectId: string;
   readonly prompt: string;
-  readonly model?: string;
-  readonly reasoningEffort?: string;
+  readonly model_id?: string;
+  readonly reasoning_effort?: ReasoningEffort;
 }
 
 /**
@@ -86,8 +87,8 @@ export class DesktopThreadCoordinator {
       ...commandOptions(input),
       projectId: input.projectId,
       prompt: input.prompt,
-      ...(input.model === undefined ? {} : { model: input.model }),
-      ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
+      ...(input.model_id === undefined ? {} : { model_id: input.model_id }),
+      ...(input.reasoning_effort === undefined ? {} : { reasoning_effort: input.reasoning_effort }),
     });
     const now = new Date().toISOString();
     try {

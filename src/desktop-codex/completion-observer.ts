@@ -54,6 +54,7 @@ export interface DesktopCompletionResult {
   readonly hostId: string;
   readonly turnId?: string;
   readonly reason?: DesktopCompletionUnknownReason;
+  readonly agentMessages?: readonly { readonly id: string; readonly text: string }[];
 }
 
 export interface DesktopCompletionObserverOptions {
@@ -63,6 +64,9 @@ export interface DesktopCompletionObserverOptions {
   /** Bound for retrying an unreadable (tool-error) first read of an empty-baseline target. */
   readonly visibilityGraceMs?: number;
   readonly visibilityPollIntervalMs?: number;
+  /** Bound continuous read failures without imposing a duration limit on a healthy running turn. */
+  readonly readFailureTimeoutMs?: number;
+  readonly onTurnStarted?: (turnId: string) => Promise<void>;
 }
 
 export class DesktopCompletionObserverError extends Error {
@@ -93,6 +97,7 @@ interface CompletionTurn {
   readonly status: unknown;
   readonly error: unknown;
   readonly completedAt: unknown;
+  readonly agentMessages: readonly { readonly id: string; readonly text: string }[];
 }
 
 interface ReadSnapshot {
@@ -145,7 +150,7 @@ function timeoutFor(context: DesktopCompletionContext): number {
 function resultFor(
   context: DesktopCompletionContext,
   status: DesktopCompletionStatus,
-  values: Pick<DesktopCompletionResult, "turnId" | "reason"> = {},
+  values: Pick<DesktopCompletionResult, "turnId" | "reason" | "agentMessages"> = {},
 ): DesktopCompletionResult {
   return {
     status,
@@ -153,6 +158,8 @@ function resultFor(
     hostId: context.hostId,
     ...(values.turnId === undefined ? {} : { turnId: values.turnId }),
     ...(values.reason === undefined ? {} : { reason: values.reason }),
+    ...(values.agentMessages === undefined || values.agentMessages.length === 0
+      ? {} : { agentMessages: values.agentMessages }),
   };
 }
 
@@ -200,6 +207,10 @@ function readSnapshot(result: CallToolResult, context: DesktopCompletionContext)
       status: value.status,
       error: value.error,
       completedAt: value.completedAt,
+      agentMessages: (Array.isArray(value.items) ? value.items : [])
+        .filter((item) => isRecord(item) && item.type === "agentMessage"
+          && nonEmpty(item.id) && item.id.length <= 256 && typeof item.text === "string")
+        .map((item) => ({ id: item.id as string, text: (item.text as string).slice(0, 100_000) })),
     });
   }
   return { turns: parsedTurns };
@@ -336,6 +347,7 @@ export class DesktopCompletionObserver {
   private readonly pollIntervalMs: number;
   private readonly visibilityGraceMs: number;
   private readonly visibilityPollIntervalMs: number;
+  private readonly readFailureTimeoutMs: number;
 
   public constructor(private readonly options: DesktopCompletionObserverOptions) {
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -347,6 +359,10 @@ export class DesktopCompletionObserver {
       throw new Error("visibilityGraceMs must be a non-negative integer.");
     }
     this.visibilityPollIntervalMs = options.visibilityPollIntervalMs ?? DEFAULT_VISIBILITY_POLL_INTERVAL_MS;
+    this.readFailureTimeoutMs = options.readFailureTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.readFailureTimeoutMs) || this.readFailureTimeoutMs < 1) {
+      throw new Error("readFailureTimeoutMs must be a positive integer.");
+    }
     // A zero interval would make the bounded visibility retry a busy-loop, so it is rejected.
     if (!Number.isSafeInteger(this.visibilityPollIntervalMs) || this.visibilityPollIntervalMs < 1) {
       throw new Error("visibilityPollIntervalMs must be a positive integer.");
@@ -462,6 +478,7 @@ export class DesktopCompletionObserver {
       : 0;
     let candidateTurnId: string | undefined;
     let afterCursor: string | undefined;
+    let readFailureSince: number | undefined;
     while (true) {
       if (context.signal?.aborted) throw abortError();
       const now = Date.now();
@@ -492,6 +509,7 @@ export class DesktopCompletionObserver {
           await this.read(context, readTimeoutMs),
           context,
         );
+        readFailureSince = undefined;
       } catch (error: unknown) {
         if (isAbort(error, context.signal)) throw abortError();
         if (visibilityActive && transientObservationError(error)) {
@@ -513,6 +531,10 @@ export class DesktopCompletionObserver {
             : resultFor(context, "unknown", { reason: "first_turn_visibility_unavailable" });
         }
         if (transientObservationError(error)) {
+          readFailureSince ??= Date.now();
+          if (Date.now() - readFailureSince >= this.readFailureTimeoutMs) {
+            return resultFor(context, "unknown", { reason: "capability_unavailable" });
+          }
           if (this.visibilityGraceMs === 0 && context.baseline.turnIds.length === 0) {
             return resultFor(context, "unknown", { reason: "tool_error" });
           }
@@ -533,13 +555,17 @@ export class DesktopCompletionObserver {
 
       const evaluation = evaluate(snapshot, context.baseline, candidateTurnId);
       if (evaluation.kind === "completed") {
-        return resultFor(context, "completed", { turnId: evaluation.turnId });
+        return resultFor(context, "completed", { turnId: evaluation.turnId,
+          agentMessages: snapshot.turns.find((turn) => turn.id === evaluation.turnId)?.agentMessages });
       }
       if (evaluation.kind === "unknown") {
         return resultFor(context, "unknown", {
           reason: evaluation.reason,
           ...(evaluation.turnId === undefined ? {} : { turnId: evaluation.turnId }),
         });
+      }
+      if (candidateTurnId === undefined && evaluation.candidateTurnId !== undefined) {
+        await this.options.onTurnStarted?.(evaluation.candidateTurnId);
       }
       candidateTurnId = evaluation.candidateTurnId ?? candidateTurnId;
 

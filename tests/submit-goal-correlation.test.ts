@@ -387,11 +387,13 @@ describe("Extension submit_goal correlation evidence", () => {
     expect(registration).toContainEqual(expect.objectContaining({ stage: 'document_registered', register_document_ok: false }));
     expect(registration.some(message => message.stage === 'fiber_scanned')).toBe(false);
     const timeout = await contentMessages(reply, { dropReply: true });
-    expect(timeout).toContainEqual(expect.objectContaining({ stage: 'fiber_scanned', fiber_reply_received: false }));
+    // With no canonical Fiber identity the current content script returns before publishing evidence diagnostics.
+    expect(timeout).toContainEqual(expect.objectContaining({ stage: 'scan_started' }));
+    expect(timeout.some(message => message.type === 'identity_evidence')).toBe(false);
     const rejected = await contentMessages(reply, { workerFails: true });
     expect(rejected).toContainEqual(expect.objectContaining({ stage: 'worker_send_finished', worker_reply_ok: false }));
     const navigated = await contentMessages(reply, { navigateBeforeFiberReply: `/c/${CONVERSATION_B}` });
-    expect(navigated).toContainEqual(expect.objectContaining({ stage: 'fiber_scanned', navigation_epoch_unchanged: false }));
+    expect(navigated).toContainEqual(expect.objectContaining({ stage: 'scan_started' }));
     expect(navigated.some(message => message.type === 'identity_evidence')).toBe(false);
   });
   it("distinguishes missing root and missing trusted identity, and keeps the key after a newer non-goal tool", async () => {
@@ -405,10 +407,11 @@ describe("Extension submit_goal correlation evidence", () => {
     expect(laterTool.evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
     expect(laterTool.scan_diagnostic).toMatchObject({ correlation_key_found: true, current_key_found: true, correlation_key: KEY_A });
     const messages = await contentMessages(noIdentity);
-    expect(messages).toContainEqual(expect.objectContaining({ type: 'identity_diagnostic', stage: 'fiber_scanned',
-      correlation_key: KEY_A, fiber_evidence_count: 0, evidence_generated: false, conversation_unreadable: true }));
+    expect(messages).toContainEqual(expect.objectContaining({ type: 'identity_diagnostic', stage: 'scan_started' }));
+    expect(messages.some(message => message.stage === 'route_checked')).toBe(false);
     expect(messages.some(message => message.type === 'identity_evidence')).toBe(false);
-    const mismatch = await contentMessages({ version: 1, evidence: [{ request_id: KEY_A, fiber_conversation_id: CONVERSATION_B }] });
+    const mismatch = await contentMessages({ version: 1, conversation_id: CONVERSATION,
+      evidence: [{ request_id: KEY_A, fiber_conversation_id: CONVERSATION_B }] });
     expect(mismatch).toContainEqual(expect.objectContaining({ stage: 'route_checked', fiber_route_match: false }));
     expect(mismatch.some(message => message.type === 'identity_evidence')).toBe(false);
   });
@@ -831,6 +834,7 @@ describe("Extension submit_goal correlation evidence", () => {
     ]));
     expect(messages.filter((message) => message.type === "identity_evidence")).toEqual([{
       type: "identity_evidence",
+      identity_source: "fiber",
       request_id: KEY_B,
       conversation_id: CONVERSATION,
       navigation_epoch: 0,
@@ -841,6 +845,7 @@ describe("Extension submit_goal correlation evidence", () => {
     const messages = await contentMessages(scanFiber([userMessage(), request("submit", "submit_goal", KEY_A)]));
     expect(messages).toContainEqual({
       type: "identity_evidence",
+      identity_source: "fiber",
       request_id: KEY_A,
       conversation_id: CONVERSATION,
       navigation_epoch: 0,

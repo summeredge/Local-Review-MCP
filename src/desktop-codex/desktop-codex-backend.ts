@@ -1,4 +1,5 @@
 ﻿import { resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { ExecutionContextService } from "../context/execution-service.js";
 import { SessionStore } from "../context/session-store.js";
 import { TaskContextService } from "../context/service.js";
@@ -27,6 +28,7 @@ import { resolveDesktopProject } from "./desktop-project-resolver.js";
 import { DesktopThreadBindingStore } from "./desktop-thread-binding-store.js";
 import { DesktopThreadCoordinator } from "./desktop-thread-coordinator.js";
 import { DesktopCodexThreadCommands } from "./thread-commands.js";
+import { openDesktopThread } from "./desktop-thread-activator.js";
 
 /** Stable, honest command label. Desktop executions never claim an app-server command. */
 export const DESKTOP_EXECUTION_COMMAND = "desktop codex_app";
@@ -56,12 +58,13 @@ export class DesktopExecutionError extends Error {
 
 export interface DesktopCodexBackendOptions {
   readonly storageRoot?: string;
-  readonly eventStore?: Pick<EventStore, "appendEvent">;
+  readonly eventStore?: Pick<EventStore, "appendEvent" | "listEvents">;
   readonly runtimeFactory?: DesktopCodexRuntimeProvider;
   readonly desktopState?: () => DesktopSyncState;
   readonly completionTimeoutMs?: number;
   readonly pollIntervalMs?: number;
   readonly now?: () => string;
+  readonly openDesktopThread?: (url: string) => Promise<void>;
 }
 
 interface DesktopRuntime {
@@ -92,7 +95,7 @@ function boundedSummary(value: string | undefined, fallback: string): string {
   return summary === "" ? fallback : summary;
 }
 
-function requestKey(request: ExecutionBackendStartRequest): string {
+function requestKey(request: Pick<ExecutionBackendStartRequest, "workspace_id" | "task_id" | "execution_id">): string {
   return request.workspace_id + "\0" + request.task_id + "\0" + request.execution_id;
 }
 
@@ -105,12 +108,13 @@ export class DesktopCodexBackend implements ExecutionBackend {
   private readonly sessions: SessionStore;
   private readonly executions: ExecutionContextService;
   private readonly tasks: TaskContextService;
-  private readonly events: Pick<EventStore, "appendEvent">;
+  private readonly events: Pick<EventStore, "appendEvent" | "listEvents">;
   private readonly runtimeFactory: DesktopCodexRuntimeProvider | undefined;
   private readonly desktopState: (() => DesktopSyncState) | undefined;
   private readonly completionTimeoutMs: number;
   private readonly pollIntervalMs: number | undefined;
   private readonly now: () => string;
+  private readonly openThread: (url: string) => Promise<void>;
   private readonly inFlight = new Map<string, Promise<ExecutionStartResult>>();
   private readonly runtimes = new Map<string, DesktopRuntime>();
   private readonly watchAbortControllers = new Map<string, AbortController>();
@@ -132,6 +136,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
     this.completionTimeoutMs = options.completionTimeoutMs ?? DEFAULT_TOOL_CALL_TIMEOUT_MS;
     this.pollIntervalMs = options.pollIntervalMs;
     this.now = options.now ?? (() => new Date().toISOString());
+    this.openThread = options.openDesktopThread ?? openDesktopThread;
   }
 
   public start(request: ExecutionBackendStartRequest): Promise<ExecutionStartResult> {
@@ -171,6 +176,41 @@ export class DesktopCodexBackend implements ExecutionBackend {
    */
   public whenIdle(): Promise<void> {
     return Promise.all([...this.completions.values()]).then(() => undefined);
+  }
+
+  /** Startup reconciliation never resends a task whose completion observer belonged to an old Host. */
+  public async reconcileOrphanedExecutions(): Promise<void> {
+    const sessions = await this.sessions.listSessions();
+    for (const task of await this.tasks.listTaskContexts()) {
+      let cwd: string;
+      try { cwd = this.registry.resolve(task.workspace_id).manager.canonicalRoot; }
+      catch { continue; }
+      for (const execution of await this.executions.listExecutions(task.workspace_id, task.task_id)) {
+        if (execution.status !== "running" || execution.command !== DESKTOP_EXECUTION_COMMAND) continue;
+        const identity = { workspace_id: task.workspace_id, task_id: task.task_id, execution_id: execution.execution_id };
+        if (this.inFlight.has(requestKey(identity))) continue;
+        const matches: Session[] = [];
+        for (const session of sessions) {
+          if (session.task_id !== task.task_id
+            || session.backend_type !== DESKTOP_EXECUTION_BACKEND_IDENTITY
+            || session.workspace !== cwd) continue;
+          const events = await this.events.listEvents(session.session_id).catch(() => []);
+          if (events.some((event) => event.execution_id === execution.execution_id)) matches.push(session);
+        }
+        if (matches.length !== 1) {
+          await this.projectFailure(identity, undefined, {
+            summary: "Desktop execution has no unambiguous Session or completion observer after runtime shutdown.",
+          });
+          continue;
+        }
+        const session = matches[0]!;
+        if (this.completions.has(session.session_id)) continue;
+        await this.projectFailure(identity, session.session_id, {
+          summary: "Desktop execution completion observer was lost by a previous runtime shutdown.",
+          ...(session.thread_id === undefined ? {} : { threadId: session.thread_id }),
+        });
+      }
+    }
   }
 
   public async close(): Promise<void> {
@@ -243,6 +283,8 @@ export class DesktopCodexBackend implements ExecutionBackend {
         backend_type: DESKTOP_EXECUTION_BACKEND_IDENTITY,
         status: "created",
         workspace: cwd,
+        ...(request.model_id === undefined ? {} : { model_id: request.model_id }),
+        ...(request.reasoning_effort === undefined ? {} : { reasoning_effort: request.reasoning_effort }),
       });
       session = await this.sessions.updateSession(session.session_id, { status: "starting" });
       execution = await this.executions.createExecutionContext({
@@ -264,8 +306,8 @@ export class DesktopCodexBackend implements ExecutionBackend {
         executorThreadId,
         projectId,
         prompt: request.instruction,
-        ...(request.model === undefined ? {} : { model: request.model }),
-        ...(request.reasoning_effort === undefined ? {} : { reasoningEffort: request.reasoning_effort }),
+        ...(request.model_id === undefined ? {} : { model_id: request.model_id }),
+        ...(request.reasoning_effort === undefined ? {} : { reasoning_effort: request.reasoning_effort }),
       });
       if (!created.created) {
         throw new DesktopExecutionError(
@@ -281,6 +323,13 @@ export class DesktopCodexBackend implements ExecutionBackend {
         status: "active",
         thread_id: threadId,
       });
+      // create_thread has already dispatched the task. Navigation is only a UI hint and must
+      // not prevent observation or incorrectly fail an execution that is still running.
+      try {
+        await this.openThread(`codex://threads/${encodeURIComponent(threadId)}`);
+      } catch (error: unknown) {
+        console.warn("Desktop thread activation failed; completion observation will continue", errorMessage(error));
+      }
       await this.recordEvent({
         session_id: session.session_id,
         execution_id: request.execution_id,
@@ -425,6 +474,12 @@ export class DesktopCodexBackend implements ExecutionBackend {
         'Execution "' + execution.execution_id + '" has no recoverable Desktop Session.',
       );
     }
+    if (!this.completions.has(session.session_id)) {
+      await this.projectFailure(request, session.session_id, {
+        summary: "Desktop execution has no live completion observer in this runtime.", threadId: session.thread_id,
+      });
+      throw new DesktopExecutionError("execution_not_recoverable", "Desktop completion observer is unavailable.");
+    }
     return {
       execution_id: execution.execution_id,
       started_at: execution.started_at,
@@ -453,8 +508,11 @@ export class DesktopCodexBackend implements ExecutionBackend {
       const observer = new DesktopCompletionObserver({
         client,
         contracts,
+        readFailureTimeoutMs: this.completionTimeoutMs,
+        onTurnStarted: (turnId) => this.recordTurnStarted(watch, turnId),
         ...(this.pollIntervalMs === undefined ? {} : { pollIntervalMs: this.pollIntervalMs }),
       });
+      let unavailableSince: number | undefined;
       while (!this.closing) {
         const completion = await observer.waitForCompletion({
           executorThreadId: watch.executorThreadId,
@@ -469,7 +527,13 @@ export class DesktopCodexBackend implements ExecutionBackend {
         }
         if (completion.reason === "first_turn_visibility_unavailable"
           || (completion.reason === "tool_error" && completion.turnId === undefined)) {
-          // This is an observer availability result, not evidence that the Desktop turn failed.
+          // Transient visibility errors may recover, but cannot keep an Execution running forever.
+          unavailableSince ??= Date.now();
+          if (Date.now() - unavailableSince >= this.completionTimeoutMs) {
+            await this.fail(watch, "Desktop turn completion observation unavailable.");
+            return;
+          }
+          await delay(Math.min(250, this.completionTimeoutMs), undefined, { signal: watch.signal });
           continue;
         }
         // Only a verifiable observer turn id is carried into failure projection; never synthesize one.
@@ -486,8 +550,8 @@ export class DesktopCodexBackend implements ExecutionBackend {
         );
         return;
       }
+      await this.fail(watch, "Desktop execution observer stopped before completion.");
     } catch (error: unknown) {
-      if (this.closing) return;
       await this.fail(watch, "Desktop turn failed: " + errorMessage(error));
     } finally {
       this.watchAbortControllers.delete(watch.sessionId);
@@ -504,6 +568,17 @@ export class DesktopCodexBackend implements ExecutionBackend {
     );
     if (execution === null || execution.status !== "running") return;
     if (completion.turnId !== undefined) {
+      await this.recordTurnStarted(watch, completion.turnId);
+      for (const message of completion.agentMessages ?? []) {
+        for (let offset = 0; offset < message.text.length; offset += 4_000) {
+          await this.recordEvent({
+            session_id: watch.sessionId, execution_id: watch.request.execution_id,
+            thread_id: watch.threadId, timestamp: this.now(), event_type: "agent_message_completed",
+            turn_id: completion.turnId, item_id: message.id,
+            payload: { content: message.text.slice(offset, offset + 4_000) },
+          });
+        }
+      }
       await this.recordEvent({
         session_id: watch.sessionId,
         execution_id: watch.request.execution_id,
@@ -522,6 +597,13 @@ export class DesktopCodexBackend implements ExecutionBackend {
     );
     await this.sessions.updateSession(watch.sessionId, { status: "completed" });
     await this.notifyTerminal(next);
+  }
+
+  private async recordTurnStarted(watch: WatchContext, turnId: string): Promise<void> {
+    if (watch.resolvedTurnId === turnId) return;
+    await this.recordEvent({ session_id: watch.sessionId, execution_id: watch.request.execution_id,
+      thread_id: watch.threadId, timestamp: this.now(), event_type: "turn_started", turn_id: turnId, payload: {} });
+    watch.resolvedTurnId = turnId;
   }
 
   private async fail(watch: WatchContext, reason: string): Promise<void> {
@@ -557,6 +639,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
     await this.projectFailure(request, session?.session_id, {
       summary: boundedSummary(errorMessage(error), "Desktop execution failed."),
       persistEvent: session !== undefined && current?.status === "running",
+      ...(session?.thread_id === undefined ? {} : { threadId: session.thread_id }),
     });
   }
 
@@ -567,7 +650,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
    * event schema requires a thread identity and the backend must never fabricate one.
    */
   private async projectFailure(
-    request: ExecutionBackendStartRequest,
+    request: Pick<ExecutionBackendStartRequest, "workspace_id" | "task_id" | "execution_id">,
     sessionId: string | undefined,
     values: {
       readonly summary: string;

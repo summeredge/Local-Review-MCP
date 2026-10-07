@@ -29,10 +29,16 @@ import { CODEX_EXECUTION_COMMAND, readCodexExecutionEvents } from "./codex-execu
 import { ActuationAuthorizationStore } from "./controlled-actuation.js";
 import { DESKTOP_EXECUTION_COMMAND } from "../desktop-codex/desktop-codex-backend.js";
 import { APP_SERVER_COMMAND } from "../backends/codex_app_server/backend.js";
+import { MODEL_CATALOG } from "../models/model-catalog.js";
 
 const providerIdSchema = z.string().min(1).max(256);
 const optionalModelSchema = z.string().min(1).max(256).optional();
 const optionalEffortSchema = z.string().min(1).max(64).optional();
+
+function modelStatusFields(model_id: string): { model: string; display_name?: string } {
+  const display_name = MODEL_CATALOG.find((entry) => entry.model_id === model_id)?.display_name;
+  return { model: model_id, ...(display_name === undefined ? {} : { display_name }) };
+}
 
 export const sessionStatusQueryInputSchema = z.object({
   session_id: sessionIdSchema.optional(),
@@ -77,6 +83,7 @@ export const sessionStatusOutputSchema = z.object({
   status: sessionStatusSchema,
   thread_id: providerIdSchema.optional(),
   model: optionalModelSchema,
+  display_name: optionalModelSchema,
   reasoning_effort: optionalEffortSchema,
   goal_status: z.enum(["pending", "running", "completed", "failed", "human_required"]).optional(),
   current_execution: currentExecutionSchema.optional(),
@@ -142,6 +149,7 @@ export interface LauncherSessionSummary {
   readonly status: SessionStatusOutput["status"];
   readonly thread_id?: string;
   readonly model?: string;
+  readonly display_name?: string;
   readonly reasoning_effort?: string;
   readonly goal_status?: SessionStatusOutput["goal_status"];
   readonly current_execution?: SessionStatusOutput["current_execution"];
@@ -173,6 +181,7 @@ export interface LauncherExecutionSummary {
   readonly thread_id?: string;
   readonly backend_type?: SessionBackendType;
   readonly model?: string;
+  readonly display_name?: string;
   readonly reasoning_effort?: string;
   readonly updated_at: string;
 }
@@ -341,7 +350,7 @@ export class StatusQueryService {
       backend_type: session.backend_type,
       status: session.status,
       ...(session.thread_id === undefined ? {} : { thread_id: session.thread_id }),
-      ...(session.model === undefined ? {} : { model: session.model }),
+      ...(session.model_id === undefined ? {} : modelStatusFields(session.model_id)),
       ...(session.reasoning_effort === undefined ? {} : { reasoning_effort: session.reasoning_effort }),
       ...(sessionGoal === undefined ? {} : { goal_status: sessionGoal.status }),
       ...(executionId === undefined || currentExecutionStatus === undefined ? {} : {
@@ -515,7 +524,7 @@ export class StatusQueryService {
       : execution.command === APP_SERVER_COMMAND ? "codex_app_server"
       : session?.backend_type;
     const mode = backend === undefined ? undefined : backend === "cli" ? "batch" : "interactive";
-    const model = session?.model ?? authorization?.model;
+    const model = session?.model_id ?? authorization?.model_id;
     const effort = session?.reasoning_effort ?? authorization?.reasoning_effort;
     return {
       execution_id: execution.execution_id,
@@ -525,7 +534,7 @@ export class StatusQueryService {
         goal_id: goal.goal_id,
       }),
       ...(mode === undefined ? {} : { execution_mode: mode }),
-      ...(model === undefined ? {} : { model }),
+      ...(model === undefined ? {} : modelStatusFields(model)),
       ...(effort === undefined ? {} : { reasoning_effort: effort }),
       name: goalName ?? taskName,
       ...(goalName === undefined ? {} : { goal_name: goalName }),

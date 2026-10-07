@@ -6,6 +6,7 @@ import {
   workspaceIdSchema,
 } from "../context/schema.js";
 import type { ExecutionContext } from "../context/types.js";
+import { reasoningEffortSchema } from "../models/model-catalog.js";
 import {
   CodexExecutionAdapter,
   type CodexExecutionStartRequest,
@@ -19,8 +20,7 @@ const executionInstructionSchema = z.string()
   .max(1_000_000)
   .refine((value) => value.trim() !== "", "instruction is required")
   .refine((value) => !value.includes("\0"), "instruction contains a null byte");
-const executionModelSchema = z.string().min(1).max(256);
-const executionReasoningEffortSchema = z.string().min(1).max(64);
+const executionModelIdSchema = z.string().min(1).max(256);
 
 export const executionBackendStartRequestSchema = z.object({
   goal_id: goalIdSchema.optional(),
@@ -30,8 +30,8 @@ export const executionBackendStartRequestSchema = z.object({
   execution_id: executionIdSchema,
   instruction: executionInstructionSchema,
   execution_mode: executionModeSchema.default("batch"),
-  model: executionModelSchema.optional(),
-  reasoning_effort: executionReasoningEffortSchema.optional(),
+  model_id: executionModelIdSchema.optional(),
+  reasoning_effort: reasoningEffortSchema.optional(),
 }).strict();
 
 export type ExecutionBackendStartRequest = z.input<typeof executionBackendStartRequestSchema>;

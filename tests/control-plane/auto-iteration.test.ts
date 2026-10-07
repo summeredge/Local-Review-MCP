@@ -65,7 +65,7 @@ function verdict(
 async function fixture(
   decisions: Array<"APPROVE" | "ITERATE" | "HUMAN_REQUIRED"> = ["APPROVE"],
   delivery: "delivered" | "failed" | "ambiguous" = "delivered",
-  initial: Pick<ActuationAuthorizationInput, "goal_id" | "execution_mode" | "model" | "reasoning_effort"> | null = { execution_mode: "batch" },
+  initial: Pick<ActuationAuthorizationInput, "goal_id" | "execution_mode" | "model_id" | "reasoning_effort"> | null = { execution_mode: "batch" },
 ): Promise<{
   readonly root: string;
   readonly registry: WorkspaceRegistry;
@@ -246,7 +246,7 @@ describe("AutoIterationService", () => {
   it.each(["missing", "missing-mode", "missing-goal", "wrong-workspace", "wrong-task", "wrong-execution", "corrupt"])(
     "fails closed after restart when the initial authorization is %s", async (fault) => {
       const value = await fixture(["ITERATE"], "delivered", fault === "missing" ? null : {
-        goal_id: "goal-1", execution_mode: "interactive", model: "gpt-5.6-luna", reasoning_effort: "max",
+        goal_id: "goal-1", execution_mode: "interactive", model_id: "gpt-5.6-luna", reasoning_effort: "max",
       });
       await value.executionService.updateExecutionContext("workspace-a", "task-001", "execution-001", {
         command: "desktop codex_app",
@@ -286,7 +286,7 @@ describe("AutoIterationService", () => {
   it("rejects a recovered iteration authorization that lost the initial interactive configuration", async () => {
     const value = await fixture(["APPROVE"], "delivered", {
       goal_id: "goal-1",
-      execution_mode: "interactive", model: "gpt-5.6-luna", reasoning_effort: "max",
+      execution_mode: "interactive", model_id: "gpt-5.6-luna", reasoning_effort: "max",
     });
     const pending = { goal: "Fix", requirements: ["Preserve routing"], acceptance_criteria: ["Tests pass"] };
     const authorization = await value.auto.controlledActuation.authorize({

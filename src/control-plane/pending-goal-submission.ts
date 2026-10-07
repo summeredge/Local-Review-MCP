@@ -24,6 +24,8 @@ import type { ConversationCorrelationRegistry } from "./conversation-correlation
 import type { ExtensionIdentityEvidence } from "./extension-identity.js";
 import { IdentityEvidenceInbox, IdentityEvidenceConflictError, identityEvidenceAck, type IdentityEvidenceAck } from "./identity-evidence-inbox.js";
 import { executionModeSchema } from "./execution-service.js";
+import { reasoningEffortSchema } from "../models/model-catalog.js";
+import { migrateLegacyModelIdFields } from "../models/model-resolver.js";
 import type {
   IdentityTraceRecordInput,
   IdentityTraceService,
@@ -50,8 +52,8 @@ const pendingPayloadSchema = goalSubmissionRequestSchema.pick({
 }).extend({
   workspace_id: workspaceIdSchema,
   execution_mode: executionModeSchema.optional(),
-  model: z.string().min(1).max(256).optional(),
-  reasoning_effort: z.string().min(1).max(64).optional(),
+  model_id: z.string().min(1).max(256).optional(),
+  reasoning_effort: reasoningEffortSchema.optional(),
 }).strict();
 
 export const pendingGoalSubmissionInputSchema = pendingPayloadSchema.extend({
@@ -165,8 +167,8 @@ function payloadFingerprint(value: PendingGoalSubmission | PendingGoalSubmission
     requirements: value.requirements,
     acceptance_criteria: value.acceptance_criteria,
     max_iterations: value.max_iterations,
-    execution_mode: value.execution_mode ?? "batch",
-    model: value.model ?? null,
+    execution_mode: value.execution_mode ?? "interactive",
+    model_id: value.model_id ?? null,
     reasoning_effort: value.reasoning_effort ?? null,
     connector_provenance: value.connector_provenance?.source ?? null,
   });
@@ -310,7 +312,7 @@ export class PendingGoalSubmissionService {
         created_at: record.accepted_at,
         expires_at: record.expires_at,
         timeout_ms: Date.parse(record.expires_at) - Date.parse(record.accepted_at),
-        execution_mode: record.execution_mode ?? "batch",
+        execution_mode: record.execution_mode ?? "interactive",
       });
       return this.receipt(record);
     });
@@ -484,7 +486,7 @@ export class PendingGoalSubmissionService {
         ...(claimed.record.execution_mode === undefined
           ? {}
           : { execution_mode: claimed.record.execution_mode }),
-        ...(claimed.record.model === undefined ? {} : { model: claimed.record.model }),
+        ...(claimed.record.model_id === undefined ? {} : { model_id: claimed.record.model_id }),
         ...(claimed.record.reasoning_effort === undefined
           ? {}
           : { reasoning_effort: claimed.record.reasoning_effort }),
@@ -603,7 +605,7 @@ export class PendingGoalSubmissionService {
       throw error;
     }
 
-    const state = stateSchema.parse(JSON.parse(raw));
+    const state = stateSchema.parse(migrateLegacyModelIdFields(JSON.parse(raw)));
 
     const restored = new Map<string, PendingGoalSubmission>();
     for (const entry of state.submissions) {

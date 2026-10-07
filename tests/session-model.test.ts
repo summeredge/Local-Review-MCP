@@ -1,8 +1,9 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SessionStore } from "../src/context/session-store.js";
+import { sessionFile, sessionsDirectory } from "../src/context/session.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -67,7 +68,7 @@ describe("SessionStore", () => {
       backend_type: "codex_app_server",
       workspace: "C:\\workspace",
       thread_id: "thread-001",
-      model: "model-a",
+      model_id: "model-a",
       reasoning_effort: "high",
     });
 
@@ -76,5 +77,25 @@ describe("SessionStore", () => {
     expect(cli.backend_type).toBe("cli");
     expect(appServer.backend_type).toBe("codex_app_server");
     expect(appServer.thread_id).toBe("thread-001");
+  });
+
+  it("reads legacy session model fields as model_id", async () => {
+    const root = await makeStorageRoot();
+    await mkdir(sessionsDirectory(root), { recursive: true });
+    await writeFile(sessionFile(root, "session-legacy"), JSON.stringify({
+      session_id: "session-legacy",
+      goal_id: "goal-001",
+      task_id: "task-001",
+      backend_type: "codex_app_server",
+      status: "active",
+      workspace: "C:\\workspace",
+      model: "gpt-6-luna",
+      reasoning_effort: "high",
+      created_at: "2026-10-01T00:00:00.000Z",
+      updated_at: "2026-10-01T00:00:00.000Z",
+    }));
+
+    await expect(new SessionStore(root).getSession("session-legacy"))
+      .resolves.toMatchObject({ model_id: "gpt-6-luna", reasoning_effort: "high" });
   });
 });

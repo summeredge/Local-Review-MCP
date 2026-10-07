@@ -465,6 +465,14 @@ export class CapabilityNegotiator implements ExecutionBackend {
       } catch (error: unknown) {
         const wrapped = new CapabilityExecutionError("desktop", error);
         this.setState(context, "desktop_failed", "desktop", errorReason("desktop"), [], wrapped);
+        // These failures occur before create_thread can dispatch work. Reuse the standalone
+        // provider only at this bootstrap boundary; a target/observer failure must never resend.
+        if (["desktop_disconnected", "executor_identity_unavailable", "desktop_tools_pipe_unavailable",
+          "runtime_connect_failed", "tools_contract_incompatible"].includes(wrapped.code ?? "")) {
+          return this.startStandalone(request, context, {
+            reason: "desktop_handoff_failed", error_code: wrapped.code,
+          });
+        }
         throw wrapped;
       }
     }

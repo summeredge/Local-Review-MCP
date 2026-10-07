@@ -1,4 +1,5 @@
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { ReasoningEffort } from "../models/model-catalog.js";
 import { CodexAppRuntimeError } from "./codex-app-runtime.js";
 
 type JsonSchema = Readonly<Record<string, unknown>>;
@@ -212,7 +213,7 @@ export class CodexAppToolContracts {
   public createThreadArguments(
     prompt: string,
     projectId: string,
-    options: { readonly model?: string; readonly reasoningEffort?: string } = {},
+    options: { readonly model_id?: string; readonly reasoning_effort?: ReasoningEffort } = {},
   ): CreateThreadArguments {
     const tool = this.tools.get("create_thread");
     if (tool === undefined) throw incompatible("create_thread");
@@ -232,11 +233,11 @@ export class CodexAppToolContracts {
     if (localEnvironment === undefined || !requirementsWithin(localEnvironment, new Set(["type"]))) {
       throw incompatible("create_thread");
     }
-    if (options.model !== undefined && !acceptsStringValue(properties.model, options.model)) {
+    if (options.model_id !== undefined && !acceptsStringValue(properties.model, options.model_id)) {
       throw incompatible("create_thread", "model is absent or does not accept the Goal value");
     }
-    if (options.reasoningEffort !== undefined
-      && !acceptsStringValue(properties.thinking, options.reasoningEffort)) {
+    if (options.reasoning_effort !== undefined
+      && !acceptsStringValue(properties.thinking, options.reasoning_effort)) {
       throw incompatible("create_thread", "thinking is absent or does not accept the Goal reasoning_effort");
     }
     return {
@@ -246,8 +247,8 @@ export class CodexAppToolContracts {
         projectId,
         environment: { type: "local" },
       },
-      ...(options.model === undefined ? {} : { model: options.model }),
-      ...(options.reasoningEffort === undefined ? {} : { thinking: options.reasoningEffort }),
+      ...(options.model_id === undefined ? {} : { model: options.model_id }),
+      ...(options.reasoning_effort === undefined ? {} : { thinking: options.reasoning_effort }),
     };
   }
 

@@ -28,6 +28,7 @@ import { ExecutionContextService } from "../../src/context/execution-service.js"
 import { SessionStore } from "../../src/context/session-store.js";
 import { TaskContextService } from "../../src/context/service.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
+import { CapabilityNegotiator, StandaloneCapabilityProvider } from "../../src/control-plane/capability-negotiation.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -76,7 +77,7 @@ class FakeAppServerClient {
   public readonly thread = vi.fn(async (input: { cwd: string; model?: string }): Promise<AppServerThread> => ({
     thread_id: "thread-001",
     session_id: "provider-session-001",
-    ...(input.model === undefined ? {} : { model: input.model }),
+    ...(input.model === undefined ? {} : { model_id: input.model }),
     cwd: input.cwd,
   }));
   public readonly turn = vi.fn(async (_input: {
@@ -102,9 +103,9 @@ class FakeAppServerClient {
 
   public async listModels(): Promise<readonly AppServerModel[]> {
     return [{
-      model: "provider-default",
-      label: "Provider default",
-      efforts: ["high"],
+      model_id: "provider-default",
+      display_name: "Provider default",
+      reasoning_efforts: ["high"],
       default_effort: "high",
       is_default: true,
     }];
@@ -202,7 +203,13 @@ async function fixture(): Promise<{
   });
   const executionService = new ExecutionService(new ExecutionBackendRouter({
     batch: new CliExecutionBackend({ start: cliStart }),
-    interactive: appBackend,
+    interactive: new CapabilityNegotiator({
+      desktop: { source: "desktop", prepare: async () => ({ ready: false, reason: "desktop_disconnected" }),
+        start: async () => { throw new Error("Disconnected Desktop must not start"); } },
+      standalone: new StandaloneCapabilityProvider(appBackend),
+      desktopTimeoutMs: 0,
+      fallbackAfkTimeoutMs: 0,
+    }),
   }));
   const authorizations = new ActuationAuthorizationStore(root);
   const controlled = new ControlledActuationService(registry, {
@@ -254,9 +261,9 @@ async function fixture(): Promise<{
 }
 
 describe("interactive Goal submission", () => {
-  it("keeps the default batch route on the existing CLI backend", async () => {
+  it("keeps the explicit batch route on the existing CLI backend", async () => {
     const value = await fixture();
-    const submitted = await value.submit.submitGoal(request());
+    const submitted = await value.submit.submitExternalGoal(request("batch"));
 
     expect(submitted.status).toBe("running");
     expect(value.cliStart).toHaveBeenCalledTimes(1);
@@ -270,7 +277,7 @@ describe("interactive Goal submission", () => {
 
   it("creates a Session, binds the Thread, and starts one Turn", async () => {
     const value = await fixture();
-    const submitted = await value.submit.submitGoal(request("interactive"));
+    const submitted = await value.submit.submitExternalGoal(request("interactive"));
     const session = (await value.sessions.listSessions())[0]!;
 
     expect(submitted.status).toBe("running");
@@ -282,7 +289,7 @@ describe("interactive Goal submission", () => {
       backend_type: "codex_app_server",
       status: "active",
       thread_id: "thread-001",
-      model: "provider-default",
+      model_id: "provider-default",
       reasoning_effort: "high",
     });
     expect(value.appClient.thread).toHaveBeenCalledWith({

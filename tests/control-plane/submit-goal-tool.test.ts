@@ -21,7 +21,7 @@ import {
   createMcpServer,
 } from "../../src/mcp/server.js";
 import type {
-  GoalSubmissionRequest,
+  ResolvedGoalSubmissionRequest,
   GoalSubmissionResult,
 } from "../../src/control-plane/goal-submission.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
@@ -84,7 +84,7 @@ async function fixture(options: {
   const registry = WorkspaceRegistry.fromManager(new WorkspaceManager(workspace));
   const correlations = new ConversationCorrelationRegistry(storageRoot);
   const submitGoal = vi.fn(async (
-    request: GoalSubmissionRequest,
+    request: ResolvedGoalSubmissionRequest,
     _provenance?: { readonly source: "authenticated_mcp_invocation" },
   ): Promise<GoalSubmissionResult> => ({
     goal_id: `goal-${request.conversation_id}`,
@@ -250,14 +250,46 @@ describe("submit_goal MCP tool", () => {
       .resolves.toContain(CORRELATION_A);
   });
 
-  it("preserves interactive execution mode through the pending identity gate", async () => {
+  it("resolves external model input before persisting a pending Goal", async () => {
+    const { client, correlations, pending, submitGoal } = await fixture();
+    await callFor(client, {
+      ...goalArguments(),
+      model: "GPT-6 Luna Max",
+      reasoning_effort: "high",
+    });
+
+    expect(await pending.get(CORRELATION_A)).toMatchObject({
+      model_id: "gpt-6-luna",
+      reasoning_effort: "high",
+    });
+    await correlations.observe(evidence(CORRELATION_A, "conversation-model"));
+    pending.scheduleResolve(CORRELATION_A);
+    await waitFor(() => submitGoal.mock.calls.length === 1);
+    expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
+      model_id: "gpt-6-luna",
+      reasoning_effort: "high",
+    }));
+  });
+
+  it("returns structured snake_case model resolution errors", async () => {
+    const { client, pending } = await fixture();
+    const result = await callFor(client, { ...goalArguments(), model: "gpt-9" });
+
+    expect(result.isError).toBe(true);
+    expect(toolJson(result)).toMatchObject({
+      error: { code: "model_unknown", input: "gpt-9" },
+    });
+    expect(await pending.list()).toEqual([]);
+  });
+
+  it.each([undefined, "interactive", "batch"] as const)("preserves the %s execution route through the pending identity gate", async (mode) => {
     const { client, correlations, pending, submitGoal, workspaceId } = await fixture();
 
     await callFor(client, {
       ...goalArguments(),
-      execution_mode: "interactive",
+      ...(mode === undefined ? {} : { execution_mode: mode }),
     });
-    expect((await pending.get(CORRELATION_A))?.execution_mode).toBe("interactive");
+    expect((await pending.get(CORRELATION_A))?.execution_mode).toBe(mode ?? "interactive");
 
     await correlations.observe(evidence(CORRELATION_A, "conversation-interactive"));
     pending.scheduleResolve(CORRELATION_A);
@@ -265,7 +297,7 @@ describe("submit_goal MCP tool", () => {
     await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "started");
 
     expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
-      execution_mode: "interactive",
+      execution_mode: mode ?? "interactive",
     }));
   });
 
@@ -286,6 +318,7 @@ describe("submit_goal MCP tool", () => {
       requirements: ["Use the existing Goal workflow."],
       acceptance_criteria: ["The Goal workflow starts."],
       max_iterations: 2,
+      execution_mode: "interactive",
     });
     expect((await pending.get(CORRELATION_A))?.state).toBe("started");
   });

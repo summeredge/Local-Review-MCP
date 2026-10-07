@@ -83,7 +83,8 @@ class SessionViewModel:
     session_id: str
     thread_id: str | None = None
     backend_type: str | None = None
-    model: str | None = None
+    model_id: str | None = None
+    display_name: str | None = None
     reasoning_effort: str | None = None
     updated_at: str | None = None
 
@@ -435,7 +436,8 @@ def _execution_session(document: Mapping[str, object]) -> SessionViewModel | Non
         session_id=_identifier(document.get("session_id"), "session_id"),
         thread_id=_optional_text(document.get("thread_id"), "thread_id"),
         backend_type=_optional_status(document.get("backend_type"), "backend_type", EXECUTION_BACKENDS),
-        model=_optional_text(document.get("model"), "model"),
+        model_id=_optional_text(document.get("model"), "model"),
+        display_name=_optional_text(document.get("display_name"), "display_name"),
         reasoning_effort=_optional_text(document.get("reasoning_effort"), "reasoning_effort", 64),
         updated_at=_optional_rfc3339_timestamp(document.get("updated_at"), "updated_at"),
     )

@@ -38,6 +38,13 @@ import { GoalOrchestrationService } from "../src/control-plane/goal-orchestratio
 import { StatusQueryService } from "../src/control-plane/status-query.js";
 import { BrowserRouter } from "../src/router/browser-router.js";
 import { ReviewCompletionRouter } from "../src/router/review-completion-router.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createMcpServer } from "../src/mcp/server.js";
+import { GoalSubmissionService } from "../src/control-plane/goal-submission.js";
+import { PendingGoalSubmissionService } from "../src/control-plane/pending-goal-submission.js";
+import { ConversationCorrelationRegistry } from "../src/control-plane/conversation-correlation.js";
+import { DesktopCompletionObserver } from "../src/desktop-codex/completion-observer.js";
 
 /**
  * P5.4.1 acceptance tests for the Desktop codex_app production interactive route.
@@ -296,6 +303,9 @@ async function fixture(options: {
   readonly state?: () => DesktopSyncState;
   readonly projectPath?: string;
   readonly runtimeFactory?: DesktopCodexRuntimeProvider;
+  readonly openDesktopThread?: (url: string) => Promise<void>;
+  readonly completionTimeoutMs?: number;
+  readonly pollIntervalMs?: number;
 } = {}): Promise<Fixture> {
   const root = createRoot();
   const workspaceRoot = mkdtempSync(join(tmpdir(), "lrm-p541-ws-"));
@@ -340,8 +350,9 @@ async function fixture(options: {
     eventStore: events,
     runtimeFactory: options.runtimeFactory ?? desktop.runtimeFactory,
     desktopState: options.state ?? (() => desktopState()),
-    completionTimeoutMs: 1_500,
-    pollIntervalMs: 1,
+    completionTimeoutMs: options.completionTimeoutMs ?? 1_500,
+    pollIntervalMs: options.pollIntervalMs ?? 1,
+    openDesktopThread: options.openDesktopThread ?? vi.fn(async () => undefined),
   });
 
   const router = new ExecutionBackendRouter({
@@ -450,6 +461,91 @@ async function waitForTerminalExecution(value: Fixture): Promise<void> {
 }
 
 describe("P5.4.1 route selection", () => {
+  it.each([false, true])("routes explicit interactive MCP submit_goal through completion and automatic Review with activation failure=%s", async (activationFails) => {
+    const open = vi.fn(async () => {
+      if (activationFails) throw new Error("activation failed");
+    });
+    const value = await fixture({ openDesktopThread: open });
+    const review = vi.fn(async (request) => ({ status: "COMPLETED" as const,
+      content: `<lrm-review-result>${JSON.stringify({ schema_version: 1,
+        review_request_id: request.review_request_id, decision: "APPROVE", summary: "Reviewed" })}</lrm-review-result>`,
+    }));
+    const auto = new AutoIterationService(value.registry, { storageRoot: value.root,
+      controlledActuation: value.controlled,
+      browserRouter: new BrowserRouter(value.root, { deliver: async () => ({
+        status: "delivered", delivered_at: new Date().toISOString(),
+      }) }),
+      completionRouter: new ReviewCompletionRouter(value.root, { collect: review }),
+    });
+    const goals = new GoalOrchestrationService(value.registry, { storageRoot: value.root,
+      controlledActuation: value.controlled, authorizationStore: value.controlled.authorizationStore,
+      autoIteration: auto });
+    value.service.setTerminalListener((execution) => auto.onExecutionTerminal(execution));
+    auto.setTerminalListener((loop) => goals.onAutoIterationTerminal(loop));
+    const preflight = vi.fn(async (input) => ({ ready: true, runtime: { ready: true },
+      connector: { ready: true }, extension: { ready: true },
+      workspace: { valid: true, workspace_id: input.workspace_id },
+      conversation: { valid: true, conversation_id: input.conversation_id },
+    }));
+    const correlations = new ConversationCorrelationRegistry(value.root);
+    const pending = new PendingGoalSubmissionService(correlations,
+      new GoalSubmissionService(goals, { checkGoalPreflight: preflight }), {
+        storageRoot: value.root, browserReadiness: () => ({ ready: true, bridge_available: true,
+          extension_paired: true, extension_present: true, readiness_state: "ready" }),
+      });
+    const server = createMcpServer({ registry: value.registry, correlations, pendingGoalSubmission: pending });
+    const client = new Client({ name: "desktop-interactive-route-test", version: "1" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const correlation = "00000000-0000-4000-8000-000000000091";
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      const accepted = await client.callTool({ name: "submit_goal", arguments: {
+        correlation_key: correlation, title: "Desktop interactive", goal: INSTRUCTION,
+        requirements: ["Use Desktop"], acceptance_criteria: ["Review completes"],
+        execution_mode: "interactive",
+      } });
+      expect(accepted.isError).not.toBe(true);
+      expect((await pending.get(correlation))?.execution_mode).toBe("interactive");
+      await correlations.observe({ request_id: correlation, conversation_id: "conversation-1",
+        document_id: "document-1", navigation_epoch: 1 });
+      pending.scheduleResolve(correlation);
+      await vi.waitFor(async () => expect((await pending.get(correlation))?.state).toBe("started"));
+      const record = (await pending.get(correlation))!;
+      if (record.state !== "started") throw new Error("Goal was not started");
+      const result = record;
+      expect(value.cliStart).not.toHaveBeenCalled();
+      expect(value.appServerStart).not.toHaveBeenCalled();
+      expect(preflight).toHaveBeenCalledWith(expect.objectContaining({
+        workspace_id: "workspace-a", execution_mode: "interactive",
+      }));
+      expect(value.desktop.createThreadCount()).toBe(1);
+      const session = (await value.sessions.listSessions())[0]!;
+      expect(open).toHaveBeenCalledWith(`codex://threads/${session.thread_id}`);
+      expect(value.desktop.calls.find((call) => call.name === "create_thread")?.arguments)
+        .toMatchObject({ prompt: expect.stringContaining(INSTRUCTION) });
+      expect((await value.executions.getExecutionContext("workspace-a", result.task_id, result.execution_id))?.status)
+        .toBe("running");
+      value.desktop.setTurns([{ id: "turn-default", status: "completed", completedAt: 1,
+        items: [{ id: "message-default", type: "agentMessage", text: "DESKTOP_DEFAULT_PASS" }] }]);
+      await value.backend.whenIdle();
+      await vi.waitFor(async () => expect((await goals.getGoal(result.goal_id))?.status).toBe("completed"));
+      expect(review).toHaveBeenCalledOnce();
+      expect((await new TaskContextService(value.root).getTaskContext(result.task_id))?.status).toBe("completed");
+      expect(await value.executions.getExecutionContext("workspace-a", result.task_id, result.execution_id))
+        .toMatchObject({ status: "passed", summary: "Desktop turn completed successfully." });
+      expect((await value.events.listEvents(session.session_id)).map((event) => event.event_type))
+        .toEqual(expect.arrayContaining(["session_started", "turn_started", "agent_message_completed", "turn_completed"]));
+      expect(await new StatusQueryService({ storageRoot: value.root }).getExecutionStatus({
+        workspace_id: "workspace-a", execution_id: result.execution_id,
+      })).toMatchObject({ status: "passed", agent_output: "DESKTOP_DEFAULT_PASS" });
+    } finally {
+      await client.close();
+      await server.close();
+      auto.dispose();
+      await value.service.close();
+    }
+  });
+
   it.each(["interactive", "batch"] as const)("preserves %s Goal routing across three rounds and restart", async (mode) => {
     const desktop = fakeDesktop({ uniqueThreads: true });
     const value = await fixture({ desktop });
@@ -480,7 +576,7 @@ describe("P5.4.1 route selection", () => {
       getGoal: (id) => goals.getGoal(id), listGoals: () => goals.listGoals(),
     } });
     await goals.createGoal({ goal_id: GOAL_ID, workspace_id: "workspace-a", conversation_id: "conversation-1",
-      execution_mode: mode, model: "gpt-5.6-luna", reasoning_effort: "max", phases: [{
+      execution_mode: mode, model_id: "gpt-5.6-luna", reasoning_effort: "max", phases: [{
         phase_id: "phase-1", objective: "Fix", tasks: [{ task_id: TASK_ID, goal: "Fix",
           requirements: ["Keep it small"], acceptance_criteria: ["Tests pass"], max_iterations: 3 }],
       }] });
@@ -497,7 +593,7 @@ describe("P5.4.1 route selection", () => {
           "workspace-a", TASK_ID, loop.execution_id,
         );
         expect(authorization).toMatchObject({ goal_id: GOAL_ID, execution_mode: mode,
-          model: "gpt-5.6-luna", reasoning_effort: "max" });
+          model_id: "gpt-5.6-luna", reasoning_effort: "max" });
         if (mode === "batch") {
           await value.executions.updateExecutionContext("workspace-a", TASK_ID, loop.execution_id, { status: "passed" });
         }
@@ -670,7 +766,7 @@ describe("Desktop interactive Goal model and reasoning effort", () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
 
-    await authorizeAndActuate(value, { model: "gpt-5.6-luna", reasoning_effort: "max" });
+    await authorizeAndActuate(value, { model_id: "gpt-5.6-luna", reasoning_effort: "max" });
 
     expect(value.desktop.createThreadCount()).toBe(1);
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
@@ -684,10 +780,9 @@ describe("Desktop interactive Goal model and reasoning effort", () => {
       thinking: "max",
     });
 
-    // Nor are they projected onto the Desktop Session, which needs no provider model.
+    // The Session keeps the canonical model selection; only the provider call renames it.
     const session = (await value.sessions.listSessions())[0]!;
-    expect(session.model).toBeUndefined();
-    expect(session.reasoning_effort).toBeUndefined();
+    expect(session).toMatchObject({ model_id: "gpt-5.6-luna", reasoning_effort: "max" });
   });
 
   it("keeps the Desktop route unchanged when no provider model is given", async () => {
@@ -717,12 +812,12 @@ describe("Desktop interactive Goal model and reasoning effort", () => {
 
     await seedTask(value);
     await expect(service.start(interactiveRequest({
-      model: "gpt-5.6-luna",
+      model_id: "gpt-5.6-luna",
       reasoning_effort: "max",
     }))).rejects.toBeDefined();
 
     expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatchObject({ model: "gpt-5.6-luna", reasoning_effort: "max" });
+    expect(seen[0]).toMatchObject({ model_id: "gpt-5.6-luna", reasoning_effort: "max" });
   });
 
   it("leaves the batch route on the CLI backend when model and reasoning_effort are given", async () => {
@@ -734,7 +829,7 @@ describe("Desktop interactive Goal model and reasoning effort", () => {
       task_id: TASK_ID,
       execution_id: "execution-batch",
       instruction: INSTRUCTION,
-      model: "gpt-5.6-luna",
+      model_id: "gpt-5.6-luna",
       reasoning_effort: "max",
     });
 
@@ -1058,6 +1153,97 @@ describe("P5.4.1 FIX executor identity is captured exactly once", () => {
 });
 
 describe("P5.4.1 FIX failure terminal projection", () => {
+  it("fails Desktop orphans after Host restart once without creating or resending a thread", async () => {
+    const value = await fixture();
+    await seedTask(value);
+    const session = await value.sessions.createSession({ goal_id: GOAL_ID, task_id: TASK_ID,
+      backend_type: "desktop_codex_app", workspace: value.registry.active.manager.canonicalRoot,
+      status: "active", thread_id: "previous-thread" });
+    for (const thread_id of ["older-thread-1", "older-thread-2"]) {
+      await value.sessions.createSession({ goal_id: GOAL_ID, task_id: TASK_ID,
+        backend_type: "desktop_codex_app", workspace: value.registry.active.manager.canonicalRoot,
+        status: "completed", thread_id });
+    }
+    await value.events.appendEvent({
+      session_id: session.session_id,
+      execution_id: EXECUTION_ID,
+      thread_id: "previous-thread",
+      timestamp: new Date().toISOString(),
+      event_type: "session_started",
+      payload: {},
+    });
+    await value.executions.createExecutionContext({ workspace_id: "workspace-a", task_id: TASK_ID,
+      execution_id: EXECUTION_ID, command: "desktop codex_app" });
+    await value.backend.reconcileOrphanedExecutions();
+    await value.backend.reconcileOrphanedExecutions();
+    expect(await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))
+      .toMatchObject({ status: "failed", summary: expect.stringContaining("previous runtime shutdown") });
+    expect((await value.sessions.getSession(session.session_id))?.status).toBe("failed");
+    expect(value.terminals).toHaveLength(1);
+    expect(value.desktop.createThreadCount()).toBe(0);
+    expect(value.cliStart).not.toHaveBeenCalled();
+  });
+
+  it("keeps observing the dispatched task when target activation fails without dispatching a second task", async () => {
+    const value = await fixture({ openDesktopThread: async () => { throw new Error("activation failed"); } });
+    value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
+    await authorizeAndActuate(value, {}, false);
+    expect(await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))
+      .toMatchObject({ status: "running" });
+    const session = (await value.sessions.listSessions())[0]!;
+    expect(session.status).toBe("active");
+    expect(value.desktop.runtimeCloseCount()).toBe(0);
+    expect(value.terminals).toHaveLength(0);
+
+    value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+    await value.backend.whenIdle();
+    expect(await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))
+      .toMatchObject({ status: "passed" });
+    expect((await value.sessions.getSession(session.session_id))?.status).toBe("completed");
+    expect(value.terminals).toHaveLength(1);
+    expect((await value.events.listEvents(session.session_id)).map((event) => event.event_type))
+      .not.toContain("execution_failed");
+    expect(value.desktop.createThreadCount()).toBe(1);
+    expect(value.desktop.sendCount()).toBe(0);
+    expect(value.desktop.runtimeCloseCount()).toBe(1);
+    expect(value.cliStart).not.toHaveBeenCalled();
+    expect(value.appServerStart).not.toHaveBeenCalled();
+  });
+
+  it("fails the Execution when CompletionObserver initialization rejects its configuration", async () => {
+    const value = await fixture({ pollIntervalMs: -1 });
+    await authorizeAndActuate(value);
+    expect(await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))
+      .toMatchObject({ status: "failed", summary: expect.stringContaining("pollIntervalMs") });
+    expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
+  });
+
+  it("fails the Execution when CompletionObserver throws during observation", async () => {
+    const observer = vi.spyOn(DesktopCompletionObserver.prototype, "waitForCompletion")
+      .mockRejectedValue(new Error("observer initialization failed"));
+    try {
+      const value = await fixture();
+      await authorizeAndActuate(value);
+      expect(await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))
+        .toMatchObject({ status: "failed", summary: expect.stringContaining("observer initialization failed") });
+      expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
+    } finally { observer.mockRestore(); }
+  });
+
+  it("bounds repeated first-turn visibility and tool errors instead of leaving Execution running", async () => {
+    const observer = vi.spyOn(DesktopCompletionObserver.prototype, "waitForCompletion")
+      .mockResolvedValue({ status: "unknown", reason: "first_turn_visibility_unavailable",
+        targetThreadId: "target-thread-1", hostId: "local" });
+    try {
+      const value = await fixture({ completionTimeoutMs: 10 });
+      await authorizeAndActuate(value);
+      expect(await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))
+        .toMatchObject({ status: "failed", summary: "Desktop turn completion observation unavailable." });
+      expect(observer).toHaveBeenCalledTimes(2);
+      expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
+    } finally { observer.mockRestore(); }
+  });
+
   it.each([
     ["Project unavailable", "create_thread failed: Project unavailable"],
     ["", "create_thread returned an error."],
@@ -1329,7 +1515,8 @@ describe("P5.4.1 FIX Desktop runtime ownership", () => {
       TASK_ID,
       EXECUTION_ID,
     );
-    expect(execution?.status).toBe("running");
+    expect(execution?.status).toBe("failed");
+    expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
   });
 
   it("closes a runtime held in the active map when the backend is shut down", async () => {

@@ -352,10 +352,10 @@ describe("desktop codex contracts", () => {
   it("maps Goal model and reasoning effort to create_thread model and thinking", () => {
     const contracts = createCodexAppToolContracts(appTools());
     expect(contracts.createThreadArguments("create", "project-one", {
-      model: "gpt-5.6-luna",
-      reasoningEffort: "max",
+      model_id: "gpt-6-luna",
+      reasoning_effort: "max",
     })).toEqual({
-      model: "gpt-5.6-luna",
+      model: "gpt-6-luna",
       prompt: "create",
       target: { type: "project", projectId: "project-one", environment: { type: "local" } },
       thinking: "max",
@@ -365,7 +365,7 @@ describe("desktop codex contracts", () => {
   it("sends only model when the Goal omits reasoning effort", () => {
     const contracts = createCodexAppToolContracts(appTools());
     expect(contracts.createThreadArguments("create", "project-one", {
-      model: "gpt-6-astra",
+      model_id: "gpt-6-astra",
     })).toEqual({
       model: "gpt-6-astra",
       prompt: "create",
@@ -376,7 +376,7 @@ describe("desktop codex contracts", () => {
   it("sends only thinking when the Goal omits model", () => {
     const contracts = createCodexAppToolContracts(appTools());
     expect(contracts.createThreadArguments("create", "project-one", {
-      reasoningEffort: "high",
+      reasoning_effort: "high",
     })).toEqual({
       prompt: "create",
       target: { type: "project", projectId: "project-one", environment: { type: "local" } },
@@ -395,7 +395,7 @@ describe("desktop codex contracts", () => {
   it("fails closed when reasoning effort is outside the live thinking enum", () => {
     const contracts = createCodexAppToolContracts(appTools());
     expect(() => contracts.createThreadArguments("create", "project-one", {
-      reasoningEffort: "reasoning-plus",
+      reasoning_effort: "reasoning-plus" as never,
     })).toThrowError(expect.objectContaining({
       code: "tool_contract_incompatible",
       message: expect.stringContaining("thinking"),
@@ -405,7 +405,7 @@ describe("desktop codex contracts", () => {
   it("fails closed when the live schema has no model field", () => {
     const contracts = createCodexAppToolContracts(appTools({ includeModel: false }));
     expect(() => contracts.createThreadArguments("create", "project-one", {
-      model: "gpt-5.6-luna",
+      model_id: "gpt-5.6-luna",
     })).toThrowError(expect.objectContaining({
       code: "tool_contract_incompatible",
       message: expect.stringContaining("model"),
@@ -415,7 +415,7 @@ describe("desktop codex contracts", () => {
   it("fails closed when the live schema has no thinking field", () => {
     const contracts = createCodexAppToolContracts(appTools({ includeThinking: false }));
     expect(() => contracts.createThreadArguments("create", "project-one", {
-      reasoningEffort: "max",
+      reasoning_effort: "max",
     })).toThrowError(expect.objectContaining({
       code: "tool_contract_incompatible",
       message: expect.stringContaining("thinking"),

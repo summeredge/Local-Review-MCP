@@ -6,6 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { GitError } from "../git/errors.js";
 import { GitService } from "../git/service.js";
+import { ModelResolutionError } from "../models/model-resolver.js";
 import type { GitDiffResponse, GitStatusResponse } from "../git/types.js";
 import { ReviewContextService } from "../review/review-context.js";
 import type { ConversationCorrelationRegistry } from "../control-plane/conversation-correlation.js";
@@ -23,6 +24,7 @@ import {
 import {
   goalSubmissionToolInputSchema,
   goalSubmissionAcceptedSchema,
+  resolveGoalModelFields,
   type GoalSubmissionService,
 } from "../control-plane/goal-submission.js";
 import {
@@ -78,7 +80,7 @@ export interface McpRuntimeContext {
   readonly workspace?: WorkspaceManager;
   readonly registry: WorkspaceRegistry;
   readonly correlations?: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">;
-  readonly goalSubmission?: Pick<GoalSubmissionService, "submitGoal">;
+  readonly goalSubmission?: Pick<GoalSubmissionService, "submitExternalGoal">;
   readonly pendingGoalSubmission?: Pick<PendingGoalSubmissionService, "accept">;
   readonly identityTrace?: Pick<IdentityTraceService, "getIdentityTrace" | "record">;
   readonly evidenceTransportTrace?: Pick<
@@ -329,6 +331,14 @@ interface ListedEntry {
 }
 
 export function toToolError(error: unknown) {
+  if (error instanceof ModelResolutionError) {
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify({
+        error: { ...error.details, message: error.message },
+      }) }],
+      isError: true as const,
+    };
+  }
   if (error instanceof BrowserReadinessError) {
     return {
       content: [{ type: "text" as const, text: JSON.stringify({
@@ -1163,9 +1173,8 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
           requirements: input.requirements,
           acceptance_criteria: input.acceptance_criteria,
           max_iterations: input.max_iterations,
-          ...(input.execution_mode === "interactive" ? { execution_mode: input.execution_mode } : {}),
-          ...(input.model === undefined ? {} : { model: input.model }),
-          ...(input.reasoning_effort === undefined ? {} : { reasoning_effort: input.reasoning_effort }),
+          execution_mode: input.execution_mode ?? "batch",
+          ...resolveGoalModelFields(input.model, input.reasoning_effort),
         };
         const accepted = connectorProvenance === undefined
           ? await pendingGoalSubmission.accept(pendingInput)

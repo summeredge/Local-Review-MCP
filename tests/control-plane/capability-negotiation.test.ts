@@ -87,6 +87,19 @@ function clock() {
 }
 
 describe("P5.9.1 capability negotiation", () => {
+  it.each(["desktop_disconnected", "desktop_tools_pipe_unavailable", "runtime_connect_failed", "tools_contract_incompatible"])(
+    "uses the existing AppServer fallback for pre-dispatch bootstrap failure %s", async (code) => {
+      const desktop = provider("desktop", { ready: true }, async () => {
+        throw Object.assign(new Error("Desktop bootstrap failed"), { code });
+      });
+      const standalone = provider("standalone", { ready: true });
+      const negotiator = new CapabilityNegotiator({ desktop, standalone });
+      await expect(negotiator.start(request)).resolves.toEqual(startedFor(request));
+      expect(standalone.start).toHaveBeenCalledWith(expect.objectContaining(request));
+      expect(negotiator.snapshot(request.execution_id)).toMatchObject({ state: "fallback_running", source: "standalone" });
+    },
+  );
+
   it("ends Desktop execution failure without offering or starting fallback", async () => {
     const error = Object.assign(new Error("create_thread failed: Project unavailable"), { code: "tool_call_failed" });
     const desktop = provider("desktop", { ready: true }, async () => { throw error; });

@@ -249,7 +249,9 @@ describe("CodexAppServerClient protocol handling", () => {
       }
     });
 
-    await expect(client.listModels()).resolves.toMatchObject([{ model: "model-a", efforts: ["high"] }]);
+    await expect(client.listModels()).resolves.toMatchObject([{
+      model_id: "model-a", display_name: "Model A", reasoning_efforts: ["high"],
+    }]);
     await client.startThread({ cwd: globalThis.process.cwd(), model: "model-a" });
     await client.startTurn({ threadId: "thread-1", text: "hello", model: "model-a", effort: "high" });
 

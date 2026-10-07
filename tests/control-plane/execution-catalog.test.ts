@@ -14,6 +14,7 @@ import {
   type GoalOrchestration,
 } from "../../src/control-plane/goal-orchestration.js";
 import { StatusQueryService } from "../../src/control-plane/status-query.js";
+import type { ReasoningEffort } from "../../src/models/model-catalog.js";
 
 const temporaryDirectories: string[] = [];
 const timestamp = "2026-09-15T00:00:00.000Z";
@@ -119,8 +120,8 @@ async function seedSession(root: string, options: {
   readonly taskId: string;
   readonly backendType: "codex_app_server" | "desktop_codex_app";
   readonly threadId?: string;
-  readonly model?: string;
-  readonly reasoningEffort?: string;
+  readonly model_id?: string;
+  readonly reasoning_effort?: ReasoningEffort;
   readonly status?: "created" | "starting" | "active" | "running_turn" | "waiting_input" | "completed" | "failed" | "terminated";
 }): Promise<void> {
   await new SessionStore(root).createSession({
@@ -131,8 +132,8 @@ async function seedSession(root: string, options: {
     status: options.status ?? "active",
     workspace: "C:\\workspace",
     ...(options.threadId === undefined ? {} : { thread_id: options.threadId }),
-    ...(options.model === undefined ? {} : { model: options.model }),
-    ...(options.reasoningEffort === undefined ? {} : { reasoning_effort: options.reasoningEffort }),
+    ...(options.model_id === undefined ? {} : { model_id: options.model_id }),
+    ...(options.reasoning_effort === undefined ? {} : { reasoning_effort: options.reasoning_effort }),
   });
   if (options.executionId !== undefined) {
     await new EventStore(root).appendEvent({
@@ -156,7 +157,7 @@ describe("Launcher Execution catalog", () => {
         executionId: `execution-${round}`, command: "desktop codex_app" });
       await seedSession(root, { sessionId: `session-${round}`, executionId: `execution-${round}`,
         goalId: "goal-1", taskId: "task-1", backendType: "desktop_codex_app",
-        threadId: `thread-${round}`, model: `model-${round}`, reasoningEffort: "high" });
+        threadId: `thread-${round}`, model_id: `model-${round}`, reasoning_effort: "high" });
     }
     await seedExecution(root, { workspaceId: "workspace-1", taskId: "task-1", executionId: "execution-batch" });
     await seedExecution(root, { workspaceId: "workspace-1", taskId: "task-1",
@@ -401,8 +402,8 @@ describe("Launcher Execution catalog", () => {
       taskId: "task-desktop",
       backendType: "desktop_codex_app",
       threadId: "thread-1",
-      model: "gpt-5.6-luna",
-      reasoningEffort: "max",
+      model_id: "gpt-5.6-luna",
+      reasoning_effort: "max",
     });
 
     const summaries = await queryFor(root, [goal]).listExecutionSummaries();
@@ -415,6 +416,7 @@ describe("Launcher Execution catalog", () => {
       session_id: "session-desktop",
       thread_id: "thread-1",
       model: "gpt-5.6-luna",
+      display_name: "GPT-5.6 Luna",
       reasoning_effort: "max",
       status: "running",
     });

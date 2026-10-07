@@ -93,6 +93,25 @@ function authorizationInput(executionId = "execution-001") {
 }
 
 describe("ControlledActuationService", () => {
+  it.each([false, true])("closes an interactive launch failure with an existing Execution=%s", async (materialized) => {
+    const value = await fixture();
+    const executions = new ExecutionContextService(value.storageRoot);
+    const service = new ControlledActuationService(value.registry, {
+      storageRoot: value.storageRoot,
+      adapter: { start: async (input) => {
+        if (materialized) await executions.createExecutionContext({ execution_id: input.execution_id,
+          workspace_id: input.workspace_id, task_id: input.task_id });
+        throw new Error("AppServer fallback startup failed");
+      } },
+    });
+    const authorization = await service.authorize({ ...authorizationInput(), goal_id: "goal-1", execution_mode: "interactive" });
+    await expect(service.actuate({ actuation_id: authorization.actuation_id,
+      authorization_id: authorization.authorization_id })).rejects.toThrow("AppServer fallback startup failed");
+    expect(await executions.getExecutionContext("workspace-a", "task-001", "execution-001"))
+      .toMatchObject({ status: "failed", summary: "AppServer fallback startup failed" });
+    expect((await service.getActuation(authorization.actuation_id))?.status).toBe("failed");
+  });
+
   it("authorizes durably and starts through the Adapter using only the authorization record", async () => {
     const value = await fixture();
     const process = new FakeProcess(5101);

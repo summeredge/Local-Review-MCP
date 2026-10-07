@@ -129,6 +129,7 @@ function setup(
     readonly pollIntervalMs?: number;
     readonly visibilityGraceMs?: number;
     readonly visibilityPollIntervalMs?: number;
+    readonly readFailureTimeoutMs?: number;
   } = {},
 ): ClientSetup {
   const readQueue = [...reads];
@@ -164,6 +165,7 @@ function setup(
       client: { callTool },
       contracts,
       pollIntervalMs: options.pollIntervalMs ?? 0,
+      ...(options.readFailureTimeoutMs === undefined ? {} : { readFailureTimeoutMs: options.readFailureTimeoutMs }),
       ...(options.visibilityGraceMs === undefined ? {} : { visibilityGraceMs: options.visibilityGraceMs }),
       ...(options.visibilityPollIntervalMs === undefined
         ? {}
@@ -292,6 +294,25 @@ describe("DesktopCompletionObserver", () => {
       "wait_threads",
       "read_thread",
     ]);
+  });
+
+  it("bounds continuous read failures after a turn was observed without an execution deadline", async () => {
+    const setupValue = setup([
+      readPayload([turn(B, "inProgress")]), errorResult(),
+    ], [waitPayload()], { readFailureTimeoutMs: 10 });
+    await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: {
+      targetThreadId: TARGET_THREAD, hostId: HOST_ID, turnIds: [A],
+    } })).resolves.toMatchObject({ status: "unknown", reason: "capability_unavailable" });
+  });
+
+  it("keeps a healthy running turn observable beyond the read failure window", async () => {
+    const setupValue = setup([
+      readPayload([turn(B, "inProgress")]), readPayload([turn(B, "inProgress")]),
+      readPayload([turn(B, "completed")]),
+    ], [], { wait: false, pollIntervalMs: 20, readFailureTimeoutMs: 1 });
+    await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: {
+      targetThreadId: TARGET_THREAD, hostId: HOST_ID, turnIds: [A],
+    } })).resolves.toMatchObject({ status: "completed", turnId: B });
   });
 
   it("waits when no new turn is in the immediate snapshot", async () => {

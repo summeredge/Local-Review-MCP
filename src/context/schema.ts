@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { reasoningEffortSchema } from "../models/model-catalog.js";
 import { isReservedWindowsName } from "../workspace/path.js";
 import {
   EXECUTION_STATUSES,
@@ -98,7 +99,7 @@ export const sessionStatusSchema = z.enum(SESSION_STATUSES);
 const sessionWorkspaceSchema = z.string().min(1).max(4096);
 const sessionThreadIdSchema = z.string().max(256);
 const sessionModelSchema = z.string().min(1).max(256);
-const sessionReasoningEffortSchema = z.string().min(1).max(64);
+const sessionReasoningEffortSchema = reasoningEffortSchema;
 
 export const sessionSchema = z.object({
   session_id: sessionIdSchema,
@@ -108,7 +109,7 @@ export const sessionSchema = z.object({
   status: sessionStatusSchema,
   workspace: sessionWorkspaceSchema,
   thread_id: sessionThreadIdSchema.optional(),
-  model: sessionModelSchema.optional(),
+  model_id: sessionModelSchema.optional(),
   reasoning_effort: sessionReasoningEffortSchema.optional(),
   created_at: timestampSchema,
   updated_at: timestampSchema,
@@ -122,13 +123,13 @@ export const createSessionInputSchema = z.object({
   status: sessionStatusSchema.default("created"),
   workspace: sessionWorkspaceSchema,
   thread_id: sessionThreadIdSchema.optional(),
-  model: sessionModelSchema.optional(),
+  model_id: sessionModelSchema.optional(),
   reasoning_effort: sessionReasoningEffortSchema.optional(),
 }).strict();
 
 export const updateSessionInputSchema = z.object({
   status: sessionStatusSchema.optional(),
   thread_id: sessionThreadIdSchema.optional(),
-  model: sessionModelSchema.optional(),
+  model_id: sessionModelSchema.optional(),
   reasoning_effort: sessionReasoningEffortSchema.optional(),
 }).strict();

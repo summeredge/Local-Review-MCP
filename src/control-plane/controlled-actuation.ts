@@ -17,6 +17,8 @@ import { DesktopThreadBindingStore } from "../desktop-codex/desktop-thread-bindi
 import type { ExecutionContext } from "../context/types.js";
 import { isReservedWindowsName } from "../workspace/path.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
+import { migrateLegacyModelIdFields } from "../models/model-resolver.js";
+import { reasoningEffortSchema, type ReasoningEffort } from "../models/model-catalog.js";
 import {
   CodexExecutionAdapter,
 } from "./codex-execution-adapter.js";
@@ -54,8 +56,8 @@ export interface ActuationAuthorizationInput {
   readonly execution_id: string;
   readonly instruction: string;
   readonly execution_mode?: ExecutionMode;
-  readonly model?: string;
-  readonly reasoning_effort?: string;
+  readonly model_id?: string;
+  readonly reasoning_effort?: ReasoningEffort;
 }
 
 export interface ActuationAuthorization extends ActuationAuthorizationInput {
@@ -92,8 +94,8 @@ export const actuationAuthorizationInputSchema = z.object({
   execution_id: executionIdSchema,
   instruction: instructionSchema,
   execution_mode: executionModeSchema.optional(),
-  model: z.string().min(1).max(256).optional(),
-  reasoning_effort: z.string().min(1).max(64).optional(),
+  model_id: z.string().min(1).max(256).optional(),
+  reasoning_effort: reasoningEffortSchema.optional(),
 }).strict();
 
 export const actuationAuthorizationSchema = actuationAuthorizationInputSchema.extend({
@@ -263,7 +265,7 @@ export class ActuationAuthorizationStore {
         );
       }
       try {
-        this.state = stateSchema.parse(JSON.parse(raw) as unknown);
+        this.state = stateSchema.parse(migrateLegacyModelIdFields(JSON.parse(raw) as unknown));
       } catch (error: unknown) {
         throw new ControlledActuationUnavailableError(
           "controlled actuation state could not be restored",
@@ -589,7 +591,7 @@ export class ControlledActuationService {
         execution_id: authorization.execution_id,
         instruction: authorization.instruction,
         ...(authorization.execution_mode === undefined ? {} : { execution_mode: authorization.execution_mode }),
-        ...(authorization.model === undefined ? {} : { model: authorization.model }),
+        ...(authorization.model_id === undefined ? {} : { model_id: authorization.model_id }),
         ...(authorization.reasoning_effort === undefined
           ? {}
           : { reasoning_effort: authorization.reasoning_effort }),
@@ -597,6 +599,26 @@ export class ControlledActuationService {
       started = await this.adapter.start(request);
     } catch (error: unknown) {
       await this.markFailed(actuation.actuation_id, error);
+      // Interactive launch can fail before a backend materializes its Execution (IPC/bootstrap
+      // or fallback preparation). Keep the reserved identity queryable and terminal in that case.
+      if (authorization.execution_mode === "interactive") {
+        const current = await this.executions.getExecutionContext(
+          authorization.workspace_id, authorization.task_id, authorization.execution_id,
+        );
+        const failure = { status: "failed" as const, summary: errorMessage(error).slice(0, 4_000) };
+        if (current === null) {
+          await this.executions.createExecutionContext({
+            workspace_id: authorization.workspace_id,
+            task_id: authorization.task_id,
+            execution_id: authorization.execution_id,
+            ...failure,
+          });
+        } else if (current.status === "running") {
+          await this.executions.updateExecutionContext(
+            authorization.workspace_id, authorization.task_id, authorization.execution_id, failure,
+          );
+        }
+      }
       throw error;
     }
 

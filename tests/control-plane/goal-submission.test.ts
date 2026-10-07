@@ -154,7 +154,9 @@ describe("GoalSubmissionService", () => {
     const f = await fixture();
     const createGoal = vi.spyOn(f.orchestration, "createGoal");
     const startGoal = vi.spyOn(f.orchestration, "startGoal");
-    const submitted = await new GoalSubmissionService(f.orchestration, f.preflight).submitGoal(request());
+    const submitted = await new GoalSubmissionService(f.orchestration, f.preflight).submitExternalGoal({
+      ...request(), model: "GPT-6 Luna Max", reasoning_effort: "high",
+    });
     const plan = createGoal.mock.calls[0]![0];
     const phase = plan.phases[0]!;
     const task = phase.tasks[0]!;
@@ -167,6 +169,9 @@ describe("GoalSubmissionService", () => {
     expect(plan).toMatchObject({
       workspace_id: "workspace-a",
       conversation_id: "conversation-1",
+      execution_mode: "batch",
+      model_id: "gpt-6-luna",
+      reasoning_effort: "high",
       phases: [{
         objective: "Implement the requested feature",
         tasks: [{
@@ -217,7 +222,7 @@ describe("GoalSubmissionService", () => {
     };
     const invalid = { ...request(), title: undefined };
 
-    await expect(new GoalSubmissionService(orchestration, preflight).submitGoal(invalid as never))
+    await expect(new GoalSubmissionService(orchestration, preflight).submitExternalGoal(invalid as never))
       .rejects.toThrow(/title/);
     expect(orchestration.createGoal).not.toHaveBeenCalled();
     expect(orchestration.startGoal).not.toHaveBeenCalled();
@@ -240,7 +245,7 @@ describe("GoalSubmissionService", () => {
       })),
     };
 
-    await expect(new GoalSubmissionService(f.orchestration, preflight).submitGoal(request()))
+    await expect(new GoalSubmissionService(f.orchestration, preflight).submitExternalGoal(request()))
       .rejects.toMatchObject({
         name: "GoalPreflightError",
         result: { failure_stage: "connector", failure_reason: "remote_not_configured" },

@@ -1017,6 +1017,7 @@ class LauncherDashboardTests(unittest.TestCase):
             "session_id": "session-1",
             "thread_id": "thread-1",
             "model": "gpt-5.6-luna",
+            "display_name": "GPT-5.6 Luna",
             "reasoning_effort": "max",
             "updated_at": timestamp,
         }
@@ -1092,7 +1093,8 @@ class LauncherDashboardTests(unittest.TestCase):
             session_id="session-1",
             thread_id="thread-1",
             backend_type="desktop_codex_app",
-            model="gpt-5.6-luna",
+            model_id="gpt-5.6-luna",
+            display_name="GPT-5.6 Luna",
             reasoning_effort="max",
             updated_at="2026-09-15T12:34:56+08:00",
         ))
@@ -1111,6 +1113,15 @@ class LauncherDashboardTests(unittest.TestCase):
                          ("execution-1", "turn-1", "item-1"))
         self.assertEqual(view.events[2].display_time,
                          datetime.fromisoformat(view.events[2].timestamp).astimezone().strftime("%H:%M:%S"))
+
+    def test_dashboard_displays_catalog_model_name(self) -> None:
+        view = build_execution_view_model(self._interactive_summary(), self._events())
+        window = self._window()
+        window._render_execution_dashboard((view,))
+        window.execution_table.selectRow(0)
+        window._render_selected_execution()
+
+        self.assertIn("Model：GPT-5.6 Luna", window.session_details_label.text())
 
     def test_dashboard_converts_utc_timestamps_to_local_time(self) -> None:
         for timestamp in ("2026-09-17T04:34:19Z", "2026-09-17T20:34:19+00:00",
@@ -1313,7 +1324,7 @@ class LauncherDashboardTests(unittest.TestCase):
         self.assertEqual(window.session_details_label.text().splitlines(), [
             "Session：session-1",
             "Thread：thread-1",
-            "Model：gpt-5.6-luna",
+            "Model：GPT-5.6 Luna",
             "Reasoning：max",
             "更新时间：" + LauncherWindow._format_timestamp("2026-09-15T12:34:56+08:00"),
         ])

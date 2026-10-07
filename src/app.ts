@@ -317,16 +317,19 @@ export async function startApp(
   // The interactive route prefers the Desktop codex_app provider, then uses the existing private
   // app-server provider after an explicit choice or bounded fallback timeout. Bind before HTTP/MCP
   // accepts Goals so both providers share this host's durable execution services.
+  let desktopBackend: DesktopCodexBackend | undefined;
   if (context.executionService !== undefined
     && context.storageRoot !== undefined
     && context.codexAppServerBackend !== undefined) {
+    desktopBackend = new DesktopCodexBackend(context.registry, {
+      storageRoot: context.storageRoot,
+      eventStore: context.eventStore,
+      runtimeFactory: desktopCodexRuntimeFactory,
+      desktopState: () => desktopSyncObserver.getState(),
+      ...(options.openDesktopThread === undefined ? {} : { openDesktopThread: options.openDesktopThread }),
+    });
     const desktopProvider = new DesktopCapabilityProvider({
-      backend: new DesktopCodexBackend(context.registry, {
-        storageRoot: context.storageRoot,
-        eventStore: context.eventStore,
-        runtimeFactory: desktopCodexRuntimeFactory,
-        desktopState: () => desktopSyncObserver.getState(),
-      }),
+      backend: desktopBackend,
       readiness: () => desktopInteractivePreflight.check(),
     });
     const capabilityTimeline = new CapabilityTimeline();
@@ -530,6 +533,11 @@ export async function startApp(
       await context.codexAppServerBackend?.reconcileOrphanedExecutions();
     } catch {
       console.warn("Codex AppServer orphan reconciliation failed; local MCP remains available");
+    }
+    try {
+      await desktopBackend?.reconcileOrphanedExecutions();
+    } catch {
+      console.warn("Desktop completion observer orphan reconciliation failed; local MCP remains available");
     }
     try {
       await context.autoIteration?.recover();

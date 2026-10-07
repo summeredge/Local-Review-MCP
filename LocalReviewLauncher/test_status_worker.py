@@ -866,7 +866,7 @@ class StatusCheckerTests(unittest.TestCase):
         # The interactive Session extension is preserved, including model and reasoning.
         self.assertEqual(result[1].session_id, "session-1")
         self.assertEqual(result[1].thread_id, "thread-1")
-        self.assertEqual(result[1].session.model, "gpt-5.6-luna")
+        self.assertEqual(result[1].session.model_id, "gpt-5.6-luna")
         self.assertEqual(result[1].session.reasoning_effort, "max")
         self.assertEqual(result[1].session.updated_at, timestamp)
         self.assertTrue(result[1].can_open_codex_task)

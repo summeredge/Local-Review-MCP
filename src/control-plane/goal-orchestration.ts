@@ -13,6 +13,8 @@ import { TaskContextService } from "../context/service.js";
 import { defaultTaskContextStorageRoot } from "../context/task.js";
 import type { TaskStatus } from "../context/types.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
+import { reasoningEffortSchema } from "../models/model-catalog.js";
+import { migrateLegacyModelIdFields } from "../models/model-resolver.js";
 import {
   AutoIterationService,
   autoIterationIdSchema,
@@ -56,8 +58,8 @@ export const createGoalInputSchema = z.object({
   workspace_id: workspaceIdSchema,
   conversation_id: conversationIdSchema,
   execution_mode: executionModeSchema.default("batch"),
-  model: z.string().min(1).max(256).optional(),
-  reasoning_effort: z.string().min(1).max(64).optional(),
+  model_id: z.string().min(1).max(256).optional(),
+  reasoning_effort: reasoningEffortSchema.optional(),
   phases: z.array(z.object({
     phase_id: phaseIdSchema,
     objective: instructionItemSchema,
@@ -116,8 +118,8 @@ export const goalOrchestrationSchema = z.object({
   workspace_id: workspaceIdSchema,
   conversation_id: conversationIdSchema,
   execution_mode: executionModeSchema.default("batch"),
-  model: z.string().min(1).max(256).optional(),
-  reasoning_effort: z.string().min(1).max(64).optional(),
+  model_id: z.string().min(1).max(256).optional(),
+  reasoning_effort: reasoningEffortSchema.optional(),
   review_only: z.boolean().optional(),
   phases: z.array(phaseSchema).min(1).max(1_000),
   status: goalOrchestrationStatusSchema,
@@ -237,7 +239,7 @@ function planIdentity(goal: GoalOrchestration): z.infer<typeof createGoalInputSc
     workspace_id: goal.workspace_id,
     conversation_id: goal.conversation_id,
     execution_mode: goal.execution_mode,
-    ...(goal.model === undefined ? {} : { model: goal.model }),
+    ...(goal.model_id === undefined ? {} : { model_id: goal.model_id }),
     ...(goal.reasoning_effort === undefined ? {} : { reasoning_effort: goal.reasoning_effort }),
     phases: goal.phases.map(({ status: _status, ...phase }) => phase),
   });
@@ -266,7 +268,7 @@ class GoalOrchestrationStore {
         throw new GoalOrchestrationUnavailableError("goal orchestration state could not be restored", { cause: error });
       }
       try {
-        this.state = goalOrchestrationStateSchema.parse(JSON.parse(raw) as unknown);
+        this.state = goalOrchestrationStateSchema.parse(migrateLegacyModelIdFields(JSON.parse(raw) as unknown));
       } catch (error: unknown) {
         throw new GoalOrchestrationUnavailableError("goal orchestration state could not be restored", { cause: error });
       }
@@ -699,7 +701,7 @@ export class GoalOrchestrationService {
           execution_id: executionId,
           instruction,
           execution_mode: goal.execution_mode,
-          ...(goal.model === undefined ? {} : { model: goal.model }),
+          ...(goal.model_id === undefined ? {} : { model_id: goal.model_id }),
           ...(goal.reasoning_effort === undefined ? {} : { reasoning_effort: goal.reasoning_effort }),
         });
       } catch (error: unknown) {
@@ -777,7 +779,7 @@ export class GoalOrchestrationService {
       || authorization.execution_id !== goal.execution_id
       || authorization.instruction !== instruction
       || (authorization.execution_mode ?? "batch") !== goal.execution_mode
-      || authorization.model !== goal.model
+      || authorization.model_id !== goal.model_id
       || authorization.reasoning_effort !== goal.reasoning_effort
       || (goal.execution_mode === "interactive" && authorization.goal_id !== goal.goal_id)) {
       throw new Error("Actuation authorization identity does not match the Goal task");

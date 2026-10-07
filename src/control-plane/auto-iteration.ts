@@ -1018,7 +1018,7 @@ export class AutoIterationService {
       const configuration = {
         ...(initial.goal_id === undefined ? {} : { goal_id: initial.goal_id }),
         execution_mode: initial.execution_mode,
-        ...(initial.model === undefined ? {} : { model: initial.model }),
+        ...(initial.model_id === undefined ? {} : { model_id: initial.model_id }),
         ...(initial.reasoning_effort === undefined ? {} : { reasoning_effort: initial.reasoning_effort }),
       };
       let authorization: ActuationAuthorization | null = loop.authorization_id === undefined
@@ -1051,7 +1051,7 @@ export class AutoIterationService {
         || authorization.instruction !== instruction
         || authorization.goal_id !== configuration.goal_id
         || (authorization.execution_mode ?? "batch") !== configuration.execution_mode
-        || authorization.model !== configuration.model
+        || authorization.model_id !== configuration.model_id
         || authorization.reasoning_effort !== configuration.reasoning_effort) {
         await this.humanRequired(loop, "AUTHORIZATION_IDENTITY_INVALID");
         return;

@@ -119,7 +119,7 @@ class FakeAppServerClient {
   public readonly thread = vi.fn(async (input: { cwd: string; model?: string }): Promise<AppServerThread> => ({
     thread_id: "thread-phase56",
     session_id: "provider-session-phase56",
-    ...(input.model === undefined ? {} : { model: input.model }),
+    ...(input.model === undefined ? {} : { model_id: input.model }),
     cwd: input.cwd,
   }));
   public readonly turn = vi.fn(async (_input: {
@@ -155,9 +155,9 @@ class FakeAppServerClient {
 
   public listModels(): Promise<readonly AppServerModel[]> {
     return Promise.resolve([{
-      model: "gpt-5.6-luna",
-      label: "GPT-5.6 Luna",
-      efforts: ["low", "medium", "high", "xhigh", "max"],
+      model_id: "gpt-5.6-luna",
+      display_name: "GPT-5.6 Luna",
+      reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
       default_effort: "medium",
       is_default: false,
     }]);
@@ -427,7 +427,7 @@ describe("Phase 5.6 end-to-end Review Loop", () => {
     );
     expect(accepted).toMatchObject({ accepted: true, correlation_key: correlationKey });
     expect((await value.pending.get(correlationKey))?.execution_mode).toBe("interactive");
-    expect((await value.pending.get(correlationKey))?.model).toBe("gpt-5.6-luna");
+    expect((await value.pending.get(correlationKey))?.model_id).toBe("gpt-5.6-luna");
     expect((await value.pending.get(correlationKey))?.reasoning_effort).toBe("max");
 
     await value.correlations.observe({
@@ -447,7 +447,7 @@ describe("Phase 5.6 end-to-end Review Loop", () => {
     expect(session).toMatchObject({
       backend_type: "codex_app_server",
       status: "active",
-      model: "gpt-5.6-luna",
+      model_id: "gpt-5.6-luna",
       reasoning_effort: "max",
       thread_id: "thread-phase56",
     });

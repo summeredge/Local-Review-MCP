@@ -1,4 +1,5 @@
 import { jsonRecord } from "./protocol.js";
+import { reasoningEffortSchema, type ReasoningEffort } from "../../models/model-catalog.js";
 
 export type AppServerTransport = "stdio";
 export type AppServerStatus = "starting" | "ready" | "stopping" | "stopped" | "failed";
@@ -28,17 +29,17 @@ export interface AppServerInitializeResult {
 }
 
 export interface AppServerModel {
-  readonly model: string;
-  readonly label: string;
-  readonly efforts: readonly string[];
-  readonly default_effort?: string;
+  readonly model_id: string;
+  readonly display_name: string;
+  readonly reasoning_efforts: readonly ReasoningEffort[];
+  readonly default_effort?: ReasoningEffort;
   readonly is_default?: boolean;
 }
 
 export interface AppServerThread {
   readonly thread_id: string;
   readonly session_id: string;
-  readonly model?: string;
+  readonly model_id?: string;
   readonly cwd?: string;
 }
 
@@ -115,18 +116,20 @@ export function parseModelListPage(value: unknown): ModelListPage {
     if (!Array.isArray(supported)) {
       throw new Error(`Codex app-server model/list data[${index}] has invalid reasoning efforts.`);
     }
-    const efforts = supported.map((effort, effortIndex) => {
+    const reasoning_efforts = supported.map((effort, effortIndex) => {
       const option = requiredRecord(effort, `model/list data[${index}].supportedReasoningEfforts[${effortIndex}]`);
-      return requiredString(option.reasoningEffort, "reasoningEffort");
+      return reasoningEffortSchema.parse(requiredString(option.reasoningEffort, "reasoningEffort"));
     });
-    const selection = requiredString(model.model, `model/list data[${index}].model`);
-    const label = optionalString(model.displayName) ?? selection;
-    const defaultEffort = optionalString(model.defaultReasoningEffort);
+    const model_id = requiredString(model.model, `model/list data[${index}].model`);
+    const display_name = optionalString(model.displayName) ?? model_id;
+    const rawDefaultEffort = optionalString(model.defaultReasoningEffort);
     return {
-      model: selection,
-      label,
-      efforts,
-      ...(defaultEffort === undefined ? {} : { default_effort: defaultEffort }),
+      model_id,
+      display_name,
+      reasoning_efforts,
+      ...(rawDefaultEffort === undefined
+        ? {}
+        : { default_effort: reasoningEffortSchema.parse(rawDefaultEffort) }),
       ...(typeof model.isDefault === "boolean" ? { is_default: model.isDefault } : {}),
     } satisfies AppServerModel;
   });
@@ -144,7 +147,7 @@ export function parseThreadStartResult(value: unknown): AppServerThread {
   return {
     thread_id: requiredString(thread.id, "thread.id"),
     session_id: requiredString(thread.sessionId, "thread.sessionId"),
-    ...(model === undefined ? {} : { model }),
+    ...(model === undefined ? {} : { model_id: model }),
     ...(cwd === undefined ? {} : { cwd }),
   };
 }
