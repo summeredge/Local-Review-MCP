@@ -332,6 +332,7 @@ describe("multi-workspace execution routing", () => {
       requirements: ["Keep Workspace ownership immutable."],
       acceptance_criteria: ["The Goal starts in Workspace D."],
       max_iterations: 1,
+      execution_mode: "batch" as const,
     };
     const proof = { source: "authenticated_mcp_invocation" as const };
 
@@ -494,6 +495,7 @@ describe("multi-workspace execution routing", () => {
       goal_id: `goal-${suffix}`,
       workspace_id,
       conversation_id: `conversation-${suffix}`,
+      execution_mode: "batch" as const,
       phases: [{
         phase_id: `phase-${suffix}`,
         objective: `Keep ${workspace_id} immutable`,

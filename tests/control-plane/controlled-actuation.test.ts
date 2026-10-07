@@ -10,6 +10,7 @@ import {
   controlledActuationStateFile,
   type ControlledActuationRequest,
 } from "../../src/control-plane/controlled-actuation.js";
+import { CliExecutionBackend } from "../../src/control-plane/execution-service.js";
 import {
   CodexExecutionAdapter,
   type CodexProcess,
@@ -89,6 +90,7 @@ function authorizationInput(executionId = "execution-001") {
     task_id: "task-001",
     execution_id: executionId,
     instruction: "inspect the task",
+    execution_mode: "batch",
   } as const;
 }
 
@@ -118,7 +120,7 @@ describe("ControlledActuationService", () => {
     const requests: CodexProcessSpawnRequest[] = [];
     const service = new ControlledActuationService(value.registry, {
       storageRoot: value.storageRoot,
-      adapter: adapterFor(value, process, requests),
+      adapter: new CliExecutionBackend(adapterFor(value, process, requests)),
     });
 
     const authorization = await service.authorize(authorizationInput());
@@ -206,7 +208,7 @@ describe("ControlledActuationService", () => {
     const adapter = adapterFor(value, process, requests);
     const service = new ControlledActuationService(value.registry, {
       storageRoot: value.storageRoot,
-      adapter,
+      adapter: new CliExecutionBackend(adapter),
     });
     const authorization = await service.authorize(authorizationInput());
     const request: ControlledActuationRequest = {

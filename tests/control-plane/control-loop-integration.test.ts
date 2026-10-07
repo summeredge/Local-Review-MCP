@@ -103,6 +103,7 @@ function plan(goalId: string, taskIds: readonly string[] = ["task-1"]): CreateGo
     goal_id: goalId,
     workspace_id: "workspace-a",
     conversation_id: "conversation-1",
+    execution_mode: "batch",
     phases: [{
       phase_id: "phase-1",
       objective: "Implement the requested change",
@@ -1012,6 +1013,7 @@ describe("Control Plane control loop integration", () => {
       workspace_id: value.workspace_id,
       task_id: "task-1",
       execution_id: checkpoint.execution_id!,
+      execution_mode: value.execution_mode,
       instruction: buildAutoIterationInstruction({
         goal: taskPlan.goal,
         requirements: taskPlan.requirements,

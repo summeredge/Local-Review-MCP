@@ -261,6 +261,17 @@ async function fixture(): Promise<{
 }
 
 describe("interactive Goal submission", () => {
+  it("defaults omitted execution mode to the interactive backend", async () => {
+    const value = await fixture();
+    const submitted = await value.submit.submitExternalGoal(request());
+
+    expect(submitted.status).toBe("running");
+    expect(value.cliStart).not.toHaveBeenCalled();
+    expect(value.appFactory).toHaveBeenCalledTimes(1);
+    expect(await value.sessions.listSessions()).toHaveLength(1);
+    await value.executionService.close();
+  });
+
   it("keeps the explicit batch route on the existing CLI backend", async () => {
     const value = await fixture();
     const submitted = await value.submit.submitExternalGoal(request("batch"));

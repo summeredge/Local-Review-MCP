@@ -10,6 +10,7 @@ import {
   goalSubmissionAcceptedSchema,
   goalSubmissionRequestSchema,
   goalSubmissionResultSchema,
+  resolveExecutionMode,
   type GoalSubmissionAccepted,
   type GoalSubmissionService,
 } from "./goal-submission.js";
@@ -51,7 +52,7 @@ const pendingPayloadSchema = goalSubmissionRequestSchema.pick({
   max_iterations: true,
 }).extend({
   workspace_id: workspaceIdSchema,
-  execution_mode: executionModeSchema.default("batch"),
+  execution_mode: executionModeSchema.optional(),
   model_id: z.string().min(1).max(256).optional(),
   reasoning_effort: reasoningEffortValueSchema.optional(),
 }).strict();
@@ -168,7 +169,7 @@ function payloadFingerprint(value: PendingGoalSubmission | PendingGoalSubmission
     requirements: value.requirements,
     acceptance_criteria: value.acceptance_criteria,
     max_iterations: value.max_iterations,
-    execution_mode: value.execution_mode ?? "batch",
+    execution_mode: value.execution_mode,
     model_id: value.model_id ?? null,
     reasoning_effort: value.reasoning_effort ?? null,
     connector_provenance: value.connector_provenance?.source ?? null,
@@ -313,7 +314,7 @@ export class PendingGoalSubmissionService {
         created_at: record.accepted_at,
         expires_at: record.expires_at,
         timeout_ms: Date.parse(record.expires_at) - Date.parse(record.accepted_at),
-        execution_mode: record.execution_mode ?? "batch",
+        ...(record.execution_mode === undefined ? {} : { execution_mode: record.execution_mode }),
       });
       return this.receipt(record);
     });
@@ -484,9 +485,7 @@ export class PendingGoalSubmissionService {
         requirements: claimed.record.requirements,
         acceptance_criteria: claimed.record.acceptance_criteria,
         max_iterations: claimed.record.max_iterations,
-        ...(claimed.record.execution_mode === undefined
-          ? {}
-          : { execution_mode: claimed.record.execution_mode }),
+        execution_mode: resolveExecutionMode(claimed.record.execution_mode),
         ...(claimed.record.model_id === undefined ? {} : { model_id: claimed.record.model_id }),
         ...(claimed.record.reasoning_effort === undefined
           ? {}

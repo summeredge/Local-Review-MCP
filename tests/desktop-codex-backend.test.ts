@@ -461,7 +461,7 @@ async function waitForTerminalExecution(value: Fixture): Promise<void> {
 }
 
 describe("P5.4.1 route selection", () => {
-  it.each([false, true])("routes explicit interactive MCP submit_goal through completion and automatic Review with activation failure=%s", async (activationFails) => {
+  it.each([false, true])("routes omitted MCP execution mode through Desktop preflight and completion with activation failure=%s", async (activationFails) => {
     const open = vi.fn(async () => {
       if (activationFails) throw new Error("activation failed");
     });
@@ -502,10 +502,9 @@ describe("P5.4.1 route selection", () => {
       const accepted = await client.callTool({ name: "submit_goal", arguments: {
         correlation_key: correlation, title: "Desktop interactive", goal: INSTRUCTION,
         requirements: ["Use Desktop"], acceptance_criteria: ["Review completes"],
-        execution_mode: "interactive",
       } });
       expect(accepted.isError).not.toBe(true);
-      expect((await pending.get(correlation))?.execution_mode).toBe("interactive");
+      expect((await pending.get(correlation))?.execution_mode).toBeUndefined();
       await correlations.observe({ request_id: correlation, conversation_id: "conversation-1",
         document_id: "document-1", navigation_epoch: 1 });
       pending.scheduleResolve(correlation);
@@ -653,6 +652,20 @@ describe("P5.4.1 route selection", () => {
     expect(value.cliStart).not.toHaveBeenCalled();
     expect(value.appServerStart).not.toHaveBeenCalled();
     expect(value.desktop.createThreadCount()).toBe(1);
+  });
+
+  it("rejects a missing execution mode before selecting a backend", async () => {
+    const value = await fixture();
+    await seedTask(value);
+
+    await expect(value.service.start({
+      workspace_id: "workspace-a",
+      task_id: TASK_ID,
+      execution_id: "execution-no-mode",
+      instruction: INSTRUCTION,
+    } as never)).rejects.toThrow();
+    expect(value.cliStart).not.toHaveBeenCalled();
+    expect(value.desktop.createThreadCount()).toBe(0);
   });
 
   it("does not fall back to the private app-server backend when Desktop fails", async () => {
@@ -829,6 +842,7 @@ describe("Desktop interactive Goal model and reasoning effort", () => {
       task_id: TASK_ID,
       execution_id: "execution-batch",
       instruction: INSTRUCTION,
+      execution_mode: "batch",
       model_id: "gpt-5.6-luna",
       reasoning_effort: "max",
     });

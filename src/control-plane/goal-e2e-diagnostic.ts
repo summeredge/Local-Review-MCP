@@ -324,6 +324,7 @@ export function buildDiagnosticGoalPlan(
     goal_id: goalId,
     workspace_id: workspaceId,
     conversation_id: conversationId,
+    execution_mode: "batch",
     phases: [{
       phase_id: phaseId,
       objective: "E2E Validation",

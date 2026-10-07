@@ -23,7 +23,7 @@ import type {
   CreateGoalInput,
   GoalOrchestrationService,
 } from "./goal-orchestration.js";
-import { executionModeSchema } from "./execution-service.js";
+import { executionModeSchema, type ExecutionMode } from "./execution-service.js";
 import { reasoningEffortValueSchema, type ReasoningEffort } from "../models/model-catalog.js";
 import { parseReasoningEffort, resolveModel } from "../models/model-resolver.js";
 
@@ -39,7 +39,7 @@ export const goalSubmissionRequestSchema = z.object({
   requirements: submissionItemsSchema,
   acceptance_criteria: submissionItemsSchema,
   max_iterations: z.number().int().min(1).max(10_000).default(DEFAULT_GOAL_MAX_ITERATIONS),
-  execution_mode: executionModeSchema.default("batch"),
+  execution_mode: executionModeSchema.optional(),
   model: z.string().min(1).max(256).optional(),
   reasoning_effort: z.string().min(1).max(64).optional(),
 }).strict();
@@ -53,6 +53,7 @@ export const goalSubmissionToolInputSchema = goalSubmissionRequestSchema
 export const resolvedGoalSubmissionRequestSchema = goalSubmissionRequestSchema
   .omit({ model: true, reasoning_effort: true })
   .extend({
+    execution_mode: executionModeSchema,
     model_id: z.string().min(1).max(256).optional(),
     reasoning_effort: reasoningEffortValueSchema.optional(),
   })
@@ -106,6 +107,10 @@ export function resolveGoalModelFields(
   };
 }
 
+export function resolveExecutionMode(execution_mode?: ExecutionMode): ExecutionMode {
+  return execution_mode ?? "interactive";
+}
+
 function buildPlan(request: z.output<typeof resolvedGoalSubmissionRequestSchema>): CreateGoalInput {
   const phaseId = generatedId("phase");
   return createGoalInputSchema.parse({
@@ -143,6 +148,7 @@ export class GoalSubmissionService {
     const { model, reasoning_effort, ...base } = parsed;
     return this.submitGoal({
       ...base,
+      execution_mode: resolveExecutionMode(base.execution_mode),
       ...resolveGoalModelFields(model, reasoning_effort),
     }, connectorProvenance);
   }

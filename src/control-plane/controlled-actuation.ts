@@ -55,7 +55,7 @@ export interface ActuationAuthorizationInput {
   readonly task_id: string;
   readonly execution_id: string;
   readonly instruction: string;
-  readonly execution_mode?: ExecutionMode;
+  readonly execution_mode: ExecutionMode;
   readonly model_id?: string;
   readonly reasoning_effort?: ReasoningEffortValue;
 }
@@ -93,7 +93,7 @@ export const actuationAuthorizationInputSchema = z.object({
   task_id: taskIdSchema,
   execution_id: executionIdSchema,
   instruction: instructionSchema,
-  execution_mode: executionModeSchema.optional(),
+  execution_mode: executionModeSchema,
   model_id: z.string().min(1).max(256).optional(),
   reasoning_effort: reasoningEffortValueSchema.optional(),
 }).strict();
@@ -590,7 +590,7 @@ export class ControlledActuationService {
         task_id: authorization.task_id,
         execution_id: authorization.execution_id,
         instruction: authorization.instruction,
-        ...(authorization.execution_mode === undefined ? {} : { execution_mode: authorization.execution_mode }),
+        execution_mode: authorization.execution_mode,
         ...(authorization.model_id === undefined ? {} : { model_id: authorization.model_id }),
         ...(authorization.reasoning_effort === undefined
           ? {}

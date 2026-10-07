@@ -164,12 +164,13 @@ describe("GoalSubmissionService", () => {
     expect(f.preflight.checkGoalPreflight).toHaveBeenCalledWith({
       workspace_id: "workspace-a",
       conversation_id: "conversation-1",
+      execution_mode: "interactive",
     });
     expect(startGoal).toHaveBeenCalledWith({ goal_id: plan.goal_id });
     expect(plan).toMatchObject({
       workspace_id: "workspace-a",
       conversation_id: "conversation-1",
-      execution_mode: "batch",
+      execution_mode: "interactive",
       model_id: "gpt-6-luna",
       reasoning_effort: "high",
       phases: [{

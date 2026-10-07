@@ -191,11 +191,16 @@ function interactiveRequest() {
   };
 }
 
+function defaultRequest() {
+  const { execution_mode: _omitted, ...request } = interactiveRequest();
+  return request;
+}
+
 describe("production interactive Desktop preflight", () => {
   it("fails closed with a queryable reason and creates no Goal when no pipe source exists", async () => {
     const fixture = productionFixture({ state: () => connectedState(), environment: {} });
 
-    const error = await fixture.submission.submitGoal(interactiveRequest())
+    const error = await fixture.submission.submitExternalGoal(defaultRequest())
       .then(() => null, (value: unknown) => value);
     expect(error).toBeInstanceOf(GoalPreflightError);
     expect((error as GoalPreflightError).result).toMatchObject({
@@ -224,10 +229,12 @@ describe("production interactive Desktop preflight", () => {
       },
     });
 
-    await expect(fixture.submission.submitGoal(interactiveRequest())).resolves.toMatchObject({
+    const checkPreflight = vi.spyOn(fixture.preflight, "checkGoalPreflight");
+    await expect(fixture.submission.submitExternalGoal(defaultRequest())).resolves.toMatchObject({
       goal_id: "goal-1",
       execution_id: "execution-1",
     });
+    expect(checkPreflight).toHaveBeenCalledWith(expect.objectContaining({ execution_mode: "interactive" }));
     expect(ticks).toBeGreaterThan(1);
     expect(fixture.createGoal).toHaveBeenCalledTimes(1);
     expect(fixture.startGoal).toHaveBeenCalledTimes(1);

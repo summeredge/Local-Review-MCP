@@ -57,7 +57,7 @@ export const createGoalInputSchema = z.object({
   goal_id: goalIdSchema,
   workspace_id: workspaceIdSchema,
   conversation_id: conversationIdSchema,
-  execution_mode: executionModeSchema.default("batch"),
+  execution_mode: executionModeSchema,
   model_id: z.string().min(1).max(256).optional(),
   reasoning_effort: reasoningEffortValueSchema.optional(),
   phases: z.array(z.object({
@@ -117,7 +117,7 @@ export const goalOrchestrationSchema = z.object({
   goal_id: goalIdSchema,
   workspace_id: workspaceIdSchema,
   conversation_id: conversationIdSchema,
-  execution_mode: executionModeSchema.default("batch"),
+  execution_mode: executionModeSchema,
   model_id: z.string().min(1).max(256).optional(),
   reasoning_effort: reasoningEffortValueSchema.optional(),
   review_only: z.boolean().optional(),
@@ -519,6 +519,7 @@ export class GoalOrchestrationService {
       goal_id: input.goal_id,
       workspace_id: input.workspace_id,
       conversation_id: input.conversation_id,
+      execution_mode: "batch",
       phases: [{
         phase_id: input.phase_id,
         objective: input.title,
@@ -778,7 +779,7 @@ export class GoalOrchestrationService {
       || authorization.task_id !== task.task_id
       || authorization.execution_id !== goal.execution_id
       || authorization.instruction !== instruction
-      || (authorization.execution_mode ?? "batch") !== goal.execution_mode
+      || authorization.execution_mode !== goal.execution_mode
       || authorization.model_id !== goal.model_id
       || authorization.reasoning_effort !== goal.reasoning_effort
       || (goal.execution_mode === "interactive" && authorization.goal_id !== goal.goal_id)) {

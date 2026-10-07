@@ -1163,7 +1163,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
             ? {}
             : { conversation_id: correlation.conversation_id }),
           workspace_id: selection.id,
-          execution_mode: input.execution_mode ?? "batch",
+          ...(input.execution_mode === undefined ? {} : { execution_mode: input.execution_mode }),
         });
         const pendingInput = {
           correlation_key: input.correlation_key,
@@ -1173,7 +1173,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
           requirements: input.requirements,
           acceptance_criteria: input.acceptance_criteria,
           max_iterations: input.max_iterations,
-          execution_mode: input.execution_mode ?? "batch",
+          ...(input.execution_mode === undefined ? {} : { execution_mode: input.execution_mode }),
           ...resolveGoalModelFields(input.model, input.reasoning_effort),
         };
         const accepted = connectorProvenance === undefined

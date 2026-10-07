@@ -29,7 +29,7 @@ export const executionBackendStartRequestSchema = z.object({
   task_id: taskIdSchema,
   execution_id: executionIdSchema,
   instruction: executionInstructionSchema,
-  execution_mode: executionModeSchema.default("batch"),
+  execution_mode: executionModeSchema,
   model_id: executionModelIdSchema.optional(),
   reasoning_effort: reasoningEffortValueSchema.optional(),
 }).strict();

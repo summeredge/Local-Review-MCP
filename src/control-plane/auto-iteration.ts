@@ -1050,7 +1050,7 @@ export class AutoIterationService {
         || authorization.execution_id !== loop.execution_id
         || authorization.instruction !== instruction
         || authorization.goal_id !== configuration.goal_id
-        || (authorization.execution_mode ?? "batch") !== configuration.execution_mode
+        || authorization.execution_mode !== configuration.execution_mode
         || authorization.model_id !== configuration.model_id
         || authorization.reasoning_effort !== configuration.reasoning_effort) {
         await this.humanRequired(loop, "AUTHORIZATION_IDENTITY_INVALID");

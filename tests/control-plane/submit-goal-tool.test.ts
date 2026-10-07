@@ -283,13 +283,27 @@ describe("submit_goal MCP tool", () => {
   });
 
   it.each([undefined, "interactive", "batch"] as const)("preserves the %s execution route through the pending identity gate", async (mode) => {
-    const { client, correlations, pending, submitGoal, workspaceId } = await fixture();
+    const { client, correlations, pending, submitGoal, workspaceId, storageRoot, record } = await fixture();
 
     await callFor(client, {
       ...goalArguments(),
       ...(mode === undefined ? {} : { execution_mode: mode }),
     });
-    expect((await pending.get(CORRELATION_A))?.execution_mode).toBe(mode ?? "batch");
+    expect((await pending.get(CORRELATION_A))?.execution_mode).toBe(mode);
+    const pendingState = JSON.parse(await readFile(pendingGoalSubmissionStateFile(storageRoot), "utf8")) as {
+      submissions: Array<Record<string, unknown>>;
+    };
+    if (mode === undefined) {
+      expect(pendingState.submissions[0]).not.toHaveProperty("execution_mode");
+    } else {
+      expect(pendingState.submissions[0]?.execution_mode).toBe(mode);
+    }
+    const pendingCreated = record.mock.calls.find(([event]) => event.event === "pending_created")?.[0];
+    if (mode === undefined) {
+      expect(pendingCreated).not.toHaveProperty("execution_mode");
+    } else {
+      expect(pendingCreated?.execution_mode).toBe(mode);
+    }
 
     await correlations.observe(evidence(CORRELATION_A, "conversation-interactive"));
     pending.scheduleResolve(CORRELATION_A);
@@ -297,7 +311,7 @@ describe("submit_goal MCP tool", () => {
     await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "started");
 
     expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
-      execution_mode: mode ?? "batch",
+      execution_mode: mode ?? "interactive",
     }));
   });
 

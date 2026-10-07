@@ -273,7 +273,8 @@ describe("AutoIterationService", () => {
       try {
         await expect(restarted.advance("loop-checkpoint")).resolves.toMatchObject({
           stage: "human_required", terminal_reason: fault === "corrupt" ? "INITIAL_AUTHORIZATION_UNAVAILABLE"
-            : fault === "missing-mode" || fault === "missing-goal" ? "INITIAL_AUTHORIZATION_IDENTITY_INVALID"
+          : fault === "missing-goal" ? "INITIAL_AUTHORIZATION_IDENTITY_INVALID"
+            : fault === "missing-mode" ? "INITIAL_AUTHORIZATION_UNAVAILABLE"
             : "INITIAL_AUTHORIZATION_MISSING",
         });
         expect(value.starts).toHaveLength(0);
@@ -291,7 +292,7 @@ describe("AutoIterationService", () => {
     const pending = { goal: "Fix", requirements: ["Preserve routing"], acceptance_criteria: ["Tests pass"] };
     const authorization = await value.auto.controlledActuation.authorize({
       actuation_id: "actuation-next", workspace_id: "workspace-a", task_id: "task-001",
-      execution_id: "execution-next", instruction: buildAutoIterationInstruction(pending),
+      execution_id: "execution-next", instruction: buildAutoIterationInstruction(pending), execution_mode: "interactive",
     });
     await persistLoop(value.root, checkpoint({ stage: "actuation", iteration: 2,
       execution_id: "execution-next", actuation_id: authorization.actuation_id,
@@ -877,6 +878,7 @@ describe("AutoIterationService", () => {
       task_id: "task-001",
       execution_id: "execution-uncertain-recovery",
       instruction: buildAutoIterationInstruction(pendingIteration),
+      execution_mode: "batch",
     });
     await controlled.authorizationStore.reserveActuation({
       actuation_id: authorization.actuation_id,
@@ -1312,6 +1314,7 @@ describe("AutoIterationService", () => {
       task_id: "task-001",
       execution_id: "execution-recovery",
       instruction,
+      execution_mode: "batch",
     });
     const firstLoop = {
       loop_id: "loop-recovery",
@@ -1369,6 +1372,7 @@ describe("AutoIterationService", () => {
       task_id: "task-001",
       execution_id: "execution-started",
       instruction,
+      execution_mode: "batch",
     });
     await recoveredControlled.actuate({
       actuation_id: startedAuthorization.actuation_id,

@@ -37,7 +37,7 @@ function plannedGoal(options: {
   readonly workspaceId: string;
   readonly taskId: string;
   readonly executionId: string;
-  readonly executionMode?: "batch" | "interactive";
+  readonly executionMode: "batch" | "interactive";
   readonly objective?: string;
   readonly taskGoal?: string;
 }): GoalOrchestration {
@@ -45,7 +45,7 @@ function plannedGoal(options: {
     goal_id: options.goalId,
     workspace_id: options.workspaceId,
     conversation_id: "conversation-1",
-    execution_mode: options.executionMode ?? "batch",
+    execution_mode: options.executionMode,
     phases: [{
       phase_id: "phase-1",
       objective: options.objective ?? "Phase",
@@ -242,6 +242,7 @@ describe("Launcher Execution catalog", () => {
       workspaceId: "workspace-1",
       taskId: "task-batch",
       executionId: "execution-batch",
+      executionMode: "batch",
       objective: "PCA WebUI chart",
       taskGoal: "Add the time coloring",
     });
@@ -466,6 +467,7 @@ describe("Launcher Execution catalog", () => {
       workspaceId: "workspace-1",
       taskId: "task-batch",
       executionId: "execution-batch",
+      executionMode: "batch",
     });
     const interactive = plannedGoal({
       goalId: "goal-desktop",
@@ -516,12 +518,14 @@ describe("Launcher Execution catalog", () => {
         workspaceId: "workspace-1",
         taskId: "task-running",
         executionId: "execution-running",
+        executionMode: "batch",
       }),
       plannedGoal({
         goalId: "goal-failed",
         workspaceId: "workspace-1",
         taskId: "task-failed",
         executionId: "execution-failed",
+        executionMode: "batch",
       }),
     ];
     await seedExecution(root, {

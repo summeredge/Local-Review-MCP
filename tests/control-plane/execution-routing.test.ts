@@ -373,6 +373,7 @@ describe("ExecutionRoutingService", () => {
       goal_id: "goal-existing",
       workspace_id: h.workspaceId,
       conversation_id: "conversation-1",
+      execution_mode: "batch",
       phases: [{
         phase_id: "phase-existing",
         objective: "Review the existing Goal execution",

@@ -202,6 +202,7 @@ describe("PendingGoalSubmissionService", () => {
 
     expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
       conversation_id: "conversation-a",
+      execution_mode: "interactive",
     }));
     expect((await pending.get(CORRELATION_A))?.state).toBe("started");
     expect(trace.mock.calls.map(([event]) => event.event)).toEqual([
@@ -209,6 +210,49 @@ describe("PendingGoalSubmissionService", () => {
       "evidence_match_success",
       "goal_started",
     ]);
+  });
+
+  it("keeps omitted execution mode distinct from explicit batch for idempotency", async () => {
+    const root = await makeRoot();
+    const trace = vi.fn();
+    const pending = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), {
+      submitGoal: vi.fn(async () => result()),
+    }, { storageRoot: root, identityTrace: { record: trace } });
+
+    await pending.accept(input());
+    await expect(pending.accept({ ...input(), execution_mode: "batch" }))
+      .rejects.toThrow("different pending Goal submission");
+    expect((await pending.get(CORRELATION_A))?.execution_mode).toBeUndefined();
+    expect(trace.mock.calls[0]?.[0]).not.toHaveProperty("execution_mode");
+  });
+
+  it("restores a legacy Pending without writing batch and resolves it to interactive", async () => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const initial = new PendingGoalSubmissionService(correlations, {
+      submitGoal: vi.fn(async () => result()),
+    }, { storageRoot: root });
+    await initial.accept(input());
+    const file = pendingGoalSubmissionStateFile(root);
+    const state = JSON.parse(await readFile(file, "utf8")) as {
+      submissions: Array<Record<string, unknown>>;
+    };
+    delete state.submissions[0]!.execution_mode;
+    await writeFile(file, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await correlations.observe(evidence());
+
+    const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => result(request.conversation_id));
+    const restored = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    await restored.restore();
+    expect((await restored.get(CORRELATION_A))?.execution_mode).toBeUndefined();
+    const restoredState = JSON.parse(await readFile(file, "utf8")) as { submissions: Array<Record<string, unknown>> };
+    expect(restoredState.submissions[0]).not.toHaveProperty("execution_mode");
+
+    await restored.resolve(CORRELATION_A);
+    await waitFor(async () => (await restored.get(CORRELATION_A))?.state === "started");
+    expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({ execution_mode: "interactive" }));
+    const finished = JSON.parse(await readFile(file, "utf8")) as { submissions: Array<Record<string, unknown>> };
+    expect(finished.submissions[0]).not.toHaveProperty("execution_mode");
   });
 
   it("fails closed after the identity timeout when correlation never arrives", async () => {

@@ -58,6 +58,7 @@ function input(phases: CreateGoalInput["phases"] = [{
     goal_id: "goal-1",
     workspace_id: "workspace-a",
     conversation_id: "conversation-1",
+    execution_mode: "batch",
     phases,
   };
 }
@@ -214,6 +215,7 @@ async function ensureStartedEvidence(
     workspace_id: goal.workspace_id,
     task_id: taskId,
     execution_id: executionId,
+    execution_mode: goal.execution_mode,
     instruction: [
       "## 修改目标",
       taskPlan.goal,
@@ -393,6 +395,7 @@ describe("GoalOrchestrationService", () => {
       workspace_id: plan.workspace_id,
       task_id: "task-1",
       execution_id: checkpoint.execution_id!,
+      execution_mode: plan.execution_mode,
       instruction: [
         "## 修改目标",
         "Make the change",
@@ -433,6 +436,7 @@ describe("GoalOrchestrationService", () => {
       workspace_id: plan.workspace_id,
       task_id: "task-1",
       execution_id: checkpoint.execution_id!,
+      execution_mode: plan.execution_mode,
       instruction: [
         "## 修改目标",
         "Make the change",
@@ -572,6 +576,7 @@ describe("GoalOrchestrationService", () => {
       workspace_id: plan.workspace_id,
       task_id: "task-1",
       execution_id: checkpoint.execution_id!,
+      execution_mode: plan.execution_mode,
       instruction: "wrong instruction",
     });
     await persistGoal(f.root, checkpoint);
