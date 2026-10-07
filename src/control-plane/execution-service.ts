@@ -6,7 +6,7 @@ import {
   workspaceIdSchema,
 } from "../context/schema.js";
 import type { ExecutionContext } from "../context/types.js";
-import { reasoningEffortSchema } from "../models/model-catalog.js";
+import { reasoningEffortValueSchema } from "../models/model-catalog.js";
 import {
   CodexExecutionAdapter,
   type CodexExecutionStartRequest,
@@ -31,7 +31,7 @@ export const executionBackendStartRequestSchema = z.object({
   instruction: executionInstructionSchema,
   execution_mode: executionModeSchema.default("batch"),
   model_id: executionModelIdSchema.optional(),
-  reasoning_effort: reasoningEffortSchema.optional(),
+  reasoning_effort: reasoningEffortValueSchema.optional(),
 }).strict();
 
 export type ExecutionBackendStartRequest = z.input<typeof executionBackendStartRequestSchema>;

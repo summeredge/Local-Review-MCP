@@ -89,7 +89,10 @@ export function resolveModel(input: ResolveModelInput): ResolvedModel {
   const value = input.model.trim();
   if (value === "") return fail({ code: "model_empty", input: input.model });
 
-  const effortSuffix = value.match(/^(.*?)[\s._-]+(none|minimal|low|medium|high|xhigh|max|ultra)$/iu);
+  const exactCanonical = MODEL_CATALOG.find((entry) => entry.model_id === value);
+  const effortSuffix = exactCanonical === undefined
+    ? value.match(/^(.*?)[\s._-]+(none|minimal|low|medium|high|xhigh|max|ultra)$/iu)
+    : null;
   const modelName = (effortSuffix?.[1] ?? value).trim();
   const inferredEffort = effortSuffix?.[2];
   const candidates = (query: string): ModelCatalogEntry[] => {
@@ -100,45 +103,58 @@ export function resolveModel(input: ResolveModelInput): ResolvedModel {
     return matches;
   };
 
-  const exactCanonical = MODEL_CATALOG.find((entry) => entry.model_id === value);
   let model = exactCanonical;
   let match_type: ResolvedModel["match_type"] = "canonical";
+  let ambiguousSuffixBase = false;
 
   if (model === undefined) {
     const normalizedName = normalize(modelName);
     const normalizedMatches = MODEL_CATALOG.filter((entry) =>
       normalize(entry.model_id) === normalizedName || normalize(entry.display_name) === normalizedName);
-    if (normalizedMatches.length > 1) ambiguous(value, normalizedMatches);
-    model = normalizedMatches[0];
-    match_type = "normalized";
+    if (normalizedMatches.length > 1) {
+      if (effortSuffix === null) ambiguous(value, normalizedMatches);
+      ambiguousSuffixBase = true;
+    } else {
+      model = normalizedMatches[0];
+      if (model !== undefined) match_type = "normalized";
+    }
   }
 
-  if (model === undefined) {
+  if (model === undefined && !ambiguousSuffixBase) {
     const normalizedName = normalize(modelName);
     const aliasMatches = MODEL_CATALOG.filter((entry) =>
       entry.aliases.some((alias) => normalize(alias) === normalizedName));
-    if (aliasMatches.length > 1) ambiguous(value, aliasMatches);
-    model = aliasMatches[0];
-    match_type = "alias";
+    if (aliasMatches.length > 1) {
+      if (effortSuffix === null) ambiguous(value, aliasMatches);
+      ambiguousSuffixBase = true;
+    } else {
+      model = aliasMatches[0];
+      if (model !== undefined) match_type = "alias";
+    }
   }
 
-  if (model === undefined && normalize(modelName).length >= 3) {
+  if (model === undefined && !ambiguousSuffixBase && normalize(modelName).length >= 3) {
     const fuzzyMatches = candidates(modelName);
-    if (fuzzyMatches.length > 1) ambiguous(value, fuzzyMatches);
-    model = fuzzyMatches[0];
-    match_type = "fuzzy";
+    if (fuzzyMatches.length > 1) {
+      if (effortSuffix === null) ambiguous(value, fuzzyMatches);
+      ambiguousSuffixBase = true;
+    } else {
+      model = fuzzyMatches[0];
+      if (model !== undefined) match_type = "fuzzy";
+    }
   }
 
   // Provider catalogs validate opaque canonical IDs later through model/list.
   const dynamicModel = model === undefined;
+  const resolvedModelName = dynamicModel ? value : modelName;
 
-  const effortValue = input.reasoning_effort ?? inferredEffort;
+  const effortValue = input.reasoning_effort ?? (dynamicModel ? undefined : inferredEffort);
   const reasoning_effort = effortValue === undefined
     ? undefined
     : parseReasoningEffort(effortValue, model, value);
   return {
-    model_id: model?.model_id ?? modelName,
-    display_name: model?.display_name ?? modelName,
+    model_id: model?.model_id ?? resolvedModelName,
+    display_name: model?.display_name ?? resolvedModelName,
     ...(reasoning_effort === undefined ? {} : { reasoning_effort }),
     match_type: dynamicModel ? "canonical" : match_type,
   };

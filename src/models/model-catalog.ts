@@ -13,6 +13,9 @@ export const REASONING_EFFORTS = [
 
 export type ReasoningEffort = typeof REASONING_EFFORTS[number];
 export const reasoningEffortSchema = z.enum(REASONING_EFFORTS);
+/** Provider and persisted values stay open; new user selections use reasoningEffortSchema. */
+export const reasoningEffortValueSchema = z.string().min(1).refine((value) => value.trim() !== "");
+export type ReasoningEffortValue = z.infer<typeof reasoningEffortValueSchema>;
 
 export interface ModelCatalogEntry {
   readonly model_id: string;

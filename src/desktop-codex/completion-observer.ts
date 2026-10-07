@@ -67,6 +67,7 @@ export interface DesktopCompletionObserverOptions {
   /** Bound continuous read failures without imposing a duration limit on a healthy running turn. */
   readonly readFailureTimeoutMs?: number;
   readonly onTurnStarted?: (turnId: string) => Promise<void>;
+  readonly onSuccessfulRead?: () => void;
 }
 
 export class DesktopCompletionObserverError extends Error {
@@ -510,6 +511,7 @@ export class DesktopCompletionObserver {
           context,
         );
         readFailureSince = undefined;
+        this.options.onSuccessfulRead?.();
       } catch (error: unknown) {
         if (isAbort(error, context.signal)) throw abortError();
         if (visibilityActive && transientObservationError(error)) {

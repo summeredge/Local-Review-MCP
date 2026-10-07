@@ -24,7 +24,7 @@ import type {
   GoalOrchestrationService,
 } from "./goal-orchestration.js";
 import { executionModeSchema } from "./execution-service.js";
-import { reasoningEffortSchema } from "../models/model-catalog.js";
+import { reasoningEffortValueSchema, type ReasoningEffort } from "../models/model-catalog.js";
 import { parseReasoningEffort, resolveModel } from "../models/model-resolver.js";
 
 export const DEFAULT_GOAL_MAX_ITERATIONS = 2;
@@ -54,7 +54,7 @@ export const resolvedGoalSubmissionRequestSchema = goalSubmissionRequestSchema
   .omit({ model: true, reasoning_effort: true })
   .extend({
     model_id: z.string().min(1).max(256).optional(),
-    reasoning_effort: reasoningEffortSchema.optional(),
+    reasoning_effort: reasoningEffortValueSchema.optional(),
   })
   .strict();
 
@@ -92,7 +92,7 @@ function generatedId(prefix: string): string {
 export function resolveGoalModelFields(
   model?: string,
   reasoning_effort?: string,
-): Pick<ResolvedGoalSubmissionRequest, "model_id" | "reasoning_effort"> {
+): { model_id?: string; reasoning_effort?: ReasoningEffort } {
   if (model === undefined) {
     return reasoning_effort === undefined ? {} : { reasoning_effort: parseReasoningEffort(reasoning_effort) };
   }

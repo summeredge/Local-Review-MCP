@@ -13,7 +13,7 @@ import { TaskContextService } from "../context/service.js";
 import { defaultTaskContextStorageRoot } from "../context/task.js";
 import type { TaskStatus } from "../context/types.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
-import { reasoningEffortSchema } from "../models/model-catalog.js";
+import { reasoningEffortValueSchema } from "../models/model-catalog.js";
 import { migrateLegacyModelIdFields } from "../models/model-resolver.js";
 import {
   AutoIterationService,
@@ -59,7 +59,7 @@ export const createGoalInputSchema = z.object({
   conversation_id: conversationIdSchema,
   execution_mode: executionModeSchema.default("batch"),
   model_id: z.string().min(1).max(256).optional(),
-  reasoning_effort: reasoningEffortSchema.optional(),
+  reasoning_effort: reasoningEffortValueSchema.optional(),
   phases: z.array(z.object({
     phase_id: phaseIdSchema,
     objective: instructionItemSchema,
@@ -119,7 +119,7 @@ export const goalOrchestrationSchema = z.object({
   conversation_id: conversationIdSchema,
   execution_mode: executionModeSchema.default("batch"),
   model_id: z.string().min(1).max(256).optional(),
-  reasoning_effort: reasoningEffortSchema.optional(),
+  reasoning_effort: reasoningEffortValueSchema.optional(),
   review_only: z.boolean().optional(),
   phases: z.array(phaseSchema).min(1).max(1_000),
   status: goalOrchestrationStatusSchema,

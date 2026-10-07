@@ -7,7 +7,7 @@ import {
   type DesktopThreadBindingStore,
 } from "./desktop-thread-binding-store.js";
 import type { DesktopThreadBinding } from "./desktop-thread-binding.js";
-import type { ReasoningEffort } from "../models/model-catalog.js";
+import type { ReasoningEffortValue } from "../models/model-catalog.js";
 
 export type DesktopThreadCoordinatorErrorCode =
   | "binding_not_found"
@@ -37,7 +37,7 @@ export interface CreateOrReuseThreadInput extends DesktopCodexCommandOptions {
   readonly projectId: string;
   readonly prompt: string;
   readonly model_id?: string;
-  readonly reasoning_effort?: ReasoningEffort;
+  readonly reasoning_effort?: ReasoningEffortValue;
 }
 
 /**

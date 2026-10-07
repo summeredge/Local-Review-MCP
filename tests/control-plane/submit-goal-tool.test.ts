@@ -289,7 +289,7 @@ describe("submit_goal MCP tool", () => {
       ...goalArguments(),
       ...(mode === undefined ? {} : { execution_mode: mode }),
     });
-    expect((await pending.get(CORRELATION_A))?.execution_mode).toBe(mode ?? "interactive");
+    expect((await pending.get(CORRELATION_A))?.execution_mode).toBe(mode ?? "batch");
 
     await correlations.observe(evidence(CORRELATION_A, "conversation-interactive"));
     pending.scheduleResolve(CORRELATION_A);
@@ -297,7 +297,7 @@ describe("submit_goal MCP tool", () => {
     await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "started");
 
     expect(submitGoal).toHaveBeenCalledWith(expect.objectContaining({
-      execution_mode: mode ?? "interactive",
+      execution_mode: mode ?? "batch",
     }));
   });
 

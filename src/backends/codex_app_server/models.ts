@@ -1,5 +1,5 @@
 import { jsonRecord } from "./protocol.js";
-import { reasoningEffortSchema, type ReasoningEffort } from "../../models/model-catalog.js";
+import { reasoningEffortValueSchema, type ReasoningEffortValue } from "../../models/model-catalog.js";
 
 export type AppServerTransport = "stdio";
 export type AppServerStatus = "starting" | "ready" | "stopping" | "stopped" | "failed";
@@ -31,8 +31,8 @@ export interface AppServerInitializeResult {
 export interface AppServerModel {
   readonly model_id: string;
   readonly display_name: string;
-  readonly reasoning_efforts: readonly ReasoningEffort[];
-  readonly default_effort?: ReasoningEffort;
+  readonly reasoning_efforts: readonly ReasoningEffortValue[];
+  readonly default_effort?: ReasoningEffortValue;
   readonly is_default?: boolean;
 }
 
@@ -118,7 +118,7 @@ export function parseModelListPage(value: unknown): ModelListPage {
     }
     const reasoning_efforts = supported.map((effort, effortIndex) => {
       const option = requiredRecord(effort, `model/list data[${index}].supportedReasoningEfforts[${effortIndex}]`);
-      return reasoningEffortSchema.parse(requiredString(option.reasoningEffort, "reasoningEffort"));
+      return reasoningEffortValueSchema.parse(requiredString(option.reasoningEffort, "reasoningEffort"));
     });
     const model_id = requiredString(model.model, `model/list data[${index}].model`);
     const display_name = optionalString(model.displayName) ?? model_id;
@@ -129,7 +129,7 @@ export function parseModelListPage(value: unknown): ModelListPage {
       reasoning_efforts,
       ...(rawDefaultEffort === undefined
         ? {}
-        : { default_effort: reasoningEffortSchema.parse(rawDefaultEffort) }),
+        : { default_effort: reasoningEffortValueSchema.parse(rawDefaultEffort) }),
       ...(typeof model.isDefault === "boolean" ? { is_default: model.isDefault } : {}),
     } satisfies AppServerModel;
   });

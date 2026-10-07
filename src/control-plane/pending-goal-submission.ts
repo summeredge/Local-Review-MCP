@@ -24,7 +24,7 @@ import type { ConversationCorrelationRegistry } from "./conversation-correlation
 import type { ExtensionIdentityEvidence } from "./extension-identity.js";
 import { IdentityEvidenceInbox, IdentityEvidenceConflictError, identityEvidenceAck, type IdentityEvidenceAck } from "./identity-evidence-inbox.js";
 import { executionModeSchema } from "./execution-service.js";
-import { reasoningEffortSchema } from "../models/model-catalog.js";
+import { reasoningEffortSchema, reasoningEffortValueSchema } from "../models/model-catalog.js";
 import { migrateLegacyModelIdFields } from "../models/model-resolver.js";
 import type {
   IdentityTraceRecordInput,
@@ -51,13 +51,14 @@ const pendingPayloadSchema = goalSubmissionRequestSchema.pick({
   max_iterations: true,
 }).extend({
   workspace_id: workspaceIdSchema,
-  execution_mode: executionModeSchema.optional(),
+  execution_mode: executionModeSchema.default("batch"),
   model_id: z.string().min(1).max(256).optional(),
-  reasoning_effort: reasoningEffortSchema.optional(),
+  reasoning_effort: reasoningEffortValueSchema.optional(),
 }).strict();
 
 export const pendingGoalSubmissionInputSchema = pendingPayloadSchema.extend({
   correlation_key: correlationKeySchema,
+  reasoning_effort: reasoningEffortSchema.optional(),
 }).strict();
 
 const pendingBaseSchema = pendingPayloadSchema.extend({
@@ -167,7 +168,7 @@ function payloadFingerprint(value: PendingGoalSubmission | PendingGoalSubmission
     requirements: value.requirements,
     acceptance_criteria: value.acceptance_criteria,
     max_iterations: value.max_iterations,
-    execution_mode: value.execution_mode ?? "interactive",
+    execution_mode: value.execution_mode ?? "batch",
     model_id: value.model_id ?? null,
     reasoning_effort: value.reasoning_effort ?? null,
     connector_provenance: value.connector_provenance?.source ?? null,
@@ -312,7 +313,7 @@ export class PendingGoalSubmissionService {
         created_at: record.accepted_at,
         expires_at: record.expires_at,
         timeout_ms: Date.parse(record.expires_at) - Date.parse(record.accepted_at),
-        execution_mode: record.execution_mode ?? "interactive",
+        execution_mode: record.execution_mode ?? "batch",
       });
       return this.receipt(record);
     });

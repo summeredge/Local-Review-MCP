@@ -5,7 +5,7 @@ import { TaskContextService } from "../../context/service.js";
 import type { ExecutionContext, Session } from "../../context/types.js";
 import { defaultTaskContextStorageRoot } from "../../context/task.js";
 import type { WorkspaceRegistry } from "../../workspace/registry.js";
-import type { ReasoningEffort } from "../../models/model-catalog.js";
+import type { ReasoningEffortValue } from "../../models/model-catalog.js";
 import { EventStore } from "../../control-plane/events/store.js";
 import type { LrmEvent } from "../../control-plane/events/model.js";
 import { CodexEventAdapter } from "./event-adapter.js";
@@ -97,7 +97,7 @@ function selectedModel(
 function selectedEffort(
   request: ExecutionBackendStartRequest,
   model: AppServerModel | undefined,
-): ReasoningEffort | undefined {
+): ReasoningEffortValue | undefined {
   if (request.reasoning_effort !== undefined) {
     if (model === undefined || !model.reasoning_efforts.includes(request.reasoning_effort)) {
       throw new Error(`Reasoning effort is not supported by the selected model: ${request.reasoning_effort}`);

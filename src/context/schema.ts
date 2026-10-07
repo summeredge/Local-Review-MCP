@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { reasoningEffortSchema } from "../models/model-catalog.js";
+import { reasoningEffortValueSchema } from "../models/model-catalog.js";
 import { isReservedWindowsName } from "../workspace/path.js";
 import {
   EXECUTION_STATUSES,
@@ -99,7 +99,7 @@ export const sessionStatusSchema = z.enum(SESSION_STATUSES);
 const sessionWorkspaceSchema = z.string().min(1).max(4096);
 const sessionThreadIdSchema = z.string().max(256);
 const sessionModelSchema = z.string().min(1).max(256);
-const sessionReasoningEffortSchema = reasoningEffortSchema;
+const sessionReasoningEffortSchema = reasoningEffortValueSchema;
 
 export const sessionSchema = z.object({
   session_id: sessionIdSchema,

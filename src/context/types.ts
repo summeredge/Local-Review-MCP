@@ -1,4 +1,4 @@
-import type { ReasoningEffort } from "../models/model-catalog.js";
+import type { ReasoningEffortValue } from "../models/model-catalog.js";
 
 export const TASK_STATUSES = [
   "pending",
@@ -104,7 +104,7 @@ export interface Session {
   readonly thread_id?: string;
   readonly model_id?: string;
   /** Saved default; mapped to a future app-server turn/start.effort field. */
-  readonly reasoning_effort?: ReasoningEffort;
+  readonly reasoning_effort?: ReasoningEffortValue;
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -118,14 +118,14 @@ export interface CreateSessionInput {
   readonly workspace: string;
   readonly thread_id?: string;
   readonly model_id?: string;
-  readonly reasoning_effort?: ReasoningEffort;
+  readonly reasoning_effort?: ReasoningEffortValue;
 }
 
 export interface UpdateSessionInput {
   readonly status?: SessionStatus;
   readonly thread_id?: string;
   readonly model_id?: string;
-  readonly reasoning_effort?: ReasoningEffort;
+  readonly reasoning_effort?: ReasoningEffortValue;
 }
 
 export const REVIEW_REQUEST_STATUSES = [

@@ -18,7 +18,7 @@ import type { ExecutionContext } from "../context/types.js";
 import { isReservedWindowsName } from "../workspace/path.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
 import { migrateLegacyModelIdFields } from "../models/model-resolver.js";
-import { reasoningEffortSchema, type ReasoningEffort } from "../models/model-catalog.js";
+import { reasoningEffortValueSchema, type ReasoningEffortValue } from "../models/model-catalog.js";
 import {
   CodexExecutionAdapter,
 } from "./codex-execution-adapter.js";
@@ -57,7 +57,7 @@ export interface ActuationAuthorizationInput {
   readonly instruction: string;
   readonly execution_mode?: ExecutionMode;
   readonly model_id?: string;
-  readonly reasoning_effort?: ReasoningEffort;
+  readonly reasoning_effort?: ReasoningEffortValue;
 }
 
 export interface ActuationAuthorization extends ActuationAuthorizationInput {
@@ -95,7 +95,7 @@ export const actuationAuthorizationInputSchema = z.object({
   instruction: instructionSchema,
   execution_mode: executionModeSchema.optional(),
   model_id: z.string().min(1).max(256).optional(),
-  reasoning_effort: reasoningEffortSchema.optional(),
+  reasoning_effort: reasoningEffortValueSchema.optional(),
 }).strict();
 
 export const actuationAuthorizationSchema = actuationAuthorizationInputSchema.extend({

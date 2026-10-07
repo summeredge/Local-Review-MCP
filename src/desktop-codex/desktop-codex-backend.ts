@@ -505,14 +505,15 @@ export class DesktopCodexBackend implements ExecutionBackend {
     contracts: ReturnType<typeof createCodexAppToolContracts>,
   ): Promise<void> {
     try {
+      let unavailableSince: number | undefined;
       const observer = new DesktopCompletionObserver({
         client,
         contracts,
         readFailureTimeoutMs: this.completionTimeoutMs,
         onTurnStarted: (turnId) => this.recordTurnStarted(watch, turnId),
+        onSuccessfulRead: () => { unavailableSince = undefined; },
         ...(this.pollIntervalMs === undefined ? {} : { pollIntervalMs: this.pollIntervalMs }),
       });
-      let unavailableSince: number | undefined;
       while (!this.closing) {
         const completion = await observer.waitForCompletion({
           executorThreadId: watch.executorThreadId,
@@ -571,11 +572,15 @@ export class DesktopCodexBackend implements ExecutionBackend {
       await this.recordTurnStarted(watch, completion.turnId);
       for (const message of completion.agentMessages ?? []) {
         for (let offset = 0; offset < message.text.length; offset += 4_000) {
+          const content = message.text.slice(offset, offset + 4_000);
           await this.recordEvent({
             session_id: watch.sessionId, execution_id: watch.request.execution_id,
-            thread_id: watch.threadId, timestamp: this.now(), event_type: "agent_message_completed",
+            thread_id: watch.threadId, timestamp: this.now(),
+            event_type: offset + content.length < message.text.length
+              ? "agent_message_delta"
+              : "agent_message_completed",
             turn_id: completion.turnId, item_id: message.id,
-            payload: { content: message.text.slice(offset, offset + 4_000) },
+            payload: { content },
           });
         }
       }

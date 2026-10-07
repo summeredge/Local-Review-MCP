@@ -1,5 +1,5 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type { ReasoningEffort } from "../models/model-catalog.js";
+import type { ReasoningEffortValue } from "../models/model-catalog.js";
 import {
   callCodexAppTool,
   CodexAppRuntimeError,
@@ -26,7 +26,7 @@ export interface CreateThreadInput extends DesktopCodexCommandOptions {
   readonly projectId: string;
   readonly prompt: string;
   readonly model_id?: string;
-  readonly reasoning_effort?: ReasoningEffort;
+  readonly reasoning_effort?: ReasoningEffortValue;
 }
 
 export interface SendMessageToThreadInput extends DesktopCodexCommandOptions {

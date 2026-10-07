@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -117,7 +118,7 @@ async function closeServer(server: Server): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
-async function writeNpmShim(directory: string): Promise<void> {
+async function writeNpmShim(directory: string, realBuild = false): Promise<void> {
   await writeFile(join(directory, "npm.cmd"), [
     "@echo off",
     "if \"%~1\"==\"--version\" goto version",
@@ -129,22 +130,33 @@ async function writeNpmShim(directory: string): Promise<void> {
     "exit /b 0",
     ":run",
     "echo run build>>\"%~dp0npm-log.txt\"",
+    "if \"%NPM_SHIM_REAL_BUILD%\"==\"1\" goto realbuild",
     "if \"%NPM_SHIM_BUILD_EXIT%\"==\"1\" exit /b 1",
     "exit /b 0",
+    ":realbuild",
+    "call \"%NPM_SHIM_REAL_NPM%\" %*",
+    "exit /b %ERRORLEVEL%",
     ":start",
-    "echo start>>\"%~dp0npm-log.txt\"",
+    "echo start %*>>\"%~dp0npm-log.txt\"",
+    "echo start-args [%2][%3][%~4][%~5]>>\"%~dp0npm-log.txt\"",
     "exit /b 0",
     "",
   ].join("\r\n"), "utf8");
 }
 
-function withNpmShim(shimDirectory: string, buildExitCode: number): NodeJS.ProcessEnv {
+function withNpmShim(shimDirectory: string, buildExitCode: number, realBuild = false): NodeJS.ProcessEnv {
   const pathValue = [
     shimDirectory,
     dirname(process.execPath),
     process.env.Path ?? process.env.PATH ?? "",
   ].join(";");
-  return { Path: pathValue, PATH: pathValue, NPM_SHIM_BUILD_EXIT: String(buildExitCode) };
+  return {
+    Path: pathValue,
+    PATH: pathValue,
+    NPM_SHIM_BUILD_EXIT: String(buildExitCode),
+    NPM_SHIM_REAL_BUILD: realBuild ? "1" : "0",
+    NPM_SHIM_REAL_NPM: join(dirname(process.execPath), "npm.cmd"),
+  };
 }
 
 async function makeRemoteServer(): Promise<string> {
@@ -274,7 +286,9 @@ describe("deployment scripts", () => {
     const directory = await makeTemporaryDirectory();
     const shimDirectory = await makeTemporaryDirectory();
     await writeNpmShim(shimDirectory);
-    const config = await writeConfig(directory, { workspace: directory, remoteEnabled: false });
+    const configDirectory = join(directory, "Test User", "Local Review MCP");
+    await mkdir(configDirectory, { recursive: true });
+    const config = await writeConfig(configDirectory, { workspace: directory, remoteEnabled: false });
 
     const result = await runPowerShell(
       startProductionScript,
@@ -284,8 +298,12 @@ describe("deployment scripts", () => {
 
     expect(result.code).toBe(0);
     expect(result.output).toMatch(/build: pass \(local-review-mcp /i);
-    await expect(readFile(join(shimDirectory, "npm-log.txt"), "utf8"))
-      .resolves.toMatch(/^run build\r?\nstart\r?\n$/);
+    const npmLog = await readFile(join(shimDirectory, "npm-log.txt"), "utf8");
+    expect(npmLog.trim().split(/\r?\n/)).toEqual([
+      "run build",
+      `start start -- --config "${config}"`,
+      `start-args [--][--config][${config}][]`,
+    ]);
   });
 
   it("does not start the runtime when the production build fails", async () => {
@@ -306,6 +324,65 @@ describe("deployment scripts", () => {
     await expect(readFile(join(shimDirectory, "npm-log.txt"), "utf8"))
       .resolves.toMatch(/^run build\r?\n$/);
   });
+
+  it("compiles the current src into dist before invoking npm start", async () => {
+    const directory = await makeTemporaryDirectory();
+    const shimDirectory = await makeTemporaryDirectory();
+    const probe = `launcher-build-probe-${randomUUID()}`;
+    const sourcePath = join(projectDirectory, "src", `${probe}.ts`);
+    const outputPath = join(projectDirectory, "dist", "src", `${probe}.js`);
+    await writeFile(sourcePath, `export const buildProbe = ${JSON.stringify(probe)};\n`);
+
+    try {
+      await writeNpmShim(shimDirectory, true);
+      const configDirectory = join(directory, "Test User", "Local Review MCP");
+      await mkdir(configDirectory, { recursive: true });
+      const config = await writeConfig(configDirectory, { workspace: directory, remoteEnabled: false });
+      const result = await runPowerShell(
+        startProductionScript,
+        ["-Config", config, "-SkipDesktopBootstrap"],
+        withNpmShim(shimDirectory, 0, true),
+      );
+      expect(result.code, result.output).toBe(0);
+      expect(await readFile(outputPath, "utf8")).toContain(probe);
+      expect((await readFile(join(shimDirectory, "npm-log.txt"), "utf8")).trim().split(/\r?\n/))
+        .toEqual([
+          "run build",
+          `start start -- --config "${config}"`,
+          `start-args [--][--config][${config}][]`,
+        ]);
+    } finally {
+      await Promise.all([rm(sourcePath, { force: true }), rm(outputPath, { force: true })]);
+    }
+  }, 30_000);
+
+  it("does not start when TypeScript compilation fails", async () => {
+    const directory = await makeTemporaryDirectory();
+    const shimDirectory = await makeTemporaryDirectory();
+    const probe = `launcher-build-error-${randomUUID()}`;
+    const sourcePath = join(projectDirectory, "src", `${probe}.ts`);
+    const outputPath = join(projectDirectory, "dist", "src", `${probe}.js`);
+    await writeFile(sourcePath, `const invalid: number = ${JSON.stringify(probe)};\nexport { invalid };\n`);
+
+    try {
+      await writeNpmShim(shimDirectory, true);
+      const configDirectory = join(directory, "Test User", "Local Review MCP");
+      await mkdir(configDirectory, { recursive: true });
+      const config = await writeConfig(configDirectory, { workspace: directory, remoteEnabled: false });
+      const result = await runPowerShell(
+        startProductionScript,
+        ["-Config", config, "-SkipDesktopBootstrap"],
+        withNpmShim(shimDirectory, 0, true),
+      );
+
+      expect(result.code).not.toBe(0);
+      expect(result.output).toMatch(/production build failed/i);
+      expect((await readFile(join(shimDirectory, "npm-log.txt"), "utf8")).trim().split(/\r?\n/))
+        .toEqual(["run build"]);
+    } finally {
+      await Promise.all([rm(sourcePath, { force: true }), rm(outputPath, { force: true })]);
+    }
+  }, 30_000);
 
   it("verifies health, MCP initialize, and the MCP tools", async () => {
     const remoteUrl = await makeRemoteServer();

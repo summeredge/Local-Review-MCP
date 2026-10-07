@@ -1,5 +1,5 @@
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import type { ReasoningEffort } from "../models/model-catalog.js";
+import type { ReasoningEffortValue } from "../models/model-catalog.js";
 import { CodexAppRuntimeError } from "./codex-app-runtime.js";
 
 type JsonSchema = Readonly<Record<string, unknown>>;
@@ -213,7 +213,7 @@ export class CodexAppToolContracts {
   public createThreadArguments(
     prompt: string,
     projectId: string,
-    options: { readonly model_id?: string; readonly reasoning_effort?: ReasoningEffort } = {},
+    options: { readonly model_id?: string; readonly reasoning_effort?: ReasoningEffortValue } = {},
   ): CreateThreadArguments {
     const tool = this.tools.get("create_thread");
     if (tool === undefined) throw incompatible("create_thread");

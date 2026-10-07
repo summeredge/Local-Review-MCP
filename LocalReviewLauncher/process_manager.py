@@ -144,8 +144,9 @@ class ProductionProcessManager:
                 self._launcher_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 errors.append("Production process did not stop within five seconds")
-        self._launcher_process = None
-        self._cleanup_temporary_config()
+            if self._launcher_process.poll() is not None:
+                self._launcher_process = None
+                self._cleanup_temporary_config()
         if not errors:
             self._start_time = None
         self._stopping = False
