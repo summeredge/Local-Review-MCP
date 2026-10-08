@@ -121,6 +121,7 @@ export const goalOrchestrationSchema = z.object({
   model_id: z.string().min(1).max(256).optional(),
   reasoning_effort: reasoningEffortValueSchema.optional(),
   review_only: z.boolean().optional(),
+  error: z.string().min(1).max(4_000).optional(),
   phases: z.array(phaseSchema).min(1).max(1_000),
   status: goalOrchestrationStatusSchema,
   current_phase_id: phaseIdSchema.optional(),
@@ -431,6 +432,32 @@ export class GoalOrchestrationService {
     });
   }
 
+  public async getStartEvidence(goalId: string): Promise<{ status: "started" | "failed" | "indeterminate"; error?: string }> {
+    const goal = await this.requiredGoal(goalId);
+    const phase = goal.phases[0]!;
+    const task = phase.tasks[0]!;
+    const actuationId = stableIdentity("actuation", goalId, phase.phase_id, task.task_id);
+    const executionId = stableIdentity("execution", goalId, phase.phase_id, task.task_id);
+    const [authorization, actuation, execution] = await Promise.all([
+      this.authorizations.getAuthorizationByActuation(actuationId),
+      this.controlled.getActuation(actuationId),
+      this.executions.getExecutionContext(goal.workspace_id, task.task_id, executionId),
+    ]);
+    if (authorization !== null && actuation !== null
+      && authorization.actuation_id === actuationId && actuation.actuation_id === actuationId
+      && authorization.goal_id === goalId && authorization.workspace_id === goal.workspace_id
+      && authorization.task_id === task.task_id && authorization.execution_id === executionId
+      && actuation.authorization_id === authorization.authorization_id
+      && actuation.workspace_id === goal.workspace_id && actuation.task_id === task.task_id
+      && actuation.execution_id === executionId) {
+      if (actuation.status === "started" && execution !== null
+        && execution.workspace_id === goal.workspace_id && execution.task_id === task.task_id
+        && execution.execution_id === executionId) return { status: "started" };
+      if (actuation.status === "failed") return { status: "failed", error: actuation.error ?? execution?.summary ?? goal.error ?? "Backend launch failed" };
+    }
+    return { status: "indeterminate", error: actuation?.error ?? goal.error ?? "Durable launch confirmation is missing or inconsistent" };
+  }
+
   public startGoal(input: StartGoalInput): Promise<GoalOrchestration> {
     const parsed = startGoalInputSchema.parse(input);
     return this.serial(parsed.goal_id, () => this.startOnce(parsed.goal_id));
@@ -588,7 +615,7 @@ export class GoalOrchestrationService {
         outcome = await this.driveTask(goal, active.task);
       } catch (error: unknown) {
         console.warn(`Goal task recovery failed for "${goal.goal_id}/${active.task.task_id}"`, errorMessage(error));
-        return this.finish(goal, "human_required");
+        return this.finish(await this.update(goal, { error: errorMessage(error).slice(0, 4_000) }), "human_required");
       }
       if (outcome === "active") return this.requiredGoal(goal.goal_id);
       if (outcome === "failed" || outcome === "human_required") return this.finish(goal, outcome);
@@ -684,7 +711,7 @@ export class GoalOrchestrationService {
     if (execution !== null && actuation === null) {
       throw new Error("Execution exists without its durable actuation reservation");
     }
-    if (actuation?.status === "failed" || execution?.status === "failed") return "failed";
+    if (actuation?.status === "failed") return "failed";
     if (authorization === null && (actuation !== null || execution !== null)) {
       throw new Error("execution or actuation exists without its authorization");
     }
@@ -723,11 +750,8 @@ export class GoalOrchestrationService {
         throw new Error("Controlled Actuation returned another identity");
       }
     } catch (error: unknown) {
-      const [observedActuation, observedExecution] = await Promise.all([
-        this.controlled.getActuation(actuationId),
-        this.executions.getExecutionContext(goal.workspace_id, task.task_id, executionId),
-      ]);
-      if (observedActuation?.status === "failed" || observedExecution?.status === "failed") return "failed";
+      const observedActuation = await this.controlled.getActuation(actuationId);
+      if (observedActuation?.status === "failed") return "failed";
       throw error;
     }
 

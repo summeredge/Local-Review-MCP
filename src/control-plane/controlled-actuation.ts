@@ -23,6 +23,7 @@ import {
   CodexExecutionAdapter,
 } from "./codex-execution-adapter.js";
 import {
+  ExecutionLaunchIndeterminateError,
   executionModeSchema,
   type ExecutionBackend,
   type ExecutionBackendStartRequest,
@@ -80,6 +81,7 @@ export interface ControlledActuation {
   readonly status: "starting" | "started" | "failed";
   readonly created_at: string;
   readonly updated_at: string;
+  readonly error?: string;
 }
 
 export interface ControlledActuationResult extends ExecutionStartResult {
@@ -116,6 +118,7 @@ export const controlledActuationSchema = z.object({
   task_id: taskIdSchema,
   execution_id: executionIdSchema,
   status: z.enum(["starting", "started", "failed"]),
+  error: z.string().min(1).max(4_000).optional(),
   created_at: timestampSchema,
   updated_at: timestampSchema,
 }).strict();
@@ -412,6 +415,7 @@ export class ActuationAuthorizationStore {
   public async setActuationStatus(
     actuationId: string,
     status: ControlledActuation["status"],
+    error?: string,
   ): Promise<ControlledActuation> {
     await this.restore();
     const parsedId = actuationIdSchema.parse(actuationId);
@@ -419,7 +423,7 @@ export class ActuationAuthorizationStore {
     return this.exclusive(async () => {
       const current = this.state.actuations.find((candidate) => candidate.actuation_id === parsedId);
       if (current === undefined) throw new Error(`Actuation "${parsedId}" was not found.`);
-      if (current.status === parsedStatus) return clone(current);
+      if (current.status === parsedStatus && error === undefined) return clone(current);
       if (current.status !== "starting") {
         throw new ControlledActuationConflictError(
           `Actuation "${parsedId}" is already ${current.status}.`,
@@ -428,6 +432,7 @@ export class ActuationAuthorizationStore {
       const nextActuation = controlledActuationSchema.parse({
         ...current,
         status: parsedStatus,
+        ...(error === undefined ? {} : { error: error.slice(0, 4_000) }),
         updated_at: new Date().toISOString(),
       });
       const next = stateSchema.parse({
@@ -598,6 +603,11 @@ export class ControlledActuationService {
       };
       started = await this.adapter.start(request);
     } catch (error: unknown) {
+      if (error instanceof ExecutionLaunchIndeterminateError
+        || (error instanceof Error && error.cause instanceof ExecutionLaunchIndeterminateError)) {
+        await this.authorizationStore.setActuationStatus(actuation.actuation_id, "starting", errorMessage(error));
+        throw error;
+      }
       await this.markFailed(actuation.actuation_id, error);
       // Interactive launch can fail before a backend materializes its Execution (IPC/bootstrap
       // or fallback preparation). Keep the reserved identity queryable and terminal in that case.
@@ -634,7 +644,7 @@ export class ControlledActuationService {
       completed = await this.authorizationStore.setActuationStatus(actuation.actuation_id, "started");
     } catch (error: unknown) {
       throw new Error(
-        `Actuation "${actuation.actuation_id}" started but its state could not be persisted.`,
+        `Actuation "${actuation.actuation_id}" started but its state could not be persisted: ${errorMessage(error)}`,
         { cause: error },
       );
     }
@@ -717,7 +727,7 @@ export class ControlledActuationService {
 
   private async markFailed(actuationId: string, error: unknown): Promise<void> {
     try {
-      await this.authorizationStore.setActuationStatus(actuationId, "failed");
+      await this.authorizationStore.setActuationStatus(actuationId, "failed", errorMessage(error));
     } catch (persistError: unknown) {
       throw new Error(
         `Codex execution launch failed (${errorMessage(error)}); actuation failure could not be persisted.`,

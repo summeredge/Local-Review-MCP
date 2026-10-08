@@ -39,7 +39,7 @@ export const goalSubmissionRequestSchema = z.object({
   requirements: submissionItemsSchema,
   acceptance_criteria: submissionItemsSchema,
   max_iterations: z.number().int().min(1).max(10_000).default(DEFAULT_GOAL_MAX_ITERATIONS),
-  execution_mode: executionModeSchema.optional(),
+  execution_mode: executionModeSchema.default("interactive"),
   model: z.string().min(1).max(256).optional(),
   reasoning_effort: z.string().min(1).max(64).optional(),
 }).strict();
@@ -65,6 +65,7 @@ export const goalSubmissionResultSchema = z.object({
   task_id: taskIdSchema,
   execution_id: executionIdSchema,
   status: goalOrchestrationStatusSchema,
+  start_confirmed: z.literal(true).optional(),
 }).strict();
 
 const goalSubmissionTimestampSchema = z.string().datetime({ offset: true });
@@ -82,7 +83,7 @@ export type GoalSubmissionResult = z.infer<typeof goalSubmissionResultSchema>;
 export type GoalSubmissionAccepted = z.infer<typeof goalSubmissionAcceptedSchema>;
 export type GoalSubmissionOrchestration = Pick<
   GoalOrchestrationService,
-  "createGoal" | "startGoal"
+  "createGoal" | "startGoal" | "getStartEvidence"
 >;
 export type GoalSubmissionPreflight = Pick<GoalPreflightService, "checkGoalPreflight">;
 
@@ -134,6 +135,14 @@ function buildPlan(request: z.output<typeof resolvedGoalSubmissionRequestSchema>
   });
 }
 
+export class GoalStartError extends Error {
+  public constructor(
+    public readonly state: "failed" | "indeterminate",
+    public readonly result: GoalSubmissionResult,
+    message: string,
+  ) { super(message); this.name = "GoalStartError"; }
+}
+
 export class GoalSubmissionService {
   public constructor(
     private readonly orchestration: GoalSubmissionOrchestration,
@@ -182,6 +191,12 @@ export class GoalSubmissionService {
       execution_id: started.execution_id,
       status: started.status,
     };
-    return goalSubmissionResultSchema.parse(result);
+    const evidence = await this.orchestration.getStartEvidence(created.goal_id).catch((error: unknown) => {
+      throw new GoalStartError("indeterminate", result, `Start evidence could not be read: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    if (evidence.status !== "started") {
+      throw new GoalStartError(evidence.status, result, evidence.error ?? "Goal start was not confirmed");
+    }
+    return goalSubmissionResultSchema.parse({ ...result, start_confirmed: true });
   }
 }

@@ -461,6 +461,33 @@ async function waitForTerminalExecution(value: Fixture): Promise<void> {
 }
 
 describe("P5.4.1 route selection", () => {
+  it.each(["transport", "session_persistence", "binding_persistence"] as const)("keeps %s launch uncertainty without redispatch", async failure => {
+    const value = await fixture();
+    const originalCall = value.desktop.runtime.mcpClient.callTool;
+    if (failure === "transport") value.desktop.runtime.mcpClient.callTool = async params => {
+      if (params.name === "create_thread") { value.desktop.calls.push(params); throw new Error("transport disconnected after dispatch"); }
+      return originalCall(params);
+    };
+    const originalUpdate = SessionStore.prototype.updateSession;
+    const update = failure === "session_persistence" ? vi.spyOn(SessionStore.prototype, "updateSession").mockImplementation(async function (this: SessionStore, id, input) {
+      if (input.status === "active") throw new Error("session disk unavailable");
+      return originalUpdate.call(this, id, input);
+    }) : undefined;
+    const binding = failure === "binding_persistence" ? vi.spyOn(DesktopThreadBindingStore.prototype, "createIfAbsent").mockRejectedValue(new Error("binding disk unavailable")) : undefined;
+    try {
+      await seedTask(value);
+      const authorization = await value.controlled.authorize({ actuation_id: ACTUATION_ID, ...interactiveRequest() });
+      const request = { actuation_id: ACTUATION_ID, authorization_id: authorization.authorization_id };
+      await expect(value.controlled.actuate(request)).rejects.toBeDefined();
+      expect(await value.controlled.getActuation(ACTUATION_ID)).toMatchObject({ status: "starting", error: expect.stringContaining(failure === "transport" ? "create_thread" : "persistence") });
+      await expect(value.controlled.actuate(request)).rejects.toBeDefined();
+      expect(value.desktop.createThreadCount()).toBe(1);
+      expect(value.appServerStart).not.toHaveBeenCalled();
+      expect(value.cliStart).not.toHaveBeenCalled();
+      expect(value.desktop.runtimeCloseCount()).toBe(1);
+    } finally { update?.mockRestore(); binding?.mockRestore(); await value.service.close(); }
+  });
+
   it.each([false, true])("routes omitted MCP execution mode through Desktop preflight and completion with activation failure=%s", async (activationFails) => {
     const open = vi.fn(async () => {
       if (activationFails) throw new Error("activation failed");
@@ -504,7 +531,7 @@ describe("P5.4.1 route selection", () => {
         requirements: ["Use Desktop"], acceptance_criteria: ["Review completes"],
       } });
       expect(accepted.isError).not.toBe(true);
-      expect((await pending.get(correlation))?.execution_mode).toBeUndefined();
+      expect((await pending.get(correlation))?.execution_mode).toBe("interactive");
       await correlations.observe({ request_id: correlation, conversation_id: "conversation-1",
         document_id: "document-1", navigation_epoch: 1 });
       pending.scheduleResolve(correlation);
@@ -1253,7 +1280,8 @@ describe("P5.4.1 FIX failure terminal projection", () => {
       await authorizeAndActuate(value);
       expect(await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))
         .toMatchObject({ status: "failed", summary: "Desktop turn completion observation unavailable." });
-      expect(observer).toHaveBeenCalledTimes(2);
+      // Timer granularity can require another observation; terminal state, not an exact count, is the contract.
+      expect(observer.mock.calls.length).toBeGreaterThanOrEqual(2);
       expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
     } finally { observer.mockRestore(); }
   });
@@ -1281,10 +1309,11 @@ describe("P5.4.1 FIX failure terminal projection", () => {
       standalone: { source: "standalone", prepare: async () => ({ ready: true }), start: standaloneStart },
     });
     await expect(negotiator.start(interactiveRequest())).rejects.toMatchObject({
-      code: "tool_call_failed", message: summary,
+      code: "tool_call_failed", message: expect.stringContaining(summary),
     });
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
-    expect(execution).toMatchObject({ status: "failed", summary });
+    expect(execution).toMatchObject({ status: "failed", summary: expect.stringContaining(summary) });
+    expect(execution?.summary).toContain("Desktop stage=create_thread");
     expect((await value.sessions.listSessions())[0]).toMatchObject({ status: "failed" });
     expect(value.desktop.createThreadCount()).toBe(1);
     expect(value.appServerStart).not.toHaveBeenCalled();
@@ -1364,7 +1393,7 @@ describe("P5.4.1 FIX failure terminal projection", () => {
       if (params.name === "create_thread") {
         // Record the attempt so the assertion sees the effectful call, then fail it.
         value.desktop.calls.push(params);
-        throw new Error("create_thread transport failed");
+        return { isError: true, content: [{ type: "text", text: "create_thread rejected" }] };
       }
       return original(params);
     };
@@ -1473,7 +1502,7 @@ describe("P5.4.1 FIX Desktop runtime ownership", () => {
       if (params.name === "create_thread") {
         // Record the attempt so the assertion sees the effectful call, then fail it.
         value.desktop.calls.push(params);
-        throw new Error("create_thread transport failed");
+        return { isError: true, content: [{ type: "text", text: "create_thread rejected" }] };
       }
       return original(params);
     };

@@ -89,7 +89,8 @@ export interface BridgeStatus {
 
 class RequestBodyTooLargeError extends Error {}
 
-export const EXTENSION_PRESENCE_TIMEOUT_MS = 10_000;
+export const EXTENSION_PRESENCE_TIMEOUT_MS = 90_000;
+const CONVERSATION_PRESENCE_TIMEOUT_MS = 10_000;
 
 let bridgeServer: Server | null = null;
 let activePort: number | null = null;
@@ -373,7 +374,7 @@ async function receiveDeliveryClaim(
     const command = await claimExtensionDelivery(parsed.data);
     const now = Date.now();
     for (const [key, presence] of conversationPresence) {
-      if (now - presence.seenAt >= EXTENSION_PRESENCE_TIMEOUT_MS) conversationPresence.delete(key);
+      if (now - presence.seenAt >= CONVERSATION_PRESENCE_TIMEOUT_MS) conversationPresence.delete(key);
     }
     conversationPresence.set(`${parsed.data.client_id}\0${parsed.data.document_id}`, {
       conversationId: parsed.data.conversation_id, seenAt: now,
@@ -520,7 +521,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     return;
   }
 
-  if (route !== "/pair" && route !== "/status" && route !== "/identity-evidence" && route !== "/identity-diagnostic"
+  if (route !== "/pair" && route !== "/status" && route !== "/presence" && route !== "/identity-evidence" && route !== "/identity-diagnostic"
     && route !== "/delivery/recovery-targets" && route !== "/delivery/recovery-failure"
     && route !== "/delivery/claim" && route !== "/delivery/ack"
     && route !== "/completion/claim" && route !== "/completion/ack") {
@@ -547,7 +548,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     methodNotAllowed(request, response);
     return;
   }
-  if ((route === "/identity-evidence" || route === "/identity-diagnostic") && request.method !== "POST") {
+  if ((route === "/presence" || route === "/identity-evidence" || route === "/identity-diagnostic") && request.method !== "POST") {
     methodNotAllowed(request, response);
     return;
   }
@@ -582,6 +583,20 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   if (!authorized(request, origin)) {
     request.resume();
     json(response, 401, { error: "unauthorized" }, origin);
+    return;
+  }
+  if (route === "/presence") {
+    try {
+      const body = await readJson(request);
+      if (body === null || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 0) {
+        json(response, 400, { error: "invalid_presence" }, origin);
+        return;
+      }
+      noteExtensionSeen();
+      json(response, 200, { accepted: true }, origin);
+    } catch (error: unknown) {
+      json(response, error instanceof RequestBodyTooLargeError ? 413 : 400, { error: "invalid_presence" }, origin);
+    }
     return;
   }
   if (route === "/identity-diagnostic") {
@@ -811,7 +826,7 @@ export function conversationDeliveryReadiness(conversationId: string): Extension
   if (!readiness.ready) return readiness;
   if (![...conversationPresence.values()].some((presence) =>
     presence.conversationId === conversationId
-    && Date.now() - presence.seenAt < EXTENSION_PRESENCE_TIMEOUT_MS)) {
+    && Date.now() - presence.seenAt < CONVERSATION_PRESENCE_TIMEOUT_MS)) {
     return { ...readiness, ready: false, reason: "Target conversation has no live delivery claimant.",
       readiness_state: "target_conversation_not_present" };
   }

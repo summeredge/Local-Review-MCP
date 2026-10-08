@@ -1,3 +1,4 @@
+import { ExecutionLaunchIndeterminateError } from "../../src/control-plane/execution-service.js";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -234,6 +235,48 @@ async function ensureStartedEvidence(
 }
 
 describe("GoalOrchestrationService", () => {
+  it("keeps a reservation with unknown launch outcome safe across recovery", async () => {
+    const f = await fixture();
+    const plan = input();
+    await f.service.createGoal(plan);
+    f.starts.mockRejectedValue(new ExecutionLaunchIndeterminateError("Desktop stage=session_persistence: disk unavailable"));
+    const goal = await f.service.startGoal({ goal_id: plan.goal_id });
+    expect(goal).toMatchObject({ status: "human_required", error: expect.stringContaining("disk unavailable") });
+    expect(await f.service.getStartEvidence(plan.goal_id)).toMatchObject({ status: "indeterminate" });
+    expect(await f.controlled.getActuation(goal.actuation_id!)).toMatchObject({ status: "starting", error: expect.stringContaining("session_persistence") });
+    await f.service.recover();
+    await f.service.startGoal({ goal_id: plan.goal_id });
+    expect(f.starts).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists confirmed backend launch failure and its cause", async () => {
+    const f = await fixture();
+    const plan = input();
+    f.starts.mockRejectedValue(new Error("Desktop stage=create_thread: Project unavailable"));
+    await f.service.createGoal(plan);
+    const goal = await f.service.startGoal({ goal_id: plan.goal_id });
+    expect(goal.status).toBe("failed");
+    expect(await f.service.getStartEvidence(plan.goal_id)).toEqual({ status: "failed", error: "Desktop stage=create_thread: Project unavailable" });
+    const restored = new ActuationAuthorizationStore(f.root);
+    expect(await restored.getActuation(goal.actuation_id!)).toMatchObject({ status: "failed", error: "Desktop stage=create_thread: Project unavailable" });
+  });
+
+  it.each(["passed", "failed"] as const)("confirms start even when the Execution is already %s", async status => {
+    const f = await fixture();
+    const plan = input();
+    const original = f.starts.getMockImplementation()!;
+    f.starts.mockImplementation(async request => {
+      const result = await original(request);
+      await f.executions.updateExecutionContext(request.workspace_id, request.task_id, request.execution_id, { status });
+      return result;
+    });
+    await f.service.createGoal(plan);
+    const goal = await f.service.startGoal({ goal_id: plan.goal_id });
+    expect(await f.service.getStartEvidence(plan.goal_id)).toEqual({ status: "started" });
+    expect(f.auto.start).toHaveBeenCalledTimes(1);
+    await f.service.advanceGoal(goal.goal_id);
+    expect(f.starts).toHaveBeenCalledTimes(1);
+  });
   it("creates an immutable pending plan without starting any lower state", async () => {
     const f = await fixture();
     const created = await f.service.createGoal(input());

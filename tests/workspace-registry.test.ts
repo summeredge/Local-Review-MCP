@@ -55,6 +55,18 @@ function resultJson(result: Awaited<ReturnType<Client["callTool"]>>): Record<str
 }
 
 describe("Workspace Registry", () => {
+  it("requires an unambiguous submission target while preserving read-only defaults", async () => {
+    const a = await makeWorkspace("route-a", "a");
+    const b = await makeWorkspace("route-b", "b");
+    const registry = new WorkspaceRegistry([
+      { id: "a", name: "A", path: a }, { id: "b", name: "B", path: b },
+    ]);
+    expect(registry.resolve().id).toBe("a");
+    expect(() => registry.resolveForSubmission()).toThrow("WORKSPACE_ID_REQUIRED");
+    expect(registry.resolveForSubmission("b").id).toBe("b");
+    expect(() => registry.resolveForSubmission("unknown")).toThrow("Unknown workspace_id");
+    expect(new WorkspaceRegistry([{ id: "b", name: "B", path: b }]).resolveForSubmission().id).toBe("b");
+  });
   it("lists only safe metadata and routes workspace_id to the selected workspace", async () => {
     const dataProject = await makeWorkspace("data", "data-project\n");
     const pcaBuilder = await makeWorkspace("pca", "pca-builder\n");

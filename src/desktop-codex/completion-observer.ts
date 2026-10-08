@@ -14,7 +14,7 @@ const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
 const DEFAULT_WAIT_INTERVAL_MS = 20_000;
 const WAIT_TIMEOUT_MARGIN_MS = 5_000;
 const DEFAULT_TRANSIENT_RETRY_BACKOFF_MS = 250;
-const DEFAULT_POLL_INTERVAL_MS = 50;
+const DEFAULT_POLL_INTERVAL_MS = 1_000;
 /** Bounded grace for the very first observation of a freshly created target thread. */
 const DEFAULT_VISIBILITY_GRACE_MS = 15_000;
 const DEFAULT_VISIBILITY_POLL_INTERVAL_MS = 500;

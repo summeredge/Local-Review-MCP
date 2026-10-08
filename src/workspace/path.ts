@@ -15,6 +15,7 @@ export const WORKSPACE_ERROR_CODES = [
   "WORKSPACE_IDENTITY_INVALID",
   "WORKSPACE_IDENTITY_MISMATCH",
   "UNKNOWN_WORKSPACE_ID",
+  "WORKSPACE_ID_REQUIRED",
 ] as const;
 
 export type WorkspaceErrorCode = typeof WORKSPACE_ERROR_CODES[number];

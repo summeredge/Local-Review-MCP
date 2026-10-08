@@ -518,16 +518,18 @@ function loadBackground(
   storage: Storage,
   responder: (url: URL, init: Record<string, unknown>) => Promise<Record<string, unknown>>,
   enableAlarms = false,
+  tabs?: { query: (query: unknown) => Promise<{ id: number }[]>; sendMessage: (id: number, message: unknown) => Promise<unknown> },
 ): { calls: FetchCall[]; send: (
   message: Record<string, unknown>,
   documentId: string,
   tabId?: number,
   url?: string,
-) => Promise<Record<string, unknown>>; alarm: () => void } {
+) => Promise<Record<string, unknown>>; alarm: (name?: string) => void } {
   let listener: ((message: Record<string, unknown>, sender: Record<string, unknown>, sendResponse: (value: Record<string, unknown>) => void) => boolean) | null = null;
   const calls: FetchCall[] = [];
   let alarmListener: ((alarm: { name: string }) => void) | undefined;
   const chrome = {
+    ...(tabs ? { tabs } : {}),
     storage: { local: storage },
     runtime: { onMessage: { addListener: (fn: typeof listener) => { listener = fn; } } },
     ...(enableAlarms ? { alarms: {
@@ -542,6 +544,7 @@ function loadBackground(
   vm.runInNewContext(backgroundSource, {
     chrome,
     fetch,
+    Date,
     AbortController,
     setTimeout,
     clearTimeout,
@@ -553,7 +556,7 @@ function loadBackground(
   if (!listener) throw new Error("background listener was not registered");
   return {
     calls,
-    alarm: () => alarmListener?.({ name: "identity-evidence-retry" }),
+    alarm: (name = "identity-evidence-retry") => alarmListener?.({ name }),
     send: (message, documentId, tabId = 7, url) => new Promise((resolve, reject) => {
       try {
         const keep = listener!(message, { tab: { id: tabId }, documentId, frameId: 0, url }, resolve);
@@ -723,6 +726,76 @@ describe("Extension durable identity evidence Outbox", () => {
 });
 
 describe("Extension background identity authority", () => {
+  it("probes sleeping tabs on worker startup and alarms, recovers after disconnection and worker restart", async () => {
+    const storage = new Storage({ port: 12081, token: "presence-token" });
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    let connected = true;
+    let worker: ReturnType<typeof loadBackground>;
+    const probes: unknown[] = [];
+    const tabs = {
+      query: async () => [{ id: 1 }, { id: 2 }],
+      sendMessage: async (id: number, message: unknown) => {
+        probes.push(message);
+        if (!connected || id === 2) throw new Error("tab unavailable");
+        return worker.send({ type: "presence" }, "doc", id, ORIGIN);
+      },
+    };
+    const responder = async (url: URL) => response(200, url.pathname === "/hello" ? bridgeHello : { accepted: true });
+    const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+    try {
+      worker = loadBackground(storage, responder, true, tabs);
+      await vi.waitFor(() => expect(worker.calls.filter(call => new URL(call.input).pathname === "/presence")).toHaveLength(1));
+      expect(probes).toEqual([{ type: "presence_probe" }, { type: "presence_probe" }]);
+      expect(worker.calls.filter(call => new URL(call.input).pathname === "/presence")).toHaveLength(1);
+      clock.mockReturnValue(now + 60000);
+      connected = false;
+      worker.alarm("extension-presence");
+      await flush();
+      expect(worker.calls.filter(call => new URL(call.input).pathname === "/presence")).toHaveLength(1);
+      clock.mockReturnValue(now + 120000);
+      connected = true;
+      worker.alarm("extension-presence");
+      await vi.waitFor(() => expect(worker.calls.filter(call => new URL(call.input).pathname === "/presence")).toHaveLength(2));
+      expect(worker.calls.filter(call => new URL(call.input).pathname === "/presence")).toHaveLength(2);
+      worker = loadBackground(storage, responder, true, tabs);
+      await vi.waitFor(() => expect(worker.calls.filter(call => new URL(call.input).pathname === "/presence")).toHaveLength(1));
+      expect(worker.calls.filter(call => new URL(call.input).pathname === "/presence")).toHaveLength(1);
+    } finally { clock.mockRestore(); }
+  });
+  it("merges multi-tab presence independently of registration and retries failed heartbeats", async () => {
+    const storage = new Storage({ port: 12081, token: 'presence-token' });
+    let fail = false;
+    const worker = loadBackground(storage, async endpoint => {
+      if (endpoint.pathname === '/hello') return response(200, bridgeHello);
+      if (endpoint.pathname === '/presence') return response(fail ? 503 : 200, { accepted: true });
+      throw new Error(`unexpected request: ${endpoint.pathname}`);
+    });
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      const heartbeat = (tabId: number) => worker.send({ type: 'presence' }, `document-${tabId}`, tabId, ORIGIN);
+      expect((await Promise.all(Array.from({ length: 20 }, (_, index) => heartbeat(index)))).every(result => result.ok)).toBe(true);
+      await heartbeat(1);
+      expect(worker.calls.filter(call => new URL(call.input).pathname === '/presence')).toHaveLength(1);
+      for (let elapsed = 3000; elapsed <= 15000; elapsed += 3000) {
+        clock.mockReturnValue(now + elapsed);
+        await Promise.all([heartbeat(1), heartbeat(2)]);
+      }
+      const calls = worker.calls.filter(call => new URL(call.input).pathname === '/presence');
+      expect(calls).toHaveLength(6);
+      expect(calls[0].init).toMatchObject({ body: '{}', headers: {
+        authorization: 'Bearer presence-token', 'x-lrm-bridge-protocol': '3',
+      } });
+      clock.mockReturnValue(now + 18000);
+      fail = true;
+      expect(await heartbeat(1)).toMatchObject({ ok: false });
+      fail = false;
+      expect(await heartbeat(1)).toMatchObject({ ok: true });
+      expect(await worker.send({ type: 'presence' }, 'document-1', 1, 'https://example.com')).toMatchObject({ ok: false });
+      expect(await worker.send({ type: 'presence', conversation_id: 'anything' }, 'document-1', 1, ORIGIN)).toMatchObject({ ok: false });
+    } finally { clock.mockRestore(); }
+  });
   it("retains diagnostics without credentials and flushes after normal delivery pairing", async () => {
     const storage = new Storage({ port: null, token: null });
     const url = `${ORIGIN}/c/${CONVERSATION_A}`;

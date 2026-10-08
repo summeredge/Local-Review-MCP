@@ -1,5 +1,6 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { ReasoningEffortValue } from "../models/model-catalog.js";
+import { ModelResolutionError } from "../models/model-resolver.js";
 import {
   callCodexAppTool,
   CodexAppRuntimeError,
@@ -195,23 +196,41 @@ export class DesktopCodexThreadCommands {
   public async createThread(input: CreateThreadInput): Promise<DesktopThreadIdentity> {
     const executorThreadId = nonEmpty(input.executorThreadId, "executor_thread_missing");
     const projectId = nonEmpty(input.projectId, "tool_call_failed");
-    const args: CreateThreadArguments = this.context.contracts.createThreadArguments(
-      requiredPrompt(input.prompt),
-      projectId,
-      {
-        ...(input.model_id === undefined ? {} : { model_id: input.model_id }),
-        ...(input.reasoning_effort === undefined ? {} : { reasoning_effort: input.reasoning_effort }),
-      },
-    );
-    const result = await callCodexAppTool(callInput(
-      this.context.client,
-      "create_thread",
-      args,
-      { ...input, executorThreadId },
-    ));
-    const identity = parseThreadIdentity(result);
-    assertDistinctThreadIdentity(executorThreadId, identity.targetThreadId);
-    return identity;
+    try {
+      const args: CreateThreadArguments = this.context.contracts.createThreadArguments(
+        requiredPrompt(input.prompt),
+        projectId,
+        {
+          ...(input.model_id === undefined ? {} : { model_id: input.model_id }),
+          ...(input.reasoning_effort === undefined ? {} : { reasoning_effort: input.reasoning_effort }),
+        },
+      );
+      const result = await callCodexAppTool(callInput(
+        this.context.client, "create_thread", args, { ...input, executorThreadId },
+      ));
+      const summary = result.isError ? toolErrorSummary(result) : undefined;
+      // Classify only explicit provider parameter rejection; transport and identity errors keep their codes.
+      if (summary && /(?:invalid|unknown|unsupported|not supported)\s+model|model\b.*(?:invalid|unknown|unsupported|not supported)/iu.test(summary)) {
+        const error = new ModelResolutionError({ code: "model_unknown", input: input.model_id ?? "default" });
+        error.message += `: create_thread failed: ${summary}`;
+        throw error;
+      }
+      if (summary && /(?:reasoning[_ ]effort|thinking)\b.*(?:invalid|unsupported|not supported)|(?:invalid|unsupported)\s+(?:reasoning[_ ]effort|thinking)/iu.test(summary)) {
+        const error = new ModelResolutionError({ code: "reasoning_effort_unsupported", input: input.model_id ?? "default",
+          reasoning_effort: input.reasoning_effort });
+        error.message += `: create_thread failed: ${summary}`;
+        throw error;
+      }
+      const identity = parseThreadIdentity(result);
+      assertDistinctThreadIdentity(executorThreadId, identity.targetThreadId);
+      return identity;
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        const reason = error.cause instanceof Error ? toolErrorSummary({ content: [{ type: "text", text: error.cause.message }] }) : undefined;
+        error.message = `Desktop stage=create_thread model=${input.model_id ?? "default"} reasoning_effort=${input.reasoning_effort ?? "default"}: ${error.message}${reason ? ` Cause: ${reason}` : ""}`;
+      }
+      throw error;
+    }
   }
 
   public async sendMessageToThread(input: SendMessageToThreadInput): Promise<CallToolResult> {

@@ -479,6 +479,7 @@ describe("Codex Event Adapter and LRM event stream", () => {
     temporaryDirectories.push(root);
     const timestamp = "2026-09-15T00:00:00.000Z";
     const goal = goalOrchestrationSchema.parse({
+      execution_mode: "interactive",
       goal_id: "goal-1",
       workspace_id: "workspace-1",
       conversation_id: "conversation-1",

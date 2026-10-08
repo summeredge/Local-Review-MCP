@@ -17,6 +17,7 @@ import {
 import type { GoalPreflightInput, GoalPreflightResult } from "../../src/control-plane/goal-preflight.js";
 import {
   GoalSubmissionService,
+  goalSubmissionToolInputSchema,
   type GoalSubmissionOrchestration,
   type GoalSubmissionPreflight,
   type GoalSubmissionRequest,
@@ -150,6 +151,41 @@ async function fixture(): Promise<{
 }
 
 describe("GoalSubmissionService", () => {
+  it("rejects allocated identities without durable backend start evidence", async () => {
+    const f = await fixture();
+    vi.spyOn(f.orchestration, "getStartEvidence").mockResolvedValue({ status: "indeterminate", error: "start persistence failed" });
+    await expect(new GoalSubmissionService(f.orchestration, f.preflight).submitExternalGoal(request()))
+      .rejects.toMatchObject({ state: "indeterminate", result: { execution_id: expect.any(String) }, message: "start persistence failed" });
+  });
+
+  it("retains allocated identities when start evidence cannot be read", async () => {
+    const f = await fixture();
+    vi.spyOn(f.orchestration, "getStartEvidence").mockRejectedValue(new Error("storage unavailable"));
+    await expect(new GoalSubmissionService(f.orchestration, f.preflight).submitExternalGoal(request()))
+      .rejects.toMatchObject({ state: "indeterminate", result: { goal_id: expect.any(String), task_id: expect.any(String), execution_id: expect.any(String) }, message: expect.stringContaining("storage unavailable") });
+  });
+
+  it.each(["completed", "failed"] as const)("keeps a confirmed fast %s outcome", async status => {
+    const f = await fixture();
+    const original = f.orchestration.startGoal.bind(f.orchestration);
+    vi.spyOn(f.orchestration, "startGoal").mockImplementation(async input => ({ ...await original(input), status }));
+    await expect(new GoalSubmissionService(f.orchestration, f.preflight).submitExternalGoal(request()))
+      .resolves.toMatchObject({ status });
+  });
+  it.each([undefined, "interactive", "batch"] as const)("keeps Schema and execution mode consistent for %s", async mode => {
+    const f = await fixture();
+    const create = vi.spyOn(f.orchestration, "createGoal");
+    const { workspace_id, conversation_id, ...input } = request();
+    const parsed = goalSubmissionToolInputSchema.parse({ ...input,
+      correlation_key: "00000000-0000-4000-8000-000000000001",
+      ...(mode === undefined ? {} : { execution_mode: mode }),
+    });
+    expect(parsed.execution_mode).toBe(mode ?? "interactive");
+    await new GoalSubmissionService(f.orchestration, f.preflight).submitExternalGoal({
+      ...request(), ...(mode === undefined ? {} : { execution_mode: mode }),
+    });
+    expect(create.mock.calls[0]![0].execution_mode).toBe(mode ?? "interactive");
+  });
   it("creates and starts one standard Goal workflow", async () => {
     const f = await fixture();
     const createGoal = vi.spyOn(f.orchestration, "createGoal");
@@ -217,6 +253,7 @@ describe("GoalSubmissionService", () => {
     const orchestration: GoalSubmissionOrchestration = {
       createGoal: vi.fn(),
       startGoal: vi.fn(),
+      getStartEvidence: vi.fn(),
     };
     const preflight: GoalSubmissionPreflight = {
       checkGoalPreflight: vi.fn(),

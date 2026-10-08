@@ -173,7 +173,7 @@ function productionFixture(options: {
     execution_id: "execution-1",
   }));
   const submission = new GoalSubmissionService(
-    { createGoal, startGoal } as never,
+    { createGoal, startGoal, getStartEvidence: vi.fn(async () => ({ status: "started" })) } as never,
     preflight,
   );
   return { preflight, submission, createGoal, startGoal };

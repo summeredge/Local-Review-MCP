@@ -499,6 +499,14 @@
   }
   window.addEventListener('popstate', routeChanged);
   window.addEventListener('hashchange', routeChanged);
+  const reportPresence = () => { void sendToWorker({ type: 'presence' }); };
+  reportPresence();
+  setInterval(reportPresence, 3000);
+  window.addEventListener('focus', reportPresence);
+  window.addEventListener('pageshow', reportPresence);
+  document.addEventListener?.('visibilitychange', () => {
+    if (document.visibilityState === 'visible') reportPresence();
+  });
   setInterval(routeChanged, 250);
   setInterval(scheduleScan, 1000);
   setInterval(() => { void pollDelivery(); }, 1500);
@@ -512,6 +520,11 @@
   }
   void registerDocument();
   chrome.runtime.onMessage?.addListener((message, _sender, respond) => {
+    if (message?.type === 'presence_probe') {
+      reportPresence();
+      respond({ ok: true });
+      return false;
+    }
     if (message?.type !== 'delivery_probe') return false;
     resolveConversation().then(async conversationId => {
       const registered = await registerDocument();

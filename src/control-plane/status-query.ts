@@ -19,7 +19,7 @@ import { defaultTaskContextStorageRoot, taskContextFile } from "../context/task.
 import { TaskContextService } from "../context/service.js";
 import type { ExecutionContext, Session, SessionBackendType } from "../context/types.js";
 import type { ExecutionMode } from "./execution-service.js";
-import type { GoalOrchestrationService, GoalOrchestration } from "./goal-orchestration.js";
+import { GoalOrchestrationUnavailableError, type GoalOrchestrationService, type GoalOrchestration } from "./goal-orchestration.js";
 import {
   lrmEventSchema,
   type StoredLrmEvent,
@@ -263,6 +263,12 @@ function outputFromEvents(events: readonly StoredLrmEvent[], executionId: string
   return content === "" ? undefined : content;
 }
 
+export class StatusQueryError extends Error {
+  public constructor(public readonly code: "SESSION_NOT_FOUND" | "EXECUTION_NOT_FOUND" | "GOAL_NOT_FOUND" | "STATUS_CONFLICT" | "RUNTIME_UNAVAILABLE", message: string) {
+    super(message); this.name = "StatusQueryError";
+  }
+}
+
 export class StatusQueryService {
   public readonly storageRoot: string;
   private readonly goals: GoalReader | undefined;
@@ -313,23 +319,23 @@ export class StatusQueryService {
     let session: Session | null;
     if (parsed.session_id !== undefined) {
       session = await this.sessions.getSession(parsed.session_id);
-      if (session === null) throw new Error(`Session "${parsed.session_id}" was not found.`);
+      if (session === null) throw new StatusQueryError("SESSION_NOT_FOUND", `Session "${parsed.session_id}" was not found.`);
       if (goal !== undefined && session.goal_id !== goal.goal_id) {
-        throw new Error("Session does not belong to the requested Goal.");
+        throw new StatusQueryError("STATUS_CONFLICT", "Session does not belong to the requested Goal.");
       }
     } else {
       const matches = (await this.sessions.listSessions()).filter((candidate) =>
         candidate.goal_id === parsed.goal_id,
       );
-      if (matches.length > 1) throw new Error("More than one Session matches the requested Goal.");
+      if (matches.length > 1) throw new StatusQueryError("STATUS_CONFLICT", "More than one Session matches the requested Goal.");
       session = matches[0] ?? null;
-      if (session === null) throw new Error(`No Session was found for Goal "${parsed.goal_id}".`);
+      if (session === null) throw new StatusQueryError("SESSION_NOT_FOUND", `No Session was found for Goal "${parsed.goal_id}".`);
     }
 
     const sessionGoal = goal ?? await this.optionalGoal(session.goal_id);
     this.assertWorkspace(parsed.workspace_id, sessionGoal);
     if (sessionGoal !== undefined && sessionGoal.current_task_id !== session.task_id) {
-      throw new Error("Session task identity does not match the Goal checkpoint.");
+      throw new StatusQueryError("STATUS_CONFLICT", "Session task identity does not match the Goal checkpoint.");
     }
     const events = await this.events.listEvents(session.session_id);
     const executionId = this.executionIdFor(session, sessionGoal, events);
@@ -400,7 +406,7 @@ export class StatusQueryService {
   public async listSessionEvents(input: SessionEventsQueryInput): Promise<SessionEventsOutput> {
     const parsed = sessionEventsQueryInputSchema.parse(input);
     const session = await this.sessions.getSession(parsed.session_id);
-    if (session === null) throw new Error(`Session "${parsed.session_id}" was not found.`);
+    if (session === null) throw new StatusQueryError("SESSION_NOT_FOUND", `Session "${parsed.session_id}" was not found.`);
     const goal = await this.optionalGoal(session.goal_id);
     this.assertWorkspace(parsed.workspace_id, goal);
     const all = await this.events.listEvents(session.session_id);
@@ -422,9 +428,9 @@ export class StatusQueryService {
       parsed.task_id,
       parsed.execution_id,
     );
-    if (execution === null) throw new Error(`Execution "${parsed.execution_id}" was not found.`);
+    if (execution === null) throw new StatusQueryError("EXECUTION_NOT_FOUND", `Execution "${parsed.execution_id}" was not found.`);
     if (execution.command !== CODEX_EXECUTION_COMMAND) {
-      throw new Error("Execution is not a Codex CLI batch.");
+      throw new StatusQueryError("STATUS_CONFLICT", "Execution is not a Codex CLI batch.");
     }
     return executionEventsOutputSchema.parse({
       execution_id: execution.execution_id,
@@ -760,16 +766,16 @@ export class StatusQueryService {
       : await this.requiredSession(input.session_id);
     if (requestedGoal !== undefined && requestedSession !== undefined
       && requestedSession.goal_id !== requestedGoal.goal_id) {
-      throw new Error("Session does not belong to the requested Goal.");
+      throw new StatusQueryError("STATUS_CONFLICT", "Session does not belong to the requested Goal.");
     }
 
     let candidates: Array<{ execution: ExecutionContext; goal?: GoalOrchestration; session?: Session }> = [];
     if (requestedGoal !== undefined) {
       if (requestedGoal.execution_id !== input.execution_id) {
-        throw new Error("Execution does not match the requested Goal checkpoint.");
+        throw new StatusQueryError("STATUS_CONFLICT", "Execution does not match the requested Goal checkpoint.");
       }
       if (requestedGoal.current_task_id === undefined) {
-        throw new Error("Requested Goal has no current Task checkpoint.");
+        throw new StatusQueryError("STATUS_CONFLICT", "Requested Goal has no current Task checkpoint.");
       }
       const execution = await this.executions.getExecutionContext(
         requestedGoal.workspace_id,
@@ -809,8 +815,8 @@ export class StatusQueryService {
 
     const identities = unique(candidates.map((candidate) =>
       `${candidate.execution.workspace_id}\0${candidate.execution.task_id}\0${candidate.execution.execution_id}`));
-    if (identities.length === 0) throw new Error(`Execution "${input.execution_id}" was not found.`);
-    if (identities.length > 1) throw new Error(`Execution "${input.execution_id}" is ambiguous.`);
+    if (identities.length === 0) throw new StatusQueryError("EXECUTION_NOT_FOUND", `Execution "${input.execution_id}" was not found.`);
+    if (identities.length > 1) throw new StatusQueryError("STATUS_CONFLICT", `Execution "${input.execution_id}" is ambiguous.`);
     const candidate = candidates.find((item) =>
       `${item.execution.workspace_id}\0${item.execution.task_id}\0${item.execution.execution_id}` === identities[0],
     )!;
@@ -831,7 +837,7 @@ export class StatusQueryService {
       if (session.task_id !== execution.task_id
         || !events.some((event) => event.execution_id === execution.execution_id)
         || (goal !== undefined && session.goal_id !== goal.goal_id)) {
-        throw new Error("Session does not belong to the requested Execution.");
+        throw new StatusQueryError("STATUS_CONFLICT", "Session does not belong to the requested Execution.");
       }
       return session;
     }
@@ -842,7 +848,7 @@ export class StatusQueryService {
       const events = await this.events.listEvents(session.session_id);
       if (events.some((event) => event.execution_id === execution.execution_id)) matches.push(session);
     }
-    if (matches.length > 1) throw new Error("More than one Session matches the requested Execution.");
+    if (matches.length > 1) throw new StatusQueryError("STATUS_CONFLICT", "More than one Session matches the requested Execution.");
     return matches[0];
   }
 
@@ -867,7 +873,7 @@ export class StatusQueryService {
     const matches = (await this.tasks.listTaskContexts()).filter((task) =>
       task.task_id === taskId && (workspaceId === undefined || task.workspace_id === workspaceId),
     );
-    if (matches.length > 1) throw new Error(`Task "${taskId}" is ambiguous.`);
+    if (matches.length > 1) throw new StatusQueryError("STATUS_CONFLICT", `Task "${taskId}" is ambiguous.`);
     return matches[0];
   }
 
@@ -883,18 +889,24 @@ export class StatusQueryService {
   }
 
   private async optionalGoal(goalId: string): Promise<GoalOrchestration | undefined> {
-    return this.goals === undefined ? undefined : (await this.goals.getGoal(goalId)) ?? undefined;
+    try {
+      return this.goals === undefined ? undefined : (await this.goals.getGoal(goalId)) ?? undefined;
+    } catch (error: unknown) {
+      if (error instanceof GoalOrchestrationUnavailableError) throw new StatusQueryError("RUNTIME_UNAVAILABLE", error.message);
+      throw error;
+    }
   }
 
   private async requiredGoal(goalId: string): Promise<GoalOrchestration> {
+    if (this.goals === undefined) throw new StatusQueryError("RUNTIME_UNAVAILABLE", "Goal status runtime is unavailable.");
     const goal = await this.optionalGoal(goalId);
-    if (goal === undefined) throw new Error(`Goal "${goalId}" was not found.`);
+    if (goal === undefined) throw new StatusQueryError("GOAL_NOT_FOUND", `Goal "${goalId}" was not found.`);
     return goal;
   }
 
   private async requiredSession(sessionId: string): Promise<Session> {
     const session = await this.sessions.getSession(sessionId);
-    if (session === null) throw new Error(`Session "${sessionId}" was not found.`);
+    if (session === null) throw new StatusQueryError("SESSION_NOT_FOUND", `Session "${sessionId}" was not found.`);
     return session;
   }
 
@@ -909,7 +921,7 @@ export class StatusQueryService {
   ): void {
     const ownerWorkspaceId = goal?.workspace_id ?? recordWorkspaceId;
     if (workspaceId !== undefined && ownerWorkspaceId !== workspaceId) {
-      throw new Error("Status query workspace does not match the requested record.");
+      throw new StatusQueryError("STATUS_CONFLICT", "Status query workspace does not match the requested record.");
     }
   }
 }

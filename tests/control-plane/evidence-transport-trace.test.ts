@@ -113,6 +113,7 @@ function input() {
 
 function result(request: GoalSubmissionRequest): GoalSubmissionResult {
   return {
+    start_confirmed: true,
     goal_id: `goal-${request.conversation_id}`,
     phase_id: "phase-trace",
     task_id: "task-trace",

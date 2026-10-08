@@ -12,6 +12,15 @@ import {
   type CodexExecutionStartRequest,
 } from "./codex-execution-adapter.js";
 
+export class ExecutionLaunchIndeterminateError extends Error {
+  public readonly code?: string;
+  public constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    const cause = options?.cause;
+    this.code = cause instanceof Error && "code" in cause && typeof cause.code === "string" ? cause.code : undefined;
+  }
+}
+
 export const executionModeSchema = z.enum(["batch", "interactive"]);
 export type ExecutionMode = z.infer<typeof executionModeSchema>;
 

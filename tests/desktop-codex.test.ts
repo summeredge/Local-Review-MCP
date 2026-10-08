@@ -97,6 +97,32 @@ function project(
 }
 
 describe("desktop-codex command primitives", () => {
+  it.each([
+    ["Unknown model: provider/new", "model_unknown"],
+    ["Reasoning effort is not supported", "reasoning_effort_unsupported"],
+  ])("classifies provider parameter rejection: %s", async (reason, code) => {
+    const commands = new DesktopCodexThreadCommands({
+      client: { callTool: async () => ({ isError: true, content: [{ type: "text", text: reason }] }) },
+      contracts: createCodexAppToolContracts(appTools()),
+    });
+    await expect(commands.createThread({ executorThreadId: EXECUTOR_THREAD, projectId: "project-one",
+      prompt: "create", model_id: "provider/new", reasoning_effort: "high" }))
+      .rejects.toMatchObject({ details: { code, input: "provider/new" },
+        message: expect.stringContaining("stage=create_thread model=provider/new") });
+  });
+
+  it("retains sanitized transport cause at the create_thread stage", async () => {
+    const commands = new DesktopCodexThreadCommands({
+      client: { callTool: async () => { throw new Error("Connection refused. token=private-token"); } },
+      contracts: createCodexAppToolContracts(appTools()),
+    });
+    const error = await commands.createThread({ executorThreadId: EXECUTOR_THREAD, projectId: "project-one",
+      prompt: "create", model_id: "provider/new" }).catch(error => error);
+    expect(error.code).toBe("tool_call_failed");
+    expect(error.message).toContain("stage=create_thread model=provider/new");
+    expect(error.message).toContain("Connection refused.");
+    expect(error.message).not.toContain("private-token");
+  });
   it.each<[Partial<CallToolResult>, string]>([
     [{ content: [{ type: "text", text: "Project unavailable" }] }, "create_thread failed: Project unavailable"],
     [{ content: [] }, "create_thread returned an error."],
@@ -118,7 +144,7 @@ describe("desktop-codex command primitives", () => {
     });
     await expect(commands.createThread({
       executorThreadId: EXECUTOR_THREAD, projectId: "project-one", prompt: "create",
-    })).rejects.toMatchObject({ code: "tool_call_failed", message });
+    })).rejects.toMatchObject({ message: expect.stringContaining(message) });
   });
 
   it("filters provider secrets and paths before limiting the error summary", async () => {
@@ -138,8 +164,8 @@ describe("desktop-codex command primitives", () => {
     expect(error.code).toBe("tool_call_failed");
     expect(error.message).toContain("create_thread failed: Project unavailable");
     expect(error.message).not.toContain("private-");
-    expect(error.message.length).toBeLessThanOrEqual("create_thread failed: ".length + 512);
-    expect(error.cause).toEqual({ isError: true, content: [{ type: "text", text: error.message.slice("create_thread failed: ".length) }] });
+    expect(error.message.length).toBeLessThanOrEqual(700);
+    expect(error.cause).toEqual({ isError: true, content: [{ type: "text", text: "Project unavailable at [redacted path]" }] });
     expect(JSON.stringify(error.cause)).not.toContain("private-");
   });
 

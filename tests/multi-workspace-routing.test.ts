@@ -322,7 +322,7 @@ describe("multi-workspace execution routing", () => {
       current_task_id: "task-d",
       status: "running",
     } as never));
-    const orchestration: GoalSubmissionOrchestration = { createGoal, startGoal };
+    const orchestration: GoalSubmissionOrchestration = { createGoal, startGoal, getStartEvidence: vi.fn(async () => ({ status: "started" as const })) };
     const submission = new GoalSubmissionService(orchestration, preflight);
     const request = {
       workspace_id: "workspace-d",
@@ -338,6 +338,7 @@ describe("multi-workspace execution routing", () => {
 
     await expect(submission.submitGoal(request, proof)).resolves.toMatchObject({
       execution_id: "execution-d",
+      start_confirmed: true,
       status: "running",
     });
     expect(diagnoseConnector).not.toHaveBeenCalled();
@@ -368,6 +369,7 @@ describe("multi-workspace execution routing", () => {
     const storageRoot = await root("lrm-multi-pending-");
     const correlations = new ConversationCorrelationRegistry(storageRoot);
     const starts = vi.fn(async (input: { workspace_id: string; conversation_id: string }) => ({
+      start_confirmed: true as const,
       goal_id: `goal-${input.workspace_id}`,
       phase_id: `phase-${input.workspace_id}`,
       task_id: `task-${input.workspace_id}`,

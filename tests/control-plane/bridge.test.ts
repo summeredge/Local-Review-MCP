@@ -124,6 +124,43 @@ afterEach(async () => {
 });
 
 describe("Local Control Bridge protocol", () => {
+  it("keeps idle presence alive only with valid authenticated heartbeats and expires after TTL", async () => {
+    const token = ((await request('/pair', { method: 'POST', body: {} })).body as { token: string }).token;
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      for (let elapsed = 3000; elapsed <= 18000; elapsed += 3000) {
+        clock.mockReturnValue(now + elapsed);
+        expect(await request('/presence', { method: 'POST', token, body: {} }))
+          .toEqual({ status: 200, body: { accepted: true } });
+        expect(extensionDeliveryReadiness()).toMatchObject({
+          ready: true, extension_present: true, readiness_state: 'ready',
+        });
+      }
+      // A background tab may only wake once per minute; global presence survives that gap.
+      clock.mockReturnValue(now + 18000 + 60000);
+      expect(extensionDeliveryReadiness()).toMatchObject({ ready: true, extension_present: true });
+      clock.mockReturnValue(now + 18000 + EXTENSION_PRESENCE_TIMEOUT_MS);
+      expect(extensionDeliveryReadiness()).toMatchObject({
+        ready: false, extension_present: false, readiness_state: 'extension_not_present',
+      });
+      expect((await request('/identity-diagnostic', { method: 'POST', token, body: {
+        stage: 'scan_started', scan_id: 1, navigation_epoch: 0,
+        observed_at: new Date().toISOString(), correlation_key_hash: '',
+        conversation_id_hash: '', document_id_hash: '', flags: {},
+      } })).status).toBe(202);
+      for (const body of [null, [], { alive: true }, 'broken']) {
+        expect((await request('/presence', { method: 'POST', token, body })).status).toBe(400);
+      }
+      expect((await request('/presence', { method: 'POST', body: {} })).status).toBe(401);
+      expect((await request('/presence', { method: 'POST', token, protocol: '0', body: {} })).status).toBe(426);
+      expect((await request('/presence', { method: 'POST', token, origin: ORIGIN_B, body: {} })).status).toBe(403);
+      expect((await request('/presence', { token })).status).toBe(405);
+      expect(extensionDeliveryReadiness().readiness_state).toBe('extension_not_present');
+      await request('/presence', { method: 'POST', token, body: {} });
+      expect(extensionDeliveryReadiness().ready).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
   it("requires a fresh claim from the exact conversation, not another page or background status", async () => {
     const token = ((await request("/pair", { method: "POST", body: {} })).body as { token: string }).token;
     const claim = { client_id: "client-a", document_id: "document-a", navigation_epoch: 0,
@@ -136,7 +173,7 @@ describe("Local Control Bridge protocol", () => {
       body: { ...claim, navigation_epoch: 1, conversation_id: "conversation-target" } });
     expect(conversationDeliveryReadiness("conversation-target")).toMatchObject({ ready: true });
     expect(conversationDeliveryReadiness("conversation-other").ready).toBe(false);
-    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + EXTENSION_PRESENCE_TIMEOUT_MS);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 10_000);
     try {
       await request("/status", { token });
       expect(conversationDeliveryReadiness("conversation-target")).toMatchObject({
@@ -381,7 +418,7 @@ describe("Local Control Bridge protocol", () => {
         goal_id: "goal-bridge-pending",
         phase_id: "phase-bridge-pending",
         task_id: "task-bridge-pending",
-        execution_id: "execution-bridge-pending",
+        execution_id: "execution-bridge-pending", start_confirmed: true as const,
         status: "running",
       });
     });
@@ -883,7 +920,7 @@ describe("Local Control Bridge app lifecycle", () => {
     const runtime = createAppContext(settings());
     const correlations = new ConversationCorrelationRegistry(root);
     const submitGoal = vi.fn(async () => ({ goal_id: "goal", phase_id: "phase", task_id: "task",
-      execution_id: "execution", status: "running" as const }));
+      execution_id: "execution", start_confirmed: true as const, status: "running" as const }));
     const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {
       storageRoot: root, browserReadiness: () => ({ ready: true }), identityTrace: runtime.identityTrace,
     });
@@ -926,7 +963,7 @@ describe("Local Control Bridge app lifecycle", () => {
       goal_id: "goal-evidence-before-goal",
       phase_id: "phase-evidence-before-goal",
       task_id: "task-evidence-before-goal",
-      execution_id: "execution-evidence-before-goal",
+      execution_id: "execution-evidence-before-goal", start_confirmed: true as const,
       status: "running",
     }));
     const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {
@@ -989,7 +1026,7 @@ describe("Local Control Bridge app lifecycle", () => {
       goal_id: "goal-evidence-first",
       phase_id: "phase-evidence-first",
       task_id: "task-evidence-first",
-      execution_id: "execution-evidence-first",
+      execution_id: "execution-evidence-first", start_confirmed: true as const,
       status: "running",
     }));
     const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {
@@ -1059,7 +1096,7 @@ describe("Local Control Bridge app lifecycle", () => {
       goal_id: "goal-grace-expired",
       phase_id: "phase-grace-expired",
       task_id: "task-grace-expired",
-      execution_id: "execution-grace-expired",
+      execution_id: "execution-grace-expired", start_confirmed: true as const,
       status: "running",
     }));
     const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {

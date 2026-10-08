@@ -19,6 +19,7 @@ import {
   sessionEventsQueryInputSchema,
   sessionStatusOutputSchema,
   sessionStatusQueryInputSchema,
+  StatusQueryError,
   type StatusQueryService,
 } from "../control-plane/status-query.js";
 import {
@@ -351,11 +352,15 @@ export function toToolError(error: unknown) {
       isError: true as const,
     };
   }
+  if (error instanceof StatusQueryError) {
+    return { content: [{ type: "text" as const, text: JSON.stringify({ error: error.code, message: error.message }) }], isError: true as const };
+  }
   const code = error instanceof PendingGoalSubmissionConflictError
     ? "CONFLICTING_PENDING_GOAL_SUBMISSION"
     : error instanceof WorkspacePathError || error instanceof GitError
     ? error.code
     : "INTERNAL_ERROR";
+  if (code === "INTERNAL_ERROR") console.error("MCP tool failed:", error);
   const details = code === "UNKNOWN_WORKSPACE_ID"
     ? { message: "Unknown workspace_id" }
     : {};
@@ -1010,7 +1015,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     async (input) => {
       try {
         if (context.statusQuery === undefined) {
-          return toToolError(new Error("Status query runtime is unavailable."));
+          return toToolError(new StatusQueryError("RUNTIME_UNAVAILABLE", "Status query runtime is unavailable."));
         }
         const selection = registry.resolve(input.workspace_id);
         return structuredResponse(sessionStatusOutputSchema, await context.statusQuery.getSessionStatus({
@@ -1141,7 +1146,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "submit_goal",
     {
-      description: "Control Plane: durably accept a Goal for the current ChatGPT conversation. The model must generate a new UUID v4 correlation_key for every invocation and never reuse one; users do not need to provide it manually. The Goal starts asynchronously after exact canonical Extension evidence proves the conversation.",
+      description: "Control Plane: durably accept a Goal for the current ChatGPT conversation. Resolve workspace_id from the explicitly requested project or the project associated with this conversation using workspace_list; only a uniquely registered workspace may be inferred when omitted. Never substitute the active/default workspace for an ambiguous target. execution_mode defaults to interactive (Desktop/AppServer); explicit batch uses the CLI. The model must generate a new UUID v4 correlation_key for every invocation and never reuse one; users do not need to provide it manually. The Goal starts asynchronously after exact canonical Extension evidence proves the conversation.",
       inputSchema: goalSubmissionToolInputSchema,
       outputSchema: goalSubmissionAcceptedSchema,
     },
@@ -1154,7 +1159,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
       }
 
       try {
-        const selection = registry.resolve(input.workspace_id);
+        const selection = registry.resolveForSubmission(input.workspace_id);
         const correlation = context.correlations?.correlation(input.correlation_key);
         context.identityTrace?.record({
           event: "submit_goal_received",

@@ -127,4 +127,13 @@ export class WorkspaceRegistry {
   public list(): readonly WorkspaceSummary[] {
     return this.records.map(({ id, name }) => ({ id, name }));
   }
+
+  public resolveForSubmission(workspaceId?: string): WorkspaceSelection {
+    if (workspaceId !== undefined) return this.resolve(workspaceId);
+    if (this.records.length === 1) return this.records[0]!;
+    throw new WorkspacePathError(
+      "WORKSPACE_ID_REQUIRED",
+      "WORKSPACE_ID_REQUIRED: Specify workspace_id for the intended project; multiple workspaces are registered.",
+    );
+  }
 }

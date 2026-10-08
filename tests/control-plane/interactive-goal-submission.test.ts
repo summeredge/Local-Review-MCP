@@ -261,6 +261,25 @@ async function fixture(): Promise<{
 }
 
 describe("interactive Goal submission", () => {
+  it.each([
+    { model: "provider-missing", code: "model_unknown", effort: undefined },
+    { model: "provider-default", code: "reasoning_effort_unsupported", effort: "low" },
+  ])("rejects $code before provider dispatch and keeps model diagnostics", async ({ model, code, effort }) => {
+    const value = await fixture();
+    try {
+      await expect(value.submit.submitExternalGoal({ ...request(), model, reasoning_effort: effort }))
+        .rejects.toMatchObject({ state: "failed", result: expect.objectContaining({ status: "failed" }), message: expect.stringContaining("stage=model_validation") });
+      expect(value.appClient.thread).not.toHaveBeenCalled();
+      expect(value.appClient.turn).not.toHaveBeenCalled();
+      expect(value.cliStart).not.toHaveBeenCalled();
+      const session = (await value.sessions.listSessions())[0]!;
+      expect(session.status).toBe("failed");
+      expect((await value.executions.listExecutions("workspace-a", session.task_id))[0])
+        .toMatchObject({ status: "failed", summary: expect.stringContaining(`stage=model_validation model=${model}`) });
+      expect((await value.executions.listExecutions("workspace-a", session.task_id))[0]!.summary)
+        .toContain(code === "model_unknown" ? "Unknown model" : "not supported");
+    } finally { await value.executionService.close(); }
+  });
   it("defaults omitted execution mode to the interactive backend", async () => {
     const value = await fixture();
     const submitted = await value.submit.submitExternalGoal(request());

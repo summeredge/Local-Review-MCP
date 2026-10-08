@@ -1,9 +1,9 @@
+import { ExecutionLaunchIndeterminateError } from "../control-plane/execution-service.js";
 import type {
   DesktopCodexCommandOptions,
   DesktopCodexThreadCommands,
 } from "./thread-commands.js";
 import {
-  DesktopThreadBindingConflictError,
   type DesktopThreadBindingStore,
 } from "./desktop-thread-binding-store.js";
 import type { DesktopThreadBinding } from "./desktop-thread-binding.js";
@@ -115,10 +115,7 @@ export class DesktopThreadCoordinator {
       // for the losing caller; callers that need "did I dispatch the first turn" must check it.
       return { binding: durable, created: true };
     } catch (error: unknown) {
-      if (error instanceof DesktopThreadBindingConflictError) {
-        throw new DesktopThreadCoordinatorError("binding_conflict", error.message, error);
-      }
-      throw error;
+      throw new ExecutionLaunchIndeterminateError(`Desktop stage=thread_binding_persistence: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
   }
 

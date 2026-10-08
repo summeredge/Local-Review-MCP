@@ -116,7 +116,7 @@ describe("Goal submission CLI", () => {
         status: "running",
       };
     });
-    const context = { goalSubmission: { submitGoal } } as unknown as AppContext;
+    const context = { goalSubmission: { submitExternalGoal: submitGoal } } as unknown as AppContext;
     const loadSettings = vi.fn(async (argv: readonly string[] = []) => {
       expect(argv).toEqual(["--config", "settings.json"]);
       return settings;
@@ -182,7 +182,7 @@ describe("Goal submission CLI", () => {
       const submitGoal = vi.fn(async () => {
         throw new GoalPreflightError(failure);
       });
-      const context = { goalSubmission: { submitGoal } } as unknown as AppContext;
+      const context = { goalSubmission: { submitExternalGoal: submitGoal } } as unknown as AppContext;
       const closeServer = vi.fn(async (value: Server) => {
         value.close();
       });
@@ -238,6 +238,7 @@ describe("Goal status CLI", () => {
       status: "reviewing",
     });
     const goal: GoalOrchestration = goalOrchestrationSchema.parse({
+      execution_mode: "interactive",
       goal_id: "goal-1",
       workspace_id: "workspace-a",
       conversation_id: "conversation-1",

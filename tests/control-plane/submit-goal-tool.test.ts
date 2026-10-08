@@ -87,6 +87,7 @@ async function fixture(options: {
     request: ResolvedGoalSubmissionRequest,
     _provenance?: { readonly source: "authenticated_mcp_invocation" },
   ): Promise<GoalSubmissionResult> => ({
+    start_confirmed: true,
     goal_id: `goal-${request.conversation_id}`,
     phase_id: "phase-1",
     task_id: "task-1",
@@ -156,6 +157,48 @@ function toolJson(result: unknown): Record<string, unknown> {
 }
 
 describe("submit_goal MCP tool", () => {
+  it("rejects ambiguous Workspace before accepting or binding a Goal", async () => {
+    const a = await mkdtemp(join(tmpdir(), "lrm-submit-a-"));
+    const b = await mkdtemp(join(tmpdir(), "lrm-submit-b-"));
+    temporaryDirectories.push(a, b);
+    const registry = new WorkspaceRegistry([{ id: "a", name: "A", path: a }, { id: "b", name: "B", path: b }]);
+    const accept = vi.fn(async () => ({ accepted: true as const, correlation_key: CORRELATION_A,
+      accepted_at: new Date().toISOString(), expires_at: new Date(Date.now() + 1000).toISOString() }));
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "workspace-submit-test", version: "0.1.0" });
+    clients.push(client);
+    await Promise.all([createMcpServer({ registry, pendingGoalSubmission: { accept } }).connect(serverTransport),
+      client.connect(clientTransport)]);
+    const rejected = await callFor(client);
+    expect(rejected.isError).toBe(true);
+    expect(toolJson(rejected)).toMatchObject({ error: "WORKSPACE_ID_REQUIRED" });
+    expect(accept).not.toHaveBeenCalled();
+    expect((await callFor(client, { ...goalArguments(), workspace_id: "b" })).isError).not.toBe(true);
+    expect(accept).toHaveBeenCalledWith(expect.objectContaining({ workspace_id: "b", execution_mode: "interactive" }));
+  });
+  it('accepts after idle heartbeat renewal and fails closed once heartbeat stops', async () => {
+    const { client, pending } = await fixture({ browserReady: false });
+    await startBridge({ ports: [0] });
+    const headers = { origin: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop', 'x-lrm-bridge-protocol': '3' };
+    const paired = await fetch(`http://127.0.0.1:${bridgePort()}/pair`, { method: 'POST', headers, body: '{}' });
+    const { token } = await paired.json() as { token: string };
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    for (let elapsed = 3000; elapsed <= 15000; elapsed += 3000) {
+      clock.mockReturnValue(now + elapsed);
+      const ack = await fetch(`http://127.0.0.1:${bridgePort()}/presence`, {
+        method: 'POST', headers: { ...headers, authorization: `Bearer ${token}` }, body: '{}',
+      });
+      expect(ack.status).toBe(200);
+      await ack.json();
+    }
+    expect(toolJson(await callFor(client))).toMatchObject({ accepted: true });
+    expect((await pending.get(CORRELATION_A))?.state).toBe('pending_identity');
+    clock.mockReturnValue(now + 15000 + EXTENSION_PRESENCE_TIMEOUT_MS);
+    expect(toolJson(await callFor(client, goalArguments(CORRELATION_B)))).toMatchObject({
+      error: 'BROWSER_IDENTITY_CHANNEL_NOT_READY', readiness_state: 'extension_not_present',
+    });
+  });
   it.each(["bridge_unavailable", "extension_not_paired", "extension_not_present"] as const)(
     "fails immediately for %s without a receipt, pending write, event or timer", async (state) => {
       const { client, pending, storageRoot, record, submitGoal } = await fixture({ browserReady: false });
@@ -273,11 +316,11 @@ describe("submit_goal MCP tool", () => {
 
   it("returns structured snake_case model resolution errors", async () => {
     const { client, pending } = await fixture();
-    const result = await callFor(client, { ...goalArguments(), model: "gpt-9" });
+    const result = await callFor(client, { ...goalArguments(), model: "   " });
 
     expect(result.isError).toBe(true);
     expect(toolJson(result)).toMatchObject({
-      error: { code: "model_unknown", input: "gpt-9" },
+      error: { code: "model_empty", input: "   " },
     });
     expect(await pending.list()).toEqual([]);
   });
@@ -289,21 +332,13 @@ describe("submit_goal MCP tool", () => {
       ...goalArguments(),
       ...(mode === undefined ? {} : { execution_mode: mode }),
     });
-    expect((await pending.get(CORRELATION_A))?.execution_mode).toBe(mode);
+    expect((await pending.get(CORRELATION_A))?.execution_mode).toBe(mode ?? "interactive");
     const pendingState = JSON.parse(await readFile(pendingGoalSubmissionStateFile(storageRoot), "utf8")) as {
       submissions: Array<Record<string, unknown>>;
     };
-    if (mode === undefined) {
-      expect(pendingState.submissions[0]).not.toHaveProperty("execution_mode");
-    } else {
-      expect(pendingState.submissions[0]?.execution_mode).toBe(mode);
-    }
+    expect(pendingState.submissions[0]?.execution_mode).toBe(mode ?? "interactive");
     const pendingCreated = record.mock.calls.find(([event]) => event.event === "pending_created")?.[0];
-    if (mode === undefined) {
-      expect(pendingCreated).not.toHaveProperty("execution_mode");
-    } else {
-      expect(pendingCreated?.execution_mode).toBe(mode);
-    }
+    expect(pendingCreated?.execution_mode).toBe(mode ?? "interactive");
 
     await correlations.observe(evidence(CORRELATION_A, "conversation-interactive"));
     pending.scheduleResolve(CORRELATION_A);

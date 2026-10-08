@@ -1,3 +1,4 @@
+import { ExecutionLaunchIndeterminateError } from "../control-plane/execution-service.js";
 ﻿import { resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { ExecutionContextService } from "../context/execution-service.js";
@@ -265,18 +266,25 @@ export class DesktopCodexBackend implements ExecutionBackend {
     // The executor identity is captured once per Execution and never persisted.
     const executorThreadId = this.executorIdentity();
 
-    const runtime = await this.connectRuntime();
+    const runtime = await this.connectRuntime().catch((error: unknown) => {
+      if (error instanceof Error) error.message = `Desktop stage=backend_connection: ${error.message}`;
+      throw error;
+    });
     let session: Session | undefined;
     let execution: ExecutionContext | undefined;
     // Runtime ownership starts here and moves to the completion watch exactly once. Until the
     // transfer happens, this frame is responsible for closing the runtime on every exit path.
     let runtimeOwnedByWatch = false;
+    let threadCreated = false;
+    let stage = "tools/list";
     try {
       const { commands, contracts, client } = await this.prepare(runtime);
       // Every codex_app tools/call in this Execution must use the executor captured above, so the
       // value is threaded through instead of being re-read from the current Desktop foreground.
+      stage = "project_resolution";
       const projectId = await this.resolveProject(commands, cwd, executorThreadId);
 
+      stage = "session_persistence";
       session = await this.sessions.createSession({
         goal_id: request.goal_id!,
         task_id: request.task_id,
@@ -287,6 +295,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
         ...(request.reasoning_effort === undefined ? {} : { reasoning_effort: request.reasoning_effort }),
       });
       session = await this.sessions.updateSession(session.session_id, { status: "starting" });
+      stage = "execution_persistence";
       execution = await this.executions.createExecutionContext({
         execution_id: request.execution_id,
         task_id: request.task_id,
@@ -299,6 +308,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
         commands,
         bindings: new DesktopThreadBindingStore(this.storageRoot),
       });
+      stage = "create_thread";
       const created = await coordinator.createOrReuseThread({
         workspace_id: request.workspace_id,
         task_id: request.task_id,
@@ -316,9 +326,11 @@ export class DesktopCodexBackend implements ExecutionBackend {
         );
       }
 
+      threadCreated = true;
       const threadId = created.binding.target_thread_id;
       const hostId = created.binding.host_id;
       const abortController = new AbortController();
+      stage = "session_persistence";
       session = await this.sessions.updateSession(session.session_id, {
         status: "active",
         thread_id: threadId,
@@ -369,7 +381,16 @@ export class DesktopCodexBackend implements ExecutionBackend {
         thread_id: threadId,
       };
     } catch (error: unknown) {
+      if (error instanceof Error && !error.message.startsWith("Desktop stage=")) {
+        error.message = `Desktop stage=${stage} model=${request.model_id ?? "default"} reasoning_effort=${request.reasoning_effort ?? "default"}: ${error.message}`;
+      }
       if (session !== undefined) this.runtimes.delete(session.session_id);
+      if (threadCreated || error instanceof ExecutionLaunchIndeterminateError
+        || (stage === "create_thread" && error instanceof CodexAppRuntimeError
+          && (["tool_call_timeout", "tool_call_aborted", "transport_failed", "thread_identity_missing"].includes(error.code)
+            || (error.code === "tool_call_failed" && error.cause instanceof Error)))) {
+        throw new ExecutionLaunchIndeterminateError(errorMessage(error), { cause: error });
+      }
       await this.failLaunch(request, session, execution, error);
       throw error;
     } finally {

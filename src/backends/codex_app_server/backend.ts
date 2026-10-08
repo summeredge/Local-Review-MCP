@@ -6,6 +6,7 @@ import type { ExecutionContext, Session } from "../../context/types.js";
 import { defaultTaskContextStorageRoot } from "../../context/task.js";
 import type { WorkspaceRegistry } from "../../workspace/registry.js";
 import type { ReasoningEffortValue } from "../../models/model-catalog.js";
+import { ModelResolutionError } from "../../models/model-resolver.js";
 import { EventStore } from "../../control-plane/events/store.js";
 import type { LrmEvent } from "../../control-plane/events/model.js";
 import { CodexEventAdapter } from "./event-adapter.js";
@@ -84,7 +85,7 @@ function selectedModel(
   if (request.model_id !== undefined) {
     const selected = models.find((model) => model.model_id === request.model_id);
     if (selected === undefined) {
-      throw new Error(`Requested model was not returned by model/list: ${request.model_id}`);
+      throw new ModelResolutionError({ code: "model_unknown", input: request.model_id });
     }
     return selected;
   }
@@ -100,7 +101,10 @@ function selectedEffort(
 ): ReasoningEffortValue | undefined {
   if (request.reasoning_effort !== undefined) {
     if (model === undefined || !model.reasoning_efforts.includes(request.reasoning_effort)) {
-      throw new Error(`Reasoning effort is not supported by the selected model: ${request.reasoning_effort}`);
+      throw new ModelResolutionError({
+        code: "reasoning_effort_unsupported", input: model?.model_id ?? request.model_id ?? "default",
+        reasoning_effort: request.reasoning_effort,
+      });
     }
     return request.reasoning_effort;
   }
@@ -219,6 +223,7 @@ export class CodexAppServerBackend implements ExecutionBackend {
     let session: Session | undefined;
     let execution: ExecutionContext | undefined;
     let client: AppServerClient | undefined;
+    let stage = "backend_connect";
     try {
       session = await this.sessions.createSession({
         goal_id: request.goal_id!,
@@ -254,7 +259,9 @@ export class CodexAppServerBackend implements ExecutionBackend {
         { process_id: processId },
       );
 
+      stage = "model/list";
       const models = await client.listModels();
+      stage = "model_validation";
       const model = selectedModel(request, models);
       const effort = selectedEffort(request, model);
       session = await this.sessions.updateSession(session.session_id, {
@@ -262,12 +269,14 @@ export class CodexAppServerBackend implements ExecutionBackend {
         ...(effort === undefined ? {} : { reasoning_effort: effort }),
       });
 
+      stage = "thread/start";
       const thread = await client.startThread(threadInput(cwd, model));
       session = await this.sessions.updateSession(session.session_id, {
         status: "active",
         thread_id: thread.thread_id,
       });
 
+      stage = "turn/start";
       const turn = await client.startTurn(turnInput(thread.thread_id, request.instruction, model, effort));
       const eventAdapter = new CodexEventAdapter({
         session_id: session.session_id,
@@ -311,6 +320,9 @@ export class CodexAppServerBackend implements ExecutionBackend {
         turn_id: turn.turn_id,
       };
     } catch (error: unknown) {
+      if (error instanceof Error) {
+        error.message = `AppServer stage=${stage} model=${request.model_id ?? "default"} reasoning_effort=${request.reasoning_effort ?? "default"}: ${error.message}`;
+      }
       if (client !== undefined && session !== undefined) this.clients.delete(session.session_id);
       await client?.close().catch(() => undefined);
       await this.failLaunch(request, session, execution, error);

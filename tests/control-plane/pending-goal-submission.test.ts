@@ -16,9 +16,10 @@ import {
   pendingGoalSubmissionStateFile,
   type PendingGoalSubmissionInput,
 } from "../../src/control-plane/pending-goal-submission.js";
-import type {
-  GoalSubmissionRequest,
-  GoalSubmissionResult,
+import {
+  GoalStartError,
+  type GoalSubmissionRequest,
+  type GoalSubmissionResult,
 } from "../../src/control-plane/goal-submission.js";
 
 const temporaryDirectories: string[] = [];
@@ -57,6 +58,7 @@ function evidence(request_id = CORRELATION_A) {
 
 function result(conversation_id = "conversation-a"): GoalSubmissionResult {
   return {
+    start_confirmed: true,
     goal_id: `goal-${conversation_id}`,
     phase_id: "phase-1",
     task_id: "task-1",
@@ -220,6 +222,7 @@ describe("PendingGoalSubmissionService", () => {
     }, { storageRoot: root, identityTrace: { record: trace } });
 
     await pending.accept(input());
+    await expect(pending.accept({ ...input(), execution_mode: "interactive" })).resolves.toMatchObject({ accepted: true });
     await expect(pending.accept({ ...input(), execution_mode: "batch" }))
       .rejects.toThrow("different pending Goal submission");
     expect((await pending.get(CORRELATION_A))?.execution_mode).toBeUndefined();
@@ -229,7 +232,7 @@ describe("PendingGoalSubmissionService", () => {
   it("restores a legacy Pending without writing batch and resolves it to interactive", async () => {
     const root = await makeRoot();
     const correlations = new ConversationCorrelationRegistry(root);
-    const initial = new PendingGoalSubmissionService(correlations, {
+    const initial = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), {
       submitGoal: vi.fn(async () => result()),
     }, { storageRoot: root });
     await initial.accept(input());
@@ -410,7 +413,7 @@ describe("PendingGoalSubmissionService", () => {
       submitGoal: vi.fn(async () => result()),
     }, { storageRoot: root });
     await first.accept(input());
-    await correlations.observe(evidence());
+    // Seed the interrupted checkpoint before evidence can trigger the live resolver.
     const file = pendingGoalSubmissionStateFile(root);
     const state = JSON.parse(await readFile(file, "utf8")) as {
       submissions: Array<Record<string, unknown>>;
@@ -482,6 +485,49 @@ describe("PendingGoalSubmissionService", () => {
     await uncertain.resolve(CORRELATION_A);
     expect((await uncertain.get(CORRELATION_A))?.state).toBe("indeterminate");
     expect(uncertainSubmit).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses an unconfirmed result even when an Execution ID is allocated", async () => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const record = vi.fn();
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal: async () => ({ ...result(), start_confirmed: undefined }) }, { storageRoot: root, identityTrace: { record } });
+    await pending.accept(input());
+    await correlations.observe(evidence());
+    await pending.resolve(CORRELATION_A);
+    expect(await pending.get(CORRELATION_A)).toMatchObject({ state: "indeterminate", error: expect.stringContaining("confirmation") });
+    expect(record.mock.calls.filter(([event]) => event.event === "goal_started")).toHaveLength(0);
+  });
+
+  it.each(["failed", "indeterminate"] as const)("does not emit goal_started for %s launch results", async state => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const record = vi.fn();
+    const submitGoal = vi.fn(async () => { throw new GoalStartError(state, { ...result(), status: state === "failed" ? "failed" : "human_required" }, "Desktop stage=create_thread: unavailable"); });
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root, identityTrace: { record } });
+    await pending.accept(input());
+    await correlations.observe(evidence());
+    await pending.resolve(CORRELATION_A);
+    expect(await pending.get(CORRELATION_A)).toMatchObject({ state, error: expect.stringContaining("create_thread"), result: { goal_id: result().goal_id, task_id: "task-1", execution_id: "execution-1" } });
+    expect(record.mock.calls.filter(([event]) => event.event === "goal_started")).toHaveLength(0);
+    expect(record.mock.calls.filter(([event]) => event.event === "goal_start_failed")).toMatchObject([[{ goal_id: result().goal_id, task_id: "task-1", execution_id: "execution-1", failure_reason: expect.stringContaining("create_thread") }]]);
+    const restored = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    await restored.recover();
+    await restored.resolve(CORRELATION_A);
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["running", "completed", "failed"] as const)("emits exactly one goal_started for a confirmed %s result", async status => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const record = vi.fn();
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal: vi.fn(async () => ({ ...result(), status })) }, { storageRoot: root, identityTrace: { record } });
+    await pending.accept(input());
+    await correlations.observe(evidence());
+    await pending.resolve(CORRELATION_A);
+    await pending.resolve(CORRELATION_A);
+    expect(await pending.get(CORRELATION_A)).toMatchObject({ state: "started", status });
+    expect(record.mock.calls.filter(([event]) => event.event === "goal_started")).toHaveLength(1);
   });
 
 });

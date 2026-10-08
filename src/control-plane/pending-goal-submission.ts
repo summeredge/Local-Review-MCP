@@ -7,6 +7,7 @@ import { workspaceIdSchema } from "../context/schema.js";
 import { correlationKeySchema } from "../mcp/schema/common.js";
 import { extensionDeliveryReadiness } from "./bridge.js";
 import {
+  GoalStartError,
   goalSubmissionAcceptedSchema,
   goalSubmissionRequestSchema,
   goalSubmissionResultSchema,
@@ -82,11 +83,13 @@ export const pendingGoalSubmissionSchema = z.discriminatedUnion("state", [
     resolved_at: timestampSchema,
     error: terminalErrorSchema,
     preflight: goalPreflightResultSchema.optional(),
+    result: goalSubmissionResultSchema.optional(),
   }).strict(),
   pendingBaseSchema.extend({
     state: z.literal("indeterminate"),
     resolved_at: timestampSchema,
     error: terminalErrorSchema,
+    result: goalSubmissionResultSchema.optional(),
   }).strict(),
 ]).superRefine((record, context) => {
   const acceptedAt = Date.parse(record.accepted_at);
@@ -169,7 +172,7 @@ function payloadFingerprint(value: PendingGoalSubmission | PendingGoalSubmission
     requirements: value.requirements,
     acceptance_criteria: value.acceptance_criteria,
     max_iterations: value.max_iterations,
-    execution_mode: value.execution_mode,
+    execution_mode: resolveExecutionMode(value.execution_mode),
     model_id: value.model_id ?? null,
     reasoning_effort: value.reasoning_effort ?? null,
     connector_provenance: value.connector_provenance?.source ?? null,
@@ -498,9 +501,10 @@ export class PendingGoalSubmissionService {
     } catch (error: unknown) {
       await this.finishTerminal(
         key,
-        error instanceof GoalPreflightError ? "failed" : "indeterminate",
+        error instanceof GoalStartError ? error.state : error instanceof GoalPreflightError ? "failed" : "indeterminate",
         errorMessage(error),
         error instanceof GoalPreflightError ? error.result : undefined,
+        error instanceof GoalStartError ? error.result : undefined,
       );
       this.traceTransport({
         event: "evidence_resolve_failed",
@@ -688,6 +692,9 @@ export class PendingGoalSubmissionService {
     key: string,
     result: z.infer<typeof goalSubmissionResultSchema>,
   ): Promise<void> {
+    if (result.start_confirmed !== true) {
+      throw new GoalStartError("indeterminate", result, "Goal result has no durable start confirmation");
+    }
     await this.exclusive(async () => {
       const current = this.submissions.get(key);
       if (current === undefined || current.state !== "starting") return;
@@ -718,6 +725,7 @@ export class PendingGoalSubmissionService {
     state: "failed" | "indeterminate",
     error: string,
     preflight?: GoalPreflightResult,
+    result?: z.infer<typeof goalSubmissionResultSchema>,
   ): Promise<void> {
     await this.exclusive(async () => {
       const current = this.submissions.get(key);
@@ -726,10 +734,12 @@ export class PendingGoalSubmissionService {
       next.set(key, state === "failed"
         ? this.failedRecord(current, this.currentTime(), error, preflight)
         : this.indeterminateRecord(current, this.currentTime(), error));
+      if (result !== undefined) next.set(key, pendingGoalSubmissionSchema.parse({ ...next.get(key), result }));
       await this.persist(next);
       this.submissions = next;
       this.trace({
         event: "goal_start_failed",
+        ...(result === undefined ? {} : { goal_id: result.goal_id, phase_id: result.phase_id, task_id: result.task_id, execution_id: result.execution_id }),
         correlation_key: current.correlation_key,
         workspace_id: current.workspace_id,
         reason: "goal_start_failed",

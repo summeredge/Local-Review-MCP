@@ -1,5 +1,5 @@
 import type { CallToolRequestParams, CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createCodexAppToolContracts,
   type CodexAppMcpClient,
@@ -184,6 +184,40 @@ function context(timeoutMs?: number) {
 }
 
 describe("DesktopCompletionObserver", () => {
+  it("polls once per second by default without wait_threads and detects completion on the next read", async () => {
+    vi.useFakeTimers();
+    try {
+      const read = vi.fn().mockResolvedValueOnce(readPayload([turn(B, "inProgress")]))
+        .mockResolvedValue(readPayload([turn(B, "completed")]));
+      const observer = new DesktopCompletionObserver({ client: { callTool: read },
+        contracts: createCodexAppToolContracts(appTools({ wait: false })) });
+      const pending = observer.waitForCompletion({ ...context(), baseline: {
+        targetThreadId: TARGET_THREAD, hostId: HOST_ID, turnIds: [A],
+      } });
+      await vi.advanceTimersByTimeAsync(999);
+      expect(read).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).resolves.toMatchObject({ status: "completed", turnId: B });
+      expect(read).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("cancels immediately during the default fallback sleep", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const read = vi.fn().mockResolvedValue(readPayload([turn(B, "inProgress")]));
+      const observer = new DesktopCompletionObserver({ client: { callTool: read },
+        contracts: createCodexAppToolContracts(appTools({ wait: false })) });
+      const pending = observer.waitForCompletion({ ...context(), signal: controller.signal,
+        baseline: { targetThreadId: TARGET_THREAD, hostId: HOST_ID, turnIds: [A] } });
+      const assertion = expect(pending).rejects.toThrow();
+      await vi.advanceTimersByTimeAsync(500);
+      controller.abort();
+      await assertion;
+      expect(read).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
   it("captures a minimal baseline from read_thread", async () => {
     const setupValue = setup([readPayload([turn(A, "completed")])]);
 

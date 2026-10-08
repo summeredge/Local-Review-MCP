@@ -1064,7 +1064,33 @@
     });
   }
 
+  let presenceInFlight = null;
+  let lastPresenceAt = null;
+  async function probePresence() {
+    if (!chrome.tabs?.query || !chrome.tabs?.sendMessage) return;
+    const tabs = await chrome.tabs.query({ url: ['https://chatgpt.com/*', 'https://chat.openai.com/*'] });
+    await Promise.allSettled(tabs.map(tab => probeTab(tab, 'presence_probe')));
+  }
+  function receivePresence(message, sender) {
+    if (!senderSource(sender) || Object.keys(message).length !== 1) {
+      return { ok: false, error: 'invalid_presence' };
+    }
+    try {
+      if (!['https://chatgpt.com', 'https://chat.openai.com'].includes(new URL(sender.url).origin)) {
+        return { ok: false, error: 'invalid_presence' };
+      }
+    } catch { return { ok: false, error: 'invalid_presence' }; }
+    if (presenceInFlight) return presenceInFlight;
+    if (lastPresenceAt !== null && Date.now() - lastPresenceAt < 2000) return { ok: true };
+    presenceInFlight = postBridge('/presence', {}).then(result => {
+      if (result.ok) lastPresenceAt = Date.now();
+      return result;
+    }).finally(() => { presenceInFlight = null; });
+    return presenceInFlight;
+  }
+
   const handlers = {
+    presence: receivePresence,
     register_document: registerDocument,
     navigation: receiveNavigation,
     identity_evidence: receiveEvidence,
@@ -1088,12 +1114,12 @@
         { targets, reload_at: recoveryReloads.get(tabId) || 0 }])) });
   }
 
-  async function probeTab(tab) {
+  async function probeTab(tab, type = 'delivery_probe') {
     if (!chrome.tabs.sendMessage) return null;
     let timer;
     try {
       return await Promise.race([
-        chrome.tabs.sendMessage(tab.id, { type: 'delivery_probe' }),
+        chrome.tabs.sendMessage(tab.id, { type }),
         new Promise(resolve => { timer = setTimeout(() => resolve(null), FIBER_PROBE_TIMEOUT_MS); })
       ]);
     } catch { return null; }
@@ -1223,10 +1249,13 @@
   // Alarms wake an MV3 worker even after the original Fiber/tool call has disappeared.
   if (chrome.alarms) {
     chrome.alarms.onAlarm.addListener((alarm) => {
+      if (alarm.name === 'extension-presence') void probePresence().catch(() => undefined);
       if (alarm.name === EVIDENCE_RETRY_ALARM) void flushEvidenceOutbox().catch(() => undefined);
       if (alarm.name === DELIVERY_RECOVERY_ALARM) void recoverConversations().catch(() => console.warn('[LRM recovery] worker recovery failed'));
     });
     void chrome.alarms.create(EVIDENCE_RETRY_ALARM, { periodInMinutes: 1 });
+    void chrome.alarms.create('extension-presence', { periodInMinutes: 1 });
+    void probePresence().catch(() => undefined);
     void chrome.alarms.create(DELIVERY_RECOVERY_ALARM, { periodInMinutes: 1 });
     void recoverConversations().catch(() => console.warn('[LRM recovery] worker recovery failed'));
     void flushEvidenceOutbox().catch(() => undefined);
