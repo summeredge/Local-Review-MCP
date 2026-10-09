@@ -1584,3 +1584,103 @@ describe("P5.4.1 FIX Desktop runtime ownership", () => {
   });
 });
 
+
+describe("terminal Session recovery", () => {
+  it.each([ ["passed", false], ["failed", false], ["passed", true], ["failed", true] ] as const)(
+    "recovers %s with persistent Session failure=%s", async (outcome, persistent) => {
+      const value = await fixture({ pollIntervalMs: 1 });
+      await seedTask(value);
+      const registry = value.registry;
+      const request = interactiveRequest();
+      const sessions = value.sessions;
+      const makeAuto = () => new AutoIterationService(registry, { storageRoot: value.root,
+        browserRouter: new BrowserRouter(value.root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
+        completionRouter: new ReviewCompletionRouter(value.root, { collect: async input => ({ status: "COMPLETED",
+          content: '<lrm-review-result>' + JSON.stringify({ schema_version: 1, review_request_id: input.review_request_id,
+            decision: "APPROVE", summary: "Reviewed" }) + '</lrm-review-result>' }) }),
+      });
+      let auto = makeAuto();
+      let notifications = 0;
+      value.backend.setTerminalListener(async execution => { notifications++; await auto.onExecutionTerminal(execution); });
+      const original = SessionStore.prototype.updateSession;
+      let attempts = 0;
+      const spy = vi.spyOn(SessionStore.prototype, "updateSession").mockImplementation(async function(this: SessionStore, id, patch) {
+        if (this.storageRoot === value.root && patch.status === (outcome === "passed" ? "completed" : "failed")) {
+          attempts++;
+          if (persistent || attempts === 1) throw Object.assign(new Error("terminal publish occupied"), { code: "EPERM" });
+        }
+        return original.call(this, id, patch);
+      });
+      try {
+        const started = await value.backend.start(request);
+        await auto.start({ loop_id: "terminal-loop", workspace_id: request.workspace_id, task_id: request.task_id,
+          conversation_id: "conversation-1", execution_id: request.execution_id, max_iterations: 2 });
+        value.desktop.setTurns([{ id: "turn-1", status: outcome === "passed" ? "completed" : "failed", completedAt: 1 }]);
+        await value.backend.whenIdle();
+        expect(notifications).toBe(1);
+        const terminal = await new ExecutionContextService(value.root).getExecutionContext(request.workspace_id, request.task_id, request.execution_id);
+        expect(terminal?.status).toBe(outcome);
+        await vi.waitFor(async () => expect((await auto.getLoop("terminal-loop"))?.stage).toBe(outcome === "passed" ? "completed" : "failed"));
+        const loop = await auto.getLoop("terminal-loop");
+        expect(loop?.stage).toBe(outcome === "passed" ? "completed" : "failed");
+        const reviewId = loop?.review_request_id;
+        await Promise.all([auto.onExecutionTerminal(terminal!), auto.onExecutionTerminal(terminal!)]);
+        expect((await auto.getLoop("terminal-loop"))?.review_request_id).toBe(reviewId);
+        if (!persistent) expect((await sessions.getSession(started.session_id!))?.status).toBe(outcome === "passed" ? "completed" : "failed");
+        spy.mockRestore();
+        await value.backend.close();
+        auto.dispose();
+        auto = makeAuto();
+        const restarted = new DesktopCodexBackend(registry, { storageRoot: value.root, runtimeFactory: { connect: async () => { throw new Error("must not redispatch"); } } });
+        restarted.setTerminalListener(execution => auto.onExecutionTerminal(execution));
+        try {
+          await restarted.reconcileOrphanedExecutions();
+          await auto.recover();
+          await restarted.reconcileOrphanedExecutions();
+          expect((await sessions.getSession(started.session_id!))?.status).toBe(outcome === "passed" ? "completed" : "failed");
+          expect((await auto.getLoop("terminal-loop"))?.review_request_id).toBe(reviewId);
+          expect((await auto.getLoop("terminal-loop"))?.stage).toBe(outcome === "passed" ? "completed" : "failed");
+        } finally { await restarted.close(); }
+      } finally { spy.mockRestore(); auto.dispose(); await value.backend.close(); }
+    });
+});
+
+it.each(["passed", "failed"] as const)("restarts from durable %s with an unsynchronized Loop", async outcome => {
+  const value = await fixture({ pollIntervalMs: 1 });
+  await seedTask(value);
+  const registry = value.registry;
+  const request = interactiveRequest();
+  const makeAuto = () => new AutoIterationService(registry, { storageRoot: value.root,
+    browserRouter: new BrowserRouter(value.root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
+    completionRouter: new ReviewCompletionRouter(value.root, { collect: async input => ({ status: "COMPLETED",
+      content: '<lrm-review-result>' + JSON.stringify({ schema_version: 1, review_request_id: input.review_request_id,
+      decision: "APPROVE", summary: "Reviewed" }) + '</lrm-review-result>' }) }),
+  });
+  let auto = makeAuto();
+  const notify = vi.fn(async () => { throw new Error("terminal listener unavailable"); });
+  value.backend.setTerminalListener(notify);
+  const original = SessionStore.prototype.updateSession;
+  const spy = vi.spyOn(SessionStore.prototype, "updateSession").mockImplementation(async function(this: SessionStore, id, patch) {
+    if (this.storageRoot === value.root && (patch.status === "completed" || patch.status === "failed")) throw new Error("Session unavailable");
+    return original.call(this, id, patch);
+  });
+  try {
+    const started = await value.backend.start(request);
+    await auto.start({ loop_id: "restart-loop", workspace_id: request.workspace_id, task_id: request.task_id,
+      execution_id: request.execution_id, conversation_id: "conversation-1", max_iterations: 2 });
+    value.desktop.setTurns([{ id: "turn-1", status: outcome === "passed" ? "completed" : "failed", completedAt: 1 }]);
+    await value.backend.whenIdle();
+    expect((await auto.getLoop("restart-loop"))?.stage).toBe("execution");
+    await value.backend.close(); auto.dispose(); spy.mockRestore();
+    auto = makeAuto();
+    const restarted = new DesktopCodexBackend(registry, { storageRoot: value.root, runtimeFactory: { connect: async () => { throw new Error("unexpected dispatch"); } } });
+    restarted.setTerminalListener(execution => auto.onExecutionTerminal(execution));
+    try {
+      await restarted.reconcileOrphanedExecutions();
+      expect((await auto.getLoop("restart-loop"))?.stage).toBe(outcome === "passed" ? "completed" : "failed");
+      expect((await new SessionStore(value.root).getSession(started.session_id!))?.status).toBe(outcome === "passed" ? "completed" : "failed");
+      await restarted.reconcileOrphanedExecutions();
+      expect(await new ExecutionContextService(value.root).listExecutions(request.workspace_id, request.task_id)).toHaveLength(1);
+    } finally { await restarted.close(); }
+  } finally { spy.mockRestore(); auto.dispose(); await value.backend.close(); }
+});

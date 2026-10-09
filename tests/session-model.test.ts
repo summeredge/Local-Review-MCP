@@ -99,3 +99,13 @@ describe("SessionStore", () => {
       .resolves.toMatchObject({ model_id: "gpt-6-luna", reasoning_effort: "high" });
   });
 });
+
+it("adds an Execution association to legacy Sessions without allowing reassignment", async () => {
+  const store = new SessionStore(await makeStorageRoot());
+  const session = await store.createSession({ goal_id: "goal-1", task_id: "task-1", backend_type: "codex_app_server", workspace: "C:/workspace" });
+  expect((await store.getSession(session.session_id))?.execution_id).toBeUndefined();
+  await store.updateSession(session.session_id, { execution_id: "execution-1" });
+  expect((await store.getSession(session.session_id))?.execution_id).toBe("execution-1");
+  await expect(store.updateSession(session.session_id, { execution_id: "execution-2" })).rejects.toThrow("association cannot be changed");
+  expect((await store.getSession(session.session_id))?.execution_id).toBe("execution-1");
+});

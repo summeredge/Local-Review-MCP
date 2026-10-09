@@ -84,6 +84,7 @@ export class SessionStore {
     const timestamp = new Date().toISOString();
     const session = sessionSchema.parse({
       session_id: parsed.session_id,
+      ...(parsed.execution_id === undefined ? {} : { execution_id: parsed.execution_id }),
       goal_id: parsed.goal_id,
       task_id: parsed.task_id,
       backend_type: parsed.backend_type,
@@ -140,8 +141,13 @@ export class SessionStore {
     if (current === null) throw new Error(`Session "${sessionId}" was not found.`);
 
     const parsed = updateSessionInputSchema.parse(patch);
+    if (current.execution_id !== undefined && parsed.execution_id !== undefined
+      && current.execution_id !== parsed.execution_id) {
+      throw new Error("Session Execution association cannot be changed.");
+    }
     const next = sessionSchema.parse({
       ...current,
+      ...(parsed.execution_id === undefined ? {} : { execution_id: parsed.execution_id }),
       ...(parsed.status === undefined ? {} : { status: parsed.status }),
       ...(parsed.thread_id === undefined ? {} : { thread_id: parsed.thread_id }),
       ...(parsed.model_id === undefined ? {} : { model_id: parsed.model_id }),

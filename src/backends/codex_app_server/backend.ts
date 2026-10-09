@@ -1,3 +1,4 @@
+import { sessionForExecution, syncTerminalSession } from "../../context/session-execution.js";
 import { resolve } from "node:path";
 import { ExecutionContextService } from "../../context/execution-service.js";
 import { SessionStore } from "../../context/session-store.js";
@@ -74,7 +75,7 @@ function boundedSummary(value: string | undefined, fallback: string): string {
   return summary === "" ? fallback : summary;
 }
 
-function requestKey(request: ExecutionBackendStartRequest): string {
+function requestKey(request: ExecutionIdentity): string {
   return `${request.workspace_id}\0${request.task_id}\0${request.execution_id}`;
 }
 
@@ -151,6 +152,7 @@ export class CodexAppServerBackend implements ExecutionBackend {
    */
   private readonly watchers = new Map<string, WatcherEntry>();
   private readonly tasks: TaskContextService;
+  private readonly notified = new Set<string>();
   private terminalListener: ExecutionTerminalListener | undefined;
   private closing = false;
 
@@ -226,6 +228,7 @@ export class CodexAppServerBackend implements ExecutionBackend {
     let stage = "backend_connect";
     try {
       session = await this.sessions.createSession({
+        execution_id: request.execution_id,
         goal_id: request.goal_id!,
         task_id: request.task_id,
         backend_type: "codex_app_server",
@@ -365,7 +368,7 @@ export class CodexAppServerBackend implements ExecutionBackend {
    * Startup orphan reconciliation. It never resumes, retries, or migrates anything: a running
    * app-server Execution that this instance does not own is terminated as failed so Goal and
    * Auto Iteration see the standard execution failure and route to human handling. Safe to call
-   * repeatedly; an already terminal record is left untouched and not notified twice.
+   * repeatedly; terminal records also repair Session state and retry unsuccessful notifications.
    */
   public async reconcileOrphanedExecutions(): Promise<ExecutionContext[]> {
     const reconciled: ExecutionContext[] = [];
@@ -383,11 +386,18 @@ export class CodexAppServerBackend implements ExecutionBackend {
         );
         continue;
       }
-      const session = sessions
-        .filter((candidate) => candidate.task_id === task.task_id)
-        .sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
+
       for (const execution of executions) {
-        if (execution.status !== "running" || execution.command !== APP_SERVER_COMMAND) continue;
+        if (execution.command !== APP_SERVER_COMMAND) continue;
+        const session = await sessionForExecution(
+          sessions.filter(candidate => candidate.task_id === task.task_id
+            && candidate.workspace === this.registry.resolve(task.workspace_id).manager.canonicalRoot),
+          execution, executions.filter(candidate => candidate.command === APP_SERVER_COMMAND), this.events);
+        if (execution.status !== "running") {
+          await syncTerminalSession(this.sessions, session?.session_id, execution);
+          await this.notifyTerminal(execution);
+          continue;
+        }
         if (this.watchers.has(execution.execution_id)) continue;
         const next = await this.terminate(
           execution,
@@ -406,8 +416,34 @@ export class CodexAppServerBackend implements ExecutionBackend {
       session.goal_id === request.goal_id
       && session.task_id === request.task_id
       && session.backend_type === "codex_app_server");
-    if (matches.length > 1) throw new Error("More than one interactive Session matches the Goal task.");
-    return matches[0] ?? null;
+    const current: Session[] = [];
+    for (const session of matches) {
+      let ids = session.execution_id === undefined
+        ? [...new Set((await this.events.listEvents(session.session_id)).map((event) => event.execution_id))]
+        : [session.execution_id];
+      if (ids.length === 0 && matches.length === 1) {
+        const evidence = (await this.executions.listExecutions(request.workspace_id, request.task_id))
+          .filter(execution => execution.command === APP_SERVER_COMMAND);
+        if (evidence.length === 1) ids = [evidence[0]!.execution_id];
+      }
+      if (ids.length === 0) {
+        // Legacy records without execution evidence cannot safely authorize another dispatch.
+        throw new Error(`Interactive Session "${session.session_id}" exists without its Execution association.`);
+      }
+      if (ids.length !== 1) throw new Error("Interactive Session has conflicting Execution associations.");
+      if (session.execution_id === undefined) {
+        await this.sessions.updateSession(session.session_id, { execution_id: ids[0]! });
+      }
+      if (ids[0] === request.execution_id) current.push(session);
+      else {
+        const history = await this.executions.getExecutionContext(request.workspace_id, request.task_id, ids[0]!);
+        if (history === null || history.status === "running") {
+          throw new Error("Interactive Session has an unresolved historical Execution.");
+        }
+      }
+    }
+    if (current.length > 1) throw new Error("More than one interactive Session matches the Execution.");
+    return current[0] ?? null;
   }
 
   private async watch(
@@ -496,14 +532,19 @@ export class CodexAppServerBackend implements ExecutionBackend {
       request.task_id,
       request.execution_id,
     );
-    if (execution === null || execution.status !== "running") return;
+    if (execution === null) return;
+    if (execution.status !== "running") {
+      await syncTerminalSession(this.sessions, sessionId, execution);
+      await this.notifyTerminal(execution);
+      return;
+    }
     const next = await this.executions.updateExecutionContext(
       request.workspace_id,
       request.task_id,
       request.execution_id,
       { status: "passed", summary: "Codex turn completed successfully." },
     );
-    await this.sessions.updateSession(sessionId, { status: "completed" });
+    await syncTerminalSession(this.sessions, sessionId, next);
     await this.notifyTerminal(next);
   }
 
@@ -518,14 +559,19 @@ export class CodexAppServerBackend implements ExecutionBackend {
       request.task_id,
       request.execution_id,
     );
-    if (execution === null || execution.status !== "running") return;
+    if (execution === null) return;
+    if (execution.status !== "running") {
+      await syncTerminalSession(this.sessions, sessionId, execution);
+      await this.notifyTerminal(execution);
+      return;
+    }
     const next = await this.executions.updateExecutionContext(
       request.workspace_id,
       request.task_id,
       request.execution_id,
       { status: "failed", summary: boundedSummary(reason, "Codex turn failed.") },
     );
-    await this.sessions.updateSession(sessionId, { status: "failed" });
+    await syncTerminalSession(this.sessions, sessionId, next);
     await this.notifyTerminal(next);
   }
 
@@ -547,7 +593,7 @@ export class CodexAppServerBackend implements ExecutionBackend {
       { status: "failed", summary: boundedSummary(summary, summary) },
     );
     if (sessionId !== undefined) {
-      await this.sessions.updateSession(sessionId, { status: "failed" });
+      await syncTerminalSession(this.sessions, sessionId, next);
     }
     await this.notifyTerminal(next);
     return next;
@@ -566,6 +612,11 @@ export class CodexAppServerBackend implements ExecutionBackend {
         request.task_id,
         request.execution_id,
       ).catch(() => null);
+    if (current !== null && current.status !== "running") {
+      await syncTerminalSession(this.sessions, session?.session_id, current);
+      await this.notifyTerminal(current);
+      return;
+    }
     if (current?.status === "running") {
       const next = await this.executions.updateExecutionContext(
         request.workspace_id,
@@ -573,14 +624,21 @@ export class CodexAppServerBackend implements ExecutionBackend {
         request.execution_id,
         { status: "failed", summary: boundedSummary(errorMessage(error), "Interactive execution failed.") },
       ).catch(() => undefined);
-      if (next !== undefined) await this.notifyTerminal(next);
+      if (next !== undefined) {
+        await syncTerminalSession(this.sessions, session?.session_id, next);
+        await this.notifyTerminal(next);
+        return;
+      }
     }
     if (session !== undefined) await this.sessions.updateSession(session.session_id, { status: "failed" }).catch(() => undefined);
   }
 
   private async notifyTerminal(execution: ExecutionContext): Promise<void> {
+    const key = requestKey(execution);
+    if (this.notified.has(key) || this.terminalListener === undefined) return;
     try {
-      await this.terminalListener?.(execution);
+      await this.terminalListener(execution);
+      this.notified.add(key);
     } catch (error: unknown) {
       console.warn("Interactive execution terminal notification failed", errorMessage(error));
     }

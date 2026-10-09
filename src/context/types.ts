@@ -94,6 +94,7 @@ export const SESSION_STATUSES = [
 export type SessionStatus = typeof SESSION_STATUSES[number];
 
 export interface Session {
+  readonly execution_id?: string;
   readonly session_id: string;
   readonly goal_id: string;
   readonly task_id: string;
@@ -111,6 +112,7 @@ export interface Session {
 }
 
 export interface CreateSessionInput {
+  readonly execution_id?: string;
   readonly session_id?: string;
   readonly goal_id: string;
   readonly task_id: string;
@@ -123,6 +125,7 @@ export interface CreateSessionInput {
 }
 
 export interface UpdateSessionInput {
+  readonly execution_id?: string;
   readonly status?: SessionStatus;
   readonly thread_id?: string;
   readonly model_id?: string;

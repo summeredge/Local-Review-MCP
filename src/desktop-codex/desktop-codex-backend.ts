@@ -1,3 +1,4 @@
+import { sessionForExecution, syncTerminalSession } from "../context/session-execution.js";
 import { ExecutionLaunchIndeterminateError } from "../control-plane/execution-service.js";
 ﻿import { resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -120,6 +121,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
   private readonly runtimes = new Map<string, DesktopRuntime>();
   private readonly watchAbortControllers = new Map<string, AbortController>();
   private readonly completions = new Map<string, Promise<void>>();
+  private readonly notified = new Set<string>();
   private terminalListener: ExecutionTerminalListener | undefined;
   private closing = false;
 
@@ -186,25 +188,26 @@ export class DesktopCodexBackend implements ExecutionBackend {
       let cwd: string;
       try { cwd = this.registry.resolve(task.workspace_id).manager.canonicalRoot; }
       catch { continue; }
-      for (const execution of await this.executions.listExecutions(task.workspace_id, task.task_id)) {
-        if (execution.status !== "running" || execution.command !== DESKTOP_EXECUTION_COMMAND) continue;
+      const executions = await this.executions.listExecutions(task.workspace_id, task.task_id);
+      for (const execution of executions) {
+        if (execution.command !== DESKTOP_EXECUTION_COMMAND) continue;
+        const associated = await sessionForExecution(sessions.filter(session => session.task_id === task.task_id
+          && session.backend_type === DESKTOP_EXECUTION_BACKEND_IDENTITY && session.workspace === cwd),
+          execution, executions.filter(candidate => candidate.command === DESKTOP_EXECUTION_COMMAND), this.events);
+        if (execution.status !== "running") {
+          await syncTerminalSession(this.sessions, associated?.session_id, execution);
+          await this.notifyTerminal(execution);
+          continue;
+        }
         const identity = { workspace_id: task.workspace_id, task_id: task.task_id, execution_id: execution.execution_id };
         if (this.inFlight.has(requestKey(identity))) continue;
-        const matches: Session[] = [];
-        for (const session of sessions) {
-          if (session.task_id !== task.task_id
-            || session.backend_type !== DESKTOP_EXECUTION_BACKEND_IDENTITY
-            || session.workspace !== cwd) continue;
-          const events = await this.events.listEvents(session.session_id).catch(() => []);
-          if (events.some((event) => event.execution_id === execution.execution_id)) matches.push(session);
-        }
-        if (matches.length !== 1) {
+        if (associated === undefined) {
           await this.projectFailure(identity, undefined, {
             summary: "Desktop execution has no unambiguous Session or completion observer after runtime shutdown.",
           });
           continue;
         }
-        const session = matches[0]!;
+        const session = associated;
         if (this.completions.has(session.session_id)) continue;
         await this.projectFailure(identity, session.session_id, {
           summary: "Desktop execution completion observer was lost by a previous runtime shutdown.",
@@ -286,6 +289,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
 
       stage = "session_persistence";
       session = await this.sessions.createSession({
+        execution_id: request.execution_id,
         goal_id: request.goal_id!,
         task_id: request.task_id,
         backend_type: DESKTOP_EXECUTION_BACKEND_IDENTITY,
@@ -516,8 +520,9 @@ export class DesktopCodexBackend implements ExecutionBackend {
       session.goal_id === request.goal_id
       && session.task_id === request.task_id
       && session.backend_type === DESKTOP_EXECUTION_BACKEND_IDENTITY);
-    if (matches.length > 1) throw new Error("More than one Desktop Session matches the Goal task.");
-    return matches[0] ?? null;
+    const executions = await this.executions.listExecutions(request.workspace_id, request.task_id);
+    const execution = executions.find(candidate => candidate.execution_id === request.execution_id);
+    return execution === undefined ? null : await sessionForExecution(matches, execution, executions, this.events) ?? null;
   }
 
   private async watch(
@@ -588,7 +593,12 @@ export class DesktopCodexBackend implements ExecutionBackend {
       watch.request.task_id,
       watch.request.execution_id,
     );
-    if (execution === null || execution.status !== "running") return;
+    if (execution === null) return;
+    if (execution.status !== "running") {
+      await syncTerminalSession(this.sessions, watch.sessionId, execution);
+      await this.notifyTerminal(execution);
+      return;
+    }
     if (completion.turnId !== undefined) {
       await this.recordTurnStarted(watch, completion.turnId);
       for (const message of completion.agentMessages ?? []) {
@@ -621,7 +631,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
       watch.request.execution_id,
       { status: "passed", summary: "Desktop turn completed successfully." },
     );
-    await this.sessions.updateSession(watch.sessionId, { status: "completed" });
+    await syncTerminalSession(this.sessions, watch.sessionId, next);
     await this.notifyTerminal(next);
   }
 
@@ -638,7 +648,12 @@ export class DesktopCodexBackend implements ExecutionBackend {
       watch.request.task_id,
       watch.request.execution_id,
     );
-    if (execution === null || execution.status !== "running") return;
+    if (execution === null) return;
+    if (execution.status !== "running") {
+      await syncTerminalSession(this.sessions, watch.sessionId, execution);
+      await this.notifyTerminal(execution);
+      return;
+    }
     await this.projectFailure(watch.request, watch.sessionId, {
       summary: boundedSummary(reason, "Desktop turn failed."),
       ...(watch.resolvedTurnId === undefined ? {} : { turnId: watch.resolvedTurnId }),
@@ -706,13 +721,14 @@ export class DesktopCodexBackend implements ExecutionBackend {
       console.warn("Desktop execution failure could not be persisted", errorMessage(error));
     }
 
-    if (sessionId !== undefined) {
-      await this.sessions.updateSession(sessionId, { status: "failed" }).catch((error: unknown) => {
+    if (next !== undefined) await syncTerminalSession(this.sessions, sessionId, next);
+    else if (sessionId !== undefined) {
+      await this.sessions.updateSession(sessionId, { status: "failed" }).catch(error => {
         console.warn("Desktop Session failure could not be persisted", errorMessage(error));
       });
     }
 
-    if (values.persistEvent !== false && values.threadId !== undefined && sessionId !== undefined) {
+    if (next?.status !== "passed" && values.persistEvent !== false && values.threadId !== undefined && sessionId !== undefined) {
       try {
         await this.recordEvent({
           session_id: sessionId,
@@ -732,8 +748,11 @@ export class DesktopCodexBackend implements ExecutionBackend {
   }
 
   private async notifyTerminal(execution: ExecutionContext): Promise<void> {
+    const key = requestKey(execution);
+    if (this.notified.has(key) || this.terminalListener === undefined) return;
     try {
-      await this.terminalListener?.(execution);
+      await this.terminalListener(execution);
+      this.notified.add(key);
     } catch (error: unknown) {
       console.warn("Desktop execution terminal notification failed", errorMessage(error));
     }

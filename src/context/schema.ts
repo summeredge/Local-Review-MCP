@@ -103,6 +103,7 @@ const sessionModelSchema = z.string().min(1).max(256);
 const sessionReasoningEffortSchema = reasoningEffortValueSchema;
 
 export const sessionSchema = z.object({
+  execution_id: executionIdSchema.optional(),
   session_id: sessionIdSchema,
   goal_id: goalIdSchema,
   task_id: taskIdSchema,
@@ -117,6 +118,7 @@ export const sessionSchema = z.object({
 }).strict();
 
 export const createSessionInputSchema = z.object({
+  execution_id: executionIdSchema.optional(),
   session_id: sessionIdSchema.optional(),
   goal_id: goalIdSchema,
   task_id: taskIdSchema,
@@ -129,6 +131,7 @@ export const createSessionInputSchema = z.object({
 }).strict();
 
 export const updateSessionInputSchema = z.object({
+  execution_id: executionIdSchema.optional(),
   status: sessionStatusSchema.optional(),
   thread_id: sessionThreadIdSchema.optional(),
   model_id: sessionModelSchema.optional(),
