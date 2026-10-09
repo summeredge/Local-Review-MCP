@@ -5,6 +5,11 @@ import { z } from "zod";
 import { defaultTaskContextStorageRoot } from "../context/task.js";
 import { reviewDeliveryIdSchema as reviewDeliveryIdentitySchema } from "../context/review-delivery-schema.js";
 import { reviewRequestIdSchema } from "../context/review-schema.js";
+import { conversationRecoveryFailureSchema, type ConversationRecoveryFailure } from "./extension-delivery.js";
+import { ReviewResultService } from "../context/review-result-service.js";
+import { reviewResultSchema } from "../context/review-result-schema.js";
+import { REVIEW_RESULTS_DIRECTORY, reviewResultFile, type ReviewResult } from "../context/review-result.js";
+import { findReviewTransport, saveReviewTransport } from "./review-transport-history.js";
 import {
   conversationIdSchema,
   taskIdSchema,
@@ -100,6 +105,7 @@ export interface ExtensionReviewCompletion {
   readonly phase: ExtensionReviewCompletionPhase;
   readonly lease?: ExtensionReviewCompletionLease;
   readonly receipt?: ExtensionReviewCompletionReceipt;
+  readonly recovery_error?: ConversationRecoveryFailure["code"];
 }
 
 export interface LeasedExtensionReviewCompletion {
@@ -152,6 +158,7 @@ const completionSchema: z.ZodType<ExtensionReviewCompletion> = z.object({
   phase: z.enum(["queued", "leased", "completed", "failed", "ambiguous"]),
   lease: leaseSchema.optional(),
   receipt: receiptSchema.optional(),
+  recovery_error: z.enum(["TARGET_CONVERSATION_NAVIGATION_FAILED", "TARGET_CONVERSATION_NOT_FOUND", "TARGET_CONVERSATION_AUTH_REQUIRED"]).optional(),
 }).strict().superRefine((completion, context) => {
   if ((completion.phase === "leased") !== (completion.lease !== undefined)) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: "lease does not match phase" });
@@ -208,6 +215,17 @@ export function extensionReviewCompletionStateFile(storageRoot: string): string 
 
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+function restoredTransport(result: ReviewResult): ExtensionReviewCompletion {
+  const transport = result.extension_transport as ExtensionReviewCompletion;
+  const completion = completionSchema.parse({ ...transport, receipt: { ...transport.receipt, content: result.content } });
+  if (result.status !== "COMPLETED" || completion.phase !== "completed"
+    || completion.workspace_id !== result.workspace_id || completion.task_id !== result.task_id
+    || completion.review_request_id !== result.review_request_id || completion.review_delivery_id !== result.delivery_id) {
+    throw new ExtensionReviewCompletionConflictError("archived completion does not match Review Result");
+  }
+  return completion;
 }
 
 function sameOwner(
@@ -328,9 +346,8 @@ export class ExtensionReviewCompletionService {
     const parsed = createSchema.parse(input);
     return this.exclusive(async () => {
       const next = new Map(this.completions);
-      const existing = [...next.values()].find((completion) =>
-        completion.review_request_id === parsed.review_request_id);
-      if (existing !== undefined) {
+      const existing = await this.getByReviewRequestId(parsed.review_request_id);
+      if (existing !== null) {
         if (!sameInput(existing, parsed)) {
           throw new ExtensionReviewCompletionConflictError(
             "review request already targets different completion identity",
@@ -338,7 +355,23 @@ export class ExtensionReviewCompletionService {
         }
         return clone(existing);
       }
-      if (next.size >= MAX_COMPLETIONS) throw new Error("extension review completion queue is full");
+      while (next.size >= MAX_COMPLETIONS) {
+        let terminal: ExtensionReviewCompletion | undefined;
+        const results = new ReviewResultService(this.storageRoot);
+        for (const candidate of next.values()) {
+          if (candidate.phase !== "completed" || this.waiters.has(candidate.completion_id)) continue;
+          const result = await results.getReviewResultByRequest(candidate.workspace_id, candidate.review_request_id);
+          if (result?.status !== "COMPLETED" || result.delivery_id !== candidate.review_delivery_id
+            || result.task_id !== candidate.task_id || result.content !== candidate.receipt?.content) continue;
+          const { content: _content, ...receipt } = candidate.receipt!;
+          await saveReviewTransport(reviewResultFile(this.storageRoot, result.workspace_id, result.result_id), result,
+            { ...candidate, receipt });
+          terminal = candidate;
+          break;
+        }
+        if (!terminal) throw new Error("extension review completion queue is full");
+        next.delete(terminal.completion_id);
+      }
       const completion: ExtensionReviewCompletion = {
         completion_id: randomUUID(),
         ...parsed,
@@ -356,7 +389,36 @@ export class ExtensionReviewCompletionService {
     await this.restore();
     const parsedId = z.string().uuid().parse(completionId);
     const completion = this.completions.get(parsedId);
-    return completion === undefined ? null : clone(completion);
+    if (completion !== undefined) return clone(completion);
+    const result = await findReviewTransport(join(this.storageRoot, REVIEW_RESULTS_DIRECTORY), reviewResultSchema,
+      record => restoredTransport(record).completion_id === parsedId);
+    return result === null ? null : restoredTransport(result);
+  }
+
+  public async recoveryTargets(): Promise<Array<{ completion_id: string; conversation_id: string }>> {
+    await this.restore();
+    return [...this.completions.values()]
+      // Restored diagnostics must not reopen pages without a live result collector.
+      .filter(completion => this.waiters.has(completion.completion_id) && (completion.phase === "queued"
+        || (completion.phase === "leased" && completion.lease!.deadline <= Date.now()))
+        && (completion.recovery_error === undefined || completion.recovery_error === "TARGET_CONVERSATION_NAVIGATION_FAILED"))
+      .map(({ completion_id, conversation_id }) => ({ completion_id, conversation_id }));
+  }
+
+  public async reportRecoveryFailure(input: Extract<ConversationRecoveryFailure, { completion_id: string }>): Promise<void> {
+    await this.restore();
+    const failure = conversationRecoveryFailureSchema.parse(input);
+    if (!("completion_id" in failure)) throw new ExtensionReviewCompletionConflictError("expected completion recovery identity");
+    await this.exclusive(async () => {
+      const current = this.completions.get(failure.completion_id);
+      if (!current) return;
+      if (current.conversation_id !== failure.conversation_id) throw new ExtensionReviewCompletionConflictError("recovery conversation does not match completion");
+      if (current.receipt !== undefined) return;
+      const next = new Map(this.completions);
+      next.set(current.completion_id, { ...current, recovery_error: failure.code });
+      await this.persist(next);
+      this.completions = next;
+    });
   }
 
   public async getByReviewRequestId(
@@ -366,7 +428,10 @@ export class ExtensionReviewCompletionService {
     const parsedId = reviewRequestIdSchema.parse(reviewRequestId);
     const completion = [...this.completions.values()].find((candidate) =>
       candidate.review_request_id === parsedId);
-    return completion === undefined ? null : clone(completion);
+    if (completion !== undefined) return clone(completion);
+    const result = await findReviewTransport(join(this.storageRoot, REVIEW_RESULTS_DIRECTORY), reviewResultSchema,
+      record => record.review_request_id === parsedId);
+    return result === null ? null : restoredTransport(result);
   }
 
   public async claim(
@@ -395,7 +460,8 @@ export class ExtensionReviewCompletionService {
       }
 
       const completion = [...next.values()].find((candidate) =>
-        candidate.phase === "queued" && candidate.conversation_id === owner.conversation_id);
+        candidate.phase === "queued" && candidate.conversation_id === owner.conversation_id
+        && (candidate.recovery_error === undefined || candidate.recovery_error === "TARGET_CONVERSATION_NAVIGATION_FAILED"));
       if (completion === undefined) {
         if (changed) {
           await this.persist(next);
@@ -428,8 +494,8 @@ export class ExtensionReviewCompletionService {
     await this.restore();
     const ack = extensionReviewCompletionAckSchema.parse(input);
     return this.exclusive(async () => {
-      const current = this.completions.get(ack.completion_id);
-      if (current === undefined) {
+      const current = this.completions.get(ack.completion_id) ?? await this.get(ack.completion_id);
+      if (current === null) {
         throw new ExtensionReviewCompletionNotFoundError("completion not found");
       }
       if (current.receipt !== undefined) {
@@ -469,8 +535,8 @@ export class ExtensionReviewCompletionService {
     const registration = await this.exclusive<{
       readonly receipt: ExtensionReviewCompletionReceipt | null;
       readonly pending: Promise<ExtensionReviewCompletionReceipt | null> | null;
-    }>(() => {
-      const completion = this.completions.get(parsedId);
+    }>(async () => {
+      const completion = this.completions.get(parsedId) ?? await this.get(parsedId);
       if (completion?.receipt !== undefined || timeoutMs === 0) {
         return Promise.resolve({
           receipt: completion?.receipt === undefined ? null : clone(completion.receipt),
@@ -527,8 +593,8 @@ export class ExtensionReviewCompletionService {
     await chmod(directory, 0o700);
     try {
       await writeFile(temporary, snapshot, { encoding: "utf8", mode: 0o600 });
+      await chmod(temporary, 0o600);
       await rename(temporary, this.file);
-      await chmod(this.file, 0o600);
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
     }

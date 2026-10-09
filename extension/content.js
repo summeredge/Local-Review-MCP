@@ -227,6 +227,11 @@
           else if (previous === undefined) byRequest.set(entry.request_id, entry.fiber_conversation_id);
         }
         const diagnostic = {};
+        const snapshotReason = data.scan_diagnostic?.snapshot_selection_reason;
+        if (['selected', 'no_current_turn', 'historical_viewport', 'snapshot_unreadable',
+          'user_conflict', 'user_boundary', 'no_submit_goal', 'scan_exception'].includes(snapshotReason)) {
+          diagnostic.snapshot_selection_reason = snapshotReason;
+        }
         for (const key of ['current_turn_present', 'fiber_root_detected', 'messages_found',
           'submit_goal_found', 'correlation_key_found', 'current_key_found',
           'conversation_id_found', 'conversation_conflict', 'conversation_unreadable']) {
@@ -418,8 +423,14 @@
       const askedUrl = location.href;
       identityDiagnostic('scan_started', scanId, { route_conversation_present: Boolean(routeConversation(askedUrl)) });
       const scan = await fiberScan();
+      identityDiagnostic('fiber_scanned', scanId, { ...scan.diagnostic,
+        fiber_reply_received: scan.fiber_reply_received === true,
+        fiber_evidence_count: scan.evidence.length, evidence_generated: scan.evidence.length > 0,
+        navigation_epoch_unchanged: askedEpoch === navigationEpoch && askedUrl === location.href });
       if (askedEpoch !== navigationEpoch || askedUrl !== location.href) return;
-      const conversationId = await resolveConversation(scan);
+      // Current tool evidence has its own validated identity; history still gates Delivery.
+      const conversationId = await resolveConversation(!scan.conversation_id && scan.evidence.length === 1
+        ? { ...scan, conversation_id: scan.evidence[0].fiber_conversation_id } : scan);
       if (!conversationId) return;
       const registered = await registerDocument();
       identityDiagnostic('document_registered', scanId, { register_document_ok: registered });
@@ -427,10 +438,6 @@
       const stillCurrent = () => askedEpoch === navigationEpoch
         && askedUrl === location.href
         && currentConversation === conversationId;
-      const observation = { ...scan.diagnostic, fiber_reply_received: scan.fiber_reply_received === true,
-        fiber_evidence_count: scan.evidence.length, evidence_generated: scan.evidence.length > 0,
-        navigation_epoch_unchanged: stillCurrent() };
-      identityDiagnostic('fiber_scanned', scanId, observation);
       if (!stillCurrent()) return;
       for (const entry of scan.evidence) {
         if (!stillCurrent()) return;

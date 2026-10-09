@@ -1,0 +1,16 @@
+* text=auto
+
+# Source and documentation files use LF
+*.py   text eol=lf
+*.js   text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Windows command scripts use CRLF
+*.bat  text eol=crlf
+*.cmd  text eol=crlf

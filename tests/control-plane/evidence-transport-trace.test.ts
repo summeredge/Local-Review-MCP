@@ -123,6 +123,33 @@ function result(request: GoalSubmissionRequest): GoalSubmissionResult {
 }
 
 describe("EvidenceTransportTraceService", () => {
+  it('reads bounded recent browser diagnostics including rows without a key', async () => {
+    const trace = new EvidenceTransportTraceService(await makeRoot('lrm-recent-browser-diagnostic-'));
+    const diagnostic = { stage: 'fiber_scanned' as const, scan_id: 1, navigation_epoch: 0,
+      observed_at: new Date().toISOString(), correlation_key_hash: '', conversation_id_hash: '',
+      document_id_hash: 'b'.repeat(64), flags: { fiber_root_detected: false } };
+    trace.record({ event: 'browser_identity_diagnostic', diagnostic });
+    trace.record({ event: 'bridge_evidence_received', correlation_key: KEY_A });
+    const keyed = { ...diagnostic, scan_id: 2, correlation_key_hash: identityHash(KEY_A) };
+    trace.record({ event: 'browser_identity_diagnostic', diagnostic: keyed });
+    await expect(trace.getEvidenceTransportTrace({})).resolves.toEqual({ events: [
+      { event: 'browser_identity_diagnostic', timestamp: expect.any(String), diagnostic },
+      { event: 'browser_identity_diagnostic', timestamp: expect.any(String), diagnostic: keyed },
+    ] });
+    await expect(trace.getEvidenceTransportTrace({ limit: 1 })).resolves.toMatchObject({
+      events: [{ diagnostic: keyed }],
+    });
+    const filtered = await trace.getEvidenceTransportTrace(KEY_A);
+    expect(filtered.events).toHaveLength(2);
+    expect(filtered.events.some(event => event.diagnostic?.correlation_key_hash === '')).toBe(false);
+    for (const limit of [0, 201, 1.5]) {
+      await expect(trace.getEvidenceTransportTrace({ limit })).rejects.toThrow();
+    }
+    for (let scan_id = 3; scan_id <= 105; scan_id += 1) {
+      trace.record({ event: 'browser_identity_diagnostic', diagnostic: { ...diagnostic, scan_id } });
+    }
+    expect((await trace.getEvidenceTransportTrace({})).events).toHaveLength(100);
+  });
   it("traces extension, Bridge, connector, and resolver order without storing identity plaintext", async () => {
     const root = await makeRoot("local-review-mcp-evidence-transport-normal-");
     const trace = new EvidenceTransportTraceService(root);
@@ -218,6 +245,15 @@ describe("EvidenceTransportTraceService", () => {
     expect(result.structuredContent).toEqual({
       events: [{ event: "extension_evidence_created", timestamp: expect.any(String) }],
     });
+    const diagnostic = { stage: 'fiber_scanned' as const, scan_id: 1, navigation_epoch: 0,
+      observed_at: new Date().toISOString(), correlation_key_hash: '', conversation_id_hash: '',
+      document_id_hash: '', flags: { fiber_reply_received: false } };
+    trace.record({ event: 'browser_identity_diagnostic', diagnostic });
+    const recent = await client.callTool({ name: 'get_evidence_transport_trace', arguments: { limit: 1 } });
+    expect(recent.isError).not.toBe(true);
+    expect(recent.structuredContent).toEqual({ events: [
+      { event: 'browser_identity_diagnostic', timestamp: expect.any(String), diagnostic },
+    ] });
   });
 
   it("persists authenticated strict diagnostics without identity resolution or presence refresh", async () => {
@@ -229,15 +265,19 @@ describe("EvidenceTransportTraceService", () => {
       observed_at: new Date().toISOString(), correlation_key_hash: 'a'.repeat(64),
       conversation_id_hash: '', document_id_hash: 'b'.repeat(64),
       flags: { current_key_found: true, conversation_unreadable: true }, fiber_evidence_count: 0 };
+    const observation = { ...body, snapshot_selection_reason: 'snapshot_unreadable' };
     expect((await request('/identity-diagnostic', { method: 'POST', body })).status).toBe(401);
     expect((await request('/identity-diagnostic', { method: 'POST', token, body: { ...body, prompt: 'SECRET' } })).status).toBe(400);
     expect((await request('/identity-diagnostic', { method: 'POST', token, body: { ...body, flags: { cookie: true } } })).status).toBe(400);
     const before = bridgeStatus().lastSeenAt;
-    expect((await request('/identity-diagnostic', { method: 'POST', token, body })).status).toBe(202);
+    expect((await request('/identity-diagnostic', { method: 'POST', token, body: {
+      ...observation, snapshot_selection_reason: 'arbitrary payload',
+    } })).status).toBe(400);
+    expect((await request('/identity-diagnostic', { method: 'POST', token, body: observation })).status).toBe(202);
     expect(bridgeStatus().lastSeenAt).toBe(before);
     expect(connector).not.toHaveBeenCalled();
     const saved = await readFile(trace.file, 'utf8');
-    expect(JSON.parse(saved)).toMatchObject({ event: 'browser_identity_diagnostic', diagnostic: body });
+    expect(JSON.parse(saved)).toMatchObject({ event: 'browser_identity_diagnostic', diagnostic: observation });
     expect(saved).not.toContain('SECRET');
   });
 

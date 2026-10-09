@@ -9,6 +9,7 @@ import {
   extensionDeliveryClaimSchema,
   conversationRecoveryFailureSchema,
   type ConversationRecoveryFailure,
+  type ConversationRecoveryTarget,
   type ExtensionDeliveryReadiness,
   type ExtensionDeliveryAck,
   type ExtensionDeliveryClaim,
@@ -51,7 +52,7 @@ import {
 } from "./bridge-protocol.js";
 
 export interface BridgeStartOptions {
-  readonly conversationRecoveryTargets?: () => Promise<Array<{ delivery_id: string; conversation_id: string }>>;
+  readonly conversationRecoveryTargets?: () => Promise<ConversationRecoveryTarget[]>;
   readonly reportConversationRecoveryFailure?: (failure: ConversationRecoveryFailure) => Promise<void>;
   readonly ports?: readonly number[];
   readonly onIdentityEvidence?: (evidence: ExtensionIdentityEvidence) => IdentityEvidenceAck | void | Promise<IdentityEvidenceAck | void>;
@@ -631,7 +632,8 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
       }
     } catch (error: unknown) {
       json(response, error instanceof RequestBodyTooLargeError ? 413
-        : error instanceof ExtensionDeliveryConflictError ? 409 : 503, { error: "recovery_failed" }, origin);
+        : error instanceof ExtensionDeliveryConflictError || error instanceof ExtensionReviewCompletionConflictError
+          ? 409 : 503, { error: "recovery_failed" }, origin);
     }
     return;
   }

@@ -15,6 +15,7 @@ export interface ReviewResult {
   readonly content?: string;
   readonly error?: string;
   readonly created_at: string;
+  readonly extension_transport?: unknown;
 }
 
 export interface CreateReviewResultInput {

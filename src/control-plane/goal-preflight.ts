@@ -368,6 +368,7 @@ export class GoalPreflightService {
   private readonly sleep: (milliseconds: number) => Promise<void>;
   private readonly extensionReadyTimeoutMs: number | undefined;
   private runtimeReadyValue = false;
+  private runtimeFailureReason: string | undefined;
 
   public constructor(private readonly options: GoalPreflightServiceOptions) {
     const storageRoot = options.storageRoot ?? defaultTaskContextStorageRoot();
@@ -387,8 +388,9 @@ export class GoalPreflightService {
     this.extensionReadyTimeoutMs = options.extensionReadyTimeoutMs;
   }
 
-  public setRuntimeReady(ready: boolean): void {
+  public setRuntimeReady(ready: boolean, reason?: string): void {
     this.runtimeReadyValue = ready;
+    this.runtimeFailureReason = ready ? undefined : reason?.slice(0, 4_000);
   }
 
   /**
@@ -458,7 +460,7 @@ export class GoalPreflightService {
       return fail(result, "runtime", `Runtime readiness check failed: ${errorMessage(error)}`);
     }
     result = goalPreflightResultSchema.parse({ ...result, runtime: { ready: runtimeReady } });
-    if (!runtimeReady) return fail(result, "runtime", "Runtime is not ready");
+    if (!runtimeReady) return fail(result, "runtime", this.runtimeFailureReason ?? "Runtime is not ready");
 
     // Observe the interactive Desktop route before Goal creation. Without a fallback provider a
     // blocked capability remains a fail-closed preflight result; the P5.9 negotiator may instead

@@ -69,6 +69,7 @@ export const executionContextSchema = z.object({
   started_at: timestampSchema,
   finished_at: timestampSchema.optional(),
   summary: executionSummarySchema.optional(),
+  extension_transport: z.record(z.unknown()).optional(),
 }).strict();
 
 export const createExecutionContextInputSchema = z.object({

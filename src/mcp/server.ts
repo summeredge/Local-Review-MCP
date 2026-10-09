@@ -1123,7 +1123,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "get_evidence_transport_trace",
     {
-      description: "Read the hash-only Browser Extension evidence transport trace for one submit_goal correlation key.",
+      description: "Read the hash-only evidence transport trace for one submit_goal correlation key. Omit correlation_key to read recent browser diagnostics, including uncorrelated rows; these observations cannot bind a Goal. Optional limit: 1–200 (default 100 for recent diagnostics).",
       inputSchema: evidenceTransportTraceQueryInputSchema,
       outputSchema: evidenceTransportTraceOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,

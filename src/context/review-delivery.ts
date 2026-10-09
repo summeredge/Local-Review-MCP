@@ -24,6 +24,7 @@ export interface ReviewDelivery {
   readonly created_at: string;
   readonly updated_at: string;
   readonly delivered_at?: string;
+  readonly extension_transport?: unknown;
 }
 
 export interface CreateReviewDeliveryInput {

@@ -146,7 +146,9 @@ def main() -> int:
         return 0
     try:
         try:
-            window = LauncherWindow(project_root, ConfigManager(project_root))
+            window = LauncherWindow(
+                project_root, ConfigManager(project_root), login_startup="--login-startup" in sys.argv
+            )
         except LauncherConfigError as error:
             QMessageBox.critical(None, "Local Review MCP Launcher", str(error))
             return 1

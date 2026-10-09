@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import * as vm from "node:vm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { parseExtensionReviewCompletionDiagnosticArgs } from "../src/control-plane/extension-review-completion-diagnostic.js";
+import { parseReviewVerdict } from "../src/control/review-verdict-parser.js";
 
 const ORIGIN = "https://chatgpt.com";
 const CONVERSATION_A = "11111111-2222-3333-4444-555555555555";
@@ -220,8 +221,10 @@ function finalMessage(id = "assistant-final", text = "Final answer", options: Pa
 }
 
 describe("MAIN-world review completion observation", () => {
-  function timelineReply(items: Record<string, unknown>[], status = 'complete', conversationId = CONVERSATION_A) {
+  function timelineReply(items: Record<string, unknown>[], status = 'complete', conversationId = CONVERSATION_A,
+    rendered: Section[] = []) {
     const timeline: Section = { getAttribute: name => name === 'data-turn-key' ? 'current-turn' : null,
+      querySelectorAll: selector => selector === '[data-dil-source-message-id]' ? rendered : [],
       __reactFiber$test: { memoizedProps: { entry: { conversationId, turn: { items, status } } }, return: null } };
     return completionReply([timeline]);
   }
@@ -239,6 +242,54 @@ describe("MAIN-world review completion observation", () => {
     expect(timelineReply([u, { type: 'chatgpt-reasoning-group', items: [a] }])).toMatchObject({ status: 'pending' });
     expect(timelineReply([u, { ...a, phase: 'commentary' }])).toMatchObject({ status: 'pending' });
     expect(timelineReply([u, { ...u, messageId: 'new-user' }, a])).toMatchObject({ status: 'ambiguous' });
+  });
+
+  it('resolves a terminal content reference to its exact rendered body and preserves verdict JSON', () => {
+    const id = 'answer-001';
+    const u = { type: 'user-message', messageId: EXPECTED_USER, serverMessageId: EXPECTED_USER };
+    const verdict = { schema_version: 1 as const, review_request_id: 'review-request-001',
+      decision: 'APPROVE' as const, summary: 'Checked C:\\path_with_underscore\\file and "quotes".' };
+    const text = `审查通过\n<lrm-review-result>\n${JSON.stringify(verdict)}\n</lrm-review-result>`;
+    const root = (source = id, index = '0', innerText = text): Section => ({
+      innerText, getAttribute: name => name === 'data-dil-source-message-id' ? source
+        : name === 'data-chatgpt-copy-reference' ? index : null,
+    });
+    const a = { type: 'assistant-message', messageId: id, latestMessageId: id,
+      completed: true, phase: 'final_answer',
+      content: `::chatgpt-content-reference{index="0" source_message_id="${id}"}`,
+      contentReferences: [{ source_message_id: id, source_message_status: 'finished_successfully' }] };
+    const reply = timelineReply([u, a], 'complete', CONVERSATION_A, [root()]);
+    expect(reply).toMatchObject({ status: 'completed', content: text, assistant_message_id: id });
+    expect(parseReviewVerdict({ result_id: 'result-001', review_request_id: verdict.review_request_id,
+      delivery_id: 'delivery-001', workspace_id: 'workspace-001', task_id: 'task-001',
+      status: 'COMPLETED', content: reply.content as string, created_at: new Date().toISOString() })).toEqual(verdict);
+    const discussingReference = `已修复 ::chatgpt-content-reference 采集问题。\n${text}`;
+    for (const literal of [timelineReply([u, { ...a, content: discussingReference }]),
+      timelineReply([u, a], 'complete', CONVERSATION_A, [root(id, '0', discussingReference)])]) {
+      expect(literal).toMatchObject({ status: 'completed', content: discussingReference });
+      expect(parseReviewVerdict({ result_id: 'result-001', review_request_id: verdict.review_request_id,
+        delivery_id: 'delivery-001', workspace_id: 'workspace-001', task_id: 'task-001',
+        status: 'COMPLETED', content: literal.content as string, created_at: new Date().toISOString() })).toEqual(verdict);
+    }
+    const unresolved = `${text}\n${a.content}`;
+    expect(timelineReply([u, { ...a, content: unresolved }])).toMatchObject({ status: 'pending', error: 'public_text_unavailable' });
+    expect(timelineReply([u, a], 'complete', CONVERSATION_A, [root(id, '0', unresolved)]))
+      .toMatchObject({ status: 'pending', error: 'public_text_unavailable' });
+    for (const rendered of [[], [root('foreign-message')], [root(id, '1')],
+      [root(), root()], [root(id, '0', '')], [root(id, '0', a.content)]]) {
+      expect(timelineReply([u, a], 'complete', CONVERSATION_A, rendered))
+        .toMatchObject({ status: 'pending', error: 'public_text_unavailable' });
+    }
+    for (const invalid of [
+      { ...a, content: '::chatgpt-content-reference{index="0" source_message_id="foreign"}' },
+      { ...a, contentReferences: [] },
+      { ...a, contentReferences: [...a.contentReferences, ...a.contentReferences] },
+      { ...a, contentReferences: [{ source_message_id: id, source_message_status: 'in_progress' }] },
+    ]) expect(timelineReply([u, invalid], 'complete', CONVERSATION_A, [root()]))
+      .toMatchObject({ status: 'pending', error: 'public_text_unavailable' });
+    expect(timelineReply([u, a], 'complete', CONVERSATION_B, [root()])).toMatchObject({ status: 'ambiguous' });
+    expect(timelineReply([u, a], 'complete', CONVERSATION_A, [root(id, '0', 'x'.repeat(256 * 1024 + 1))]))
+      .toMatchObject({ status: 'failed', error: 'completion_content_too_large' });
   });
 
   it("observes separate user/assistant turns from streaming through completion", () => {

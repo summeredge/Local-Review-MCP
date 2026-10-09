@@ -402,18 +402,22 @@ export async function startApp(
       void desktopThreadActivator?.observe();
       context.capabilityNegotiator?.reconcileDesktopCapability(undefined, state);
     });
+    let goalRuntimeFailure: string | undefined;
     try {
       const extensionDeliveries = context.extensionDeliveries;
       await context.correlations.restore();
-      try {
-        await context.pendingGoalSubmission?.restore();
-      } catch {
-        console.warn("Pending Goal submission unavailable; durable state could not be restored");
-      }
-      try {
-        await context.controlledActuation?.restore();
-      } catch {
-        console.warn("Controlled Actuation unavailable; durable state could not be restored");
+      for (const [name, service] of [
+        ["Pending Goal submission", context.pendingGoalSubmission],
+        ["Goal Orchestration", context.goalOrchestration],
+        ["Controlled Actuation", context.controlledActuation],
+        ["Auto Iteration", context.autoIteration],
+      ] as const) {
+        try { await service?.restore(); }
+        catch (error: unknown) {
+          const reason = `${name} unavailable: ${error instanceof Error ? error.message : String(error)}`;
+          goalRuntimeFailure ??= reason;
+          console.warn(reason);
+        }
       }
       let deliveryAvailable = true;
       try {
@@ -433,12 +437,19 @@ export async function startApp(
       const bridgePort = await startBridge({
         ports: options.bridgePorts,
         conversationRecoveryTargets: async () => {
-          if (!deliveryAvailable) throw new ExtensionDeliveryUnavailableError("extension delivery unavailable");
-          return extensionDeliveries.recoveryTargets();
+          return [
+            ...(deliveryAvailable ? await extensionDeliveries.recoveryTargets() : []),
+            ...(completionAvailable ? await extensionReviewCompletions.recoveryTargets() : []),
+          ];
         },
         reportConversationRecoveryFailure: async (failure) => {
-          if (!deliveryAvailable) throw new ExtensionDeliveryUnavailableError("extension delivery unavailable");
-          await extensionDeliveries.reportRecoveryFailure(failure);
+          if ("completion_id" in failure) {
+            if (!completionAvailable) throw new ExtensionReviewCompletionUnavailableError("extension review completion unavailable");
+            await extensionReviewCompletions.reportRecoveryFailure(failure);
+          } else {
+            if (!deliveryAvailable) throw new ExtensionDeliveryUnavailableError("extension delivery unavailable");
+            await extensionDeliveries.reportRecoveryFailure(failure);
+          }
         },
         evidenceTransportTrace: context.evidenceTransportTrace,
         onIdentityEvidence: async (evidence) => {
@@ -505,6 +516,7 @@ export async function startApp(
     }
     server.once("close", () => {
       context.autoIteration?.dispose();
+      context.goalOrchestration?.dispose();
       cleanupDesktopToolsPipeLifecycle();
       try {
         desktopSyncObserver.dispose();
@@ -540,23 +552,23 @@ export async function startApp(
       console.warn("Desktop completion observer orphan reconciliation failed; local MCP remains available");
     }
     try {
-      await context.autoIteration?.recover();
+      if (goalRuntimeFailure === undefined) await context.autoIteration?.recover();
     } catch {
       console.warn("Auto Iterate recovery failed; local MCP remains available");
     }
     try {
-      await context.goalOrchestration?.recover();
+      if (goalRuntimeFailure === undefined) await context.goalOrchestration?.recover();
     } catch {
       console.warn("Goal Orchestration recovery failed; local MCP remains available");
     }
     try {
-      await context.executionRouter?.recoverCompletedExecutions();
+      if (goalRuntimeFailure === undefined) await context.executionRouter?.recoverCompletedExecutions();
     } catch {
       console.warn("Execution Routing recovery failed; local MCP remains available");
     }
-    context.goalPreflight?.setRuntimeReady(true);
+    context.goalPreflight?.setRuntimeReady(goalRuntimeFailure === undefined, goalRuntimeFailure);
     try {
-      await context.pendingGoalSubmission?.recover();
+      if (goalRuntimeFailure === undefined) await context.pendingGoalSubmission?.recover();
     } catch {
       console.warn("Pending Goal submission recovery failed; local MCP remains available");
     }

@@ -705,6 +705,26 @@ describe("Local Control Bridge protocol", () => {
 });
 
 describe("Local Control Bridge app lifecycle", () => {
+  it("exposes collection-only recovery targets and routes their failure reports", async () => {
+    await stopBridge();
+    const runtime = createAppContext(settings());
+    const watch = await runtime.extensionReviewCompletions.enqueue({ workspace_id: "workspace-a", task_id: "task-a",
+      review_request_id: "review-recovery", review_delivery_id: "delivery-recovery", conversation_id: "conversation-a",
+      expected_user_message_id: "user-sent" });
+    const server = await startApp(settings(), runtime, { bridgePorts: [0] });
+    try {
+      const paired = await request("/pair", { method: "POST", body: {} });
+      const token = (paired.body as { token: string }).token;
+      expect(await request("/delivery/recovery-targets", { method: "POST", body: {}, token }))
+        .toMatchObject({ status: 200, body: { targets: [{ completion_id: watch.completion_id, conversation_id: "conversation-a" }] } });
+      expect(await request("/delivery/recovery-failure", { method: "POST", token, body: {
+        completion_id: watch.completion_id, conversation_id: "conversation-a", code: "TARGET_CONVERSATION_NAVIGATION_FAILED" } }))
+        .toMatchObject({ status: 200 });
+      expect((await runtime.extensionReviewCompletions.get(watch.completion_id))?.recovery_error)
+        .toBe("TARGET_CONVERSATION_NAVIGATION_FAILED");
+      expect(await runtime.extensionDeliveries.recoveryTargets()).toEqual([]);
+    } finally { await close(server); }
+  });
   it.each(["identity-evidence-inbox.json", "pending-goal-submissions.json"])(
     "keeps MCP running but refuses successful evidence ACKs when %s is corrupt", async stateFile => {
     await stopBridge();

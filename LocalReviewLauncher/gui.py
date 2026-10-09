@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
+import sys
+import winreg
 from collections import deque
 from dataclasses import replace
 from datetime import datetime
@@ -18,6 +21,7 @@ from PySide6.QtGui import QAction, QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QFrame,
     QFileDialog,
     QGridLayout,
@@ -97,6 +101,8 @@ BUTTON_HEIGHT = 34
 BUTTON_SPACING = 6
 CONTENT_MARGIN = 16
 CONTENT_SPACING = 10
+LOGIN_STARTUP_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+LOGIN_STARTUP_NAME = "LocalReviewMCPLauncher"
 ROW_LABEL_WIDTH = 132
 IDLE_CAPABILITY_TEXT = "\n".join([
     "执行：—",
@@ -126,7 +132,7 @@ class LauncherState(str, Enum):
 
 
 class LauncherWindow(QMainWindow):
-    def __init__(self, project_root: Path, config_manager: ConfigManager):
+    def __init__(self, project_root: Path, config_manager: ConfigManager, *, login_startup: bool = False):
         super().__init__()
         self.config_manager = config_manager
         self.configuration: LauncherConfig = config_manager.load()
@@ -256,6 +262,22 @@ class LauncherWindow(QMainWindow):
         self.start_button = QPushButton("启动 MCP")
         self.stop_button = QPushButton("停止 MCP")
         self.refresh_button = QPushButton("刷新状态")
+        self.auto_start_checkbox = QCheckBox("开机自启")
+        self._login_startup = None
+        try:
+            self._login_startup = self._read_login_startup()
+            valid = self._login_startup_is_valid(self._login_startup)
+            self.auto_start_checkbox.setChecked(valid)
+            if self._login_startup is not None and not valid:
+                self.message_label.setText("Windows 登录启动项无效，请重新勾选“开机自启”修复命令、路径或旧版 autoStart 配置。")
+            elif valid and not self.configuration.auto_start:
+                self.message_label.setText("Windows 登录启动已启用；autoStart 未开启，手动启动时不会自动启动 MCP。")
+            elif self._login_startup is None and self.configuration.auto_start:
+                self.message_label.setText("未注册 Windows 登录启动项；autoStart 仅控制 Launcher 启动后自动启动 MCP。")
+        except OSError as error:
+            self.auto_start_checkbox.setEnabled(False)
+            self.message_label.setText(f"读取开机自启状态失败：{error}")
+        self.auto_start_checkbox.toggled.connect(self.set_login_startup)
         self.recheck_desktop_button = QPushButton("重试 Desktop")
         self.standalone_button = QPushButton("使用 Standalone")
         self.run_doctor_button = QPushButton("运行诊断")
@@ -329,6 +351,7 @@ class LauncherWindow(QMainWindow):
         control_buttons.addWidget(self.start_button)
         control_buttons.addWidget(self.stop_button)
         control_buttons.addWidget(self.refresh_button)
+        control_buttons.addWidget(self.auto_start_checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
         top_actions_layout.addLayout(control_buttons)
         startup_layout.addWidget(top_actions, 0, Qt.AlignmentFlag.AlignLeft)
         status_cards = QGridLayout()
@@ -519,8 +542,85 @@ class LauncherWindow(QMainWindow):
         self._render_execution_dashboard(())
         self._render_runtime_info()
         self.refresh_status()
-        if self.configuration.auto_start:
+        if self.configuration.auto_start or login_startup:
             QTimer.singleShot(0, self.start_mcp)
+
+    def _login_startup_is_valid(self, value: tuple[str, int] | None) -> bool:
+        if value is None or value[1] not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+            return False
+        command = os.path.expandvars(value[0]) if value[1] == winreg.REG_EXPAND_SZ else value[0]
+        match = re.fullmatch(r'"([^"]+)"\s+"([^"]+)"(?:\s+(--login-startup))?', command.strip())
+        if match is None:
+            return False
+        pythonw, launcher = (Path(path) for path in match.group(1, 2))
+        return (
+            pythonw == Path(sys.executable).with_name("pythonw.exe")
+            and launcher == Path(__file__).resolve().with_name("launcher.py")
+            and pythonw.is_file()
+            and launcher.is_file()
+            and (match.group(3) is not None or self.configuration.auto_start)
+        )
+
+    @staticmethod
+    def _read_login_startup() -> tuple[str, int] | None:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, LOGIN_STARTUP_KEY) as key:
+                return winreg.QueryValueEx(key, LOGIN_STARTUP_NAME)
+        except FileNotFoundError:
+            return None
+
+    @staticmethod
+    def _write_login_startup(value: tuple[str, int] | None) -> None:
+        if value is None:
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER, LOGIN_STARTUP_KEY, 0, winreg.KEY_SET_VALUE
+                ) as key:
+                    winreg.DeleteValue(key, LOGIN_STARTUP_NAME)
+            except FileNotFoundError:
+                pass
+        else:
+            with winreg.CreateKeyEx(
+                winreg.HKEY_CURRENT_USER, LOGIN_STARTUP_KEY, 0, winreg.KEY_SET_VALUE
+            ) as key:
+                winreg.SetValueEx(key, LOGIN_STARTUP_NAME, 0, value[1], value[0])
+
+    @Slot(bool)
+    def set_login_startup(self, enabled: bool) -> None:
+        previous = self._login_startup
+        registry_updated = False
+        try:
+            previous = self._read_login_startup()
+            value = None
+            if enabled:
+                pythonw = Path(sys.executable).with_name("pythonw.exe")
+                launcher = Path(__file__).resolve().with_name("launcher.py")
+                if not pythonw.is_file() or not launcher.is_file():
+                    raise OSError("找不到当前 Python 环境的 pythonw.exe 或 launcher.py")
+                value = (f'"{pythonw}" "{launcher}" --login-startup', winreg.REG_SZ)
+            self._write_login_startup(value)
+            registry_updated = True
+            self.configuration = self.config_manager.set_auto_start(self.configuration, enabled)
+        except (OSError, LauncherConfigError) as error:
+            message = f"更新开机自启失败：{error}"
+            if registry_updated:
+                try:
+                    self._write_login_startup(previous)
+                except OSError as rollback_error:
+                    message += f"\n恢复 Windows 启动项失败：{rollback_error}"
+            try:
+                self._login_startup = self._read_login_startup()
+            except OSError as read_error:
+                self._login_startup = previous
+                self.auto_start_checkbox.setEnabled(False)
+                message += f"\n无法确认 Windows 启动项状态：{read_error}"
+            self.auto_start_checkbox.blockSignals(True)
+            self.auto_start_checkbox.setChecked(self._login_startup_is_valid(self._login_startup))
+            self.auto_start_checkbox.blockSignals(False)
+            self._show_error(message)
+            return
+        self._login_startup = value
+        self.message_label.setText("开机自启已开启。" if enabled else "开机自启已关闭。")
 
     @staticmethod
     def _section_title(text: str) -> QLabel:

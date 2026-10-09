@@ -1,5 +1,6 @@
 import { ExecutionLaunchIndeterminateError } from "../../src/control-plane/execution-service.js";
 import { createHash } from "node:crypto";
+import * as fs from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -28,8 +29,16 @@ import { TaskContextService } from "../../src/context/service.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
 
 const temporaryDirectories: string[] = [];
+const services: GoalOrchestrationService[] = [];
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, rename: vi.fn(actual.rename) };
+});
+const actualFs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 
 afterEach(async () => {
+  services.splice(0).forEach(service => service.dispose());
+  vi.mocked(fs.rename).mockReset().mockImplementation(actualFs.rename);
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {
     recursive: true,
     force: true,
@@ -164,8 +173,63 @@ async function fixture(auto = new FakeAutoIteration()): Promise<{
     controlledActuation: controlled,
     autoIteration: auto,
   });
+  services.push(service);
   return { root, registry, tasks, executions, authorizations, controlled, starts, auto, service };
 }
+
+describe("Goal terminal persistence failures", () => {
+  it.each(["completed", "failed", "human_required"] as const)("recovers %s after retry exhaustion without another execution", async (status) => {
+    const f = await fixture();
+    await f.service.createGoal(input());
+    const running = await f.service.startGoal({ goal_id: "goal-1" });
+    const terminal = f.auto.terminal(running.loop_id!, status);
+    let locked = true;
+    let attempts = 0;
+    vi.mocked(fs.rename).mockImplementation(async (source, destination) => {
+      if (destination === goalOrchestrationStateFile(f.root) && locked) {
+        attempts += 1;
+        throw Object.assign(new Error("file occupied"), { code: "EPERM" });
+      }
+      return actualFs.rename(source, destination);
+    });
+    await f.service.onAutoIterationTerminal(terminal);
+    expect(attempts).toBe(3);
+    expect((await f.service.getGoal("goal-1"))!.status).toBe("running");
+    expect((await f.tasks.getTaskContext("task-1"))!.status).toBe(status);
+    if (status === "completed") {
+      await vi.waitFor(() => expect(attempts).toBe(6), { timeout: 3000 });
+      expect(f.starts).toHaveBeenCalledTimes(1);
+    }
+    locked = false;
+    await vi.waitFor(async () => expect((await f.service.getGoal("goal-1"))!.status).toBe(status), { timeout: 3000 });
+    await f.service.onAutoIterationTerminal(terminal);
+    await f.service.recover();
+    expect(f.starts).toHaveBeenCalledTimes(1);
+    expect(f.auto.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a transient publish and recovers durable evidence after restart", async () => {
+    const f = await fixture();
+    await f.service.createGoal(input());
+    const running = await f.service.startGoal({ goal_id: "goal-1" });
+    const terminal = f.auto.terminal(running.loop_id!, "completed");
+    vi.mocked(fs.rename).mockImplementation(async (source, destination) => {
+      if (destination === goalOrchestrationStateFile(f.root)) throw Object.assign(new Error("occupied"), { code: "EBUSY" });
+      return actualFs.rename(source, destination);
+    });
+    await f.service.onAutoIterationTerminal(terminal);
+    f.service.dispose();
+    vi.mocked(fs.rename).mockImplementation(actualFs.rename);
+    const restarted = new GoalOrchestrationService(f.registry, { storageRoot: f.root,
+      taskContextService: f.tasks, executionContextService: f.executions,
+      authorizationStore: f.authorizations, controlledActuation: f.controlled, autoIteration: f.auto });
+    services.push(restarted);
+    vi.mocked(fs.rename).mockRejectedValueOnce(Object.assign(new Error("occupied"), { code: "EACCES" }));
+    await restarted.recover();
+    expect((await restarted.getGoal("goal-1"))!.status).toBe("completed");
+    expect(f.starts).toHaveBeenCalledTimes(1);
+  });
+});
 
 function runningGoal(plan: CreateGoalInput, phaseIndex = 0, taskIndex = 0): GoalOrchestration {
   const timestamp = new Date().toISOString();
@@ -630,17 +694,17 @@ describe("GoalOrchestrationService", () => {
     expect(await f.executions.listExecutions(plan.workspace_id, "task-1")).toEqual([]);
   });
 
-  it("stores only schema v1 orchestration data under control-plane and rejects corrupt or unknown state", async () => {
+  it("stores schema v2 orchestration data under control-plane and rejects corrupt or unknown state", async () => {
     const f = await fixture();
     const created = await f.service.createGoal(input());
     const file = goalOrchestrationStateFile(f.root);
     const state = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
     expect(file).toBe(join(f.root, "control-plane", "goal-orchestrations.json"));
-    expect(state).toMatchObject({ schema_version: 1, goals: [created] });
+    expect(state).toMatchObject({ schema_version: 2, goals: [created] });
     expect(JSON.stringify(state)).not.toContain("authorization_id");
     expect(JSON.stringify(state)).not.toContain("process_id");
 
-    for (const contents of ["not json", JSON.stringify({ schema_version: 2, goals: [] })]) {
+    for (const contents of ["not json", JSON.stringify({ schema_version: 99, goals: [] })]) {
       const root = await mkdtemp(join(tmpdir(), "local-review-mcp-goal-invalid-"));
       temporaryDirectories.push(root);
       const invalidFile = goalOrchestrationStateFile(root);

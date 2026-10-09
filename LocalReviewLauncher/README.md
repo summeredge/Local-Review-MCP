@@ -23,6 +23,29 @@ needed. That config carries the active registry entry as `workspace.id`,
 `workspace.name`, and `workspace.path`, alongside the compatible `workspaces`
 array.
 
+## 开机自启
+
+在“启动信息”页勾选“开机自启”即可启用，取消勾选即可关闭。启动项写入
+`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` 的
+`LocalReviewMCPLauncher` 值，无需管理员权限，仅在当前 Windows 用户登录时执行。
+命令使用当前环境的 `pythonw.exe` 和本项目的 `launcher.py --login-startup`，
+两个路径均加双引号；登录入口会自动启动 MCP，重复启动仍复用已有单实例。
+启用和关闭时同时保存 `autoStart=true/false`；手动启动继续遵循 `autoStart`。
+
+GUI 初始化只读取启动项，不自动改写配置。复选框仅勾选命令、当前环境及
+Launcher 路径有效且能自动启动 MCP 的启动项。带 `--login-startup` 的启动项
+即使配置被改为 `autoStart=false`，登录时仍会自动启动 MCP；界面会提示此差异。
+旧版无参数启动项需要 `autoStart=true`，否则显示无效，可重新勾选修复。
+移动项目或删除 Python 环境后，失效启动项也会显示未勾选并提示修复。
+
+实际 Windows 登录需人工验收：
+
+1. 勾选后确认上述 Run 值存在，命令包含有效的两个绝对路径和 `--login-startup`。
+2. 退出 Launcher，注销并重新登录当前 Windows 用户，确认 Launcher 出现、MCP
+   状态变为运行中；如 Windows 任务管理器禁用了该启动项，先将其启用。
+3. 再运行 `start-launcher.cmd`，确认只激活已有窗口，没有第二个 GUI。
+4. 取消勾选，确认 Run 值删除、重开 GUI 后未勾选；再次注销登录，确认不再自动启动。
+
 Run the launcher-only configuration check with:
 
 ```powershell

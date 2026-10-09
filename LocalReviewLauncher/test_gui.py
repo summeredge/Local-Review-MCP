@@ -566,6 +566,13 @@ class LauncherLogTests(unittest.TestCase):
 
         self.assertFalse(window.session_viewer_toggle.isChecked())
         self.assertTrue(window.session_viewer_content.isHidden())
+        self.assertFalse(window.session_viewer_toggle.isEnabled())
+        window._render_execution_dashboard((ExecutionViewModel(
+            execution_id="execution-1", name="Goal", mode="batch", backend="cli",
+            status="passed", workspace_id="workspace-1", task_id="task-1",
+        ),))
+        window.execution_table.selectRow(0)
+        self.assertTrue(window.session_viewer_toggle.isEnabled())
         window.session_viewer_toggle.click()
         self.assertTrue(window.session_viewer_toggle.isChecked())
         self.assertFalse(window.session_viewer_content.isHidden())
@@ -891,12 +898,14 @@ class LauncherLayoutAcceptanceTests(unittest.TestCase):
         self.assertIn("任务列表范围：", texts)
         self.assertIn("所有已注册工作区", texts)
         self.assertIn("默认工作区：", texts)
-        self.assertIn("线程信息", texts)
-        self.assertIn("Execution Dashboard", texts)
-        self.assertIn("维护", texts)
+        for removed in ("线程信息", "Execution Dashboard", "维护"):
+            self.assertNotIn(removed, texts)
+        self.assertIsInstance(window.execution_table, QTableWidget)
+        self.assertIn("清理界面缓存", self._button_texts(window))
+        self.assertIn("清理持久化任务记录", self._button_texts(window))
         self.assertNotIn("会话所属工作区：", texts)
         self.assertNotIn("打开 Codex 任务", self._button_texts(window))
-        self.assertIn("线程信息", self._button_texts(window))
+        self.assertEqual(window.session_viewer_toggle.text(), "线程信息")
 
     def test_thread_info_dialog_shows_ids_only(self) -> None:
         window = self._window()
@@ -970,7 +979,6 @@ class LauncherDashboardTests(unittest.TestCase):
     def _window():
         window = LauncherWindow.__new__(LauncherWindow)
         window.execution_table = QTableWidget(0, len(EXECUTION_DASHBOARD_COLUMNS))
-        window.execution_empty_label = QLabel("暂无执行记录")
         window.session_details_label = QLabel()
         window.execution_details_label = QLabel()
         window.event_table = QTableWidget(0, 3)
@@ -1213,8 +1221,6 @@ class LauncherDashboardTests(unittest.TestCase):
 
         LauncherWindow._render_execution_dashboard(window, ())  # type: ignore[arg-type]
 
-        self.assertEqual(window.execution_empty_label.text(), "暂无执行记录")
-        self.assertTrue(window.execution_empty_label.isVisible())
         self.assertEqual(window.execution_table.rowCount(), 0)
         self.assertFalse(window.open_codex_task_button.isEnabled())
         self.assertFalse(window.event_empty_label.isVisible())
@@ -1246,7 +1252,7 @@ class LauncherDashboardTests(unittest.TestCase):
         self.assertEqual(window.event_table.item(3, 1).text(), "execution_failed")
         self.assertEqual(window.event_table.item(3, 2).text(), "provider failed")
 
-    def test_batch_row_keeps_open_codex_task_disabled_and_shows_the_empty_event_state(self) -> None:
+    def test_batch_row_enables_details_and_shows_the_empty_event_state(self) -> None:
         view = build_execution_view_model(self._batch_summary())
         window = self._window()
 
@@ -1262,7 +1268,8 @@ class LauncherDashboardTests(unittest.TestCase):
         self.assertIn("后端：CLI Batch（cli）", window.execution_details_label.text())
         self.assertIn("摘要：Batch finished", window.execution_details_label.text())
         self.assertEqual(window.session_details_label.text(), "Session：—\nThread：—")
-        self.assertFalse(window.open_codex_task_button.isEnabled())
+        self.assertTrue(window.open_codex_task_button.isEnabled())
+        self.assertFalse(view.can_open_codex_task)
         self.assertEqual(window.event_table.rowCount(), 0)
         self.assertEqual(window.event_empty_label.text(), "暂无执行事件")
         self.assertTrue(window.event_empty_label.isVisible())
@@ -1313,7 +1320,6 @@ class LauncherDashboardTests(unittest.TestCase):
               window.execution_table.item(row, 2).text()) for row in range(2)],
             [("batch", "CLI Batch"), ("interactive", "Desktop")],
         )
-        self.assertFalse(window.execution_empty_label.isVisible())
         self.assertFalse(window.open_codex_task_button.isEnabled())
         self.assertEqual(window.event_table.rowCount(), 0)
 
@@ -1337,7 +1343,8 @@ class LauncherDashboardTests(unittest.TestCase):
         window.execution_table.selectRow(0)
         window._render_selected_execution()
         self.assertEqual(window._selected_execution().execution_id, "execution-batch")
-        self.assertFalse(window.open_codex_task_button.isEnabled())
+        self.assertTrue(window.open_codex_task_button.isEnabled())
+        self.assertFalse(batch.can_open_codex_task)
         self.assertEqual(window.event_table.rowCount(), 0)
         self.assertTrue(window.event_empty_label.isVisible())
 

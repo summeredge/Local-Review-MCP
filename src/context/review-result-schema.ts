@@ -32,6 +32,7 @@ export const reviewResultSchema = z.object({
   content: contentSchema.optional(),
   error: errorSchema.optional(),
   created_at: timestampSchema,
+  extension_transport: z.unknown().optional(),
 }).strict().superRefine((result, context) => {
   if (result.status === "COMPLETED" && result.content === undefined) {
     context.addIssue({

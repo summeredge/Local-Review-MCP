@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { ExecutionContextService } from "../context/execution-service.js";
 import {
@@ -20,8 +21,10 @@ import type { WorkspaceRegistry } from "../workspace/registry.js";
 import { migrateLegacyModelIdFields } from "../models/model-resolver.js";
 import { reasoningEffortValueSchema, type ReasoningEffortValue } from "../models/model-catalog.js";
 import {
+  CODEX_EXECUTION_COMMAND,
   CodexExecutionAdapter,
 } from "./codex-execution-adapter.js";
+import { backupLegacyState, stateRestoreDiagnostic } from "./state-migration.js";
 import {
   ExecutionLaunchIndeterminateError,
   executionModeSchema,
@@ -31,7 +34,7 @@ import {
   type ExecutionMode,
 } from "./execution-service.js";
 
-const STATE_VERSION = 1;
+const STATE_VERSION = 2;
 const ACTUATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const timestampSchema = z.string().datetime({ offset: true });
 const actuationIdSchema = z.string()
@@ -65,6 +68,7 @@ export interface ActuationAuthorization extends ActuationAuthorizationInput {
   readonly authorization_id: string;
   readonly status: "authorized" | "consumed";
   readonly created_at: string;
+  readonly replay_blocked_reason?: string;
 }
 
 export interface ControlledActuationRequest {
@@ -104,6 +108,7 @@ export const actuationAuthorizationSchema = actuationAuthorizationInputSchema.ex
   authorization_id: authorizationIdSchema,
   status: z.enum(["authorized", "consumed"]),
   created_at: timestampSchema,
+  replay_blocked_reason: z.string().min(1).max(4_000).optional(),
 }).strict();
 
 export const controlledActuationRequestSchema = z.object({
@@ -171,11 +176,12 @@ const stateSchema = z.object({
     actuationsByAuthorization.set(actuation.authorization_id, actuation);
   });
 
-  for (const authorization of state.authorizations) {
+  for (const [index, authorization] of state.authorizations.entries()) {
     const actuation = actuationsById.get(authorization.actuation_id);
     if (authorization.status === "authorized" && actuation !== undefined) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
+        path: ["authorizations", index, "status"],
         message: "authorized authorization already has an actuation record",
       });
     }
@@ -183,12 +189,13 @@ const stateSchema = z.object({
       && (actuation === undefined || actuation.authorization_id !== authorization.authorization_id)) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
+        path: ["authorizations", index, "status"],
         message: "consumed authorization does not have its actuation record",
       });
     }
   }
 
-  for (const actuation of state.actuations) {
+  for (const [index, actuation] of state.actuations.entries()) {
     const authorization = authorizationsById.get(actuation.authorization_id);
     if (authorization === undefined
       || authorization.status !== "consumed"
@@ -198,6 +205,7 @@ const stateSchema = z.object({
       || authorization.execution_id !== actuation.execution_id) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
+        path: ["actuations", index],
         message: "actuation identity does not match its authorization",
       });
     }
@@ -215,6 +223,70 @@ export const controlledActuationStartResultSchema = z.object({
 }).strict();
 
 type DurableState = z.infer<typeof stateSchema>;
+
+const legacyStateSchema = z.object({
+  schema_version: z.literal(1),
+  authorizations: z.array(actuationAuthorizationSchema.extend({ execution_mode: executionModeSchema.optional() })),
+  actuations: z.array(controlledActuationSchema),
+}).strict();
+
+async function migrateLegacyState(value: unknown, storageRoot: string): Promise<unknown> {
+  if (typeof value !== "object" || value === null || !("schema_version" in value)
+    || value.schema_version !== 1) return value;
+  const legacy = legacyStateSchema.parse(value);
+  const missing = legacy.authorizations.filter((record) => record.execution_mode === undefined);
+  let goals: unknown[] = [];
+  let goalReadError: string | undefined;
+  if (missing.length !== 0) {
+    const file = join(storageRoot, "control-plane", "goal-orchestrations.json");
+    try {
+      const data = z.object({ schema_version: z.union([z.literal(1), z.literal(2)]), goals: z.array(z.unknown()) }).strict().parse(JSON.parse(await readFile(file, "utf8")));
+      goals = data.goals;
+    } catch (error: unknown) {
+      if (errorCode(error) !== "ENOENT") goalReadError = stateRestoreDiagnostic(file, error);
+    }
+  }
+  const goalEvidenceSchema = z.object({
+    goal_id: goalIdSchema, workspace_id: workspaceIdSchema,
+    execution_mode: executionModeSchema.optional(),
+    phases: z.array(z.object({ tasks: z.array(z.object({ task_id: taskIdSchema }).passthrough()) }).passthrough()),
+  }).passthrough();
+  const executions = new ExecutionContextService(storageRoot);
+  const authorizations = [];
+  for (const record of legacy.authorizations) {
+    if (record.execution_mode !== undefined) { authorizations.push(record); continue; }
+    let mode: ExecutionMode | undefined;
+    let blocked = goalReadError;
+    const matches = goals.filter((goal) => typeof goal === "object" && goal !== null
+      && ((record.goal_id !== undefined && "goal_id" in goal && goal.goal_id === record.goal_id)
+        || ("actuation_id" in goal && goal.actuation_id === record.actuation_id)));
+    if (matches.length > 1) blocked = "Legacy authorization has multiple matching Goals";
+    else if (matches.length === 1) {
+      const goal = goalEvidenceSchema.safeParse(matches[0]);
+      if (!goal.success || goal.data.workspace_id !== record.workspace_id
+        || !goal.data.phases.some((phase) => phase.tasks.some((task) => task.task_id === record.task_id))) {
+        blocked = "Legacy authorization Goal evidence is invalid or has a different identity";
+      } else mode = goal.data.execution_mode ?? "batch";
+    }
+    try {
+      const execution = await executions.getExecutionContext(record.workspace_id, record.task_id, record.execution_id);
+      if (execution?.command !== undefined) {
+        const observed = execution.command === CODEX_EXECUTION_COMMAND ? "batch"
+          : ["desktop codex_app", "codex app-server --listen stdio://"].includes(execution.command) ? "interactive" : undefined;
+        if (observed === undefined) blocked = "Legacy execution backend is unknown";
+        else if (mode !== undefined && mode !== observed) blocked = "Legacy Goal and execution modes disagree";
+        else mode = observed;
+      }
+    } catch (error: unknown) {
+      blocked = `Legacy execution evidence is unavailable: ${stateRestoreDiagnostic(record.execution_id, error)}`;
+    }
+    // Before 4361eaa, omitted authorization modes used the router's batch default.
+    // This historical default does not change the interactive default for new Goals.
+    authorizations.push({ ...record, execution_mode: mode ?? "batch",
+      ...(blocked === undefined ? {} : { replay_blocked_reason: blocked.slice(0, 4_000) }) });
+  }
+  return { ...legacy, schema_version: STATE_VERSION, authorizations };
+}
 
 const actuationFlights = new Map<string, Promise<ControlledActuationResult>>();
 
@@ -263,19 +335,25 @@ export class ActuationAuthorizationStore {
       } catch (error: unknown) {
         if (errorCode(error) === "ENOENT") return;
         throw new ControlledActuationUnavailableError(
-          "controlled actuation state could not be restored",
+          `controlled actuation state could not be restored: ${stateRestoreDiagnostic(this.file, error)}`,
           { cause: error },
         );
       }
       try {
-        this.state = stateSchema.parse(migrateLegacyModelIdFields(JSON.parse(raw) as unknown));
+        const source = migrateLegacyModelIdFields(JSON.parse(raw) as unknown);
+        const next = stateSchema.parse(await migrateLegacyState(source, this.storageRoot));
+        if (typeof source === "object" && source !== null && "schema_version" in source && source.schema_version === 1) {
+          await backupLegacyState(this.file, raw);
+          await this.persist(next);
+        }
+        this.state = next;
       } catch (error: unknown) {
         throw new ControlledActuationUnavailableError(
-          "controlled actuation state could not be restored",
+          `controlled actuation state could not be restored: ${stateRestoreDiagnostic(this.file, error)}`,
           { cause: error },
         );
       }
-    });
+    }).catch((error: unknown) => { this.restorePromise = null; throw error; });
     return this.restorePromise;
   }
 
@@ -358,6 +436,9 @@ export class ActuationAuthorizationStore {
       );
       if (authorization === undefined) {
         throw new Error(`Authorization "${parsed.authorization_id}" was not found.`);
+      }
+      if (authorization.replay_blocked_reason !== undefined) {
+        throw new ControlledActuationConflictError(`Legacy authorization cannot be replayed: ${authorization.replay_blocked_reason}`);
       }
       if (authorization.actuation_id !== parsed.actuation_id) {
         throw new ControlledActuationConflictError(
@@ -460,7 +541,20 @@ export class ActuationAuthorizationStore {
     await chmod(directory, 0o700);
     try {
       await writeFile(temporary, snapshot, { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, this.file);
+      // Windows readers can briefly deny replacement; retry publication of the same snapshot only.
+      const retryDelays = [10, 20, 40, 80, 160];
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await rename(temporary, this.file);
+          break;
+        } catch (error: unknown) {
+          const retryDelay = process.platform === "win32"
+            && ["EPERM", "EACCES", "EBUSY"].includes(errorCode(error) ?? "")
+            ? retryDelays[attempt] : undefined;
+          if (retryDelay === undefined) throw error;
+          await delay(retryDelay);
+        }
+      }
       await chmod(this.file, 0o600);
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
@@ -553,6 +647,9 @@ export class ControlledActuationService {
     const authorization = await this.authorizationStore.getAuthorization(request.authorization_id);
     if (authorization === null) {
       throw new Error(`Authorization "${request.authorization_id}" was not found.`);
+    }
+    if (authorization.replay_blocked_reason !== undefined) {
+      throw new ControlledActuationConflictError(`Legacy authorization cannot be replayed: ${authorization.replay_blocked_reason}`);
     }
     if (authorization.actuation_id !== request.actuation_id) {
       throw new ControlledActuationConflictError(

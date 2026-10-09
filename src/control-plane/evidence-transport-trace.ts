@@ -41,6 +41,8 @@ export const evidenceTransportTraceFailureReasonSchema = z.enum(EVIDENCE_TRANSPO
 const timestampSchema = z.string().datetime({ offset: true });
 const hashSchema = z.string().regex(/^(?:[a-f0-9]{64})?$/u);
 export const browserIdentityDiagnosticSchema = z.object({
+  snapshot_selection_reason: z.enum(['selected', 'no_current_turn', 'historical_viewport',
+    'snapshot_unreadable', 'user_conflict', 'user_boundary', 'no_submit_goal', 'scan_exception']).optional(),
   stage: z.enum(['scan_started', 'scan_busy', 'document_registered', 'fiber_scanned',
     'route_checked', 'deduplicated', 'worker_send_attempted', 'worker_send_finished',
     'background_received', 'document_authorized', 'bridge_send_attempted', 'bridge_send_finished']),
@@ -90,7 +92,8 @@ export interface EvidenceTransportTraceRecordInput {
 }
 
 export const evidenceTransportTraceQueryInputSchema = z.object({
-  correlation_key: correlationKeySchema,
+  correlation_key: correlationKeySchema.optional(),
+  limit: z.number().int().min(1).max(200).optional(),
 }).strict();
 
 export const evidenceTransportTraceOutputSchema = z.object({
@@ -203,7 +206,7 @@ export class EvidenceTransportTraceService {
       throw new Error("Evidence transport trace could not be read.", { cause: error });
     }
 
-    const correlationHash = identityHash(parsed.correlation_key);
+    const correlationHash = parsed.correlation_key === undefined ? null : identityHash(parsed.correlation_key);
     const events: z.infer<typeof evidenceTransportTraceQueryEventSchema>[] = [];
     for (const line of contents.split(/\r?\n/u)) {
       if (line.trim() === "") continue;
@@ -214,7 +217,10 @@ export class EvidenceTransportTraceService {
         continue;
       }
       const candidate = evidenceTransportTraceEventSchema.safeParse(value);
-      if (!candidate.success || candidate.data.correlation_key_hash !== correlationHash) continue;
+      if (!candidate.success) continue;
+      if (correlationHash === null
+        ? candidate.data.event !== "browser_identity_diagnostic"
+        : candidate.data.correlation_key_hash !== correlationHash) continue;
       events.push({
         event: candidate.data.event,
         timestamp: candidate.data.timestamp,
@@ -222,6 +228,8 @@ export class EvidenceTransportTraceService {
         ...(candidate.data.diagnostic === undefined ? {} : { diagnostic: candidate.data.diagnostic }),
       });
     }
-    return evidenceTransportTraceOutputSchema.parse({ events: events.slice(-10_000) });
+    return evidenceTransportTraceOutputSchema.parse({
+      events: events.slice(-(parsed.limit ?? (correlationHash === null ? 100 : 10_000))),
+    });
   }
 }

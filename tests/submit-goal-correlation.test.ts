@@ -211,6 +211,54 @@ async function contentMessages(
 }
 
 describe("Extension submit_goal correlation evidence", () => {
+  it('uses canonical ancestors for a fresh local-chatgpt timeline without promoting local ids', async () => {
+    const localId = 'local-chatgpt:1d0e7a73-a1e7-4dff-ae6d-c3c77fdb9212';
+    function fresh(ancestors: string[], entryId = localId) {
+      let parent: Record<string, unknown> | null = null;
+      for (const conversationId of [...ancestors].reverse()) {
+        parent = { memoizedProps: { conversationId }, return: parent };
+      }
+      return { getAttribute: (name: string) => name === 'data-turn-key' ? 'fresh-turn' : null,
+        __reactFiber$test: { memoizedProps: { entry: { conversationId: entryId, isMostRecentTurn: true,
+          turn: { items: [{ type: 'user-message', messageId: 'user-current' }, directTimelineCall()] } } }, return: parent } };
+    }
+    const success = scanFiberSections([fresh([localId, CONVERSATION, localId, CONVERSATION])]);
+    expect(success.evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+    expect(await contentMessages(success)).toContainEqual(expect.objectContaining({ type: 'identity_evidence', request_id: KEY_A }));
+    const localOnly = scanFiberSections([fresh([localId])]);
+    expect(localOnly.evidence).toEqual([]);
+    expect(localOnly.scan_diagnostic.conversation_unreadable).toBe(true);
+    for (const ancestors of [[CONVERSATION, CONVERSATION_B],
+      ['local-chatgpt:00000000-0000-4000-8000-000000000002', CONVERSATION]]) {
+      const conflict = scanFiberSections([fresh(ancestors)]);
+      expect(conflict.evidence).toEqual([]);
+      expect(conflict.scan_diagnostic.conversation_conflict).toBe(true);
+    }
+    for (const invalid of ['local-chatgpt:invalid', 'unknown:1d0e7a73-a1e7-4dff-ae6d-c3c77fdb9212']) {
+      const reply = scanFiberSections([fresh([CONVERSATION], invalid)]);
+      expect(reply.evidence).toEqual([]);
+      expect(reply.scan_diagnostic.conversation_unreadable).toBe(true);
+    }
+    const mismatch = scanFiberSections([fresh([CONVERSATION_B])]);
+    expect((await contentMessages(mismatch)).some(message => message.type === 'identity_evidence')).toBe(false);
+  });
+  it('reports why current tool snapshot selection succeeds or stops, and forwards that reason', async () => {
+    const selected = scanFiber([userMessage(), currentConnectorRequest('a', 'submit_goal', KEY_A)]);
+    expect(selected.scan_diagnostic.snapshot_selection_reason).toBe('selected');
+    expect(scanFiberSections([]).scan_diagnostic.snapshot_selection_reason).toBe('no_current_turn');
+    expect(scanFiberSections([{}]).scan_diagnostic.snapshot_selection_reason).toBe('snapshot_unreadable');
+    expect(scanFiber([userMessage()]).scan_diagnostic.snapshot_selection_reason).toBe('no_submit_goal');
+    expect(scanTimeline([directTimelineCall()], { current: false }).scan_diagnostic.snapshot_selection_reason)
+      .toBe('historical_viewport');
+    const boundary = scanFiberSections([
+      fiberSection([userMessage('old'), currentConnectorRequest('a', 'submit_goal', KEY_A)], 'old'),
+      fiberSection([userMessage('new')], 'new'),
+    ]);
+    expect(boundary.scan_diagnostic.snapshot_selection_reason).toBe('user_boundary');
+    expect(await contentMessages(selected)).toContainEqual(expect.objectContaining({
+      stage: 'fiber_scanned', snapshot_selection_reason: 'selected',
+    }));
+  });
   function timelineCall(key: unknown = KEY_A): Record<string, any> {
     return { type: 'mcp-tool-call', functionName: 'Local MCP Connector__link_test/submit_goal',
       invocation: { server: 'Local MCP Connector', tool: 'link_test/submit_goal', arguments: { correlation_key: key } } };
@@ -232,6 +280,58 @@ describe("Extension submit_goal correlation evidence", () => {
           ? { memoizedProps: { conversationId: options.parentConversation }, return: null } : null } } };
     return scanFiberSections([section], 'section[data-testid^="conversation-turn"], [data-turn-key]');
   }
+
+  it('keeps Delivery and Completion on the active timeline despite retained conversations', async () => {
+    const current = (conversationId = CONVERSATION, mostRecent = true, parentId = conversationId) => ({
+      getAttribute: (name: string) => name === 'data-turn-key' ? 'active-turn' : null,
+      __reactFiber$test: { memoizedProps: { entry: { conversationId, isMostRecentTurn: mostRecent,
+        turn: { items: [{ type: 'user-message', messageId: 'user-current' }] } } },
+        return: { memoizedProps: { conversationId: parentId }, return: null } },
+    });
+    const retained = [current(CONVERSATION_B, false), current(CONVERSATION), fiberSection([], 'old', 'invalid identity')];
+    async function claims(active: Record<string, unknown>) {
+      const window = pageWindow();
+      const messages: Record<string, any>[] = [];
+      const intervals: (() => void)[] = [];
+      let probe: ((message: object, sender: object, respond: (reply: object) => void) => void) | undefined;
+      const context = vm.createContext({ window, URL, console: { debug() {} },
+        location: { origin: ORIGIN, href: `${ORIGIN}/c/${CONVERSATION}` },
+        document: { documentElement: {}, querySelectorAll: () => [...retained, active] },
+        history: { pushState() {}, replaceState() {} },
+        LRM_DOM: { ready: () => true },
+        chrome: { runtime: {
+          sendMessage(message: Record<string, any>, callback: (reply: object) => void) {
+            messages.push(structuredClone(message));
+            callback(message.type === 'register_document' ? { ok: true, document_id: 'document-a' } : { ok: true });
+          },
+          onMessage: { addListener(listener: typeof probe) { probe = listener; } },
+        } },
+        setTimeout, clearTimeout, setInterval(callback: () => void) { intervals.push(callback); },
+      });
+      vm.runInContext(fiberSource, context);
+      vm.runInContext(contentSource, context);
+      await new Promise(resolve => setTimeout(resolve, 220));
+      for (const callback of intervals) callback();
+      const result = await new Promise<Record<string, any>>(resolve => probe!({ type: 'delivery_probe' }, {}, resolve));
+      await new Promise(resolve => setTimeout(resolve, 20));
+      return { messages, result };
+    }
+    const active = current();
+    expect(scanFiberSections([...retained, active])).toMatchObject({ conversation_id: CONVERSATION, evidence: [] });
+    const success = await claims(active);
+    expect(success.result).toMatchObject({ ok: true, conversation_id: CONVERSATION });
+    for (const type of ['delivery_claim', 'completion_claim']) {
+      expect(success.messages).toContainEqual(expect.objectContaining({ type, conversation_id: CONVERSATION, navigation_epoch: 0 }));
+    }
+    expect(success.messages.filter(message => message.type === 'register_document').map(message => message.navigation_epoch))
+      .toEqual([0]);
+    for (const invalid of [current(CONVERSATION, false), current('invalid identity'),
+      current(CONVERSATION, true, CONVERSATION_B), current(CONVERSATION_B)]) {
+      const blocked = await claims(invalid);
+      expect(blocked.result.conversation_id).toBeNull();
+      expect(blocked.messages.some(message => ['delivery_claim', 'completion_claim'].includes(message.type))).toBe(false);
+    }
+  });
 
   it('reads the production timeline DOM and nested structured MCP invocation', () => {
     const reply = scanTimeline([{ type: 'user-message', messageId: 'user-current' },
@@ -385,15 +485,15 @@ describe("Extension submit_goal correlation evidence", () => {
     const reply = scanFiber([userMessage(), currentConnectorRequest('a', 'submit_goal', KEY_A)]);
     const registration = await contentMessages(reply, { registrationFails: true });
     expect(registration).toContainEqual(expect.objectContaining({ stage: 'document_registered', register_document_ok: false }));
-    expect(registration.some(message => message.stage === 'fiber_scanned')).toBe(false);
+    expect(registration).toContainEqual(expect.objectContaining({ stage: 'fiber_scanned', fiber_reply_received: true }));
     const timeout = await contentMessages(reply, { dropReply: true });
-    // With no canonical Fiber identity the current content script returns before publishing evidence diagnostics.
-    expect(timeout).toContainEqual(expect.objectContaining({ stage: 'scan_started' }));
+    expect(timeout).toContainEqual(expect.objectContaining({ stage: 'fiber_scanned', fiber_reply_received: false }));
     expect(timeout.some(message => message.type === 'identity_evidence')).toBe(false);
     const rejected = await contentMessages(reply, { workerFails: true });
     expect(rejected).toContainEqual(expect.objectContaining({ stage: 'worker_send_finished', worker_reply_ok: false }));
     const navigated = await contentMessages(reply, { navigateBeforeFiberReply: `/c/${CONVERSATION_B}` });
     expect(navigated).toContainEqual(expect.objectContaining({ stage: 'scan_started' }));
+    expect(navigated).toContainEqual(expect.objectContaining({ stage: 'fiber_scanned' }));
     expect(navigated.some(message => message.type === 'identity_evidence')).toBe(false);
   });
   it("distinguishes missing root and missing trusted identity, and keeps the key after a newer non-goal tool", async () => {
@@ -408,12 +508,49 @@ describe("Extension submit_goal correlation evidence", () => {
     expect(laterTool.scan_diagnostic).toMatchObject({ correlation_key_found: true, current_key_found: true, correlation_key: KEY_A });
     const messages = await contentMessages(noIdentity);
     expect(messages).toContainEqual(expect.objectContaining({ type: 'identity_diagnostic', stage: 'scan_started' }));
+    expect(messages).toContainEqual(expect.objectContaining({ stage: 'fiber_scanned', conversation_unreadable: true }));
     expect(messages.some(message => message.stage === 'route_checked')).toBe(false);
     expect(messages.some(message => message.type === 'identity_evidence')).toBe(false);
     const mismatch = await contentMessages({ version: 1, conversation_id: CONVERSATION,
       evidence: [{ request_id: KEY_A, fiber_conversation_id: CONVERSATION_B }] });
     expect(mismatch).toContainEqual(expect.objectContaining({ stage: 'route_checked', fiber_route_match: false }));
     expect(mismatch.some(message => message.type === 'identity_evidence')).toBe(false);
+  });
+  it('publishes current tool evidence despite unrelated historical nodes, but rejects current identity conflicts', async () => {
+    const current = fiberSection([userMessage(), currentConnectorRequest('a', 'submit_goal', KEY_A)], 'current');
+    for (const history of [{}, fiberSection([], 'old', 'invalid identity')]) {
+      const reply = scanFiberSections([history, current]);
+      expect(reply.conversation_id).toBeNull();
+      expect(reply.evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+      expect(await contentMessages(reply)).toContainEqual(expect.objectContaining({
+        type: 'identity_evidence', request_id: KEY_A, conversation_id: CONVERSATION,
+      }));
+    }
+    for (const history of [fiberSection([], 'old', CONVERSATION_B),
+      fiberSection([], 'old', CONVERSATION, { conversationId: CONVERSATION_B })]) {
+      const reply = scanFiberSections([history, current]);
+      expect(reply.conversation_id).toBeNull();
+      expect(reply.evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+      expect(await contentMessages(reply)).toContainEqual(expect.objectContaining({
+        type: 'identity_evidence', request_id: KEY_A, conversation_id: CONVERSATION,
+      }));
+    }
+    const conflictingCurrent = scanFiberSections([fiberSection([
+      userMessage(), currentConnectorRequest('a', 'submit_goal', KEY_A),
+    ], 'current', CONVERSATION, { conversationId: CONVERSATION_B })]);
+    expect(conflictingCurrent.evidence).toEqual([]);
+    expect((await contentMessages(conflictingCurrent)).some(message => message.type === 'identity_evidence')).toBe(false);
+    const wrongRoute = scanFiberSections([{}, fiberSection([
+      userMessage(), currentConnectorRequest('a', 'submit_goal', KEY_A),
+    ], 'current', CONVERSATION_B)]);
+    expect((await contentMessages(wrongRoute)).some(message => message.type === 'identity_evidence')).toBe(false);
+  });
+
+  it('does not extract identity evidence from functions.exec JavaScript text', () => {
+    const reply = scanFiber([userMessage(), { author: { role: 'assistant' }, recipient: 'functions.exec',
+      content: { content_type: 'code', text: `await tools.mcp__Local_MCP_Connector__submit_goal({correlation_key: "${KEY_A}"})` } }]);
+    expect(reply.evidence).toEqual([]);
+    expect(reply.scan_diagnostic.current_key_found).toBe(false);
   });
   it("reports the reloaded conversation identity as matched for the fresh correlation key", () => {
     const FRESH_KEY = "dd3bf476-5a9e-4a5d-b445-a09e5dfe9dec";

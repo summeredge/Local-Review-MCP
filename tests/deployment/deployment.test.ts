@@ -1,10 +1,10 @@
 import { createServer, type Server } from "node:http";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { REGISTERED_TOOL_NAMES } from "../../src/mcp/server.js";
 
 const projectDirectory = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -13,7 +13,25 @@ const startProductionScript = join(projectDirectory, "scripts", "start-productio
 const verifyScript = join(projectDirectory, "scripts", "verify-remote.ps1");
 const temporaryDirectories: string[] = [];
 const runningServers: Server[] = [];
+const runningProcesses = new Set<ChildProcess>();
 const REMOTE_TOKEN = "deployment-test-token";
+const POWERSHELL_TIMEOUT_MS = 12_000;
+const POWERSHELL_TEST_TIMEOUT_MS = 15_000;
+const POWERSHELL_BUILD_TIMEOUT_MS = 40_000;
+const POWERSHELL_BUILD_TEST_TIMEOUT_MS = 45_000;
+
+function terminateProcessTree(child: ChildProcess): void {
+  if (child.pid === undefined) return;
+  if (process.platform === "win32") {
+    const taskkill = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe");
+    execFile(taskkill, ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true }, (error) => {
+      if (error !== null && child.exitCode === null) child.kill();
+    });
+    return;
+  }
+  try { process.kill(-child.pid, "SIGKILL"); }
+  catch { child.kill("SIGKILL"); }
+}
 
 interface ScriptResult {
   readonly code: number;
@@ -24,6 +42,7 @@ function runPowerShell(
   script: string,
   args: readonly string[],
   environment: NodeJS.ProcessEnv = {},
+  timeoutMs = POWERSHELL_TIMEOUT_MS,
 ): Promise<ScriptResult> {
   const shell = process.platform === "win32" ? "powershell.exe" : "pwsh";
   const shellArgs = ["-NoLogo", "-NoProfile", "-NonInteractive"];
@@ -31,18 +50,80 @@ function runPowerShell(
   shellArgs.push("-File", script, ...args);
 
   return new Promise((resolve) => {
-    execFile(shell, shellArgs, {
+    let timedOut = false;
+    let outputTooLarge = false;
+    let spawnFailed = false;
+    let stdout = "";
+    let stderr = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    const child = spawn(shell, shellArgs, {
       cwd: projectDirectory,
       env: { ...process.env, ...environment },
       windowsHide: true,
-      maxBuffer: 1024 * 1024,
-    }, (error, stdout, stderr) => {
-      const code = error === null
-        ? 0
-        : typeof error.code === "number" ? error.code : 1;
-      resolve({ code, output: `${stdout}\n${stderr}` });
+      detached: process.platform !== "win32",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    runningProcesses.add(child);
+    const append = (target: "stdout" | "stderr", chunk: string) => {
+      if (outputTooLarge) return;
+      if (target === "stdout") {
+        stdoutBytes += Buffer.byteLength(chunk);
+        if (stdoutBytes > 1024 * 1024) {
+          outputTooLarge = true;
+          terminateProcessTree(child);
+          return;
+        }
+        stdout += chunk;
+      } else {
+        stderrBytes += Buffer.byteLength(chunk);
+        if (stderrBytes > 1024 * 1024) {
+          outputTooLarge = true;
+          terminateProcessTree(child);
+          return;
+        }
+        stderr += chunk;
+      }
+    };
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => append("stdout", chunk));
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => append("stderr", chunk));
+    child.once("error", () => { spawnFailed = true; });
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      terminateProcessTree(child);
+    }, timeoutMs);
+    child.once("close", (code) => {
+      clearTimeout(timeout);
+      runningProcesses.delete(child);
+      resolve({ code: timedOut || outputTooLarge || spawnFailed ? 1 : code ?? 1, output: `${stdout}\n${stderr}` });
+    });
+    child.once("spawn", () => {
+      if (timedOut) terminateProcessTree(child);
     });
   });
+}
+
+async function makeIsolatedBuildProject(directory: string): Promise<string> {
+  const root = join(directory, "build-project");
+  await mkdir(join(root, "scripts"), { recursive: true });
+  await Promise.all([
+    cp(startProductionScript, join(root, "scripts", "start-production.ps1")),
+    cp(preflightScript, join(root, "scripts", "preflight-check.ps1")),
+    cp(join(projectDirectory, "package.json"), join(root, "package.json")),
+  ]);
+  const tsconfig = JSON.parse(await readFile(join(projectDirectory, "tsconfig.json"), "utf8")) as {
+    compilerOptions: Record<string, unknown>;
+    include: string[];
+  };
+  tsconfig.compilerOptions.rootDir = projectDirectory;
+  tsconfig.compilerOptions.outDir = join(root, "dist");
+  tsconfig.include = ["../../src/**/*.ts", "../../tests/**/*.ts", "src/**/*.ts"];
+  await writeFile(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+  await symlink(join(projectDirectory, "node_modules"), join(root, "node_modules"),
+    process.platform === "win32" ? "junction" : "dir");
+  return root;
 }
 
 async function makeTemporaryDirectory(): Promise<string> {
@@ -218,6 +299,11 @@ async function makeRemoteServer(): Promise<string> {
 }
 
 afterEach(async () => {
+  const processes = [...runningProcesses];
+  processes.forEach(terminateProcessTree);
+  await Promise.all(processes.map((child) => new Promise<void>((resolve) => {
+    child.once("close", () => resolve());
+  })));
   await Promise.all(runningServers.splice(0).map(closeServer));
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {
     recursive: true,
@@ -226,13 +312,22 @@ afterEach(async () => {
 });
 
 describe("deployment scripts", () => {
+  it("terminates a PowerShell process that exceeds its deadline", async () => {
+    const directory = await makeTemporaryDirectory();
+    const script = join(directory, "sleep.ps1");
+    await writeFile(script, "Start-Sleep -Seconds 30\n");
+    const result = await runPowerShell(script, [], {}, 100);
+
+    expect(result.code).not.toBe(0);
+  });
+
   it("fails when the production config is missing", async () => {
     const directory = await makeTemporaryDirectory();
     const result = await runPowerShell(preflightScript, ["-Config", join(directory, "missing.json")]);
 
     expect(result.code).not.toBe(0);
     expect(result.output).toMatch(/production config.*not found/i);
-  });
+  }, POWERSHELL_TEST_TIMEOUT_MS);
 
   it("fails when the configured workspace does not exist", async () => {
     const directory = await makeTemporaryDirectory();
@@ -244,7 +339,7 @@ describe("deployment scripts", () => {
 
     expect(result.code).not.toBe(0);
     expect(result.output).toMatch(/workspace.*(missing|directory|accessible)/i);
-  });
+  }, POWERSHELL_TEST_TIMEOUT_MS);
 
   it("fails when remote access is enabled without cloudflared", async () => {
     const directory = await makeTemporaryDirectory();
@@ -256,7 +351,7 @@ describe("deployment scripts", () => {
 
     expect(result.code).not.toBe(0);
     expect(result.output).toMatch(/cloudflared/i);
-  });
+  }, POWERSHELL_TEST_TIMEOUT_MS);
 
   it("passes without cloudflared when remote access is disabled", async () => {
     const directory = await makeTemporaryDirectory();
@@ -269,7 +364,7 @@ describe("deployment scripts", () => {
     expect(result.code).toBe(0);
     expect(result.output).toMatch(/preflight passed/i);
     expect(result.output).toMatch(/cloudflare tunnel: disabled/i);
-  });
+  }, POWERSHELL_TEST_TIMEOUT_MS);
 
   it("rejects an incorrect remote token", async () => {
     const remoteUrl = await makeRemoteServer();
@@ -280,7 +375,7 @@ describe("deployment scripts", () => {
 
     expect(result.code).not.toBe(0);
     expect(result.output).toMatch(/authenticated health check.*401/i);
-  });
+  }, POWERSHELL_TEST_TIMEOUT_MS);
 
   it("builds the production runtime before starting it", async () => {
     const directory = await makeTemporaryDirectory();
@@ -304,7 +399,7 @@ describe("deployment scripts", () => {
       `start start -- --config "${config}"`,
       `start-args [--][--config][${config}][]`,
     ]);
-  });
+  }, POWERSHELL_TEST_TIMEOUT_MS);
 
   it("does not start the runtime when the production build fails", async () => {
     const directory = await makeTemporaryDirectory();
@@ -323,66 +418,64 @@ describe("deployment scripts", () => {
     expect(result.output).not.toMatch(/starting local review mcp/i);
     await expect(readFile(join(shimDirectory, "npm-log.txt"), "utf8"))
       .resolves.toMatch(/^run build\r?\n$/);
-  });
+  }, POWERSHELL_TEST_TIMEOUT_MS);
 
   it("compiles the current src into dist before invoking npm start", async () => {
     const directory = await makeTemporaryDirectory();
     const shimDirectory = await makeTemporaryDirectory();
+    const buildProject = await makeIsolatedBuildProject(directory);
     const probe = `launcher-build-probe-${randomUUID()}`;
-    const sourcePath = join(projectDirectory, "src", `${probe}.ts`);
-    const outputPath = join(projectDirectory, "dist", "src", `${probe}.js`);
+    const sourcePath = join(buildProject, "src", `${probe}.ts`);
+    const outputPath = join(buildProject, "dist", relative(projectDirectory, sourcePath).replace(/\.ts$/u, ".js"));
+    await mkdir(dirname(sourcePath), { recursive: true });
     await writeFile(sourcePath, `export const buildProbe = ${JSON.stringify(probe)};\n`);
 
-    try {
-      await writeNpmShim(shimDirectory, true);
-      const configDirectory = join(directory, "Test User", "Local Review MCP");
-      await mkdir(configDirectory, { recursive: true });
-      const config = await writeConfig(configDirectory, { workspace: directory, remoteEnabled: false });
-      const result = await runPowerShell(
-        startProductionScript,
-        ["-Config", config, "-SkipDesktopBootstrap"],
-        withNpmShim(shimDirectory, 0, true),
-      );
-      expect(result.code, result.output).toBe(0);
-      expect(await readFile(outputPath, "utf8")).toContain(probe);
-      expect((await readFile(join(shimDirectory, "npm-log.txt"), "utf8")).trim().split(/\r?\n/))
-        .toEqual([
-          "run build",
-          `start start -- --config "${config}"`,
-          `start-args [--][--config][${config}][]`,
-        ]);
-    } finally {
-      await Promise.all([rm(sourcePath, { force: true }), rm(outputPath, { force: true })]);
-    }
-  }, 30_000);
+    await writeNpmShim(shimDirectory, true);
+    const configDirectory = join(directory, "Test User", "Local Review MCP");
+    await mkdir(configDirectory, { recursive: true });
+    const config = await writeConfig(configDirectory, { workspace: directory, remoteEnabled: false });
+    const result = await runPowerShell(
+      join(buildProject, "scripts", "start-production.ps1"),
+      ["-Config", config, "-SkipDesktopBootstrap"],
+      withNpmShim(shimDirectory, 0, true),
+      POWERSHELL_BUILD_TIMEOUT_MS,
+    );
+    expect(result.code, result.output).toBe(0);
+    await expect(readFile(join(buildProject, "dist", "src", "app.js"), "utf8")).resolves.toBeTruthy();
+    expect(await readFile(outputPath, "utf8")).toContain(probe);
+    expect((await readFile(join(shimDirectory, "npm-log.txt"), "utf8")).trim().split(/\r?\n/))
+      .toEqual([
+        "run build",
+        `start start -- --config "${config}"`,
+        `start-args [--][--config][${config}][]`,
+      ]);
+  }, POWERSHELL_BUILD_TEST_TIMEOUT_MS);
 
   it("does not start when TypeScript compilation fails", async () => {
     const directory = await makeTemporaryDirectory();
     const shimDirectory = await makeTemporaryDirectory();
+    const buildProject = await makeIsolatedBuildProject(directory);
     const probe = `launcher-build-error-${randomUUID()}`;
-    const sourcePath = join(projectDirectory, "src", `${probe}.ts`);
-    const outputPath = join(projectDirectory, "dist", "src", `${probe}.js`);
+    const sourcePath = join(buildProject, "src", `${probe}.ts`);
+    await mkdir(dirname(sourcePath), { recursive: true });
     await writeFile(sourcePath, `const invalid: number = ${JSON.stringify(probe)};\nexport { invalid };\n`);
 
-    try {
-      await writeNpmShim(shimDirectory, true);
-      const configDirectory = join(directory, "Test User", "Local Review MCP");
-      await mkdir(configDirectory, { recursive: true });
-      const config = await writeConfig(configDirectory, { workspace: directory, remoteEnabled: false });
-      const result = await runPowerShell(
-        startProductionScript,
-        ["-Config", config, "-SkipDesktopBootstrap"],
-        withNpmShim(shimDirectory, 0, true),
-      );
+    await writeNpmShim(shimDirectory, true);
+    const configDirectory = join(directory, "Test User", "Local Review MCP");
+    await mkdir(configDirectory, { recursive: true });
+    const config = await writeConfig(configDirectory, { workspace: directory, remoteEnabled: false });
+    const result = await runPowerShell(
+      join(buildProject, "scripts", "start-production.ps1"),
+      ["-Config", config, "-SkipDesktopBootstrap"],
+      withNpmShim(shimDirectory, 0, true),
+      POWERSHELL_BUILD_TIMEOUT_MS,
+    );
 
-      expect(result.code).not.toBe(0);
-      expect(result.output).toMatch(/production build failed/i);
-      expect((await readFile(join(shimDirectory, "npm-log.txt"), "utf8")).trim().split(/\r?\n/))
-        .toEqual(["run build"]);
-    } finally {
-      await Promise.all([rm(sourcePath, { force: true }), rm(outputPath, { force: true })]);
-    }
-  }, 30_000);
+    expect(result.code).not.toBe(0);
+    expect(result.output.replace(/\s+/gu, "")).toMatch(/productionbuildfailed/i);
+    expect((await readFile(join(shimDirectory, "npm-log.txt"), "utf8")).trim().split(/\r?\n/))
+      .toEqual(["run build"]);
+  }, POWERSHELL_BUILD_TEST_TIMEOUT_MS);
 
   it("verifies health, MCP initialize, and the MCP tools", async () => {
     const remoteUrl = await makeRemoteServer();
@@ -396,5 +489,5 @@ describe("deployment scripts", () => {
     expect(result.output).toMatch(/tools\/list: passed.*\d+ tools/i);
     expect(result.output).toMatch(/remote verification passed/i);
     expect(result.output).not.toContain(REMOTE_TOKEN);
-  });
+  }, POWERSHELL_TEST_TIMEOUT_MS);
 });

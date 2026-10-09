@@ -52,6 +52,7 @@ export interface ExecutionContext {
   readonly started_at: string;
   readonly finished_at?: string;
   readonly summary?: string;
+  readonly extension_transport?: Readonly<Record<string, unknown>>;
 }
 
 export interface CreateExecutionContextInput {

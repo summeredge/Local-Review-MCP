@@ -148,7 +148,7 @@
         .then((stored) => {
           for (const [tabId, entry] of Object.entries(stored.conversationRecoveryTabs || {})) {
             if (/^\d+$/u.test(tabId) && entry && Array.isArray(entry.targets)
-              && entry.targets.every(target => DELIVERY_ID.test(target?.delivery_id)
+              && entry.targets.every(target => validRecoveryTarget(target)
                 && CONVERSATION_ID.test(target?.conversation_id))) {
               recoveryTabs.set(Number(tabId), entry.targets);
               recoveryReloads.set(Number(tabId), entry.reload_at || 0);
@@ -671,6 +671,10 @@
           ? message.correlation_key : ''),
         conversation_id_hash: await diagnosticHash(documentConversation(message, sender)),
         document_id_hash: await diagnosticHash(source?.documentId), flags };
+      if (['selected', 'no_current_turn', 'historical_viewport', 'snapshot_unreadable',
+        'user_conflict', 'user_boundary', 'no_submit_goal', 'scan_exception'].includes(message.snapshot_selection_reason)) {
+        entry.snapshot_selection_reason = message.snapshot_selection_reason;
+      }
       for (const [key, limit] of [['assistant_tool_calls_found', 100000], ['fiber_evidence_count', 200]]) {
         if (Number.isSafeInteger(message[key]) && message[key] >= 0 && message[key] <= limit) entry[key] = message[key];
       }
@@ -1127,6 +1131,13 @@
   }
   const FIBER_PROBE_TIMEOUT_MS = 3000;
 
+  function validRecoveryTarget(target) {
+    return target && Object.keys(target).length === 2
+      && ((typeof target.delivery_id === 'string' && DELIVERY_ID.test(target.delivery_id))
+        || (typeof target.completion_id === 'string' && DELIVERY_ID.test(target.completion_id)))
+      && typeof target.conversation_id === 'string' && CONVERSATION_ID.test(target.conversation_id);
+  }
+
   async function recoveryFailure(tabId, code) {
     await load();
     const targets = recoveryTabs.get(tabId) || [];
@@ -1145,19 +1156,19 @@
     recoveryInFlight = serialDeliveryState(async () => {
       // ACKs take precedence: restoring a page must never cause a confirmed send to repeat.
       const ready = await prepareDeliveryClaim();
-      if (!ready.ok || ready.blocked || deliveryRecoveryBlocked) return;
+      const completionReady = await serialCompletionState(() => prepareCompletionClaim());
+      if ((!ready.ok || ready.blocked || deliveryRecoveryBlocked) && !completionReady.ok) return;
       const result = await postBridge('/delivery/recovery-targets', {});
       if (!result.ok || !Array.isArray(result.data?.targets)) {
         console.warn('[LRM recovery] target discovery failed', result.error || result.status);
         return;
       }
-      const targets = result.data.targets;
-      if (!targets.every(target => target && Object.keys(target).length === 2
-        && typeof target.delivery_id === 'string' && DELIVERY_ID.test(target.delivery_id)
-        && typeof target.conversation_id === 'string' && CONVERSATION_ID.test(target.conversation_id))) {
+      if (!result.data.targets.every(validRecoveryTarget)) {
         console.warn('[LRM recovery] invalid target response');
         return;
       }
+      const targets = result.data.targets.filter(target => target.completion_id === undefined
+        ? ready.ok && !ready.blocked && !deliveryRecoveryBlocked : completionReady.ok && !completionRecoveryBlocked);
       if (targets.length === 0) {
         recoveryTabs.clear();
         await persistRecoveryTabs();

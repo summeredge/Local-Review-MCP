@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import {
   conversationIdSchema,
@@ -29,8 +30,9 @@ import {
   type ControlledActuation,
 } from "./controlled-actuation.js";
 import { executionModeSchema } from "./execution-service.js";
+import { backupLegacyState, stateRestoreDiagnostic } from "./state-migration.js";
 
-const STATE_VERSION = 1;
+const STATE_VERSION = 2;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const timestampSchema = z.string().datetime({ offset: true });
 const instructionItemSchema = z.string().min(1).max(16_000);
@@ -266,14 +268,25 @@ class GoalOrchestrationStore {
         raw = await readFile(this.file, "utf8");
       } catch (error: unknown) {
         if (errorCode(error) === "ENOENT") return;
-        throw new GoalOrchestrationUnavailableError("goal orchestration state could not be restored", { cause: error });
+        throw new GoalOrchestrationUnavailableError(`goal orchestration state could not be restored: ${stateRestoreDiagnostic(this.file, error)}`, { cause: error });
       }
       try {
-        this.state = goalOrchestrationStateSchema.parse(migrateLegacyModelIdFields(JSON.parse(raw) as unknown));
+        const source = migrateLegacyModelIdFields(JSON.parse(raw) as unknown);
+        const legacy = typeof source === "object" && source !== null && "schema_version" in source && source.schema_version === 1;
+        let migrated = source;
+        if (legacy) {
+          const data = z.object({ goals: z.array(z.unknown()) }).passthrough().parse(source);
+          migrated = { ...data, schema_version: STATE_VERSION, goals: data.goals.map((goal) =>
+            typeof goal === "object" && goal !== null && !("execution_mode" in goal)
+              ? { ...goal, execution_mode: "batch" } : goal) };
+        }
+        const next = goalOrchestrationStateSchema.parse(migrated);
+        if (legacy) { await backupLegacyState(this.file, raw); await this.persist(next); }
+        this.state = next;
       } catch (error: unknown) {
-        throw new GoalOrchestrationUnavailableError("goal orchestration state could not be restored", { cause: error });
+        throw new GoalOrchestrationUnavailableError(`goal orchestration state could not be restored: ${stateRestoreDiagnostic(this.file, error)}`, { cause: error });
       }
-    });
+    }).catch((error: unknown) => { this.restorePromise = null; throw error; });
     return this.restorePromise;
   }
 
@@ -356,6 +369,8 @@ export class GoalOrchestrationService {
   private readonly controlled: ControlledActuationPort;
   private readonly auto: AutoIterationPort;
   private readonly operations = new Map<string, Promise<void>>();
+  private readonly recoveryTimers = new Map<string, NodeJS.Timeout>();
+  private disposed = false;
 
   public constructor(
     private readonly registry: WorkspaceRegistry,
@@ -400,6 +415,25 @@ export class GoalOrchestrationService {
 
   public restore(): Promise<void> {
     return this.store.restore();
+  }
+
+  public dispose(): void {
+    this.disposed = true;
+    for (const timer of this.recoveryTimers.values()) clearTimeout(timer);
+    this.recoveryTimers.clear();
+  }
+
+  private scheduleRecovery(goalId: string): void {
+    if (this.disposed || this.recoveryTimers.has(goalId)) return;
+    const timer = setTimeout(() => {
+      this.recoveryTimers.delete(goalId);
+      void this.advanceGoal(goalId).catch((error: unknown) => {
+        console.warn(`Goal orchestration recovery failed for "${goalId}"`, errorMessage(error));
+        this.scheduleRecovery(goalId);
+      });
+    }, 1_000);
+    timer.unref();
+    this.recoveryTimers.set(goalId, timer);
   }
 
   public getGoal(goalId: string): Promise<GoalOrchestration | null> {
@@ -898,12 +932,24 @@ export class GoalOrchestrationService {
     });
   }
 
-  private update(goal: GoalOrchestration, patch: Partial<GoalOrchestration>): Promise<GoalOrchestration> {
-    return this.store.put(goalOrchestrationSchema.parse({
+  private async update(goal: GoalOrchestration, patch: Partial<GoalOrchestration>): Promise<GoalOrchestration> {
+    const next = goalOrchestrationSchema.parse({
       ...goal,
       ...patch,
       updated_at: new Date().toISOString(),
-    }));
+    });
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.store.put(next);
+      } catch (error: unknown) {
+        if (attempt >= 2 || !["EPERM", "EACCES", "EBUSY"].includes(errorCode(error) ?? "")) {
+          // The persisted running checkpoint and Loop outcome remain the recovery source.
+          if (goal.status === "running") this.scheduleRecovery(goal.goal_id);
+          throw error;
+        }
+      }
+      await delay(10 * (attempt + 1));
+    }
   }
 
   private async requiredGoal(goalId: string): Promise<GoalOrchestration> {

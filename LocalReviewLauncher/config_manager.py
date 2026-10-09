@@ -157,6 +157,10 @@ class ConfigManager:
     def save_workspace(self, configuration: LauncherConfig, workspace: Path) -> LauncherConfig:
         return self.add_workspace(configuration, workspace)
 
+    def set_auto_start(self, configuration: LauncherConfig, enabled: bool) -> LauncherConfig:
+        current = self._configuration_for_update(configuration)
+        return self._write_configuration(replace(current, auto_start=enabled))
+
     def add_workspace(
         self,
         configuration: LauncherConfig,
@@ -336,7 +340,17 @@ class ConfigManager:
             "workspaces": self._records_json(configuration.workspaces),
         })
         self.launcher_directory.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(values, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.launcher_directory, delete=False
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                temporary.write(json.dumps(values, ensure_ascii=False, indent=2) + "\n")
+            os.replace(temporary_path, self.path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
         return configuration
 
     def _validate_workspace_path(self, workspace: Path) -> Path:

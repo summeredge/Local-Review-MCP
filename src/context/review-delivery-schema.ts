@@ -41,6 +41,7 @@ export const reviewDeliverySchema = z.object({
   created_at: reviewDeliveryTimestampSchema,
   updated_at: reviewDeliveryTimestampSchema,
   delivered_at: reviewDeliveryTimestampSchema.optional(),
+  extension_transport: z.unknown().optional(),
 }).strict().superRefine((delivery, context) => {
   if (delivery.status === "pending" && delivery.attempt_count !== 0) {
     context.addIssue({

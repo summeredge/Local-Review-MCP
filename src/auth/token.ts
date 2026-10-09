@@ -66,7 +66,7 @@ function isStoredToken(value: unknown): value is StoredOAuthToken {
 }
 
 export class OAuthTokenStore {
-  private readonly tokens = new Map<string, StoredOAuthToken>();
+  private tokens = new Map<string, StoredOAuthToken>();
   private readonly path: string | undefined;
   private readonly accessTtlSeconds: number;
   private readonly refreshTtlSeconds: number;
@@ -90,9 +90,15 @@ export class OAuthTokenStore {
   ): IssuedOAuthToken {
     const clientId = typeof clientIdOrNow === "string" ? clientIdOrNow : "legacy";
     const now = typeof clientIdOrNow === "number" ? clientIdOrNow : requestedNow;
+    return this.issuePair(resource, clientId, now);
+  }
+
+  private issuePair(resource: string, clientId: string, now: number, replacedRefreshToken?: string): IssuedOAuthToken {
     const accessToken = randomBytes(32).toString("base64url");
     const refreshToken = randomBytes(32).toString("base64url");
-    this.tokens.set(hashToken(accessToken), {
+    const next = new Map(this.tokens);
+    if (replacedRefreshToken !== undefined) next.delete(replacedRefreshToken);
+    next.set(hashToken(accessToken), {
       hash: hashToken(accessToken),
       kind: "access",
       client_id: clientId,
@@ -101,7 +107,7 @@ export class OAuthTokenStore {
       expires_at: now + this.accessTtlSeconds * 1000,
       revoked: false,
     });
-    this.tokens.set(hashToken(refreshToken), {
+    next.set(hashToken(refreshToken), {
       hash: hashToken(refreshToken),
       kind: "refresh",
       client_id: clientId,
@@ -110,7 +116,7 @@ export class OAuthTokenStore {
       expires_at: now + this.refreshTtlSeconds * 1000,
       revoked: false,
     });
-    this.save(now);
+    this.save(now, next);
     return { token: accessToken, refreshToken, expiresIn: this.accessTtlSeconds };
   }
 
@@ -119,8 +125,9 @@ export class OAuthTokenStore {
     const stored = this.tokens.get(hashToken(token));
     if (stored === undefined || stored.kind !== "access" || stored.revoked) return false;
     if (stored.expires_at <= now) {
-      this.tokens.delete(stored.hash);
-      this.save(now);
+      const next = new Map(this.tokens);
+      next.delete(stored.hash);
+      this.save(now, next);
       return false;
     }
     return stored.resource === resource;
@@ -142,16 +149,16 @@ export class OAuthTokenStore {
       || (resource !== undefined && stored.resource !== resource)) {
       return null;
     }
-    this.tokens.delete(key);
-    return this.issue(stored.resource, stored.client_id, now);
+    return this.issuePair(stored.resource, stored.client_id, now, key);
   }
 
   public delete(token: string): void {
     const key = hashToken(token);
     const stored = this.tokens.get(key);
     if (stored === undefined) return;
-    this.tokens.delete(key);
-    this.save();
+    const next = new Map(this.tokens);
+    next.delete(key);
+    this.save(Date.now(), next);
   }
 
   private load(): void {
@@ -181,13 +188,13 @@ export class OAuthTokenStore {
     }
   }
 
-  private save(now = Date.now()): void {
-    if (this.path === undefined) return;
+  private save(now = Date.now(), tokens = this.tokens): void {
+    if (this.path === undefined) { this.tokens = tokens; return; }
     const directory = dirname(this.path);
     const temporary = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
     const state: PersistedOAuthTokens = {
       schema_version: 1,
-      tokens: [...this.tokens.values()].filter((token) => !token.revoked && token.expires_at > now),
+      tokens: [...tokens.values()].filter((token) => !token.revoked && token.expires_at > now),
     };
     try {
       mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -196,8 +203,9 @@ export class OAuthTokenStore {
         encoding: "utf8",
         mode: 0o600,
       });
+      chmodSync(temporary, 0o600);
       renameSync(temporary, this.path);
-      chmodSync(this.path, 0o600);
+      this.tokens = tokens;
     } catch (error: unknown) {
       rmSync(temporary, { force: true });
       throw new Error("OAuth token store could not be saved", { cause: error });

@@ -3,6 +3,11 @@ import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { defaultTaskContextStorageRoot } from "../context/task.js";
+import { reviewDeliverySchema, reviewDeliveryIdSchema } from "../context/review-delivery-schema.js";
+import { REVIEW_DELIVERIES_DIRECTORY, reviewDeliveryFile, type ReviewDelivery } from "../context/review-delivery.js";
+import { findExecutionFailure, findExecutionTransport, findReviewDelivery, findReviewTransport, saveReviewTransport } from "./review-transport-history.js";
+import { executionFile } from "../context/execution.js";
+import { buildExecutionFailureMessage } from "../delivery/execution-failure-message.js";
 
 const STATE_VERSION = 1;
 const MAX_DELIVERIES = 1_000;
@@ -10,13 +15,19 @@ export const EXTENSION_DELIVERY_LEASE_MS = 90_000;
 const ID = /^[A-Za-z0-9_-]+$/u;
 const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const logicalDeliveryIdSchema = z.string().min(1).max(128);
-export const conversationRecoveryFailureSchema = z.object({
+const deliveryRecoveryFailureSchema = z.object({
   delivery_id: z.string().uuid(),
   conversation_id: z.string().min(1).max(256).regex(CONVERSATION_ID),
   code: z.enum(["TARGET_CONVERSATION_NAVIGATION_FAILED", "TARGET_CONVERSATION_NOT_FOUND",
     "TARGET_CONVERSATION_AUTH_REQUIRED"]),
 }).strict();
+export const conversationRecoveryFailureSchema = z.union([
+  deliveryRecoveryFailureSchema,
+  deliveryRecoveryFailureSchema.omit({ delivery_id: true }).extend({ completion_id: z.string().uuid() }).strict(),
+]);
 export type ConversationRecoveryFailure = z.infer<typeof conversationRecoveryFailureSchema>;
+export type ConversationRecoveryTarget = { conversation_id: string } & (
+  { delivery_id: string } | { completion_id: string });
 
 const enqueueSchema = z.object({
   conversation_id: z.string().min(1).max(256).regex(CONVERSATION_ID),
@@ -153,7 +164,7 @@ const deliverySchema = z.object({
   claim_time: z.number().int().nonnegative().refine(Number.isSafeInteger).optional(),
   ack_time: z.number().int().nonnegative().refine(Number.isSafeInteger).optional(),
   timeout_reason: z.string().min(1).max(500).optional(),
-  recovery_error: conversationRecoveryFailureSchema.shape.code.optional(),
+  recovery_error: deliveryRecoveryFailureSchema.shape.code.optional(),
   phase: z.enum(["queued", "leased", "delivered", "failed", "ambiguous"]),
   lease: leaseSchema.optional(),
   receipt: receiptSchema.optional(),
@@ -209,6 +220,15 @@ function stateFile(storageRoot: string): string {
 
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+function restoredTransport(review: ReviewDelivery): ExtensionDelivery {
+  const delivery = deliverySchema.parse(review.extension_transport);
+  if (review.status !== "delivered" || delivery.phase !== "delivered"
+    || delivery.logical_delivery_id !== review.delivery_id || delivery.conversation_id !== review.conversation_id) {
+    throw new ExtensionDeliveryConflictError("archived delivery does not match Review Delivery");
+  }
+  return delivery;
 }
 
 function sameOwner(lease: ExtensionDeliveryLease, owner: ExtensionDeliveryClaim): boolean {
@@ -321,22 +341,42 @@ export class ExtensionDeliveryService {
     return this.exclusive(async () => {
       const next = new Map(this.deliveries);
       if (parsed.logical_delivery_id !== undefined) {
-        const existing = [...next.values()].find((delivery) =>
-          delivery.logical_delivery_id === parsed.logical_delivery_id);
-        if (existing !== undefined) {
+        const existing = await this.getByLogicalDeliveryId(parsed.logical_delivery_id);
+        if (existing !== null) {
           if (existing.conversation_id !== parsed.conversation_id || existing.message !== parsed.message) {
             throw new ExtensionDeliveryConflictError("logical delivery command already targets different content");
           }
           if (!existing.receipt || !retryableNotSent(existing.receipt)) return clone(existing);
-          // The old attempt has durable proof of no send. Keep its receipt for late
-          // duplicate ACKs; a fresh physical id fences those ACKs from the retry.
+          // Durable proof of no send allows a fresh physical id that fences late ACKs from the retry.
           const { logical_delivery_id: _logicalId, ...retired } = existing;
           next.set(existing.delivery_id, retired);
         }
       }
       while (next.size >= MAX_DELIVERIES) {
-        const terminal = [...next.values()].find((delivery) =>
-          delivery.receipt !== undefined && delivery.logical_delivery_id === undefined);
+        let terminal: ExtensionDelivery | undefined;
+        for (const candidate of next.values()) {
+          if (!candidate.receipt || candidate.receipt.status === "ambiguous" || this.waiters.has(candidate.delivery_id)) continue;
+          if (candidate.logical_delivery_id === undefined) {
+            terminal = candidate;
+            break;
+          }
+          const failure = await findExecutionFailure(this.storageRoot, candidate.logical_delivery_id);
+          if (failure !== null) {
+            if (retryableNotSent(candidate.receipt) || candidate.conversation_id !== failure.loop.conversation_id
+              || candidate.message !== buildExecutionFailureMessage({ ...failure.loop, reason: "EXECUTION_FAILED", summary: failure.execution.summary })) continue;
+            await saveReviewTransport(executionFile(this.storageRoot, failure.execution.workspace_id,
+              failure.execution.task_id, failure.execution.execution_id), failure.execution,
+              { ...failure.execution.extension_transport, [candidate.logical_delivery_id]: candidate });
+            terminal = candidate;
+            break;
+          }
+          if (candidate.phase !== "delivered" || !reviewDeliveryIdSchema.safeParse(candidate.logical_delivery_id).success) continue;
+          const review = await findReviewDelivery(this.storageRoot, candidate.logical_delivery_id);
+          if (review?.status !== "delivered" || review.conversation_id !== candidate.conversation_id) continue;
+          await saveReviewTransport(reviewDeliveryFile(this.storageRoot, review.workspace_id, review.delivery_id), review, candidate);
+          terminal = candidate;
+          break;
+        }
         if (!terminal) throw new Error("extension delivery queue is full");
         next.delete(terminal.delivery_id);
       }
@@ -410,7 +450,7 @@ export class ExtensionDeliveryService {
     await this.restore();
     const ack = extensionDeliveryAckSchema.parse(input);
     return this.exclusive(async () => {
-      const current = this.deliveries.get(ack.delivery_id);
+      const current = this.deliveries.get(ack.delivery_id) ?? await this.get(ack.delivery_id);
       if (!current) throw new ExtensionDeliveryNotFoundError("delivery not found");
       if (current.receipt) {
         if (current.receipt.status === "ambiguous"
@@ -452,7 +492,28 @@ export class ExtensionDeliveryService {
   public async get(deliveryId: string): Promise<ExtensionDelivery | null> {
     await this.restore();
     const delivery = this.deliveries.get(z.string().uuid().parse(deliveryId));
-    return delivery ? clone(delivery) : null;
+    if (delivery) return clone(delivery);
+    const review = await findReviewTransport(join(this.storageRoot, REVIEW_DELIVERIES_DIRECTORY), reviewDeliverySchema,
+      record => restoredTransport(record).delivery_id === deliveryId);
+    if (review) return restoredTransport(review);
+    const execution = await findExecutionTransport(this.storageRoot, record => Object.values(record.extension_transport ?? {})
+      .some(transport => deliverySchema.parse(transport).delivery_id === deliveryId));
+    const transport = Object.values(execution?.extension_transport ?? {}).map(value => deliverySchema.parse(value))
+      .find(candidate => candidate.delivery_id === deliveryId);
+    return transport?.logical_delivery_id === undefined ? null : this.getFailureNotification(transport.logical_delivery_id);
+  }
+
+  private async getFailureNotification(logicalId: string): Promise<ExtensionDelivery | null> {
+    const failure = await findExecutionFailure(this.storageRoot, logicalId);
+    const transport = failure?.execution.extension_transport?.[logicalId];
+    if (failure === null || transport === undefined) return null;
+    const delivery = deliverySchema.parse(transport);
+    if (delivery.logical_delivery_id !== logicalId || !delivery.receipt || delivery.receipt.status === "ambiguous"
+      || retryableNotSent(delivery.receipt) || delivery.conversation_id !== failure.loop.conversation_id
+      || delivery.message !== buildExecutionFailureMessage({ ...failure.loop, reason: "EXECUTION_FAILED", summary: failure.execution.summary })) {
+      throw new ExtensionDeliveryConflictError("archived notification does not match failed Execution");
+    }
+    return delivery;
   }
 
   public async recoveryTargets(): Promise<Array<{ delivery_id: string; conversation_id: string }>> {
@@ -467,7 +528,7 @@ export class ExtensionDeliveryService {
 
   public async reportRecoveryFailure(input: ConversationRecoveryFailure): Promise<void> {
     await this.restore();
-    const failure = conversationRecoveryFailureSchema.parse(input);
+    const failure = deliveryRecoveryFailureSchema.parse(input);
     await this.exclusive(async () => {
       const current = this.deliveries.get(failure.delivery_id);
       if (!current) return;
@@ -488,7 +549,12 @@ export class ExtensionDeliveryService {
     const parsedId = logicalDeliveryIdSchema.parse(logicalDeliveryId);
     const delivery = [...this.deliveries.values()].find((candidate) =>
       candidate.logical_delivery_id === parsedId);
-    return delivery ? clone(delivery) : null;
+    if (delivery) return clone(delivery);
+    const notification = await this.getFailureNotification(parsedId);
+    if (notification) return notification;
+    if (!reviewDeliveryIdSchema.safeParse(parsedId).success) return null;
+    const review = await findReviewDelivery(this.storageRoot, parsedId);
+    return review?.extension_transport === undefined ? null : restoredTransport(review);
   }
 
   public async awaitResult(deliveryId: string, timeoutMs: number): Promise<ExtensionDeliveryReceipt | null> {
@@ -497,8 +563,8 @@ export class ExtensionDeliveryService {
     const registration = await this.exclusive<{
       readonly receipt: ExtensionDeliveryReceipt | null;
       readonly pending: Promise<ExtensionDeliveryReceipt | null> | null;
-    }>(() => {
-      const delivery = this.deliveries.get(parsedDeliveryId);
+    }>(async () => {
+      const delivery = this.deliveries.get(parsedDeliveryId) ?? await this.get(parsedDeliveryId);
       if (delivery?.receipt || timeoutMs <= 0) {
         return Promise.resolve({
           receipt: delivery?.receipt ? clone(delivery.receipt) : null,
@@ -599,8 +665,8 @@ export class ExtensionDeliveryService {
     await chmod(directory, 0o700);
     try {
       await writeFile(temporary, snapshot, { encoding: "utf8", mode: 0o600 });
+      await chmod(temporary, 0o600);
       await rename(temporary, this.file);
-      await chmod(this.file, 0o600);
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
     }

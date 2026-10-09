@@ -206,7 +206,7 @@ function stableIdentity(kind: string, loopId: string, iteration: number): string
   return `auto-${kind}-${digest}`;
 }
 
-function executionFailureNotificationId(loop: Pick<AutoIteration, "loop_id" | "iteration" | "execution_id">): string {
+export function executionFailureNotificationId(loop: Pick<AutoIteration, "loop_id" | "iteration" | "execution_id">): string {
   const digest = createHash("sha256")
     .update(`${loop.loop_id}\0${loop.iteration}\0${loop.execution_id}\0execution-failure-notification`)
     .digest("hex")

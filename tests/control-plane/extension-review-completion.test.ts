@@ -41,6 +41,52 @@ afterEach(async () => {
 });
 
 describe("ExtensionReviewCompletionService", () => {
+  it("restores queued and expired collection targets and fences recovery failure identity", async () => {
+    vi.useFakeTimers();
+    const { root, completions } = await service();
+    const queued = await completions.enqueue(input);
+    expect(await completions.recoveryTargets()).toEqual([]);
+    const pending = completions.awaitResult(queued.completion_id, 120_000);
+    await vi.waitFor(async () => expect(await completions.recoveryTargets()).toHaveLength(1));
+    expect(await completions.recoveryTargets()).toEqual([{ completion_id: queued.completion_id, conversation_id: input.conversation_id }]);
+    await completions.claim(owner);
+    expect(await completions.recoveryTargets()).toEqual([]);
+    vi.advanceTimersByTime(30001);
+    expect(await completions.recoveryTargets()).toHaveLength(1);
+    await expect(completions.reportRecoveryFailure({ completion_id: queued.completion_id,
+      conversation_id: "wrong", code: "TARGET_CONVERSATION_NOT_FOUND" })).rejects.toBeInstanceOf(ExtensionReviewCompletionConflictError);
+    await completions.reportRecoveryFailure({ completion_id: queued.completion_id,
+      conversation_id: input.conversation_id, code: "TARGET_CONVERSATION_NAVIGATION_FAILED" });
+    const restarted = new ExtensionReviewCompletionService(root);
+    expect(await restarted.recoveryTargets()).toEqual([]);
+    const recovered = restarted.awaitResult(queued.completion_id, 120_000);
+    await vi.waitFor(async () => expect(await restarted.recoveryTargets()).toHaveLength(1));
+    await restarted.claim({ ...owner, document_id: "recovered-document" });
+    await restarted.acknowledge({ ...owner, document_id: "recovered-document", completion_id: queued.completion_id,
+      status: "completed", assistant_message_id: "assistant-final", content: "collected" });
+    await restarted.reportRecoveryFailure({ completion_id: queued.completion_id,
+      conversation_id: input.conversation_id, code: "TARGET_CONVERSATION_AUTH_REQUIRED" });
+    expect(await restarted.recoveryTargets()).toEqual([]);
+    expect((await restarted.get(queued.completion_id))?.phase).toBe("completed");
+    expect((await recovered)?.status).toBe("completed");
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(await pending).toBeNull();
+  });
+  it("stops reopening a retained diagnostic when its collector times out", async () => {
+    vi.useFakeTimers();
+    const { root, completions } = await service();
+    const queued = await completions.enqueue(input);
+    const pending = completions.awaitResult(queued.completion_id, 1_000);
+    await vi.waitFor(async () => expect(await completions.recoveryTargets()).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await pending).toBeNull();
+    expect(await completions.recoveryTargets()).toEqual([]);
+    const before = await readFile(extensionReviewCompletionStateFile(root), "utf8");
+    const restored = new ExtensionReviewCompletionService(root);
+    expect(await restored.recoveryTargets()).toEqual([]);
+    expect((await restored.get(queued.completion_id))?.phase).toBe("queued");
+    expect(await readFile(extensionReviewCompletionStateFile(root), "utf8")).toBe(before);
+  });
   it("durably enqueues one queued watch and coalesces only the exact identity", async () => {
     const { root, completions } = await service();
     const first = await completions.enqueue(input);

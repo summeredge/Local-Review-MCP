@@ -7,6 +7,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { bridgePort, conversationDeliveryReadiness, startBridge, stopBridge } from "../src/control-plane/bridge.js";
 import { DispatchCommandBroker } from "../src/control-plane/dispatch-command-broker.js";
 import { ExtensionDeliveryService } from "../src/control-plane/extension-delivery.js";
+import { ExtensionReviewCompletionService } from "../src/control-plane/extension-review-completion.js";
 import { ExtensionDeliveryAdapter } from "../src/delivery/extension-delivery-adapter.js";
 import type { ReviewDeliveryRequest } from "../src/delivery/review-delivery-adapter.js";
 
@@ -32,13 +33,17 @@ async function setup(timeoutMs = 1000) {
   const root = await mkdtemp(join(tmpdir(), "lrm-conversation-recovery-"));
   roots.push(root);
   const deliveries = new ExtensionDeliveryService(root);
+  const completions = new ExtensionReviewCompletionService(root);
   const connect = async (service: ExtensionDeliveryService) => {
     // Avoid Fetch-forbidden random ephemeral ports; these are separate from production ports.
     await startBridge({ ports: [18081, 18082, 18083, 18084, 18085],
       claimExtensionDelivery: claim => service.claim(claim),
       ackExtensionDelivery: ack => service.acknowledge(ack),
-      conversationRecoveryTargets: () => service.recoveryTargets(),
-      reportConversationRecoveryFailure: failure => service.reportRecoveryFailure(failure),
+      claimExtensionReviewCompletion: claim => completions.claim(claim),
+      ackExtensionReviewCompletion: ack => completions.acknowledge(ack),
+      conversationRecoveryTargets: async () => [...await service.recoveryTargets(), ...await completions.recoveryTargets()],
+      reportConversationRecoveryFailure: failure => "completion_id" in failure
+        ? completions.reportRecoveryFailure(failure) : service.reportRecoveryFailure(failure),
     });
     const response = await bridgeFetch(`http://127.0.0.1:${bridgePort()}/pair`, {
       method: "POST", body: "{}", headers: { "x-lrm-bridge-protocol": "3" },
@@ -52,7 +57,7 @@ async function setup(timeoutMs = 1000) {
   const adapter = (service = deliveries, dispatchTimeoutMs = timeoutMs) => new ExtensionDeliveryAdapter(new DispatchCommandBroker(service, {
     timeoutMs: dispatchTimeoutMs, readiness: conversationDeliveryReadiness,
   }));
-  return { root, deliveries, token, request, adapter, connect };
+  return { root, deliveries, completions, token, request, adapter, connect };
 }
 
 function bridgeFetch(input: string, init: RequestInit = {}) {
@@ -129,6 +134,7 @@ function background(state: ReturnType<typeof browser>) {
 function content(worker: ReturnType<typeof background>, options: {
   state?: ReturnType<typeof browser>; tabId?: number; href?: string; canonical?: string | null;
   senderUrl?: string; localId?: boolean;
+  completionMessages?: Record<string, unknown>[];
 } = {}) {
   const messages: Record<string, unknown>[] = [];
   const dom = {
@@ -146,7 +152,7 @@ function content(worker: ReturnType<typeof background>, options: {
   const section = { getAttribute: () => null, __reactFiber$test: {
     get memoizedProps() {
       return { conversation: { id: options.localId ? "WEB:32ca0d45-8b29-414a-bbe4-8e26c3aae911" : canonical,
-        serverId$: () => canonical }, turn: { messages: [] } };
+        serverId$: () => canonical }, turn: { messages: options.completionMessages ?? [] } };
     }, return: null,
   } };
   const intervals: Array<() => void> = [];
@@ -177,6 +183,71 @@ function content(worker: ReturnType<typeof background>, options: {
 }
 
 describe("conversation recovery through the production Extension transport", () => {
+  it("does not reopen abandoned diagnostic watches on repeated worker alarms", async () => {
+    const f = await setup();
+    const watch = await f.completions.enqueue({ workspace_id: f.request.workspace_id, task_id: f.request.task_id,
+      review_request_id: "diagnostic-review-abandoned", review_delivery_id: f.request.delivery_id,
+      conversation_id: conversation, expected_user_message_id: "user-sent" });
+    await f.completions.reportRecoveryFailure({ completion_id: watch.completion_id,
+      conversation_id: conversation, code: "TARGET_CONVERSATION_NAVIGATION_FAILED" });
+    const state = browser();
+    Object.assign(state.storage, { port: bridgePort(), token: f.token });
+    const worker = background(state);
+    await vi.waitFor(() => expect(worker.requests).toBe(1));
+    for (let count = 2; count <= 4; count++) {
+      worker.wake();
+      await vi.waitFor(() => expect(worker.requests).toBe(count));
+    }
+    expect(state.created).not.toHaveBeenCalled();
+    expect((await f.completions.get(watch.completion_id))?.phase).toBe("queued");
+  });
+  it("validates Completion recovery reports through the authenticated Bridge", async () => {
+    const f = await setup();
+    const watch = await f.completions.enqueue({ workspace_id: f.request.workspace_id, task_id: f.request.task_id,
+      review_request_id: f.request.review_request_id, review_delivery_id: f.request.delivery_id,
+      conversation_id: conversation, expected_user_message_id: "user-sent" });
+    const pending = f.completions.awaitResult(watch.completion_id, 100);
+    await vi.waitFor(async () => expect(await f.completions.recoveryTargets()).toHaveLength(1));
+    const headers = { "x-lrm-bridge-protocol": "3", authorization: `Bearer ${f.token}` };
+    const url = `http://127.0.0.1:${bridgePort()}`;
+    const targets = await bridgeFetch(`${url}/delivery/recovery-targets`, { method: "POST", headers, body: "{}" });
+    expect(await targets.json()).toEqual({ targets: [{ completion_id: watch.completion_id, conversation_id: conversation }] });
+    expect((await bridgeFetch(`${url}/delivery/recovery-failure`, { method: "POST", headers, body: JSON.stringify({
+      completion_id: watch.completion_id, conversation_id: "wrong", code: "TARGET_CONVERSATION_NOT_FOUND" }) })).status).toBe(409);
+    expect((await bridgeFetch(`${url}/delivery/recovery-failure`, { method: "POST", headers, body: JSON.stringify({
+      completion_id: watch.completion_id, conversation_id: conversation, code: "TARGET_CONVERSATION_AUTH_REQUIRED" }) })).status).toBe(200);
+    expect(await f.completions.recoveryTargets()).toEqual([]);
+    expect((await f.completions.get(watch.completion_id))?.phase).toBe("queued");
+    expect(await f.deliveries.getByLogicalDeliveryId(f.request.delivery_id)).toBeNull();
+    expect(await pending).toBeNull();
+  });
+  it.each(["closed", "navigated"])("recovers completion on a %s page without sending Review again", async stateOfPage => {
+    const f = await setup(3000);
+    const sent = await f.deliveries.enqueue(conversation, f.request.message!, f.request.delivery_id);
+    await f.deliveries.claim(owner);
+    await f.deliveries.acknowledge({ ...owner, delivery_id: sent.delivery_id, status: "sent", message_id: "user-sent" });
+    const watch = await f.completions.enqueue({ workspace_id: f.request.workspace_id, task_id: f.request.task_id,
+      review_request_id: f.request.review_request_id, review_delivery_id: f.request.delivery_id,
+      conversation_id: conversation, expected_user_message_id: "user-sent" });
+    const pending = f.completions.awaitResult(watch.completion_id, 3000);
+    await vi.waitFor(async () => expect(await f.completions.recoveryTargets()).toHaveLength(1));
+    const state = browser();
+    if (stateOfPage === "navigated") state.tabs.push({ id: 1, url: "https://chatgpt.com/c/conversation-other" });
+    Object.assign(state.storage, { port: bridgePort(), token: f.token });
+    const worker = background(state);
+    await vi.waitFor(() => expect(state.created).toHaveBeenCalledOnce());
+    const recovered = content(worker, { state, tabId: state.tabs.at(-1)!.id, completionMessages: [
+      { id: "user-sent", author: { role: "user" }, recipient: "all", content: { content_type: "text", parts: [f.request.message] } },
+      { id: "assistant-final", author: { role: "assistant" }, recipient: "all", status: "finished_successfully", end_turn: true,
+        content: { content_type: "text", parts: ["Review complete"] }, metadata: { parent_id: "user-sent", turn_exchange_id: "exchange-1" } },
+    ] });
+    await vi.waitFor(async () => expect((await f.completions.get(watch.completion_id))?.phase).toBe("completed"), { timeout: 3000 });
+    expect(recovered.dom.send).not.toHaveBeenCalled();
+    expect(recovered.dom.insertPrompt).not.toHaveBeenCalled();
+    expect(await f.deliveries.recoveryTargets()).toEqual([]);
+    expect(await f.completions.recoveryTargets()).toEqual([]);
+    expect((await pending)?.status).toBe("completed");
+  });
   it("recovers the original conversation after its live document navigates elsewhere during execution", async () => {
     const f = await setup(3000);
     const state = browser();
