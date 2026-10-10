@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { defaultTaskContextStorageRoot } from "../context/task.js";
 import { workspaceIdSchema } from "../context/schema.js";
@@ -40,6 +41,8 @@ import type {
 export const PENDING_GOAL_SUBMISSION_TTL_MS = 2 * 60 * 1000;
 const PENDING_IDENTITY_TIMEOUT_ENV = "LRM_PENDING_IDENTITY_TIMEOUT_MS";
 
+const IDENTITY_RESOLUTION_RETRY_DELAYS_MS = [50, 100, 250, 500, 1_000] as const;
+const IDENTITY_RESOLUTION_DEFER_MS = 5_000;
 const STATE_SCHEMA_VERSION = 1;
 const MAX_PENDING_GOAL_SUBMISSIONS = 10_000;
 const TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -141,6 +144,10 @@ function errorCode(error: unknown): string | undefined {
   return error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
 }
 
+function transientFilesystemError(error: unknown): boolean {
+  return ["EPERM", "EACCES", "EBUSY"].includes(errorCode(error) ?? "");
+}
+
 function errorMessage(error: unknown): string {
   const message = error instanceof Error && error.message !== "" ? error.message : String(error);
   return message.slice(0, 4_000) || "pending Goal submission failed";
@@ -235,6 +242,11 @@ export class PendingGoalSubmissionService {
   // ponytail: process-local serialization; add an inter-process lock only if multiple runtimes share one state root.
   private operationQueue: Promise<void> = Promise.resolve();
   private readonly scheduled = new Map<string, Promise<void>>();
+  private readonly deferredResolves = new Map<string, NodeJS.Timeout>();
+  private recovery: Promise<void> | null = null;
+  private recoveryTimer: NodeJS.Timeout | undefined;
+  private recoveryDeadline: number | undefined;
+  private recoveryDelayMs = 1_000;
 
   public constructor(
     correlations: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation" | "observe">,
@@ -254,7 +266,10 @@ export class PendingGoalSubmissionService {
   }
 
   public restore(): Promise<void> {
-    this.restorePromise ??= this.exclusive(() => this.restoreOnce());
+    this.restorePromise ??= this.exclusive(() => this.restoreOnce()).catch((error: unknown) => {
+      if (transientFilesystemError(error)) this.restorePromise = null;
+      throw error;
+    });
     return this.restorePromise;
   }
 
@@ -356,7 +371,7 @@ export class PendingGoalSubmissionService {
 
   public scheduleResolve(correlationKey: string): void {
     const parsed = correlationKeySchema.safeParse(correlationKey);
-    if (!parsed.success || this.scheduled.has(parsed.data)) return;
+    if (!parsed.success || this.scheduled.has(parsed.data) || this.deferredResolves.has(parsed.data)) return;
     this.traceTransport({
       event: "connector_resolve_called",
       correlation_key: parsed.data,
@@ -364,7 +379,16 @@ export class PendingGoalSubmissionService {
     });
     const work = this.resolve(parsed.data)
       .catch((error: unknown) => {
-        console.warn("Pending Goal submission resolution failed:", errorMessage(error));
+        console.warn(`Pending Goal submission resolution failed for ${parsed.data} (${errorCode(error) ?? "unknown"}):`, errorMessage(error));
+        const current = this.submissions.get(parsed.data);
+        if (!transientFilesystemError(error) || current?.state !== "pending_identity"
+          || isExpired(current, this.currentTime()) || this.correlations.correlation(parsed.data) === null) return;
+        const timer = setTimeout(() => {
+          this.deferredResolves.delete(parsed.data);
+          this.scheduleResolve(parsed.data);
+        }, Math.min(IDENTITY_RESOLUTION_DEFER_MS, Date.parse(current.expires_at) - this.currentTime()));
+        timer.unref?.();
+        this.deferredResolves.set(parsed.data, timer);
       })
       .finally(() => {
         this.scheduled.delete(parsed.data);
@@ -407,6 +431,30 @@ export class PendingGoalSubmissionService {
 
   public async resolve(correlationKey: string): Promise<void> {
     const key = correlationKeySchema.parse(correlationKey);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await this.resolveOnce(key);
+        return;
+      } catch (error: unknown) {
+        const current = this.submissions.get(key);
+        const retryDelay = IDENTITY_RESOLUTION_RETRY_DELAYS_MS[attempt];
+        if (!transientFilesystemError(error)
+          || current?.state !== "pending_identity" || this.correlations.correlation(key) === null) throw error;
+        if (isExpired(current, this.currentTime())) {
+          await this.expire(key);
+          return;
+        }
+        if (retryDelay === undefined) throw error;
+        console.warn(
+          `Pending Goal identity resolution retry ${attempt + 1} for ${key} (${errorCode(error)}):`,
+          errorMessage(error),
+        );
+        await delay(Math.min(retryDelay, Date.parse(current.expires_at) - this.currentTime()));
+      }
+    }
+  }
+
+  private async resolveOnce(key: string): Promise<void> {
     await this.restore();
     this.traceTransport({
       event: "evidence_resolve_attempted",
@@ -515,8 +563,47 @@ export class PendingGoalSubmissionService {
     }
   }
 
-  public async recover(): Promise<void> {
-    await this.restore();
+  public recover(): Promise<void> {
+    if (this.recovery !== null) return this.recovery;
+    clearTimeout(this.recoveryTimer);
+    this.recoveryTimer = undefined;
+    this.recoveryDeadline ??= this.currentTime() + this.identityTimeoutMs;
+    this.recovery = this.recoverOnce().then(() => {
+      this.recoveryDeadline = undefined;
+      this.recoveryDelayMs = 1_000;
+    }).catch((error: unknown) => {
+      const remaining = this.recoveryDeadline! - this.currentTime();
+      console.warn(`Pending Goal startup recovery failed (${errorCode(error) ?? "unknown"}):`, errorMessage(error));
+      if (transientFilesystemError(error) && remaining > 0) {
+        this.recoveryTimer = setTimeout(() => {
+          this.recoveryTimer = undefined;
+          if (this.currentTime() >= this.recoveryDeadline!) {
+            console.warn("Pending Goal startup recovery deadline exhausted; durable records remain unchanged.");
+            this.recoveryDeadline = undefined;
+            this.recoveryDelayMs = 1_000;
+            return;
+          }
+          void this.recover().catch(() => undefined);
+        }, Math.min(this.recoveryDelayMs, remaining));
+        this.recoveryTimer.unref?.();
+        this.recoveryDelayMs = Math.min(this.recoveryDelayMs * 2, 10_000);
+      } else {
+        this.recoveryDeadline = undefined;
+        this.recoveryDelayMs = 1_000;
+      }
+      throw error;
+    }).finally(() => { this.recovery = null; });
+    return this.recovery;
+  }
+
+  private async recoverOnce(): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      try { await this.restore(); break; }
+      catch (error: unknown) {
+        if (!transientFilesystemError(error) || attempt >= 2) throw error;
+        await delay(50 * (attempt + 1));
+      }
+    }
     const pending = await this.exclusive(async () => {
       const now = this.currentTime();
       const next = new Map(this.submissions);
@@ -835,6 +922,11 @@ export class PendingGoalSubmissionService {
   }
 
   private cancelExpiry(correlationKey: string): void {
+    const recovery = this.deferredResolves.get(correlationKey);
+    if (recovery !== undefined) {
+      clearTimeout(recovery);
+      this.deferredResolves.delete(correlationKey);
+    }
     const timer = this.expiryTimers.get(correlationKey);
     if (timer === undefined) return;
     clearTimeout(timer);
@@ -852,8 +944,8 @@ export class PendingGoalSubmissionService {
     await chmod(directory, 0o700);
     try {
       await writeFile(temporary, snapshot, { encoding: "utf8", mode: 0o600 });
+      await chmod(temporary, 0o600);
       await rename(temporary, this.file);
-      await chmod(this.file, 0o600);
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
     }

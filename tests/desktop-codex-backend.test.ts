@@ -1684,3 +1684,38 @@ it.each(["passed", "failed"] as const)("restarts from durable %s with an unsynch
     } finally { await restarted.close(); }
   } finally { spy.mockRestore(); auto.dispose(); await value.backend.close(); }
 });
+
+it("recovers Pending identity persistence before desktop Interactive dispatch without a duplicate start", async () => {
+  const value = await fixture();
+  const correlations = new ConversationCorrelationRegistry(value.root);
+  const goals = new GoalOrchestrationService(value.registry, { storageRoot: value.root,
+    controlledActuation: value.controlled, authorizationStore: value.controlled.authorizationStore });
+  const submission = new GoalSubmissionService(goals, { checkGoalPreflight: async input => ({ ready: true,
+    runtime: { ready: true }, connector: { ready: true }, extension: { ready: true },
+    workspace: { valid: true, workspace_id: input.workspace_id }, conversation: { valid: true, conversation_id: input.conversation_id } }) });
+  const pending = new PendingGoalSubmissionService(correlations, submission, { storageRoot: value.root,
+    browserReadiness: () => ({ ready: true, readiness_state: "ready" }) });
+  const key = "00000000-0000-4000-8000-000000000098";
+  const proof = { request_id: key, conversation_id: "conversation-001", document_id: "document-1", navigation_epoch: 1 };
+  const persistence = pending as unknown as { persist(records: Map<string, { state: string }>): Promise<void> };
+  const persist = persistence.persist.bind(pending);
+  let failures = 0;
+  const spy = vi.spyOn(persistence, "persist").mockImplementation(async records => {
+    if (records.get(key)?.state === "starting" && failures++ < 2) throw Object.assign(new Error("Pending publish locked"), { code: "EPERM" });
+    await persist(records);
+  });
+  try {
+    await pending.accept({ correlation_key: key, workspace_id: "workspace-a", title: "Interactive identity retry",
+      goal: "Start once", requirements: ["Use interactive"], acceptance_criteria: ["No duplicate dispatch"], execution_mode: "interactive" });
+    await pending.receiveIdentityEvidence(proof);
+    await vi.waitFor(async () => expect((await pending.get(key))?.state).toBe("started"));
+    await Promise.all([pending.resolve(key), pending.resolve(key), pending.receiveIdentityEvidence(proof)]);
+    expect(value.cliStart).not.toHaveBeenCalled();
+    expect(value.appServerStart).not.toHaveBeenCalled();
+    expect(value.desktop.createThreadCount()).toBe(1);
+    expect(await value.sessions.listSessions()).toHaveLength(1);
+    const record = (await pending.get(key))!;
+    if (record.state !== "started") throw new Error("Pending did not start");
+    expect(await value.executions.listExecutions("workspace-a", record.task_id)).toHaveLength(1);
+  } finally { spy.mockRestore(); await value.service.close(); }
+});

@@ -494,10 +494,10 @@ export class ExtensionDeliveryService {
     const delivery = this.deliveries.get(z.string().uuid().parse(deliveryId));
     if (delivery) return clone(delivery);
     const review = await findReviewTransport(join(this.storageRoot, REVIEW_DELIVERIES_DIRECTORY), reviewDeliverySchema,
-      record => restoredTransport(record).delivery_id === deliveryId);
+      record => (record.extension_transport as { delivery_id?: string } | undefined)?.delivery_id === deliveryId, undefined, deliveryId);
     if (review) return restoredTransport(review);
     const execution = await findExecutionTransport(this.storageRoot, record => Object.values(record.extension_transport ?? {})
-      .some(transport => deliverySchema.parse(transport).delivery_id === deliveryId));
+      .some(transport => (transport as { delivery_id?: string } | null)?.delivery_id === deliveryId), deliveryId);
     const transport = Object.values(execution?.extension_transport ?? {}).map(value => deliverySchema.parse(value))
       .find(candidate => candidate.delivery_id === deliveryId);
     return transport?.logical_delivery_id === undefined ? null : this.getFailureNotification(transport.logical_delivery_id);

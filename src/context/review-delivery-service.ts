@@ -1,3 +1,5 @@
+import { ZodError } from "zod";
+import { atomicWriteRecord, serializeRecord } from "./record-store.js";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { validateWorkspaceIdentityConsistency } from "../workspace/identity.js";
@@ -64,7 +66,7 @@ export class ReviewDeliveryService {
     this.assertRoutingLinks(parsed, routing);
     await this.routings.validateRouting(routing, this.runtimeIdentity);
 
-    const existing = await this.findDeliveryByRouting(parsed.workspace_id, parsed.routing_id);
+    const existing = await this.findDelivery(parsed.workspace_id, "routing_id", parsed.routing_id);
     if (existing !== null) {
       if (parsed.delivery_id !== undefined && parsed.delivery_id !== existing.delivery_id) {
         throw new Error(
@@ -132,8 +134,8 @@ export class ReviewDeliveryService {
     routingId: string,
   ): Promise<ReviewDelivery | null> {
     this.validateRuntimeIdentity(workspaceId, this.runtimeIdentity);
-    return this.findDeliveryByRouting(
-      workspaceId,
+    return this.findDelivery(
+      workspaceId, "routing_id",
       conversationRoutingIdSchema.parse(routingId),
     );
   }
@@ -143,8 +145,8 @@ export class ReviewDeliveryService {
     reviewRequestId: string,
   ): Promise<ReviewDelivery | null> {
     this.validateRuntimeIdentity(workspaceId, this.runtimeIdentity);
-    return this.findDeliveryByReviewRequest(
-      workspaceId,
+    return this.findDelivery(
+      workspaceId, "review_request_id",
       reviewRequestIdSchema.parse(reviewRequestId),
     );
   }
@@ -153,20 +155,22 @@ export class ReviewDeliveryService {
     workspaceId: string,
     deliveryId: string,
   ): Promise<ReviewDelivery> {
-    const current = await this.requiredDelivery(workspaceId, deliveryId);
-    await this.validateDelivery(current, this.runtimeIdentity);
-    if (current.status !== "pending" && current.status !== "failed") {
-      throw new Error(`Review delivery cannot begin from status "${current.status}".`);
-    }
+    return serializeRecord(reviewDeliveryFile(this.storageRoot, workspaceId, deliveryId), async () => {
+      const current = await this.requiredDelivery(workspaceId, deliveryId);
+      await this.validateDelivery(current, this.runtimeIdentity);
+      if (current.status !== "pending" && current.status !== "failed") {
+        throw new Error(`Review delivery cannot begin from status "${current.status}".`);
+      }
 
-    const { last_error: _lastError, delivered_at: _deliveredAt, ...base } = current;
-    const next = reviewDeliverySchema.parse({
-      ...base,
-      status: "delivering",
-      attempt_count: current.attempt_count + 1,
-      updated_at: new Date().toISOString(),
+      const { last_error: _lastError, delivered_at: _deliveredAt, ...base } = current;
+      const next = reviewDeliverySchema.parse({
+        ...base,
+        status: "delivering",
+        attempt_count: current.attempt_count + 1,
+        updated_at: new Date().toISOString(),
+      });
+      return this.saveUpdatedDelivery(next);
     });
-    return this.saveUpdatedDelivery(next);
   }
 
   public async markDelivered(
@@ -174,21 +178,23 @@ export class ReviewDeliveryService {
     deliveryId: string,
     deliveredAt?: string,
   ): Promise<ReviewDelivery> {
-    const current = await this.requiredDelivery(workspaceId, deliveryId);
-    await this.validateDelivery(current, this.runtimeIdentity);
-    if (current.status !== "delivering") {
-      throw new Error(`Review delivery cannot be marked delivered from status "${current.status}".`);
-    }
+    return serializeRecord(reviewDeliveryFile(this.storageRoot, workspaceId, deliveryId), async () => {
+      const current = await this.requiredDelivery(workspaceId, deliveryId);
+      await this.validateDelivery(current, this.runtimeIdentity);
+      if (current.status !== "delivering") {
+        throw new Error(`Review delivery cannot be marked delivered from status "${current.status}".`);
+      }
 
-    const { last_error: _lastError, delivered_at: _previousDeliveredAt, ...base } = current;
-    const timestamp = reviewDeliveryTimestampSchema.parse(deliveredAt ?? new Date().toISOString());
-    const next = reviewDeliverySchema.parse({
-      ...base,
-      status: "delivered",
-      updated_at: timestamp,
-      delivered_at: timestamp,
+      const { last_error: _lastError, delivered_at: _previousDeliveredAt, ...base } = current;
+      const timestamp = reviewDeliveryTimestampSchema.parse(deliveredAt ?? new Date().toISOString());
+      const next = reviewDeliverySchema.parse({
+        ...base,
+        status: "delivered",
+        updated_at: timestamp,
+        delivered_at: timestamp,
+      });
+      return this.saveUpdatedDelivery(next);
     });
-    return this.saveUpdatedDelivery(next);
   }
 
   public async markFailed(
@@ -213,21 +219,23 @@ export class ReviewDeliveryService {
     status: "failed" | "ambiguous",
     error: ReviewDeliveryError,
   ): Promise<ReviewDelivery> {
-    const current = await this.requiredDelivery(workspaceId, deliveryId);
-    await this.validateDelivery(current, this.runtimeIdentity);
-    if (current.status !== "delivering") {
-      throw new Error(`Review delivery cannot be marked ${status} from status "${current.status}".`);
-    }
+    return serializeRecord(reviewDeliveryFile(this.storageRoot, workspaceId, deliveryId), async () => {
+      const current = await this.requiredDelivery(workspaceId, deliveryId);
+      await this.validateDelivery(current, this.runtimeIdentity);
+      if (current.status !== "delivering") {
+        throw new Error(`Review delivery cannot be marked ${status} from status "${current.status}".`);
+      }
 
-    const parsedError = markReviewDeliveryFailedInputSchema.parse(error);
-    const { last_error: _previousError, delivered_at: _deliveredAt, ...base } = current;
-    const next = reviewDeliverySchema.parse({
-      ...base,
-      status,
-      last_error: parsedError,
-      updated_at: new Date().toISOString(),
+      const parsedError = markReviewDeliveryFailedInputSchema.parse(error);
+      const { last_error: _previousError, delivered_at: _deliveredAt, ...base } = current;
+      const next = reviewDeliverySchema.parse({
+        ...base,
+        status,
+        last_error: parsedError,
+        updated_at: new Date().toISOString(),
+      });
+      return this.saveUpdatedDelivery(next);
     });
-    return this.saveUpdatedDelivery(next);
   }
 
   public async validateDelivery(
@@ -249,59 +257,48 @@ export class ReviewDeliveryService {
 
   private async saveUpdatedDelivery(delivery: ReviewDelivery): Promise<ReviewDelivery> {
     try {
-      await writeFile(
-        reviewDeliveryFile(this.storageRoot, delivery.workspace_id, delivery.delivery_id),
-        json(delivery),
-        { encoding: "utf8", mode: 0o600 },
-      );
+      await atomicWriteRecord(reviewDeliveryFile(this.storageRoot, delivery.workspace_id, delivery.delivery_id), json(delivery));
     } catch (error: unknown) {
       throw new Error("Review delivery could not be saved.", { cause: error });
     }
     return delivery;
   }
 
-  private async findDeliveryByRouting(
-    workspaceId: string,
-    routingId: string,
+  private async findDelivery(
+    workspaceId: string, field: "routing_id" | "review_request_id", id: string,
   ): Promise<ReviewDelivery | null> {
     const directory = reviewDeliveriesDirectory(this.storageRoot, workspaceId);
     let entries;
-    try {
-      entries = await readdir(directory, { withFileTypes: true });
-    } catch (error: unknown) {
-      if (errorCode(error) === "ENOENT") return null;
-      throw new Error("Review deliveries could not be inspected.", { cause: error });
-    }
-
+    try { entries = await readdir(directory, { withFileTypes: true }); }
+    catch (error: unknown) { if (errorCode(error) === "ENOENT") return null; throw error; }
+    let found: ReviewDelivery | null = null;
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-      const deliveryId = entry.name.slice(0, -".json".length);
-      const delivery = await this.getDelivery(workspaceId, deliveryId);
-      if (delivery?.routing_id === routingId) return delivery;
+      const file = join(directory, entry.name);
+      const contents = await readFile(file, "utf8");
+      let raw: Record<string, unknown>;
+      try { raw = JSON.parse(contents) as Record<string, unknown>; }
+      catch (error: unknown) {
+        if (!(error instanceof SyntaxError) || new RegExp('"' + field + '"\\s*:\\s*' + JSON.stringify(id).replaceAll(".", "\\.")).test(contents)) throw error;
+        console.warn("Invalid historical Review Delivery JSON skipped", file);
+        continue;
+      }
+      const target = raw?.[field] === id;
+      let delivery: ReviewDelivery;
+      try { delivery = reviewDeliverySchema.parse(raw); }
+      catch (error: unknown) {
+        if (target || !(error instanceof ZodError)) throw error;
+        console.warn("Invalid historical Review Delivery schema skipped", file);
+        continue;
+      }
+      if (!target) continue;
+      if (delivery.workspace_id !== workspaceId || delivery.delivery_id !== entry.name.slice(0, -5)) {
+        throw new Error("Review delivery does not match the requested identity.");
+      }
+      if (found !== null) throw new Error("Multiple Review deliveries match the requested identity.");
+      found = delivery;
     }
-    return null;
-  }
-
-  private async findDeliveryByReviewRequest(
-    workspaceId: string,
-    reviewRequestId: string,
-  ): Promise<ReviewDelivery | null> {
-    const directory = reviewDeliveriesDirectory(this.storageRoot, workspaceId);
-    let entries;
-    try {
-      entries = await readdir(directory, { withFileTypes: true });
-    } catch (error: unknown) {
-      if (errorCode(error) === "ENOENT") return null;
-      throw new Error("Review deliveries could not be inspected.", { cause: error });
-    }
-
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-      const deliveryId = entry.name.slice(0, -".json".length);
-      const delivery = await this.getDelivery(workspaceId, deliveryId);
-      if (delivery?.review_request_id === reviewRequestId) return delivery;
-    }
-    return null;
+    return found;
   }
 
   private async routingForDelivery(

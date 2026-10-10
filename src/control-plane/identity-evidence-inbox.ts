@@ -43,6 +43,11 @@ export class IdentityEvidenceInbox {
       this.entries = entries;
       await this.prune();
       this.scheduleExpiry();
+    }).catch((error: unknown) => {
+      if (error instanceof Error && ["EPERM", "EACCES", "EBUSY"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+        this.restored = undefined;
+      }
+      throw error;
     });
     return this.restored;
   }

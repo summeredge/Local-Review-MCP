@@ -1,7 +1,7 @@
-import { randomUUID } from "node:crypto";
-import { chmod, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import type { ZodType } from "zod";
+import { atomicWriteRecord, serializeRecord } from "../context/record-store.js";
+import { readFile, readdir } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { ZodError, type ZodType } from "zod";
 import { ReviewDeliveryService } from "../context/review-delivery-service.js";
 import { REVIEW_DELIVERIES_DIRECTORY, type ReviewDelivery } from "../context/review-delivery.js";
 import { ExecutionContextService } from "../context/execution-service.js";
@@ -19,12 +19,15 @@ async function entries(directory: string) {
 
 export async function findReviewDelivery(storageRoot: string, deliveryId: string): Promise<ReviewDelivery | null> {
   const service = new ReviewDeliveryService(storageRoot);
+  let found: ReviewDelivery | null = null;
   for (const workspace of await entries(join(storageRoot, REVIEW_DELIVERIES_DIRECTORY))) {
     if (!workspace.isDirectory()) continue;
     const delivery = await service.getDelivery(workspace.name, deliveryId);
-    if (delivery !== null) return delivery;
+    if (delivery === null) continue;
+    if (found !== null) throw new Error("Multiple historical Review deliveries match the identity.");
+    found = delivery;
   }
-  return null;
+  return found;
 }
 
 export async function findExecutionFailure(storageRoot: string, logicalId: string) {
@@ -45,38 +48,67 @@ export async function findExecutionFailure(storageRoot: string, logicalId: strin
   return execution?.status === "failed" ? { loop, execution } : null;
 }
 
-export async function findExecutionTransport(storageRoot: string, matches: (execution: ExecutionContext) => boolean): Promise<ExecutionContext | null> {
+export async function findExecutionTransport(storageRoot: string, matches: (execution: ExecutionContext) => boolean, transportId?: string): Promise<ExecutionContext | null> {
   const directory = join(storageRoot, TASK_EXECUTIONS_DIRECTORY);
+  let found: ExecutionContext | null = null;
   for (const workspace of await entries(directory)) {
     if (!workspace.isDirectory()) continue;
-    const execution = await findReviewTransport(join(directory, workspace.name), executionContextSchema, matches);
-    if (execution) return execution;
+    const execution = await findReviewTransport(join(directory, workspace.name), executionContextSchema, matches, undefined, transportId);
+    if (execution === null) continue;
+    if (found !== null) throw new Error("Multiple historical Executions match the transport identity.");
+    found = execution;
   }
-  return null;
+  return found;
 }
 
 export async function findReviewTransport<T extends { extension_transport?: unknown }>(
-  directory: string, schema: ZodType<T>, matches: (record: T) => boolean,
+  directory: string, schema: ZodType<T>, matches: (record: T) => boolean, workspaceId?: string, targetId?: string,
 ): Promise<T | null> {
+  let found: T | null = null;
   for (const workspace of await entries(directory)) {
-    if (!workspace.isDirectory()) continue;
+    if (!workspace.isDirectory() || (workspaceId !== undefined && workspace.name !== workspaceId)) continue;
     for (const file of await entries(join(directory, workspace.name))) {
       if (!file.isFile() || !file.name.endsWith(".json")) continue;
-      const record = schema.parse(JSON.parse(await readFile(join(directory, workspace.name, file.name), "utf8")));
-      if (record.extension_transport !== undefined && matches(record)) return record;
+      const path = join(directory, workspace.name, file.name);
+      const contents = await readFile(path, "utf8");
+      let raw: T;
+      try { raw = JSON.parse(contents) as T; }
+      catch (error: unknown) {
+        if (!(error instanceof SyntaxError) || (targetId !== undefined && new RegExp('"(?:review_request_id|completion_id|delivery_id)"\\s*:\\s*' + JSON.stringify(targetId).replaceAll(".", "\\.")).test(contents))) throw error;
+        console.warn("Invalid historical Review JSON skipped", path);
+        continue;
+      }
+      const target = raw !== null && typeof raw === "object" && matches(raw);
+      let record: T;
+      try { record = schema.parse(raw); }
+      catch (error: unknown) {
+        if (target || !(error instanceof ZodError)) throw error;
+        console.warn("Invalid historical Review schema skipped", path);
+        continue;
+      }
+      if (!target || record.extension_transport === undefined) continue;
+      const identity = record as T & { result_id?: string; delivery_id?: string; execution_id?: string; workspace_id?: string; task_id?: string };
+      const id = identity.result_id ?? identity.delivery_id ?? identity.execution_id;
+      const expectedWorkspace = identity.execution_id === undefined ? workspace.name : basename(directory);
+      if (id !== file.name.slice(0, -5) || identity.workspace_id !== expectedWorkspace
+        || (identity.execution_id !== undefined && identity.task_id !== workspace.name)) {
+        throw new Error("Historical Review record does not match its file identity.");
+      }
+      if (found !== null) throw new Error("Multiple historical Review records match the transport identity.");
+      found = record;
     }
   }
-  return null;
+  return found;
 }
 
 // Publish the receipt in the authoritative Review record before removing it from the queue.
 export async function saveReviewTransport(file: string, record: object, transport: unknown): Promise<void> {
-  const temporary = `${file}.${randomUUID()}.tmp`;
-  try {
-    await writeFile(temporary, `${JSON.stringify({ ...record, extension_transport: transport }, null, 2)}\n`, { mode: 0o600 });
-    await chmod(temporary, 0o600);
-    await rename(temporary, file);
-  } finally {
-    await rm(temporary, { force: true }).catch(() => undefined);
-  }
+  await serializeRecord(file, async () => {
+    const current = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+    const expected = record as Record<string, unknown>;
+    for (const key of ["workspace_id", "task_id", "result_id", "delivery_id", "execution_id", "review_request_id", "status", "content"]) {
+      if (key in expected && current[key] !== expected[key]) throw new Error("Review transport publication conflicts with the authoritative record.");
+    }
+    await atomicWriteRecord(file, JSON.stringify({ ...current, extension_transport: transport }, null, 2) + "\n");
+  });
 }

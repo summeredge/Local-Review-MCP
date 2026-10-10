@@ -1,3 +1,4 @@
+import { atomicWriteRecord, serializeRecord } from "./record-store.js";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
@@ -102,28 +103,26 @@ export class ReviewRequestService {
     reviewRequestId: string,
     patch: UpdateReviewRequestInput,
   ): Promise<ReviewRequestContext> {
-    const current = await this.getReviewRequest(workspaceId, reviewRequestId);
-    if (current === null) {
-      throw new Error(`Review request "${reviewRequestId}" was not found.`);
-    }
+    return serializeRecord(reviewRequestFile(this.storageRoot, workspaceId, reviewRequestId), async () => {
+      const current = await this.getReviewRequest(workspaceId, reviewRequestId);
+      if (current === null) {
+        throw new Error(`Review request "${reviewRequestId}" was not found.`);
+      }
 
-    const parsed = updateReviewRequestInputSchema.parse(patch);
-    const next = reviewRequestContextSchema.parse({
-      ...current,
-      ...(parsed.conversation_id === undefined ? {} : { conversation_id: parsed.conversation_id }),
-      ...(parsed.status === undefined ? {} : { status: parsed.status }),
-      updated_at: new Date().toISOString(),
+      const parsed = updateReviewRequestInputSchema.parse(patch);
+      const next = reviewRequestContextSchema.parse({
+        ...current,
+        ...(parsed.conversation_id === undefined ? {} : { conversation_id: parsed.conversation_id }),
+        ...(parsed.status === undefined ? {} : { status: parsed.status }),
+        updated_at: new Date().toISOString(),
+      });
+      try {
+        await atomicWriteRecord(reviewRequestFile(this.storageRoot, workspaceId, reviewRequestId), json(next));
+      } catch (error: unknown) {
+        throw new Error("Review request could not be saved.", { cause: error });
+      }
+      return next;
     });
-    try {
-      await writeFile(
-        reviewRequestFile(this.storageRoot, workspaceId, reviewRequestId),
-        json(next),
-        { encoding: "utf8", mode: 0o600 },
-      );
-    } catch (error: unknown) {
-      throw new Error("Review request could not be saved.", { cause: error });
-    }
-    return next;
   }
 
   public async listReviewRequests(

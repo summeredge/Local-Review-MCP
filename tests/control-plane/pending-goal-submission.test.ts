@@ -1,3 +1,12 @@
+const faults = vi.hoisted(() => ({ rename: vi.fn(), chmod: vi.fn(), readFile: vi.fn() }));
+vi.mock("node:fs/promises", async () => {
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  return { ...actual,
+    readFile: async (...args: Parameters<typeof actual.readFile>) => { await faults.readFile(...args); return actual.readFile(...args); },
+    rename: async (...args: Parameters<typeof actual.rename>) => { await faults.rename(...args); return actual.rename(...args); },
+    chmod: async (...args: Parameters<typeof actual.chmod>) => { await faults.chmod(...args); return actual.chmod(...args); },
+  };
+});
 import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +35,9 @@ const temporaryDirectories: string[] = [];
 const CORRELATION_A = "00000000-0000-4000-8000-000000000001";
 
 beforeEach(() => {
+  faults.readFile.mockReset();
+  faults.rename.mockReset();
+  faults.chmod.mockReset();
   vi.spyOn(bridge, "extensionDeliveryReadiness").mockReturnValue({ ready: true, readiness_state: "ready" });
 });
 
@@ -530,4 +542,383 @@ describe("PendingGoalSubmissionService", () => {
     expect(record.mock.calls.filter(([event]) => event.event === "goal_started")).toHaveLength(1);
   });
 
+});
+
+describe("Interactive Pending identity persistence recovery", () => {
+  it.each([ ["EPERM", 1], ["EACCES", 3], ["EBUSY", 2] ] as const)("retries %s across %s starting publish failures", async (code, failures) => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => {
+      expect(request.execution_mode).toBe("interactive");
+      expect(request.conversation_id).toBe("conversation-a");
+      return result();
+    });
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    await pending.accept({ ...input(), execution_mode: "interactive" });
+    let attempts = 0;
+    faults.rename.mockImplementation(async (source, target) => {
+      if (target === pendingGoalSubmissionStateFile(root) && (await readFile(source, "utf8")).includes('"state": "starting"')) {
+        if (++attempts <= failures) throw Object.assign(new Error("publish occupied"), { code });
+      }
+    });
+    await pending.receiveIdentityEvidence(evidence());
+    await Promise.all([pending.resolve(CORRELATION_A), pending.resolve(CORRELATION_A)]);
+    await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "started", 3_000);
+    await Promise.all([pending.resolve(CORRELATION_A), pending.resolve(CORRELATION_A), pending.receiveIdentityEvidence(evidence())]);
+    expect(attempts).toBe(failures + 1);
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+    const restarted = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    await restarted.recover();
+    expect((await restarted.get(CORRELATION_A))?.state).toBe("started");
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+  });
+
+  it("sets permissions before publication and never errors after successful rename", async () => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const submitGoal = vi.fn(async () => result());
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    faults.chmod.mockImplementation(async path => {
+      if (path === pendingGoalSubmissionStateFile(root)) throw Object.assign(new Error("post-publish permission denied"), { code: "EPERM" });
+    });
+    await pending.accept({ ...input(), execution_mode: "interactive" });
+    await pending.receiveIdentityEvidence(evidence());
+    await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "started");
+    expect(faults.chmod.mock.calls.some(([path]) => path === pendingGoalSubmissionStateFile(root))).toBe(false);
+    expect(faults.chmod.mock.calls.some(([path]) => String(path).includes(".pending-goal-submissions-") && String(path).endsWith(".tmp"))).toBe(true);
+    const disk = JSON.parse(await readFile(pendingGoalSubmissionStateFile(root), "utf8"));
+    expect(disk.submissions[0].state).toBe("started");
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds persistent publish failures and retains normal expiry semantics", async () => {
+    const root = await makeRoot(); let now = Date.now();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const submitGoal = vi.fn(async () => result());
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root, now: () => now });
+    // Disable automatic waiter scheduling so this test measures one bounded resolver.
+    const isolated = new PendingGoalSubmissionService({
+      correlation: key => correlations.correlation(key), observe: proof => correlations.observe(proof),
+      awaitCorrelation: async () => null,
+    }, { submitGoal }, { storageRoot: root, now: () => now });
+    await isolated.accept({ ...input(), execution_mode: "interactive" });
+    await correlations.observe(evidence());
+    let attempts = 0;
+    faults.rename.mockImplementation(async (source, target) => {
+      if (target === pendingGoalSubmissionStateFile(root) && (await readFile(source, "utf8")).includes('"state": "starting"')) {
+        attempts++; throw Object.assign(new Error("publish occupied"), { code: "EBUSY" });
+      }
+    });
+    await expect(isolated.resolve(CORRELATION_A)).rejects.toMatchObject({ code: "EBUSY" });
+    expect(attempts).toBe(6);
+    expect(submitGoal).not.toHaveBeenCalled();
+    now += PENDING_GOAL_SUBMISSION_TTL_MS;
+    await isolated.expire(CORRELATION_A);
+    expect(await isolated.get(CORRELATION_A)).toMatchObject({ state: "failed", error: "pending_identity_expired" });
+  });
+
+  it("does not retry an uncertain launch even if the launch error has a transient filesystem code", async () => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const submitGoal = vi.fn(async () => { throw Object.assign(new Error("unknown launch result"), { code: "EPERM" }); });
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    await pending.accept({ ...input(), execution_mode: "interactive" });
+    await pending.receiveIdentityEvidence(evidence());
+    await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "indeterminate");
+    await Promise.all([pending.resolve(CORRELATION_A), pending.resolve(CORRELATION_A)]);
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+  });
+});
+
+it("restores durable Interactive evidence and retries starting publication after restart", async () => {
+  const root = await makeRoot();
+  const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => { expect(request.execution_mode).toBe("interactive"); return result(); });
+  const first = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+  await first.accept({ ...input(), execution_mode: "interactive" });
+  await first.evidenceInbox.put(evidence());
+  let failures = 0;
+  faults.rename.mockImplementation(async (source, target) => {
+    if (target === pendingGoalSubmissionStateFile(root) && (await readFile(source, "utf8")).includes('"state": "starting"') && failures++ < 2) {
+      throw Object.assign(new Error("restored publish locked"), { code: "EACCES" });
+    }
+  });
+  const correlations = new ConversationCorrelationRegistry(root);
+  const restored = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+  await restored.recover();
+  await waitFor(async () => (await restored.get(CORRELATION_A))?.state === "started", 3_000);
+  expect(correlations.correlation(CORRELATION_A)?.conversation_id).toBe("conversation-a");
+  expect(submitGoal).toHaveBeenCalledTimes(1);
+});
+
+it("does not extend the original Interactive Pending expiry while a retry is waiting", async () => {
+  const root = await makeRoot(); let now = Date.now();
+  const correlations = new ConversationCorrelationRegistry(root);
+  const submitGoal = vi.fn(async () => result());
+  const pending = new PendingGoalSubmissionService({ correlation: key => correlations.correlation(key),
+    observe: proof => correlations.observe(proof), awaitCorrelation: async () => null }, { submitGoal }, { storageRoot: root, now: () => now });
+  const receipt = await pending.accept({ ...input(), execution_mode: "interactive" });
+  await correlations.observe(evidence());
+  let attempts = 0;
+  faults.rename.mockImplementation(async (source, target) => {
+    if (target === pendingGoalSubmissionStateFile(root) && (await readFile(source, "utf8")).includes('"state": "starting"')) {
+      attempts++; throw Object.assign(new Error("locked until expiry"), { code: "EPERM" });
+    }
+  });
+  const resolving = pending.resolve(CORRELATION_A);
+  await waitFor(() => attempts === 1);
+  now = Date.parse(receipt.expires_at);
+  await resolving;
+  expect(attempts).toBe(1);
+  expect(submitGoal).not.toHaveBeenCalled();
+  expect(await pending.get(CORRELATION_A)).toMatchObject({ state: "failed", error: "pending_identity_expired", expires_at: receipt.expires_at });
+});
+
+it("does not retry nontransient Interactive identity publication errors", async () => {
+  const root = await makeRoot();
+  const correlations = new ConversationCorrelationRegistry(root);
+  const submitGoal = vi.fn(async () => result());
+  const pending = new PendingGoalSubmissionService({ correlation: key => correlations.correlation(key),
+    observe: proof => correlations.observe(proof), awaitCorrelation: async () => null }, { submitGoal }, { storageRoot: root });
+  await pending.accept({ ...input(), execution_mode: "interactive" });
+  await correlations.observe(evidence());
+  let attempts = 0;
+  faults.rename.mockImplementation(async (source, target) => {
+    if (target === pendingGoalSubmissionStateFile(root) && (await readFile(source, "utf8")).includes('"state": "starting"')) {
+      attempts++; throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+    }
+  });
+  await expect(pending.resolve(CORRELATION_A)).rejects.toMatchObject({ code: "ENOSPC" });
+  expect(attempts).toBe(1);
+  expect(submitGoal).not.toHaveBeenCalled();
+});
+
+describe("Interactive Pending deferred recovery", () => {
+  it("recovers a lock longer than the short retry window without new evidence, and deduplicates later evidence", async () => {
+    const root = await makeRoot();
+    const correlations = new ConversationCorrelationRegistry(root);
+    const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => {
+      expect(request.execution_mode).toBe("interactive");
+      return result();
+    });
+    const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, { storageRoot: root });
+    await pending.accept({ ...input(), execution_mode: "interactive" });
+    const lockedUntil = Date.now() + 2_600;
+    let attempts = 0;
+    faults.rename.mockImplementation(async (source, target) => {
+      if (target === pendingGoalSubmissionStateFile(root) && (await readFile(source, "utf8")).includes('"state": "starting"')) {
+        attempts++;
+        if (Date.now() < lockedUntil) throw Object.assign(new Error("long publish lock"), { code: "EPERM" });
+      }
+    });
+    await pending.receiveIdentityEvidence(evidence());
+    await waitFor(() => attempts === 6, 3_000);
+    expect(submitGoal).not.toHaveBeenCalled();
+    await pending.recover(); // Lifecycle recovery must not bypass the one deferred timer.
+    await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "started", 8_000);
+    await Promise.all(Array.from({ length: 5 }, () => pending.receiveIdentityEvidence(evidence())));
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+    expect(attempts).toBe(7);
+    expect((pending as unknown as { deferredResolves: Map<string, unknown> }).deferredResolves.size).toBe(0);
+  }, 15_000);
+
+  it("expires under a persistent starting lock and cancels deferred recovery", async () => {
+    const root = await makeRoot();
+    const submitGoal = vi.fn(async () => result());
+    const pending = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, {
+      storageRoot: root, environment: { LRM_PENDING_IDENTITY_TIMEOUT_MS: "3000" },
+    });
+    const accepted = await pending.accept({ ...input(), execution_mode: "interactive" });
+    faults.rename.mockImplementation(async (source, target) => {
+      if (target === pendingGoalSubmissionStateFile(root) && (await readFile(source, "utf8")).includes('"state": "starting"')) {
+        throw Object.assign(new Error("locked through TTL"), { code: "EBUSY" });
+      }
+    });
+    await pending.receiveIdentityEvidence(evidence());
+    await waitFor(async () => (await pending.get(CORRELATION_A))?.state === "failed", 5_000);
+    expect(await pending.get(CORRELATION_A)).toMatchObject({ error: "pending_identity_expired", expires_at: accepted.expires_at });
+    expect(submitGoal).not.toHaveBeenCalled();
+    expect((pending as unknown as { deferredResolves: Map<string, unknown> }).deferredResolves.size).toBe(0);
+  }, 8_000);
+
+  it.each(["pending", "inbox"])("retries a transient %s restore and shares concurrent restore work", async location => {
+    const root = await makeRoot();
+    const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => { expect(request.execution_mode).toBe("interactive"); return result(); });
+    const first = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    await first.accept({ ...input(), execution_mode: "interactive" });
+    await first.evidenceInbox.put(evidence());
+    const file = location === "pending" ? pendingGoalSubmissionStateFile(root) : first.evidenceInbox.file;
+    let reads = 0;
+    faults.readFile.mockImplementation(async path => {
+      if (path === file && ++reads === 1) throw Object.assign(new Error("restore locked"), { code: "EPERM" });
+    });
+    const restored = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    const a = restored.restore(); const b = restored.restore();
+    expect(a).toBe(b);
+    await expect(a).rejects.toMatchObject({ code: "EPERM" });
+    await expect(b).rejects.toMatchObject({ code: "EPERM" });
+    await restored.recover();
+    await waitFor(async () => (await restored.get(CORRELATION_A))?.state === "started");
+    expect(reads).toBe(2);
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+  });
+
+  it("automatically retries initial lifecycle restore errors but keeps invalid JSON fail-closed", async () => {
+    const root = await makeRoot();
+    const submitGoal = vi.fn(async () => result());
+    const first = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    await first.accept({ ...input(), execution_mode: "interactive" });
+    await first.evidenceInbox.put(evidence());
+    let failures = 2;
+    faults.readFile.mockImplementation(async path => {
+      if (path === pendingGoalSubmissionStateFile(root) && failures-- > 0) throw Object.assign(new Error("initial restore locked"), { code: "EACCES" });
+    });
+    const restored = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    await restored.recover();
+    await waitFor(async () => (await restored.get(CORRELATION_A))?.state === "started");
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+    faults.readFile.mockReset();
+    await writeFile(pendingGoalSubmissionStateFile(root), "invalid JSON", "utf8");
+    const corrupt = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    const failed = corrupt.restore();
+    await expect(failed).rejects.toThrow();
+    expect(corrupt.restore()).toBe(failed);
+    await expect(corrupt.recover()).rejects.toThrow();
+    expect((corrupt as unknown as { recoveryTimer: unknown }).recoveryTimer).toBeUndefined();
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+  });
+});
+
+it("cancels deferred resolution on starting and never redispatches an in-flight Interactive Goal", async () => {
+  const root = await makeRoot();
+  let complete!: (value: GoalSubmissionResult) => void;
+  const submitted = new Promise<GoalSubmissionResult>(resolve => { complete = resolve; });
+  const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => { expect(request.execution_mode).toBe("interactive"); return submitted; });
+  const pending = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+  await pending.accept({ ...input(), execution_mode: "interactive" });
+  let locked = true;
+  faults.rename.mockImplementation(async (source, target) => {
+    if (locked && target === pendingGoalSubmissionStateFile(root) && (await readFile(source, "utf8")).includes('"state": "starting"')) {
+      throw Object.assign(new Error("temporarily locked"), { code: "EPERM" });
+    }
+  });
+  await pending.receiveIdentityEvidence(evidence());
+  const timers = (pending as unknown as { deferredResolves: Map<string, unknown> }).deferredResolves;
+  await waitFor(() => timers.size === 1, 3_000);
+  locked = false;
+  const resolving = pending.resolve(CORRELATION_A);
+  await waitFor(() => submitGoal.mock.calls.length === 1);
+  expect((await pending.get(CORRELATION_A))?.state).toBe("starting");
+  expect(timers.size).toBe(0);
+  await Promise.all([pending.receiveIdentityEvidence(evidence()), pending.resolve(CORRELATION_A), pending.recover()]);
+  expect(submitGoal).toHaveBeenCalledTimes(1);
+  complete(result()); await resolving;
+  expect((await pending.get(CORRELATION_A))?.state).toBe("started");
+}, 6_000);
+
+it("keeps persisted Interactive identity across a shutdown between deferred scheduling and restart", async () => {
+  const root = await makeRoot();
+  const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => { expect(request.execution_mode).toBe("interactive"); expect(request.conversation_id).toBe("conversation-a"); return result(); });
+  const first = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+  await first.accept({ ...input(), execution_mode: "interactive" });
+  faults.rename.mockImplementation(async (source, target) => {
+    if (target === pendingGoalSubmissionStateFile(root) && (await readFile(source, "utf8")).includes('"state": "starting"')) {
+      throw Object.assign(new Error("locked before shutdown"), { code: "EBUSY" });
+    }
+  });
+  await first.receiveIdentityEvidence(evidence());
+  const previous = first as unknown as { deferredResolves: Map<string, unknown>; cancelExpiry(key: string): void };
+  await waitFor(() => previous.deferredResolves.size === 1, 3_000);
+  // A stopped runtime cannot keep its process-local timers; preserve only its durable records.
+  previous.cancelExpiry(CORRELATION_A);
+  faults.rename.mockReset();
+  const restarted = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+  await restarted.recover();
+  await Promise.all([restarted.receiveIdentityEvidence(evidence()), restarted.recover()]);
+  await waitFor(async () => (await restarted.get(CORRELATION_A))?.state === "started");
+  expect(submitGoal).toHaveBeenCalledTimes(1);
+  expect(previous.deferredResolves.size).toBe(0);
+}, 6_000);
+
+describe("Interactive startup recovery scheduling", () => {
+  it.each(["pending", "inbox"])("automatically restores a %s file locked for seconds after startup retries are exhausted", async location => {
+    const root = await makeRoot();
+    const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => { expect(request.execution_mode).toBe("interactive"); expect(request.conversation_id).toBe("conversation-a"); return result(); });
+    const first = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    const receipt = await first.accept({ ...input(), execution_mode: "interactive" });
+    await first.evidenceInbox.put(evidence());
+    (first as unknown as { cancelExpiry(key: string): void }).cancelExpiry(CORRELATION_A);
+    const file = location === "pending" ? pendingGoalSubmissionStateFile(root) : first.evidenceInbox.file;
+    const unlockAt = Date.now() + 2_500;
+    let reads = 0;
+    faults.readFile.mockImplementation(async path => {
+      if (path === file) { reads++; if (Date.now() < unlockAt) throw Object.assign(new Error("startup file locked"), { code: "EPERM" }); }
+    });
+    const restored = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    const a = restored.recover(); const b = restored.recover();
+    expect(a).toBe(b);
+    await expect(a).rejects.toMatchObject({ code: "EPERM" });
+    await expect(b).rejects.toMatchObject({ code: "EPERM" });
+    expect(submitGoal).not.toHaveBeenCalled();
+    // No recover(), get(), resubmission, or evidence receipt triggers the automatic retry.
+    await waitFor(() => submitGoal.mock.calls.length === 1, 7_000);
+    await waitFor(async () => (await restored.get(CORRELATION_A))?.state === "started");
+    expect((await restored.get(CORRELATION_A))?.expires_at).toBe(receipt.expires_at);
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+    expect(reads).toBeGreaterThan(3);
+    expect((restored as unknown as { recoveryTimer: unknown }).recoveryTimer).toBeUndefined();
+    await Promise.all([restored.recover(), restored.recover()]);
+    expect(submitGoal).toHaveBeenCalledTimes(1);
+  }, 10_000);
+
+  it.each(["pending_identity", "starting"] as const)("automatically reconciles restored %s without dispatch after a lock outlasts the original TTL", async state => {
+    const root = await makeRoot();
+    const submitGoal = vi.fn(async () => result());
+    const first = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, {
+      storageRoot: root, environment: { LRM_PENDING_IDENTITY_TIMEOUT_MS: "500" },
+    });
+    const receipt = await first.accept({ ...input(), execution_mode: "interactive" });
+    await first.evidenceInbox.put(evidence());
+    (first as unknown as { cancelExpiry(key: string): void }).cancelExpiry(CORRELATION_A);
+    const file = pendingGoalSubmissionStateFile(root);
+    const disk = JSON.parse(await readFile(file, "utf8")); disk.submissions[0].state = state;
+    await writeFile(file, JSON.stringify(disk), "utf8");
+    const unlockedAt = Date.now() + 800;
+    faults.readFile.mockImplementation(async path => {
+      if (path === file && Date.now() < unlockedAt) throw Object.assign(new Error("startup locked past pending TTL"), { code: "EBUSY" });
+    });
+    const restored = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    await expect(restored.recover()).rejects.toMatchObject({ code: "EBUSY" });
+    await waitFor(async () => {
+      const persisted = JSON.parse(await readFile(file, "utf8").catch(() => '{"submissions":[]}'));
+      return persisted.submissions[0]?.state === (state === "starting" ? "indeterminate" : "failed");
+    }, 4_000);
+    expect(await restored.get(CORRELATION_A)).toMatchObject({ state: state === "starting" ? "indeterminate" : "failed", expires_at: receipt.expires_at });
+    expect(submitGoal).not.toHaveBeenCalled();
+    expect((restored as unknown as { recoveryTimer: unknown }).recoveryTimer).toBeUndefined();
+  }, 6_000);
+
+  it("stops automatic startup retries at the fixed recovery deadline and reports the failure", async () => {
+    const root = await makeRoot(); let now = Date.now();
+    const submitGoal = vi.fn(async () => result());
+    const first = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, { storageRoot: root });
+    await first.accept({ ...input(), execution_mode: "interactive" });
+    (first as unknown as { cancelExpiry(key: string): void }).cancelExpiry(CORRELATION_A);
+    const file = pendingGoalSubmissionStateFile(root); const original = await readFile(file, "utf8");
+    let reads = 0;
+    faults.readFile.mockImplementation(async path => {
+      if (path === file) { reads++; throw Object.assign(new Error("persistent startup lock"), { code: "EACCES" }); }
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const restored = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(root), { submitGoal }, {
+      storageRoot: root, now: () => now, environment: { LRM_PENDING_IDENTITY_TIMEOUT_MS: "1000" },
+    });
+    await expect(restored.recover()).rejects.toMatchObject({ code: "EACCES" });
+    now += 1000;
+    await waitFor(() => (restored as unknown as { recoveryTimer: unknown }).recoveryTimer === undefined, 2_000);
+    expect(reads).toBe(3);
+    expect(warn.mock.calls.some(([message]) => String(message).includes("deadline exhausted"))).toBe(true);
+    expect(submitGoal).not.toHaveBeenCalled();
+    faults.readFile.mockReset();
+    expect(await readFile(file, "utf8")).toBe(original);
+  }, 4_000);
 });

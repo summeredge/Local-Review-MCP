@@ -360,14 +360,16 @@ export class CapabilityNegotiator implements ExecutionBackend {
   public start(request: ExecutionBackendStartRequest): Promise<ExecutionStartResult> {
     const parsed = executionBackendStartRequestSchema.parse(request);
     const key = requestKey(parsed);
+    const context = this.ensureContext(parsed);
     const pending = this.inFlight.get(key);
     if (pending !== undefined) return pending.then((result) => ({ ...result, accepted: "existing" as const }));
 
-    const context = this.ensureContext(parsed);
     const operation = this.startOnce(parsed, context);
     this.inFlight.set(key, operation);
     void operation.finally(() => {
-      if (this.inFlight.get(key) === operation) this.inFlight.delete(key);
+      // Keep the settled start outcome: this Execution must never be dispatched again.
+      context.requestedAction = null;
+      if (context.actions.length > 0) this.setState(context, context.state, context.source, context.reason, [], context.lastError);
     }).catch(() => undefined);
     return operation;
   }
@@ -564,7 +566,7 @@ export class CapabilityNegotiator implements ExecutionBackend {
       "fallback_ready",
       "standalone",
       fallbackReason,
-      ["recheck"],
+      [],
       fallbackError,
       selection?.timelineEvent,
     );
@@ -573,7 +575,7 @@ export class CapabilityNegotiator implements ExecutionBackend {
       if (!preparation.ready) {
         const cause = new Error(preparation.reason ?? "Standalone capability is unavailable.");
         const wrapped = new CapabilityExecutionError("standalone", cause);
-        this.setState(context, "fallback_ready", "standalone", "standalone_execution_failed", ["recheck", "standalone"], wrapped);
+        this.setState(context, "fallback_ready", "standalone", "standalone_execution_failed", [], wrapped);
         throw wrapped;
       }
       const result = await this.standalone.start(request);
@@ -582,7 +584,7 @@ export class CapabilityNegotiator implements ExecutionBackend {
     } catch (error: unknown) {
       if (error instanceof CapabilityExecutionError) throw error;
       const wrapped = new CapabilityExecutionError("standalone", error);
-      this.setState(context, "fallback_ready", "standalone", errorReason("standalone"), ["recheck", "standalone"], wrapped);
+      this.setState(context, "fallback_ready", "standalone", errorReason("standalone"), [], wrapped);
       throw wrapped;
     }
   }

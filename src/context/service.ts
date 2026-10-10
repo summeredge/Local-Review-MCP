@@ -1,3 +1,4 @@
+import { atomicWriteRecord, serializeRecord } from "./record-store.js";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
@@ -87,25 +88,24 @@ export class TaskContextService {
     taskId: string,
     patch: UpdateTaskContextInput,
   ): Promise<TaskContext> {
-    const current = await this.getTaskContext(taskId);
-    if (current === null) throw new Error(`Task context "${taskId}" was not found.`);
+    return serializeRecord(taskContextFile(this.storageRoot, taskId), async () => {
+      const current = await this.getTaskContext(taskId);
+      if (current === null) throw new Error(`Task context "${taskId}" was not found.`);
 
-    const parsed = updateTaskContextInputSchema.parse(patch);
-    const next = taskContextSchema.parse({
-      ...current,
-      ...(parsed.conversation_id === undefined ? {} : { conversation_id: parsed.conversation_id }),
-      ...(parsed.status === undefined ? {} : { status: parsed.status }),
-      updated_at: new Date().toISOString(),
-    });
-    try {
-      await writeFile(taskContextFile(this.storageRoot, taskId), json(next), {
-        encoding: "utf8",
-        mode: 0o600,
+      const parsed = updateTaskContextInputSchema.parse(patch);
+      const next = taskContextSchema.parse({
+        ...current,
+        ...(parsed.conversation_id === undefined ? {} : { conversation_id: parsed.conversation_id }),
+        ...(parsed.status === undefined ? {} : { status: parsed.status }),
+        updated_at: new Date().toISOString(),
       });
-    } catch (error: unknown) {
-      throw new Error("Task context could not be saved.", { cause: error });
-    }
-    return next;
+      try {
+        await atomicWriteRecord(taskContextFile(this.storageRoot, taskId), json(next));
+      } catch (error: unknown) {
+        throw new Error("Task context could not be saved.", { cause: error });
+      }
+      return next;
+    });
   }
 
   public async listTaskContexts(): Promise<TaskContext[]> {

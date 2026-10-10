@@ -346,7 +346,7 @@ export class ExtensionReviewCompletionService {
     const parsed = createSchema.parse(input);
     return this.exclusive(async () => {
       const next = new Map(this.completions);
-      const existing = await this.getByReviewRequestId(parsed.review_request_id);
+      const existing = await this.getByReviewRequestId(parsed.review_request_id, parsed.workspace_id);
       if (existing !== null) {
         if (!sameInput(existing, parsed)) {
           throw new ExtensionReviewCompletionConflictError(
@@ -391,7 +391,7 @@ export class ExtensionReviewCompletionService {
     const completion = this.completions.get(parsedId);
     if (completion !== undefined) return clone(completion);
     const result = await findReviewTransport(join(this.storageRoot, REVIEW_RESULTS_DIRECTORY), reviewResultSchema,
-      record => restoredTransport(record).completion_id === parsedId);
+      record => (record.extension_transport as { completion_id?: string } | undefined)?.completion_id === parsedId, undefined, parsedId);
     return result === null ? null : restoredTransport(result);
   }
 
@@ -423,6 +423,7 @@ export class ExtensionReviewCompletionService {
 
   public async getByReviewRequestId(
     reviewRequestId: string,
+    workspaceId?: string,
   ): Promise<ExtensionReviewCompletion | null> {
     await this.restore();
     const parsedId = reviewRequestIdSchema.parse(reviewRequestId);
@@ -430,7 +431,7 @@ export class ExtensionReviewCompletionService {
       candidate.review_request_id === parsedId);
     if (completion !== undefined) return clone(completion);
     const result = await findReviewTransport(join(this.storageRoot, REVIEW_RESULTS_DIRECTORY), reviewResultSchema,
-      record => record.review_request_id === parsedId);
+      record => record.review_request_id === parsedId, workspaceId, parsedId);
     return result === null ? null : restoredTransport(result);
   }
 

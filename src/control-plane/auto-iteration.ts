@@ -186,6 +186,13 @@ function errorCode(error: unknown): string | undefined {
   return error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
 }
 
+function transientInfrastructureError(error: unknown): boolean {
+  for (let cause = error; cause instanceof Error; cause = cause.cause) {
+    if (["EPERM", "EACCES", "EBUSY"].includes(errorCode(cause) ?? "")) return true;
+  }
+  return false;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error && error.message !== "" ? error.message : String(error);
 }
@@ -377,6 +384,8 @@ export class AutoIterationService {
   private readonly authorizationStore: AuthorizationReader;
   private readonly flights = new Map<string, Promise<AutoIteration>>();
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
+  private readonly infrastructureRetries = new Map<string, number>();
+  private disposed = false;
   private readonly retryDelayMs: number;
   private terminalListener?: AutoIterationTerminalListener;
 
@@ -451,6 +460,8 @@ export class AutoIterationService {
   }
 
   public dispose(): void {
+    this.disposed = true;
+    this.infrastructureRetries.clear();
     for (const timer of this.retryTimers.values()) clearTimeout(timer);
     this.retryTimers.clear();
   }
@@ -511,6 +522,7 @@ export class AutoIterationService {
         await this.advance(loop.loop_id);
       } catch (error: unknown) {
         console.warn(`Auto Iterate recovery failed for loop "${loop.loop_id}"`, errorMessage(error));
+        if (transientInfrastructureError(error)) this.scheduleRetry(loop.loop_id, 1_000);
       }
     }
   }
@@ -571,6 +583,7 @@ export class AutoIterationService {
       let loop = await this.store.get(loopId);
       if (loop === null) throw new Error(`Auto iteration loop "${loopId}" was not found.`);
       if (loop.stage === "completed" || loop.stage === "human_required" || loop.stage === "failed") {
+        this.cancelRetry(loop.loop_id);
         return loop;
       }
       if (loop.retry_at !== undefined) {
@@ -630,11 +643,33 @@ export class AutoIterationService {
   }
 
   private scheduleRetry(loopId: string, delay: number): void {
-    if (this.retryTimers.has(loopId)) return;
+    if (this.disposed || this.retryTimers.has(loopId)) return;
     const timer = setTimeout(() => {
       this.retryTimers.delete(loopId);
-      void this.advance(loopId).catch((error: unknown) => {
+      void this.advance(loopId).then(() => {
+        this.infrastructureRetries.delete(loopId);
+      }).catch(async (error: unknown) => {
         console.warn(`Review recovery failed for loop "${loopId}"`, errorMessage(error));
+        if (this.disposed || !transientInfrastructureError(error)) return;
+        const attempts = this.infrastructureRetries.get(loopId) ?? 0;
+        if (attempts >= 6) {
+          console.warn(`Auto Iterate infrastructure recovery exhausted for loop "${loopId}"; durable checkpoint retained.`);
+          return;
+        }
+        try {
+          const current = await this.store.get(loopId);
+          if (current === null || ["completed", "failed", "human_required"].includes(current.stage)) {
+            this.cancelRetry(loopId);
+            return;
+          }
+        } catch (readError: unknown) {
+          if (!transientInfrastructureError(readError)) {
+            console.warn(`Auto Iterate recovery state unreadable for loop "${loopId}"`, errorMessage(readError));
+            return;
+          }
+        }
+        this.infrastructureRetries.set(loopId, attempts + 1);
+        this.scheduleRetry(loopId, Math.min(1_000 * 2 ** attempts, 30_000));
       });
     }, delay);
     timer.unref?.();
@@ -709,6 +744,7 @@ export class AutoIterationService {
       await this.tasks.updateTaskContext(current.task_id, { status: "reviewing" });
       await this.update(current, { stage: "routing" });
     } catch (error: unknown) {
+      if (transientInfrastructureError(error)) throw error;
       await this.humanRequired(current, "REVIEW_REQUEST_UNAVAILABLE", errorMessage(error));
     }
   }
@@ -748,6 +784,7 @@ export class AutoIterationService {
       }
       await this.update(current, { stage: "delivery" });
     } catch (error: unknown) {
+      if (transientInfrastructureError(error)) throw error;
       await this.humanRequired(current, "ROUTING_UNAVAILABLE", errorMessage(error));
     }
   }
@@ -825,6 +862,7 @@ export class AutoIterationService {
       try {
         delivered = await this.browserRouter.deliver(current.workspace_id, routingId);
       } catch (error: unknown) {
+        if (transientInfrastructureError(error)) throw error;
         await this.humanRequired(current, "REVIEW_TRANSPORT_EXCEPTION", errorMessage(error));
         return;
       }
@@ -843,6 +881,7 @@ export class AutoIterationService {
       }
       await this.update(current, { stage: "review_completion" });
     } catch (error: unknown) {
+      if (transientInfrastructureError(error)) throw error;
       await this.humanRequired(current, "DELIVERY_UNAVAILABLE", errorMessage(error));
     }
   }
@@ -870,6 +909,7 @@ export class AutoIterationService {
         try {
           result = await this.completionRouter.collect(loop.workspace_id, routingId);
         } catch (error: unknown) {
+          if (transientInfrastructureError(error)) throw error;
           await this.humanRequired(loop, "REVIEW_COMPLETION_FAILED", errorMessage(error));
           return;
         }
@@ -908,6 +948,7 @@ export class AutoIterationService {
         : await this.update(loop, { review_result_id: result.result_id });
       await this.update(current, { stage: "verdict" });
     } catch (error: unknown) {
+      if (transientInfrastructureError(error)) throw error;
       await this.humanRequired(loop, "REVIEW_COMPLETION_UNAVAILABLE", errorMessage(error));
     }
   }
@@ -979,6 +1020,7 @@ export class AutoIterationService {
         stage: "actuation",
       });
     } catch (error: unknown) {
+      if (transientInfrastructureError(error)) throw error;
       await this.humanRequired(loop, "VERDICT_UNAVAILABLE", errorMessage(error));
     }
   }
@@ -1209,7 +1251,14 @@ export class AutoIterationService {
     return current;
   }
 
+  private cancelRetry(loopId: string): void {
+    clearTimeout(this.retryTimers.get(loopId));
+    this.retryTimers.delete(loopId);
+    this.infrastructureRetries.delete(loopId);
+  }
+
   private notifyTerminal(loop: AutoIteration): void {
+    this.cancelRetry(loop.loop_id);
     if (this.terminalListener === undefined) return;
     const listener = this.terminalListener;
     void Promise.resolve()

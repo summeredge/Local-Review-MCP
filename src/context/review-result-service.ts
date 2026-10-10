@@ -1,3 +1,6 @@
+import { atomicWriteRecord, serializeRecord } from "./record-store.js";
+import { ZodError } from "zod";
+import { join } from "node:path";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { validateWorkspaceIdentityConsistency } from "../workspace/identity.js";
@@ -34,8 +37,6 @@ function workspaceMismatch(message: string): WorkspacePathError {
   );
 }
 
-const reviewResultFlights = new Map<string, Promise<ReviewResult>>();
-
 export class ReviewResultService {
   public readonly storageRoot: string;
   private readonly runtimeIdentity: WorkspaceIdentity | undefined;
@@ -56,14 +57,7 @@ export class ReviewResultService {
     const parsed = createReviewResultInputSchema.parse(input);
     this.validateRuntimeIdentity(parsed.workspace_id);
     const key = `${this.storageRoot}\0${parsed.workspace_id}\0${parsed.review_request_id}`;
-    const pending = reviewResultFlights.get(key);
-    if (pending !== undefined) return pending;
-    const operation = this.createReviewResultOnce(parsed);
-    reviewResultFlights.set(key, operation);
-    void operation.finally(() => {
-      if (reviewResultFlights.get(key) === operation) reviewResultFlights.delete(key);
-    }).catch(() => undefined);
-    return operation;
+    return serializeRecord(key, () => this.createReviewResultOnce(parsed));
   }
 
   private async createReviewResultOnce(parsed: CreateReviewResultInput): Promise<ReviewResult> {
@@ -99,7 +93,11 @@ export class ReviewResultService {
     const existing = await this.getReviewResultByRequest(
       parsed.workspace_id,
       parsed.review_request_id,
+      parsed.result_id,
     );
+    if (existing !== null && (existing.delivery_id !== parsed.delivery_id || existing.task_id !== delivery.task_id)) {
+      throw new Error("Existing Review result conflicts with the delivery identity.");
+    }
     if (existing !== null && existing.status === "COMPLETED") return existing;
 
     const result = reviewResultSchema.parse({
@@ -111,11 +109,9 @@ export class ReviewResultService {
     const directory = reviewResultsDirectory(this.storageRoot, result.workspace_id);
     await mkdir(directory, { recursive: true, mode: 0o700 });
     try {
-      await writeFile(
-        reviewResultFile(this.storageRoot, result.workspace_id, result.result_id),
-        json(result),
-        { encoding: "utf8", flag: existing === null ? "wx" : "w", mode: 0o600 },
-      );
+      const file = reviewResultFile(this.storageRoot, result.workspace_id, result.result_id);
+      if (existing === null) await writeFile(file, json(result), { encoding: "utf8", flag: "wx", mode: 0o600 });
+      else await atomicWriteRecord(file, json(result));
     } catch (error: unknown) {
       if (errorCode(error) === "EEXIST") {
         const current = await this.getReviewResultByRequest(
@@ -156,8 +152,16 @@ export class ReviewResultService {
   public async getReviewResultByRequest(
     workspaceId: string,
     reviewRequestId: string,
+    resultId?: string,
   ): Promise<ReviewResult | null> {
     reviewRequestIdSchema.parse(reviewRequestId);
+    if (resultId !== undefined) {
+      const target = await this.getReviewResult(workspaceId, resultId);
+      if (target !== null) {
+        if (target.review_request_id !== reviewRequestId) throw new Error("Review result request identity conflicts.");
+        return target;
+      }
+    }
     const directory = reviewResultsDirectory(this.storageRoot, workspaceId);
     let entries;
     try {
@@ -167,13 +171,34 @@ export class ReviewResultService {
       throw new Error("Review results could not be inspected.", { cause: error });
     }
 
+    let found: ReviewResult | null = null;
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-      const resultId = entry.name.slice(0, -".json".length);
-      const result = await this.getReviewResult(workspaceId, resultId);
-      if (result?.review_request_id === reviewRequestId) return result;
+      const file = join(directory, entry.name);
+      const contents = await readFile(file, "utf8");
+      let raw: Record<string, unknown>;
+      try { raw = JSON.parse(contents) as Record<string, unknown>; }
+      catch (error: unknown) {
+        if (!(error instanceof SyntaxError) || new RegExp('"review_request_id"\\s*:\\s*' + JSON.stringify(reviewRequestId).replaceAll(".", "\\.")).test(contents)) throw error;
+        console.warn("Invalid historical Review Result JSON skipped", file);
+        continue;
+      }
+      const target = raw?.review_request_id === reviewRequestId;
+      let result: ReviewResult;
+      try { result = reviewResultSchema.parse(raw); }
+      catch (error: unknown) {
+        if (target || !(error instanceof ZodError)) throw error;
+        console.warn("Invalid historical Review Result schema skipped", file);
+        continue;
+      }
+      if (!target) continue;
+      if (result.workspace_id !== workspaceId || result.result_id !== entry.name.slice(0, -5)) {
+        throw new Error("Review result does not match the requested identity.");
+      }
+      if (found !== null) throw new Error("Multiple Review results match the request identity.");
+      found = result;
     }
-    return null;
+    return found;
   }
 
   public async listReviewResults(workspaceId: string): Promise<ReviewResult[]> {

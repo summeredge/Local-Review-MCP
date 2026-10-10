@@ -698,3 +698,45 @@ describe("P5.9.1 capability negotiation", () => {
     await pending;
   });
 });
+
+it.each(["prepare", "start"] as const)("removes dead actions after standalone %s failure without redispatching the Execution", async boundary => {
+  const standalone = provider("standalone", boundary === "prepare" ? { ready: false, reason: "standalone_execution_failed" } : { ready: true },
+    async () => { throw Object.assign(new Error("standalone unavailable"), { code: "EPERM" }); });
+  const negotiator = new CapabilityNegotiator({ desktop: provider("desktop", { ready: false, reason: "desktop_disconnected" }), standalone,
+    desktopTimeoutMs: 0, fallbackAfkTimeoutMs: 0 });
+  await expect(negotiator.start(request)).rejects.toBeInstanceOf(CapabilityExecutionError);
+  const settled = negotiator.snapshot(request.execution_id);
+  expect(settled).toMatchObject({ reason: "standalone_execution_failed", actions: [], requestedAction: null });
+  expect(negotiator.recheckDesktop(request.execution_id)).toEqual(settled);
+  expect(negotiator.selectStandalone(request.execution_id)).toEqual(settled);
+  await expect(negotiator.start(request)).rejects.toBeInstanceOf(CapabilityExecutionError);
+  expect(() => negotiator.start({ ...request, actuation_id: "different-actuation" })).toThrow("already bound");
+  expect(standalone.prepare).toHaveBeenCalledTimes(1);
+  expect(standalone.start).toHaveBeenCalledTimes(boundary === "prepare" ? 0 : 1);
+  await negotiator.close();
+});
+
+it("returns HTTP 409 for stale actions after standalone failure and leaves the Execution unchanged", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "lrm-capability-ended-")); temporaryDirectories.push(workspace);
+  const standalone = provider("standalone", { ready: true }, async () => { throw new Error("standalone start failed"); });
+  const negotiator = new CapabilityNegotiator({ desktop: provider("desktop", { ready: false, reason: "desktop_disconnected" }), standalone,
+    desktopTimeoutMs: 0, fallbackAfkTimeoutMs: 0 });
+  await expect(negotiator.start(request)).rejects.toBeInstanceOf(CapabilityExecutionError);
+  const before = negotiator.snapshot(request.execution_id);
+  const settings: ResolvedSettings = { host: "127.0.0.1", port: 0, workspace, auth: { token: "test-token" },
+    remote: { enabled: false, endpoint: "" }, supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 } };
+  const server = createHttpServer(settings, { registry: new WorkspaceRegistry([{ id: "workspace-1", name: "Workspace", path: workspace }]), capabilityNegotiator: negotiator });
+  servers.push(server); await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address(); if (address === null || typeof address === "string") throw new Error("server has no address");
+  for (const action of ["recheck", "standalone"]) {
+    const response = await fetch('http://127.0.0.1:' + address.port + LAUNCHER_CAPABILITY_PATH, {
+      method: "POST", headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+      body: JSON.stringify({ action, execution_id: request.execution_id }),
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: "capability_action_unavailable", execution_id: request.execution_id });
+  }
+  expect(negotiator.snapshot(request.execution_id)).toEqual(before);
+  expect(standalone.start).toHaveBeenCalledTimes(1);
+  await negotiator.close();
+});

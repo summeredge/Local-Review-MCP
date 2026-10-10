@@ -517,6 +517,16 @@ async function handleLauncherCapabilityRequest(
     sendJson(response, 400, { error: "capability_execution_required" });
     return;
   }
+  const current = negotiator.snapshot(executionId);
+  if (current === null) {
+    sendJson(response, 404, { error: "capability_execution_unavailable" });
+    return;
+  }
+  if (!current.actions.includes(parsed.data)) {
+    sendJson(response, 409, { error: "capability_action_unavailable", execution_id: executionId,
+      message: "当前操作不可执行；启动流程结束后请发起新的 Goal / Execution。", snapshot: current });
+    return;
+  }
   const snapshot = parsed.data === "recheck"
     ? negotiator.recheckDesktop(executionId)
     : negotiator.selectStandalone(executionId);

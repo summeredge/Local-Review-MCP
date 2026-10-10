@@ -970,7 +970,7 @@ class LauncherWindow(QMainWindow):
             "fallback_running": "Standalone 备用后端运行中。",
         }.get(capability.state, "执行能力状态未报告。")
         if capability.state == "fallback_ready" and capability.reason == "standalone_execution_failed":
-            capability_hint = "Standalone 备用后端也不可用，当前没有可执行的执行路径。"
+            capability_hint = "Standalone 启动流程已结束，请发起新的 Goal / Execution；不会重跑本次执行。"
         if capability.reason == "desktop_execution_failed":
             capability_state = "本次 Execution 已失败"
             capability_hint = "Desktop 执行已失败，请人工处理；不会切换后端或重跑任务。"
@@ -1415,7 +1415,9 @@ class LauncherWindow(QMainWindow):
         self.capability_timeline_refresh_button.setEnabled(
             capability_available and not self._capability_timeline_loading
         )
+        self.recheck_desktop_button.setVisible("recheck" in capability_actions)
         self.recheck_desktop_button.setEnabled(capability_available and "recheck" in capability_actions)
+        self.standalone_button.setVisible("standalone" in capability_actions)
         self.standalone_button.setEnabled(capability_available and "standalone" in capability_actions)
 
     def recheck_desktop_capability(self) -> None:

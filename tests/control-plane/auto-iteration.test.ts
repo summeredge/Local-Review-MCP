@@ -1403,3 +1403,126 @@ describe("AutoIterationService", () => {
     expect(noSpawn).not.toHaveBeenCalled();
   });
 });
+
+describe("Interactive infrastructure recovery", () => {
+  it.each([{ method: "put", failures: 1 }, { method: "put", failures: 3 }, { method: "get", failures: 1 }] as const)("automatically recovers $failures transient $method failures without spending business retry budget", async ({ method, failures }) => {
+    const f = await fixture(["APPROVE"], "delivered", { execution_mode: "interactive", goal_id: "goal-interactive" });
+    f.deliveryCalls.mockImplementationOnce(async () => ({ status: "failed" as const, retryable: true,
+      error: { code: "TEMPORARY_TRANSPORT", message: "retry delivery" } }));
+    const auto = new AutoIterationService(f.registry, { storageRoot: f.root, browserRouter: f.auto.browserRouter,
+      completionRouter: f.completionRouter, controlledActuation: f.auto.controlledActuation, retryDelayMs: 30_000 });
+    const internal = auto as unknown as { store: { put(loop: AutoIteration): Promise<AutoIteration>; get(id: string): Promise<AutoIteration | null> }; retryTimers: Map<string, unknown>; cancelRetry(id: string): void; scheduleRetry(id: string, delay: number): void };
+    let spy: { mockRestore(): void } | undefined;
+    try {
+      const waiting = await auto.start(startInput());
+      expect(waiting.stage).toBe("delivery");
+      internal.cancelRetry(waiting.loop_id);
+      await internal.store.put({ ...waiting, retry_at: new Date(Date.now() - 1).toISOString() });
+      const writes = vi.spyOn(internal.store, method);
+      spy = writes;
+      for (let i = 0; i < failures; i++) writes.mockRejectedValueOnce(new Error("checkpoint unavailable", {
+        cause: Object.assign(new Error("locked"), { code: "EPERM" }),
+      }));
+      internal.scheduleRetry(waiting.loop_id, 1);
+      await vi.waitFor(() => expect(f.completionCalls).toHaveBeenCalledTimes(1), { timeout: 12_000 });
+      await auto.advance("loop-001");
+      expect((await auto.getLoop("loop-001"))?.stage).toBe("completed");
+      expect((await auto.getLoop("loop-001"))?.completion_attempt_count ?? 0).toBe(0);
+      expect(f.deliveryCalls).toHaveBeenCalledTimes(2);
+      expect(await new ReviewRequestService(f.root).listReviewRequests("workspace-a")).toHaveLength(1);
+      expect(await new ReviewResultService(f.root).listReviewResults("workspace-a")).toHaveLength(1);
+      expect(internal.retryTimers.size).toBe(0);
+      await Promise.all([auto.advance("loop-001"), auto.recover()]);
+      expect(f.completionCalls).toHaveBeenCalledTimes(1); expect(f.starts).toHaveLength(0);
+    } finally { spy?.mockRestore(); auto.dispose(); f.auto.dispose(); }
+  }, 15_000);
+
+  it("does not turn a transient Review Request write failure into a business terminal outcome", async () => {
+    const f = await fixture(["APPROVE"], "delivered", { execution_mode: "interactive", goal_id: "goal-interactive" });
+    f.deliveryCalls.mockImplementationOnce(async () => ({ status: "failed" as const, retryable: true,
+      error: { code: "TEMPORARY_TRANSPORT", message: "retry delivery" } }));
+    const auto = new AutoIterationService(f.registry, { storageRoot: f.root, browserRouter: f.auto.browserRouter,
+      completionRouter: f.completionRouter, controlledActuation: f.auto.controlledActuation, retryDelayMs: 30_000 });
+    const original = ReviewRequestService.prototype.updateReviewRequest;
+    let failed = false;
+    const spy = vi.spyOn(ReviewRequestService.prototype, "updateReviewRequest").mockImplementation(async function(this: ReviewRequestService, workspace, id, patch) {
+      if (this.storageRoot === f.root && !failed) { failed = true; throw Object.assign(new Error("request locked"), { code: "EBUSY" }); }
+      return original.call(this, workspace, id, patch);
+    });
+    try {
+      // Seed the retry checkpoint before injecting the phase-level fault.
+      spy.mockRestore();
+      const waiting = await auto.start(startInput());
+      const timerControl = auto as unknown as { store: { put(loop: AutoIteration): Promise<AutoIteration> }; cancelRetry(id: string): void; scheduleRetry(id: string, delay: number): void };
+      timerControl.cancelRetry(waiting.loop_id);
+      await timerControl.store.put({ ...waiting, retry_at: new Date(Date.now() - 1).toISOString() });
+      vi.spyOn(ReviewRequestService.prototype, "updateReviewRequest").mockImplementation(async function(this: ReviewRequestService, workspace, id, patch) {
+        if (this.storageRoot === f.root && !failed) { failed = true; throw Object.assign(new Error("request locked"), { code: "EBUSY" }); }
+        return original.call(this, workspace, id, patch);
+      });
+      timerControl.scheduleRetry(waiting.loop_id, 1);
+      await vi.waitFor(async () => expect((await auto.getLoop("loop-001"))?.stage).toBe("completed"), { timeout: 5_000 });
+      await auto.advance("loop-001");
+      expect(failed).toBe(true); expect(f.completionCalls).toHaveBeenCalledTimes(1);
+      expect((await auto.getLoop("loop-001"))?.completion_attempt_count ?? 0).toBe(0);
+    } finally { vi.restoreAllMocks(); auto.dispose(); f.auto.dispose(); }
+  });
+
+  it("bounds persistent infrastructure retries and leaves the checkpoint intact", async () => {
+    const f = await fixture(["APPROVE"], "delivered", { execution_mode: "interactive", goal_id: "goal-interactive" });
+    const auto = f.auto;
+    const internal = auto as unknown as { scheduleRetry(id: string, delay: number): void; store: { put(loop: AutoIteration): Promise<AutoIteration> }; retryTimers: Map<string, unknown> };
+    const loop = checkpoint({ stage: "execution" }); await internal.store.put(loop);
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const advance = vi.spyOn(auto, "advance").mockRejectedValue(Object.assign(new Error("always locked"), { code: "EACCES" }));
+    try {
+      internal.scheduleRetry(loop.loop_id, 1); internal.scheduleRetry(loop.loop_id, 1);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(advance).toHaveBeenCalledTimes(7);
+      expect(internal.retryTimers.size).toBe(0);
+      expect((await auto.getLoop(loop.loop_id))?.stage).toBe("execution");
+      expect(warn.mock.calls.some(([message]) => String(message).includes("infrastructure recovery exhausted"))).toBe(true);
+      expect(f.starts).toHaveLength(0);
+    } finally { advance.mockRestore(); warn.mockRestore(); auto.dispose(); vi.useRealTimers(); }
+  });
+
+  it("does not reschedule an in-flight failure after dispose", async () => {
+    const f = await fixture(["APPROVE"], "delivered", { execution_mode: "interactive", goal_id: "goal-interactive" });
+    const internal = f.auto as unknown as { scheduleRetry(id: string, delay: number): void; retryTimers: Map<string, unknown> };
+    let reject!: (error: Error) => void;
+    const advance = vi.spyOn(f.auto, "advance").mockImplementation(() => new Promise<AutoIteration>((_, failure) => { reject = failure; }));
+    try {
+      internal.scheduleRetry("loop-001", 1);
+      await vi.waitFor(() => expect(advance).toHaveBeenCalledTimes(1));
+      f.auto.dispose(); reject(Object.assign(new Error("locked during shutdown"), { code: "EPERM" }));
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(internal.retryTimers.size).toBe(0);
+    } finally { advance.mockRestore(); f.auto.dispose(); }
+  });
+});
+
+it("Interactive infrastructure recovery resumes the persisted checkpoint after restart without another Review", async () => {
+  const f = await fixture(["APPROVE"], "delivered", { execution_mode: "interactive", goal_id: "goal-interactive" });
+  f.deliveryCalls.mockImplementationOnce(async () => ({ status: "failed" as const, retryable: true, error: { code: "TEMPORARY_TRANSPORT", message: "retry delivery" } }));
+  const make = () => new AutoIterationService(f.registry, { storageRoot: f.root, browserRouter: f.auto.browserRouter,
+    completionRouter: f.completionRouter, controlledActuation: f.auto.controlledActuation, retryDelayMs: 30_000 });
+  const first = make();
+  const internal = first as unknown as { store: { put(loop: AutoIteration): Promise<AutoIteration> }; infrastructureRetries: Map<string, number>;
+    cancelRetry(id: string): void; scheduleRetry(id: string, delay: number): void };
+  const waiting = await first.start(startInput());
+  internal.cancelRetry(waiting.loop_id); await internal.store.put({ ...waiting, retry_at: new Date(Date.now() - 1).toISOString() });
+  const writes = vi.spyOn(internal.store, "put").mockRejectedValueOnce(Object.assign(new Error("checkpoint locked before restart"), { code: "EPERM" }));
+  let restarted: AutoIterationService | undefined;
+  try {
+    internal.scheduleRetry(waiting.loop_id, 1);
+    await vi.waitFor(() => expect(internal.infrastructureRetries.get(waiting.loop_id)).toBe(1));
+    first.dispose(); writes.mockRestore();
+    restarted = make(); await restarted.recover();
+    expect((await restarted.getLoop(waiting.loop_id))?.stage).toBe("completed");
+    await Promise.all([restarted.recover(), restarted.advance(waiting.loop_id)]);
+    expect(f.deliveryCalls).toHaveBeenCalledTimes(2); expect(f.completionCalls).toHaveBeenCalledTimes(1);
+    expect(await new ReviewRequestService(f.root).listReviewRequests("workspace-a")).toHaveLength(1);
+    expect(f.starts).toHaveLength(0);
+  } finally { writes.mockRestore(); first.dispose(); restarted?.dispose(); f.auto.dispose(); }
+});

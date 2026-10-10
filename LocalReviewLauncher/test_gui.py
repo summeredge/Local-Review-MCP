@@ -448,6 +448,7 @@ class LauncherLogTests(unittest.TestCase):
                         reason=reason, execution_id="old-execution",
                     ),
                 ))
+                window._apply_controls(window._last_status)
                 self.assertEqual(window.execution_summary_status.text(), "Desktop 前置能力就绪，可优先尝试")
                 self.assertIn("#16803c", window.execution_summary_status.styleSheet())
                 self.assertIn("Execution capability negotiation", window.capability_status.text())
@@ -455,6 +456,12 @@ class LauncherLogTests(unittest.TestCase):
                 self.assertIn(state, window.capability_status.text())
                 self.assertEqual(window.tools_pipe_status.text(), "活动")
                 self.assertEqual(window.pipe_source_status.text(), "handoff")
+                if reason == "standalone_execution_failed":
+                    self.assertIn("请发起新的 Goal / Execution", window.capability_status.text())
+                    self.assertTrue(window.recheck_desktop_button.isHidden())
+                    self.assertTrue(window.standalone_button.isHidden())
+                    self.assertFalse(window.recheck_desktop_button.isEnabled())
+                    self.assertFalse(window.standalone_button.isEnabled())
                 if reason == "desktop_execution_failed":
                     self.assertIn("本次 Execution 已失败", window.capability_status.text())
                     self.assertIn("请人工处理", window.capability_status.text())
