@@ -1385,7 +1385,7 @@ class LauncherWindow(QMainWindow):
             self.state != LauncherState.STOPPING
             and (
                 self.state in (LauncherState.STARTING, LauncherState.RUNNING)
-                or (self.state == LauncherState.FAILED and has_started)
+                or has_started
                 or status.mcp_running
                 or launcher_running
             )

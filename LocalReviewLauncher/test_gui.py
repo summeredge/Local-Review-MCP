@@ -985,6 +985,45 @@ class LauncherLayoutAcceptanceTests(unittest.TestCase):
         self.assertIn("code 1", window.message_label.text())
         self.assertIn("startup error log", window.log_output.toPlainText())
 
+    def test_health_failure_can_stop_clear_start_record_and_restart(self) -> None:
+        window = self._window(LauncherConfig(str(Path.cwd()), "config.production.json", False))
+        manager = window.process_manager
+        manager.has_started = True
+        manager.launcher_is_running = False
+        manager.failure_reason = ""
+        window._set_state(LauncherState.STARTING)
+        self._finish_health(window, LauncherStatus(True, False, False), "startup")
+        self.assertEqual(window.state, LauncherState.RUNNING)
+        self._finish_health(window, LauncherStatus(False, False, False))
+        self.assertEqual(window.state, LauncherState.STOPPED)
+        self.assertFalse(window.start_button.isEnabled())
+        self.assertTrue(window.stop_button.isEnabled())
+
+        def stop():
+            self.assertEqual(window.state, LauncherState.STOPPING)
+            self.assertFalse(window.stop_button.isEnabled())
+            window._apply_controls(window._last_status)
+            self.assertFalse(window.stop_button.isEnabled())
+            manager.has_started = False
+            return "MCP stopped."
+
+        manager.stop.side_effect = stop
+        with patch.object(window._status_thread_pool, "start"):
+            window.stop_button.click()
+            manager.stop.assert_called_once_with()
+            manager.stop.side_effect = None
+            self.assertFalse(manager.has_started)
+            window._status_check_finished(window._status_check_generation, LauncherStatus(False, False, False))
+            self.assertTrue(window.start_button.isEnabled())
+            self.assertFalse(window.stop_button.isEnabled())
+            window.start_button.click()
+            manager.start.assert_not_called()
+            window._status_check_finished(window._status_check_generation, LauncherStatus(False, False, False))
+            manager.start.assert_called_once_with(window.configuration)
+            self.assertEqual(window.state, LauncherState.STARTING)
+            window._status_check_finished(window._status_check_generation, LauncherStatus(True, False, False))
+        self.assertEqual(window.state, LauncherState.RUNNING)
+
     def test_stop_cancels_pending_start_and_discards_old_health(self) -> None:
         window = self._window()
         window.process_manager.stop.return_value = "MCP stopped."
