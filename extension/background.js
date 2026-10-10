@@ -665,12 +665,34 @@
       for (const key of DIAGNOSTIC_FLAGS) if (typeof message[key] === 'boolean') flags[key] = message[key];
       flags.sender_source_valid = Boolean(source);
       const entry = { stage: message.stage, scan_id: message.scan_id,
-        navigation_epoch: message.navigation_epoch, observed_at: new Date().toISOString(),
+        navigation_epoch: message.navigation_epoch, observed_at: typeof message.observed_at === 'string'
+          && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(message.observed_at)
+          && Number.isFinite(Date.parse(message.observed_at)) ? message.observed_at : new Date().toISOString(),
         correlation_key_hash: await diagnosticHash(typeof message.correlation_key === 'string'
           && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(message.correlation_key)
           ? message.correlation_key : ''),
         conversation_id_hash: await diagnosticHash(documentConversation(message, sender)),
         document_id_hash: await diagnosticHash(source?.documentId), flags };
+      entry.background_revision = '0.1.5';
+      const manifestVersion = chrome.runtime.getManifest?.().version;
+      entry.extension_version = typeof manifestVersion === 'string' && /^\d+\.\d+\.\d+(?:\.\d+)?$/u.test(manifestVersion)
+        && manifestVersion.length <= 32 ? manifestVersion : 'unknown';
+      for (const key of ['fiber_revision', 'content_revision']) {
+        entry[key] = message[key] === '0.1.5' ? message[key] : 'unknown';
+      }
+      for (const [key, values] of [
+        ['snapshot_path', ['timeline', 'legacy', 'unknown']],
+        ['anchor_state', ['stable', 'unstable', 'absent', 'unknown']],
+        ['selection_reason', ['tool_absent', 'tool_out_of_scope', 'tool_unsupported', 'selected',
+          'invalid_submit_arguments', 'user_boundary', 'snapshot_unreadable', 'user_conflict',
+          'historical_viewport', 'no_current_turn', 'scan_exception', 'unknown']],
+      ]) if (values.includes(message[key])) entry[key] = message[key];
+      if (typeof message.most_recent === 'boolean' || message.most_recent === 'unknown') entry.most_recent = message.most_recent;
+      for (const key of ['candidate_turn_count', 'searched_turn_count', 'structured_tool_count',
+        'recognized_submit_count', 'excluded_tool_count']) {
+        const value = message[key];
+        if (value === 'unknown' || (Number.isSafeInteger(value) && value >= 0 && value <= 100000)) entry[key] = value;
+      }
       if (['selected', 'no_current_turn', 'historical_viewport', 'snapshot_unreadable',
         'user_conflict', 'user_boundary', 'no_submit_goal', 'scan_exception'].includes(message.snapshot_selection_reason)) {
         entry.snapshot_selection_reason = message.snapshot_selection_reason;

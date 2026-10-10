@@ -827,6 +827,10 @@ describe("Extension background identity authority", () => {
     const url = `${ORIGIN}/c/${CONVERSATION_A}`;
     const sample = { type: 'identity_diagnostic', stage: 'fiber_scanned', scan_id: 7, navigation_epoch: 0,
       snapshot_selection_reason: 'snapshot_unreadable',
+      selection_reason: 'snapshot_unreadable', snapshot_path: 'timeline', anchor_state: 'unknown',
+      candidate_turn_count: 2, searched_turn_count: 0, structured_tool_count: 'unknown',
+      recognized_submit_count: 'unknown', excluded_tool_count: 'unknown', most_recent: 'unknown',
+      fiber_revision: '0.1.5', content_revision: '0.1.5', observed_at: '2026-10-10T07:51:21.083Z',
       correlation_key: UUID_REQUEST_ID, fiber_root_detected: true, fiber_evidence_count: 0,
       prompt: 'SECRET-PROMPT', token: 'SECRET-TOKEN', document_id: 'spoofed-document' };
     const first = loadBackground(storage, async () => response(503, {}));
@@ -836,6 +840,11 @@ describe("Extension background identity authority", () => {
     expect(queued).toHaveLength(1);
     expect(queued[0]).toMatchObject({ scan_id: 7,
       snapshot_selection_reason: 'snapshot_unreadable',
+      selection_reason: 'snapshot_unreadable', snapshot_path: 'timeline', anchor_state: 'unknown',
+      candidate_turn_count: 2, searched_turn_count: 0, structured_tool_count: 'unknown',
+      recognized_submit_count: 'unknown', excluded_tool_count: 'unknown', most_recent: 'unknown',
+      fiber_revision: '0.1.5', content_revision: '0.1.5', background_revision: '0.1.5',
+      extension_version: 'unknown', observed_at: sample.observed_at,
       correlation_key_hash: createHash('sha256').update(UUID_REQUEST_ID).digest('hex'),
       document_id_hash: createHash('sha256').update('document-1').digest('hex') });
     expect(JSON.stringify(queued)).not.toMatch(/SECRET|spoofed|32ca0d45|document-1/);

@@ -271,7 +271,9 @@ class LoginStartupTests(unittest.TestCase):
         def run_event_loop():
             callback = single_shot.call_args.args[1]
             self.assertEqual(callback, windows[0].start_mcp)
-            callback()
+            with patch.object(windows[0]._status_thread_pool, "start"), patch.object(windows[0], "_update_log"):
+                callback()
+                windows[0]._status_check_finished(0, gui.LauncherStatus(False, False, False))
             return 0
         application = Mock()
         application.exec.side_effect = run_event_loop

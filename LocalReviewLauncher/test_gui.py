@@ -796,11 +796,13 @@ class LauncherLayoutAcceptanceTests(unittest.TestCase):
 
     def _window(self, config: LauncherConfig | None = None) -> LauncherWindow:
         manager = Mock()
+        manager.runtime_info.return_value = SimpleNamespace(remote_endpoint="https://example.invalid/mcp")
         manager.load.return_value = config or LauncherConfig("", "config.production.json", False)
         with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
             LauncherWindow, "refresh_status"
         ), patch.object(LauncherWindow, "_render_runtime_info"):
             process.return_value.has_started = False
+            process.return_value.get_output.return_value = ""
             window = LauncherWindow(Path.cwd(), manager)
         window.timer.stop()
         self.addCleanup(window.close)
@@ -885,8 +887,9 @@ class LauncherLayoutAcceptanceTests(unittest.TestCase):
             window = self._window(config)
             with patch.object(LauncherWindow, "_show_error") as show_error, patch.object(
                 window.process_manager, "start"
-            ) as start:
+            ) as start, patch.object(window._status_thread_pool, "start"):
                 window.start_mcp()
+                window._status_check_finished(0, LauncherStatus(False, False, False))
             start.assert_not_called()
             show_error.assert_called_once()
             message = show_error.call_args.args[0]
@@ -898,6 +901,111 @@ class LauncherLayoutAcceptanceTests(unittest.TestCase):
         labels = self._label_texts(window)
         for removed in ("运行信息", "工作区：", "生产配置：", "隧道模式：", "cloudflared 版本："):
             self.assertNotIn(removed, labels)
+
+    def _finish_health(self, window, status, source="normal", generation=None):
+        self.assertTrue(window._status_check_scheduler.begin(source))
+        window._status_check_finished(
+            window._status_check_generation if generation is None else generation, status
+        )
+
+    def test_existing_runtime_is_adopted_before_workspace_validation(self) -> None:
+        window = self._window()
+        with patch.object(window._status_thread_pool, "start") as worker_start:
+            window.refresh_status()
+            window.start_mcp()
+            window.start_mcp()
+            worker_start.assert_called_once()
+            window._status_check_finished(0, LauncherStatus(True, False, False))
+        self.assertEqual(window.state, LauncherState.RUNNING)
+        self.assertEqual(window.launcher_state.text(), "运行中")
+        self.assertEqual(window.tunnel_status.text(), "未连接")
+        window.process_manager.start.assert_not_called()
+
+    def test_normal_health_adopts_existing_runtime_without_start_request(self) -> None:
+        window = self._window()
+        self._finish_health(window, LauncherStatus(True, False, False))
+        self.assertEqual(window.state, LauncherState.RUNNING)
+        window.process_manager.start.assert_not_called()
+
+    def test_auto_start_config_waits_for_health_before_starting(self) -> None:
+        config = LauncherConfig(str(Path.cwd()), "config.production.json", True)
+        with patch("gui.QTimer.singleShot") as deferred:
+            window = self._window(config)
+        deferred.assert_called_once_with(0, window.start_mcp)
+        with patch.object(window._status_thread_pool, "start"):
+            deferred.call_args.args[1]()
+            window.process_manager.start.assert_not_called()
+            window._status_check_finished(0, LauncherStatus(False, False, False))
+        window.process_manager.start.assert_called_once_with(config)
+
+    def test_unavailable_runtime_starts_once_after_pending_initial_check(self) -> None:
+        window = self._window(LauncherConfig(str(Path.cwd()), "config.production.json", False))
+        with patch.object(window._status_thread_pool, "start") as worker_start:
+            window.refresh_status()
+            window.start_mcp()
+            window.start_mcp()
+            window.process_manager.start.assert_not_called()
+            window._status_check_finished(0, LauncherStatus(False, False, False))
+            window.start_mcp()
+        window.process_manager.start.assert_called_once_with(window.configuration)
+        self.assertEqual(window.state, LauncherState.STARTING)
+        self.assertEqual(worker_start.call_count, 2)
+
+    def test_local_health_wins_over_timeout_and_script_failure(self) -> None:
+        window = self._window()
+        window._set_state(LauncherState.STARTING)
+        window._startup_started_at = 0
+        window.process_manager.failure_reason = "script failed"
+        self._finish_health(window, LauncherStatus(True, False, False), "startup")
+        self.assertEqual(window.state, LauncherState.RUNNING)
+        self.assertEqual(window.message_label.text(), "MCP 启动成功。")
+
+    def test_timeout_recovers_then_runtime_stop_is_reflected(self) -> None:
+        window = self._window()
+        window.process_manager.failure_reason = ""
+        window._set_state(LauncherState.STARTING)
+        window._startup_started_at = 0
+        self._finish_health(window, LauncherStatus(False, False, False), "startup")
+        self.assertEqual(window.state, LauncherState.FAILED)
+        self.assertIn("超时", window.message_label.text())
+        self._finish_health(window, LauncherStatus(True, False, False))
+        self.assertEqual(window.state, LauncherState.RUNNING)
+        self.assertNotIn("超时", window.message_label.text())
+        self._finish_health(window, LauncherStatus(False, False, False))
+        self.assertEqual(window.state, LauncherState.STOPPED)
+
+    def test_real_failure_keeps_reason_and_log(self) -> None:
+        window = self._window()
+        window.process_manager.failure_reason = "Production startup exited with code 1."
+        window.process_manager.get_output.return_value = "startup error log"
+        window._set_state(LauncherState.STARTING)
+        self._finish_health(window, LauncherStatus(False, False, False), "startup")
+        self._finish_health(window, LauncherStatus(False, False, False))
+        self.assertEqual(window.state, LauncherState.FAILED)
+        self.assertIn("code 1", window.message_label.text())
+        self.assertIn("startup error log", window.log_output.toPlainText())
+
+    def test_stop_cancels_pending_start_and_discards_old_health(self) -> None:
+        window = self._window()
+        window.process_manager.stop.return_value = "MCP stopped."
+        with patch.object(window._status_thread_pool, "start"):
+            window.start_mcp()
+            generation = window._status_check_generation
+            window.stop_mcp()
+            window._status_check_finished(generation, LauncherStatus(True, True, True))
+            self.assertEqual(window.state, LauncherState.STOPPED)
+            self.assertTrue(window._status_check_scheduler.in_progress)
+            window._status_check_finished(window._status_check_generation, LauncherStatus(False, False, False))
+        self.assertFalse(window._start_requested)
+        window.process_manager.start.assert_not_called()
+        self.assertEqual(window.state, LauncherState.STOPPED)
+
+    def test_health_during_stopping_does_not_replace_state(self) -> None:
+        window = self._window()
+        window._set_state(LauncherState.STOPPING)
+        self._finish_health(window, LauncherStatus(True, True, True))
+        self.assertEqual(window.state, LauncherState.STOPPING)
+        self.assertFalse(window._last_status.mcp_running)
 
     def test_task_tab_uses_thread_info_and_query_workspace(self) -> None:
         window = self._window()

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local Review MCP Extension Control Plane",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Captures exact ChatGPT identity and reliably delivers control-plane messages.",
   "minimum_chrome_version": "106",
   "permissions": [

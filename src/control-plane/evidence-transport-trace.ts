@@ -40,7 +40,23 @@ export const evidenceTransportTraceEventNameSchema = z.enum(EVIDENCE_TRANSPORT_T
 export const evidenceTransportTraceFailureReasonSchema = z.enum(EVIDENCE_TRANSPORT_FAILURE_REASONS);
 const timestampSchema = z.string().datetime({ offset: true });
 const hashSchema = z.string().regex(/^(?:[a-f0-9]{64})?$/u);
+const diagnosticCountSchema = z.union([z.number().int().min(0).max(100000), z.literal('unknown')]);
 export const browserIdentityDiagnosticSchema = z.object({
+  fiber_revision: z.enum(['0.1.5', 'unknown']).optional(),
+  content_revision: z.enum(['0.1.5', 'unknown']).optional(),
+  background_revision: z.enum(['0.1.5', 'unknown']).optional(),
+  extension_version: z.string().max(32).regex(/^(?:\d+\.\d+\.\d+(?:\.\d+)?|unknown)$/u).optional(),
+  snapshot_path: z.enum(['timeline', 'legacy', 'unknown']).optional(),
+  candidate_turn_count: diagnosticCountSchema.optional(),
+  searched_turn_count: diagnosticCountSchema.optional(),
+  structured_tool_count: diagnosticCountSchema.optional(),
+  recognized_submit_count: diagnosticCountSchema.optional(),
+  excluded_tool_count: diagnosticCountSchema.optional(),
+  most_recent: z.union([z.boolean(), z.literal('unknown')]).optional(),
+  anchor_state: z.enum(['stable', 'unstable', 'absent', 'unknown']).optional(),
+  selection_reason: z.enum(['tool_absent', 'tool_out_of_scope', 'tool_unsupported', 'selected',
+    'invalid_submit_arguments', 'user_boundary', 'snapshot_unreadable', 'user_conflict',
+    'historical_viewport', 'no_current_turn', 'scan_exception', 'unknown']).optional(),
   snapshot_selection_reason: z.enum(['selected', 'no_current_turn', 'historical_viewport',
     'snapshot_unreadable', 'user_conflict', 'user_boundary', 'no_submit_goal', 'scan_exception']).optional(),
   stage: z.enum(['scan_started', 'scan_busy', 'document_registered', 'fiber_scanned',

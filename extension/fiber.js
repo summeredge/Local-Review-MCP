@@ -2,6 +2,7 @@
   'use strict';
 
   const VERSION = 1;
+  const FIBER_REVISION = '0.1.5';
   const ASK = 'lrm-extension-identity-ask';
   const REPLY = 'lrm-extension-identity-reply';
   const COMPLETION_FIBER_VERSION = 1;
@@ -570,7 +571,8 @@
           if (!entry) continue;
           if (!Array.isArray(entry.turn?.items)) return null;
           const messages = timelineMessagesOf(entry.turn.items);
-          return messages ? { fiber: at, messages, mostRecent: entry.isMostRecentTurn === true } : null;
+          return messages ? { fiber: at, messages, mostRecent: entry.isMostRecentTurn === true,
+            mostRecentState: typeof entry.isMostRecentTurn === 'boolean' ? entry.isMostRecentTurn : 'unknown' } : null;
         }
         return null;
       }
@@ -693,7 +695,7 @@
     return { status: 'no_tool', snapshot: null };
   }
 
-  function currentExchangeToolSnapshotOf(turns) {
+  function currentExchangeToolSnapshotOf(turns, diagnostic) {
     const first = Math.max(0, turns.length - MAX_TURNS);
     const localFirst = Math.max(first, turns.length - MAX_UNANCHORED_TAIL_TURNS);
     // A stable user anchor only narrows the current exchange; it is not a precondition
@@ -708,15 +710,20 @@
     for (let turnIndex = turns.length - 1; turnIndex >= localFirst; turnIndex -= 1) {
       const identity = userIdentityOf(turns[turnIndex]);
       if (identity.status === 'found') {
+        diagnostic.anchor_state = 'stable';
         anchorUserId = identity.userId;
         anchorTurnIndex = turnIndex;
         break;
       }
-      if (identity.status === 'unstable_user') break;
+      if (identity.status === 'unstable_user') {
+        diagnostic.anchor_state = 'unstable';
+        break;
+      }
       if (identity.status === 'unreadable' || identity.status === 'conflict') {
         return { snapshot: null, reason: identity.status === 'unreadable' ? 'snapshot_unreadable' : 'user_conflict' };
       }
     }
+    if (diagnostic.anchor_state === 'unknown') diagnostic.anchor_state = 'absent';
 
     // Without a current-tail anchor there is no exchange to isolate, so the fallback is
     // only the newest few logical turns. A current-tail anchor keeps the full window.
@@ -726,6 +733,7 @@
     let pending = null;
     let pendingTurnIndex = -1;
     for (let turnIndex = turns.length - 1; turnIndex >= toolSearchFirst; turnIndex -= 1) {
+      diagnostic.searched.add(turns[turnIndex]);
       const identity = userIdentityOf(turns[turnIndex]);
       if (identity.status === 'unreadable' || identity.status === 'conflict') {
         return { snapshot: null, reason: identity.status === 'unreadable' ? 'snapshot_unreadable' : 'user_conflict' };
@@ -749,6 +757,7 @@
       // has to sit after that anchor, otherwise it belongs to an older exchange that the
       // unnamed user could not be shown to share.
       if (identity.status === 'unstable_user') {
+        diagnostic.user_boundary = true;
         const snapshot = anchorUserId ? (pendingTurnIndex > anchorTurnIndex ? pending : null) : pending;
         return { snapshot, reason: snapshot ? 'selected' : pending ? 'user_boundary' : 'no_submit_goal' };
       }
@@ -757,6 +766,78 @@
     // user turn belongs to a previous exchange and must not be claimed.
     const snapshot = pendingTurnIndex > anchorTurnIndex ? pending : null;
     return { snapshot, reason: snapshot ? 'selected' : pending ? 'user_boundary' : 'no_submit_goal' };
+  }
+
+  // Observe only known structural containers, with one shared budget per scan.
+  // These counts never supply a tool snapshot or identity to the selector.
+  function selectionSummaryOf(turns, timeline, latestSnapshot, selection, probe) {
+    const summary = { fiber_revision: FIBER_REVISION,
+      snapshot_path: turns.length ? (timeline ? 'timeline' : 'legacy') : 'unknown',
+      candidate_turn_count: turns.length <= 100000 ? turns.length : 'unknown',
+      searched_turn_count: probe.searched.size,
+      most_recent: timeline && latestSnapshot ? latestSnapshot.mostRecentState : 'unknown',
+      anchor_state: probe.anchor_state,
+      structured_tool_count: 0, recognized_submit_count: 0, excluded_tool_count: 0,
+      selection_reason: 'unknown' };
+    let budget = 1000;
+    let complete = turns.length <= MAX_TURNS;
+    let excludedSubmitCount = 0;
+    try {
+      for (const turn of turns.slice(-MAX_TURNS)) {
+        for (const section of turn.sections) {
+          if (--budget < 0) { complete = false; break; }
+          let items;
+          const isTimeline = Boolean(section.getAttribute?.('data-turn-key'));
+          if (isTimeline) {
+            for (let at = fiberOf(section), depth = 0; at && depth < MAX_CLIMB; at = at.return, depth += 1) {
+              if (at.memoizedProps?.entry) { items = at.memoizedProps.entry.turn?.items; break; }
+            }
+          } else items = snapshotOf(section)?.messages;
+          if (!Array.isArray(items)) { complete = false; continue; }
+          const stack = [{ items, index: 0 }];
+          while (stack.length && budget > 0) {
+            const frame = stack[stack.length - 1];
+            if (frame.index === frame.items.length) { stack.pop(); continue; }
+            const item = frame.items[frame.index++];
+            budget -= 1;
+            if (isTimeline && item?.type === 'chatgpt-reasoning-group') {
+              if (Array.isArray(item.items)) stack.push({ items: item.items, index: 0 });
+              else complete = false;
+              continue;
+            }
+            const structured = isTimeline ? item?.type === 'mcp-tool-call' : Boolean(requestOf(item));
+            if (!structured) continue;
+            const recognized = isTimeline ? timelineSubmitGoalArgumentsOf(item).recognized
+              : submitGoalInspectionOf(item).recognized;
+            summary.structured_tool_count += 1;
+            if (recognized) summary.recognized_submit_count += 1;
+            if (!probe.searched.has(turn)) {
+              summary.excluded_tool_count += 1;
+              if (recognized) excludedSubmitCount += 1;
+            }
+          }
+          if (stack.length) complete = false;
+        }
+        if (budget <= 0) { complete = false; break; }
+      }
+    } catch { complete = false; }
+    const reason = selection.reason;
+    if (reason === 'selected') summary.selection_reason = selection.snapshot?.currentTool?.key
+      ? 'selected' : 'invalid_submit_arguments';
+    else if (['user_boundary', 'snapshot_unreadable', 'user_conflict', 'historical_viewport',
+      'no_current_turn', 'scan_exception'].includes(reason)) summary.selection_reason = reason;
+    else if (probe.user_boundary) summary.selection_reason = 'user_boundary';
+    else if (complete) {
+      summary.selection_reason = excludedSubmitCount > 0
+        || (summary.excluded_tool_count > 0 && summary.excluded_tool_count === summary.structured_tool_count)
+        ? 'tool_out_of_scope' : summary.structured_tool_count > 0 ? 'tool_unsupported' : 'tool_absent';
+    }
+    if (!complete) {
+      summary.structured_tool_count = 'unknown';
+      summary.recognized_submit_count = 'unknown';
+      summary.excluded_tool_count = 'unknown';
+    }
+    return summary;
   }
 
   function scan(nonce) {
@@ -792,15 +873,17 @@
     let conversation = null;
     let messages = null;
     let snapshotSelectionReason = 'no_current_turn';
+    const selectionProbe = { searched: new Set(), anchor_state: 'unknown' };
+    let selection = { snapshot: null, reason: snapshotSelectionReason };
     if (currentTurn) {
       try {
         // A virtualized historical viewport is not the current exchange. New timeline
         // entries already contain the complete user/tool sequence for a logical turn.
-        const selection = timeline && !latestSnapshot
+        selection = timeline && !latestSnapshot
           ? { snapshot: null, reason: 'snapshot_unreadable' }
           : timeline && !latestSnapshot.mostRecent
             ? { snapshot: null, reason: 'historical_viewport' }
-            : currentExchangeToolSnapshotOf(timeline ? [currentTurn] : turns);
+            : currentExchangeToolSnapshotOf(timeline ? [currentTurn] : turns, selectionProbe);
         const snapshot = selection.snapshot;
         snapshotSelectionReason = selection.reason;
         const fiber = snapshot?.fiber;
@@ -812,6 +895,7 @@
         currentTool = snapshot?.currentTool ?? currentTool;
       } catch {
         snapshotSelectionReason = 'scan_exception';
+        selection = { snapshot: null, reason: snapshotSelectionReason };
         // An unreadable current turn must not turn into guessed identity evidence.
       }
     }
@@ -849,6 +933,8 @@
       conversation_id: deliveryIdentityInvalid ? null : deliveryConversationId,
       // Observation only: never used as identity evidence by the isolated world.
       scan_diagnostic: {
+        observed_at: new Date().toISOString(),
+        ...selectionSummaryOf(turns, timeline, latestSnapshot, selection, selectionProbe),
         snapshot_selection_reason: snapshotSelectionReason,
         current_turn_present: Boolean(currentTurn),
         fiber_root_detected: fiberRootDetected,

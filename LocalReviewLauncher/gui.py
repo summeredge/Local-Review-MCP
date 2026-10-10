@@ -150,6 +150,7 @@ class LauncherWindow(QMainWindow):
         self._status_thread_pool.setMaxThreadCount(1)
         self._closing = False
         self._startup_started_at: float | None = None
+        self._start_requested = False
 
         self.setWindowTitle("Local Review MCP 启动器")
         self.setMinimumSize(740, 520)
@@ -697,7 +698,7 @@ class LauncherWindow(QMainWindow):
         self._refresh_status(restore_task_cache=True)
 
     def _refresh_status(self, restore_task_cache: bool) -> None:
-        if self.state == LauncherState.STARTING:
+        if self.state in (LauncherState.STARTING, LauncherState.STOPPING):
             return
         if restore_task_cache:
             self._cleared_execution_ids.clear()
@@ -722,11 +723,24 @@ class LauncherWindow(QMainWindow):
     def _status_check_finished(self, generation: int, status: LauncherStatus) -> None:
         source = self._status_check_scheduler.finish()
         if self._closing or source is None or generation != self._status_check_generation:
+            if not self._closing and source is not None and self.state != LauncherState.STOPPING:
+                self._request_status_check("startup" if self.state == LauncherState.STARTING else "normal")
+            return
+        if self.state == LauncherState.STOPPING:
             return
         self._render_status(status)
         self._update_log()
-        if source == "startup":
+        if self._start_requested:
+            self._start_requested = False
+            self._start_mcp_after_check(status)
+        elif self.state == LauncherState.STARTING:
             self._handle_startup_status(status)
+        elif status.mcp_running:
+            if self.state != LauncherState.RUNNING:
+                self.message_label.setText("MCP 已在运行。")
+            self._set_state(LauncherState.RUNNING)
+        elif self.state == LauncherState.RUNNING:
+            self._set_state(LauncherState.STOPPED)
         self._apply_controls(status)
 
     def _render_status(self, status: LauncherStatus) -> None:
@@ -1523,6 +1537,13 @@ class LauncherWindow(QMainWindow):
     def _handle_startup_status(self, status: LauncherStatus) -> None:
         if self.state != LauncherState.STARTING:
             return
+        if status.mcp_running:
+            self.startup_timer.stop()
+            self.timer.start(5_000)
+            self._startup_started_at = None
+            self._set_state(LauncherState.RUNNING)
+            self.message_label.setText("MCP 启动成功。")
+            return
         failure_reason = self.process_manager.failure_reason
         timed_out = self._startup_started_at is not None and monotonic() - self._startup_started_at >= STARTUP_TIMEOUT_SECONDS
         if failure_reason and not status.mcp_running:
@@ -1532,12 +1553,6 @@ class LauncherWindow(QMainWindow):
                 "MCP 启动超时，请检查日志。\n"
                 "启动超时：本地 MCP 或隧道可能仍在运行。"
             )
-        elif status.mcp_running and status.tunnel_connected and status.remote_online:
-            self.startup_timer.stop()
-            self.timer.start(5_000)
-            self._startup_started_at = None
-            self._set_state(LauncherState.RUNNING)
-            self.message_label.setText("MCP 启动成功。")
 
     def _fail_startup(self, message: str) -> None:
         self.startup_timer.stop()
@@ -1559,6 +1574,14 @@ class LauncherWindow(QMainWindow):
     def start_mcp(self) -> None:
         if self.state in (LauncherState.STARTING, LauncherState.RUNNING, LauncherState.STOPPING):
             return
+        self._start_requested = True
+        self._request_status_check("normal")
+
+    def _start_mcp_after_check(self, status: LauncherStatus) -> None:
+        if status.mcp_running:
+            self._set_state(LauncherState.RUNNING)
+            self.message_label.setText("MCP 已在运行。")
+            return
         if self.process_manager.has_started:
             return
         if not self.configuration.workspace:
@@ -1578,10 +1601,6 @@ class LauncherWindow(QMainWindow):
                 + "\n".join(f"· {record.name}：{record.path}" for record in missing)
                 + "\n\n请在工作区列表中删除这些记录后重试。"
             )
-            return
-        if self._last_status.mcp_running:
-            self._apply_controls(self._last_status)
-            self.message_label.setText("MCP 已在运行。")
             return
         self._startup_started_at = monotonic()
         self._set_state(LauncherState.STARTING)
@@ -1606,6 +1625,7 @@ class LauncherWindow(QMainWindow):
     def stop_mcp(self) -> None:
         if self.state == LauncherState.STOPPING:
             return
+        self._start_requested = False
         self.startup_timer.stop()
         self.timer.stop()
         self._status_check_generation += 1

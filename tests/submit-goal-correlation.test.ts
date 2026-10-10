@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import * as vm from "node:vm";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 const ORIGIN = "https://chatgpt.com";
 const CONVERSATION = "11111111-2222-3333-4444-555555555555";
@@ -280,6 +280,142 @@ describe("Extension submit_goal correlation evidence", () => {
           ? { memoizedProps: { conversationId: options.parentConversation }, return: null } : null } } };
     return scanFiberSections([section], 'section[data-testid^="conversation-turn"], [data-turn-key]');
   }
+
+  it('distinguishes absent, unsupported and selected calls before timeline selection without leaking payloads', async () => {
+    const absent = scanTimeline([{ type: 'user-message', messageId: 'user-current' }]);
+    expect(absent.scan_diagnostic).toMatchObject({ snapshot_path: 'timeline', candidate_turn_count: 1,
+      searched_turn_count: 1, most_recent: true, anchor_state: 'stable', structured_tool_count: 0,
+      recognized_submit_count: 0, excluded_tool_count: 0, selection_reason: 'tool_absent',
+      snapshot_selection_reason: 'no_submit_goal' });
+    const unsupported = scanTimeline([{ type: 'mcp-tool-call', functionName: 'unrecognized-name',
+      invocation: { arguments: { correlation_key: KEY_A, prompt: 'private-prompt', token: 'private-token' } } }]);
+    expect(unsupported.scan_diagnostic).toMatchObject({ structured_tool_count: 1, recognized_submit_count: 0,
+      selection_reason: 'tool_unsupported', snapshot_selection_reason: 'no_submit_goal' });
+    expect(unsupported.evidence).toEqual([]);
+    const call = directTimelineCall();
+    call.invocation.arguments.prompt = 'private-prompt';
+    call.invocation.arguments.token = 'private-token';
+    const selected = scanTimeline([{ type: 'user-message', messageId: 'user-current', text: 'private-body' }, call]);
+    expect(selected.scan_diagnostic).toMatchObject({ selection_reason: 'selected', structured_tool_count: 1,
+      recognized_submit_count: 1, fiber_revision: '0.1.5' });
+    expect(selected.evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+    const forwarded = (await contentMessages(selected)).find(message => message.stage === 'fiber_scanned')!;
+    expect(forwarded).toMatchObject({ content_revision: '0.1.5', fiber_revision: '0.1.5',
+      selection_reason: 'selected', observed_at: selected.scan_diagnostic.observed_at });
+    for (const diagnostic of [absent.scan_diagnostic, unsupported.scan_diagnostic, selected.scan_diagnostic, forwarded]) {
+      expect(JSON.stringify(diagnostic)).not.toMatch(/private-prompt|private-token|private-body|invocation|arguments|memoizedProps/u);
+    }
+  });
+
+  it('observes excluded legacy calls without widening the unanchored tail', () => {
+    const reply = scanFiberSections([
+      fiberSection([currentConnectorRequest('excluded', 'submit_goal', KEY_A)], 'turn-1'),
+      ...[2, 3, 4].map(index => fiberSection([{ author: { role: 'assistant' } }], `turn-${index}`)),
+    ]);
+    expect(reply.evidence).toEqual([]);
+    expect(reply.scan_diagnostic).toMatchObject({ snapshot_path: 'legacy', candidate_turn_count: 4,
+      searched_turn_count: 3, most_recent: 'unknown', anchor_state: 'absent', structured_tool_count: 1,
+      recognized_submit_count: 1, excluded_tool_count: 1, selection_reason: 'tool_out_of_scope',
+      snapshot_selection_reason: 'no_submit_goal' });
+    expect(scanFiber([userMessage()]).scan_diagnostic.selection_reason).toBe('tool_absent');
+    expect(scanFiber([currentConnectorRequest('other', 'unknown_tool', KEY_A)]).scan_diagnostic.selection_reason)
+      .toBe('tool_unsupported');
+  });
+
+  it('observes retained timeline calls but never binds their identity to the latest turn', () => {
+    function section(items: unknown[], conversationId: string) {
+      return { getAttribute: (name: string) => name === 'data-turn-key' ? 'timeline' : null,
+        __reactFiber$test: { memoizedProps: { entry: { conversationId, isMostRecentTurn: true, turn: { items } } } } };
+    }
+    const old = section([directTimelineCall()], CONVERSATION_B);
+    const current = section([{ type: 'user-message', messageId: 'user-current' }], CONVERSATION);
+    const excluded = scanFiberSections([old, current]);
+    expect(excluded.evidence).toEqual([]);
+    expect(excluded.scan_diagnostic).toMatchObject({ snapshot_path: 'timeline', candidate_turn_count: 2,
+      searched_turn_count: 1, structured_tool_count: 1, recognized_submit_count: 1,
+      excluded_tool_count: 1, selection_reason: 'tool_out_of_scope' });
+    const selected = scanFiberSections([old, section([directTimelineCall(KEY_B)], CONVERSATION)]);
+    expect(selected.evidence).toEqual([{ request_id: KEY_B, fiber_conversation_id: CONVERSATION }]);
+    expect(selected.scan_diagnostic).toMatchObject({ selection_reason: 'selected', structured_tool_count: 2,
+      recognized_submit_count: 2, excluded_tool_count: 1 });
+  });
+
+  it('keeps user boundaries, malformed latest calls and unreadable snapshots distinct', () => {
+    const boundary = scanTimeline([directTimelineCall(), { type: 'user-message' }]);
+    expect(boundary.evidence).toEqual([]);
+    expect(boundary.scan_diagnostic).toMatchObject({ selection_reason: 'user_boundary', anchor_state: 'unstable' });
+    const stable = scanFiberSections([
+      fiberSection([userMessage('old'), currentConnectorRequest('old', 'submit_goal', KEY_A)], 'old'),
+      fiberSection([userMessage('new')], 'new'),
+    ]);
+    expect(stable.evidence).toEqual([]);
+    expect(stable.scan_diagnostic.selection_reason).toBe('user_boundary');
+    const malformed = scanTimeline([directTimelineCall(), directTimelineCall('invalid')]);
+    expect(malformed.evidence).toEqual([]);
+    expect(malformed.scan_diagnostic).toMatchObject({ snapshot_selection_reason: 'selected',
+      selection_reason: 'invalid_submit_arguments' });
+    expect(scanFiberSections([{}]).scan_diagnostic).toMatchObject({ selection_reason: 'snapshot_unreadable',
+      structured_tool_count: 'unknown', recognized_submit_count: 'unknown', excluded_tool_count: 'unknown' });
+    expect(scanTimeline([directTimelineCall()], { current: false }).scan_diagnostic.selection_reason)
+      .toBe('historical_viewport');
+  });
+
+  it('bounds structural observations and reports unknown rather than guessed absence', () => {
+    const reply = scanTimeline(Array.from({ length: 1100 }, () => ({ type: 'assistant-message' })));
+    expect(reply.evidence).toEqual([]);
+    expect(reply.scan_diagnostic).toMatchObject({ selection_reason: 'unknown', structured_tool_count: 'unknown',
+      recognized_submit_count: 'unknown', excluded_tool_count: 'unknown' });
+    const nested = scanTimeline([{ type: 'chatgpt-reasoning-group', items: [
+      { type: 'chatgpt-reasoning-group', items: [directTimelineCall()] },
+    ] }]);
+    expect(nested.evidence).toEqual([]);
+    expect(nested.scan_diagnostic).toMatchObject({ structured_tool_count: 1, recognized_submit_count: 1,
+      selection_reason: 'tool_unsupported' });
+  });
+
+  it('records fine-grained transitions immediately while limiting stable scans to a thirty-second heartbeat', async () => {
+    vi.useFakeTimers();
+    try {
+      const window = pageWindow();
+      const messages: Record<string, any>[] = [];
+      let scheduleScan: (() => void) | undefined;
+      let reason = 'tool_absent';
+      window.addEventListener('message', event => {
+        const data = event.data as Record<string, unknown>;
+        if (data.source !== 'lrm-extension-identity-ask') return;
+        window.postMessage({ source: 'lrm-extension-identity-reply', version: 1, nonce: data.nonce,
+          evidence: [], conversation_id: CONVERSATION, scan_diagnostic: {
+            snapshot_selection_reason: 'no_submit_goal', selection_reason: reason,
+            observed_at: new Date().toISOString(), fiber_revision: '0.1.5',
+          } }, ORIGIN);
+      });
+      vm.runInNewContext(contentSource, { window, URL, Date,
+        location: { origin: ORIGIN, href: `${ORIGIN}/c/${CONVERSATION}` },
+        history: { pushState() {}, replaceState() {} }, document: {}, setTimeout, clearTimeout,
+        setInterval(callback: () => void) { if (callback.name === 'scheduleScan') scheduleScan = callback; },
+        chrome: { runtime: { sendMessage(message: Record<string, unknown>, callback: (reply: object) => void) {
+          messages.push(structuredClone(message));
+          callback({ ok: true, document_id: 'document-a' });
+        } } },
+      });
+      const scans = () => messages.filter(message => message.stage === 'fiber_scanned');
+      await vi.advanceTimersByTimeAsync(200);
+      expect(scans()).toHaveLength(1);
+      scheduleScan!();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(scans()).toHaveLength(1);
+      reason = 'tool_unsupported';
+      scheduleScan!();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(scans().map(message => message.selection_reason)).toEqual(['tool_absent', 'tool_unsupported']);
+      await vi.advanceTimersByTimeAsync(30000);
+      scheduleScan!();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(scans()).toHaveLength(3);
+      expect(scans()[2].observed_at).not.toBe(scans()[1].observed_at);
+      expect(messages.some(message => message.type === 'identity_evidence')).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
 
   it('keeps Delivery and Completion on the active timeline despite retained conversations', async () => {
     const current = (conversationId = CONVERSATION, mostRecent = true, parentId = conversationId) => ({

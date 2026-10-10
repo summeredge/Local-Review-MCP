@@ -4,6 +4,7 @@
   const FIBER_ASK = 'lrm-extension-identity-ask';
   const FIBER_REPLY = 'lrm-extension-identity-reply';
   const FIBER_VERSION = 1;
+  const CONTENT_REVISION = '0.1.5';
   const COMPLETION_FIBER_ASK = 'lrm-extension-review-completion-ask';
   const COMPLETION_FIBER_REPLY = 'lrm-extension-review-completion-reply';
   const COMPLETION_FIBER_VERSION = 1;
@@ -36,12 +37,14 @@
   function identityDiagnostic(stage, scanId, details = {}) {
     // State changes plus a thirty-second heartbeat; no text or arbitrary objects.
     try {
-      const signature = JSON.stringify([navigationEpoch, currentConversation, details]);
+      const { observed_at: observedAt, ...state } = details;
+      const signature = JSON.stringify([navigationEpoch, currentConversation, state]);
       const prior = diagnosticStates.get(stage);
       if (prior?.signature === signature && Date.now() - prior.at < 30000) return;
       diagnosticStates.set(stage, { signature, at: Date.now() });
       void sendToWorker({ type: 'identity_diagnostic', stage, scan_id: scanId,
-        navigation_epoch: navigationEpoch, ...identityFields(), ...details });
+        navigation_epoch: navigationEpoch, ...identityFields(), ...state,
+        content_revision: CONTENT_REVISION, observed_at: observedAt ?? new Date().toISOString() });
     } catch { /* Observations must not affect scanning. */ }
   }
 
@@ -227,6 +230,26 @@
           else if (previous === undefined) byRequest.set(entry.request_id, entry.fiber_conversation_id);
         }
         const diagnostic = {};
+        const observation = data.scan_diagnostic;
+        if (typeof observation?.observed_at === 'string'
+          && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(observation.observed_at)
+          && Number.isFinite(Date.parse(observation.observed_at))) diagnostic.observed_at = observation.observed_at;
+        diagnostic.fiber_revision = observation?.fiber_revision === '0.1.5' ? observation.fiber_revision : 'unknown';
+        for (const [key, values] of [
+          ['snapshot_path', ['timeline', 'legacy', 'unknown']],
+          ['anchor_state', ['stable', 'unstable', 'absent', 'unknown']],
+          ['selection_reason', ['tool_absent', 'tool_out_of_scope', 'tool_unsupported', 'selected',
+            'invalid_submit_arguments', 'user_boundary', 'snapshot_unreadable', 'user_conflict',
+            'historical_viewport', 'no_current_turn', 'scan_exception', 'unknown']],
+        ]) if (values.includes(observation?.[key])) diagnostic[key] = observation[key];
+        if (typeof observation?.most_recent === 'boolean' || observation?.most_recent === 'unknown') {
+          diagnostic.most_recent = observation.most_recent;
+        }
+        for (const key of ['candidate_turn_count', 'searched_turn_count', 'structured_tool_count',
+          'recognized_submit_count', 'excluded_tool_count']) {
+          const value = observation?.[key];
+          if (value === 'unknown' || (Number.isSafeInteger(value) && value >= 0 && value <= 100000)) diagnostic[key] = value;
+        }
         const snapshotReason = data.scan_diagnostic?.snapshot_selection_reason;
         if (['selected', 'no_current_turn', 'historical_viewport', 'snapshot_unreadable',
           'user_conflict', 'user_boundary', 'no_submit_goal', 'scan_exception'].includes(snapshotReason)) {

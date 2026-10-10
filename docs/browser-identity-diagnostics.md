@@ -1,5 +1,50 @@
 # Browser identity evidence: persistent diagnostics
 
+## 0.1.5：选择前结构摘要
+
+扩展直接加载仓库 `extension` 下的文件，没有独立打包产物。安装目录一致不能
+证明已注入页面的脚本与磁盘一致。新版 `fiber_scanned` 分别携带 `fiber_revision`、
+`content_revision`、`background_revision` 和 worker 读取的 manifest `extension_version`。
+本次版本均应为 `0.1.5`；缺失或 `unknown` 表示无法确认该层版本。版本标签用于
+识别发布版本与混合加载，不是运行脚本的字节校验或身份证据。
+
+保留 `snapshot_selection_reason`，新增以下只读摘要：
+
+| 字段 | 含义 |
+| --- | --- |
+| `snapshot_path` | 当前路径：timeline / legacy / unknown |
+| `candidate_turn_count` | DOM 分组后的候选逻辑 turn 数 |
+| `searched_turn_count` | 选择器工具搜索阶段实际检查的 turn 数；不含单独的 anchor 探测 |
+| `most_recent` | 当前 timeline 节点显式的布尔状态；legacy 或无法判断时为 unknown |
+| `anchor_state` | stable / unstable / absent / unknown |
+| `structured_tool_count` | 已知结构容器中可读取的 MCP item 或 legacy assistant tool request 数 |
+| `recognized_submit_count` | 名称被现有解析器识别的 submit_goal 数；不保证参数或身份有效 |
+| `excluded_tool_count` | 未被工具搜索访问的候选快照中结构化调用数 |
+| `selection_reason` | 选择结果的细分原因，见下文 |
+
+摘要最多观察最后 100 个候选 turn，共用 1000 个 section/item 的预算，不遍历任意
+Fiber 对象字段。计数按读取的快照计算，不按调用 ID 去重。快照不可读、候选被截断
+或预算耗尽时，全局工具计数为 `unknown`，不会据此宣称工具不存在。
+
+`tool_absent` 表示完整观测范围内没有结构化调用；`tool_out_of_scope` 表示可读
+submit_goal 候选位于未搜索快照，或全部可读工具调用都在范围外；它不宣称这些
+调用属于当前 Goal。`tool_unsupported` 表示存在结构化调用但没有被选中，包括
+其他工具名称、未支持的结构和更深层 reasoning group。`invalid_submit_arguments`
+表示原选择器选中了 submit_goal 快照，但最新调用未提供有效 key。
+`selected` 表示选中带有效 key 的工具快照，仍需原有 canonical identity、路由与
+权限门禁才能发送 Evidence。边界、不可读、历史视口和异常继续单独标识。
+
+这些摘要不参与选择和身份认证，不输出正文、完整参数、凭据或原始 Fiber。
+`selection_reason` 等摘要变化沿现有限流立即记录；稳定状态仍最多每 30 秒一条。
+`diagnostic.observed_at` 保留 Fiber 实际完成观测的时间，外层 `timestamp` 为日志
+接收时间；旧脚本未提供有效观测时间时沿用 worker 时间，须结合版本字段判断。
+
+下一次真实 E2E 前先加载新版后端 Schema，再重新加载扩展并刷新 ChatGPT 页面。
+不刷新页面可能保留旧 Fiber/Content，单独重新加载扩展不足以确认版本一致。
+检查 `fiber_scanned` 的四个版本字段和细分原因；再按 document/epoch/scan 与
+`route_checked`、`worker_send_attempted`、Bridge/Connector 事件对照。无 key 的
+摘要只能用于诊断上下文，不能用于绑定 Pending，也不改变 120 秒 TTL。
+
 ## Current conclusion (2026-09-17)
 
 The successful hash `b6ecc5921bd445b4e5f3994b3da05b5300a811dbaf90987ee32bbc18d7d22919`

@@ -265,7 +265,11 @@ describe("EvidenceTransportTraceService", () => {
       observed_at: new Date().toISOString(), correlation_key_hash: 'a'.repeat(64),
       conversation_id_hash: '', document_id_hash: 'b'.repeat(64),
       flags: { current_key_found: true, conversation_unreadable: true }, fiber_evidence_count: 0 };
-    const observation = { ...body, snapshot_selection_reason: 'snapshot_unreadable' };
+    const observation = { ...body, snapshot_selection_reason: 'snapshot_unreadable',
+      selection_reason: 'snapshot_unreadable', snapshot_path: 'timeline', anchor_state: 'unknown',
+      candidate_turn_count: 2, searched_turn_count: 0, structured_tool_count: 'unknown',
+      recognized_submit_count: 'unknown', excluded_tool_count: 'unknown', most_recent: 'unknown',
+      fiber_revision: '0.1.5', content_revision: '0.1.5', background_revision: '0.1.5', extension_version: '0.1.5' };
     expect((await request('/identity-diagnostic', { method: 'POST', body })).status).toBe(401);
     expect((await request('/identity-diagnostic', { method: 'POST', token, body: { ...body, prompt: 'SECRET' } })).status).toBe(400);
     expect((await request('/identity-diagnostic', { method: 'POST', token, body: { ...body, flags: { cookie: true } } })).status).toBe(400);
@@ -274,10 +278,15 @@ describe("EvidenceTransportTraceService", () => {
       ...observation, snapshot_selection_reason: 'arbitrary payload',
     } })).status).toBe(400);
     expect((await request('/identity-diagnostic', { method: 'POST', token, body: observation })).status).toBe(202);
+    for (const invalid of [{ selection_reason: 'SECRET' }, { structured_tool_count: 100001 },
+      { most_recent: 'SECRET' }, { fiber_revision: 'SECRET' }]) {
+      expect((await request('/identity-diagnostic', { method: 'POST', token, body: { ...observation, ...invalid } })).status).toBe(400);
+    }
     expect(bridgeStatus().lastSeenAt).toBe(before);
     expect(connector).not.toHaveBeenCalled();
     const saved = await readFile(trace.file, 'utf8');
     expect(JSON.parse(saved)).toMatchObject({ event: 'browser_identity_diagnostic', diagnostic: observation });
+    expect((await trace.getEvidenceTransportTrace({ limit: 1 })).events[0].diagnostic).toEqual(observation);
     expect(saved).not.toContain('SECRET');
   });
 
