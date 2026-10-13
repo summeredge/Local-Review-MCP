@@ -164,6 +164,8 @@ export interface LauncherSessionSummary {
  * a Session exists.
  */
 export interface LauncherExecutionSummary {
+  readonly goal_status?: GoalOrchestration["status"];
+  readonly human_required_info?: GoalOrchestration["human_required_info"];
   readonly execution_id: string;
   readonly workspace_id: string;
   readonly task_id: string;
@@ -538,6 +540,8 @@ export class StatusQueryService {
       task_id: execution.task_id,
       ...(goal === undefined ? {} : {
         goal_id: goal.goal_id,
+        goal_status: goal.status,
+        ...(goal.human_required_info === undefined ? {} : { human_required_info: goal.human_required_info }),
       }),
       ...(mode === undefined ? {} : { execution_mode: mode }),
       ...(model === undefined ? {} : modelStatusFields(model)),
@@ -555,7 +559,8 @@ export class StatusQueryService {
         backend_type: session.backend_type,
         ...(session.thread_id === undefined ? {} : { thread_id: session.thread_id }),
       }),
-      updated_at: session?.updated_at ?? execution.finished_at ?? execution.started_at,
+      updated_at: goal?.status === "human_required" ? goal.updated_at
+        : session?.updated_at ?? execution.finished_at ?? execution.started_at,
     };
   }
 

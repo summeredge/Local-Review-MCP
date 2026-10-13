@@ -186,6 +186,7 @@ export function createAppContext(
   });
   const goalOrchestration = new GoalOrchestrationService(registry, {
     storageRoot,
+    extensionDeliveries,
     authorizationStore: actuationAuthorizationStore,
     controlledActuation,
     autoIteration,

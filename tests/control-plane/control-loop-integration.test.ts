@@ -390,6 +390,7 @@ async function createHarness(
     authorizationStore: authorizations,
     controlledActuation: controlled,
     autoIteration: auto,
+    extensionDeliveries: auto.extensionDeliveries,
   });
   const drainTerminalListeners = wireGoalAdvance(auto, goals);
   return {
@@ -811,6 +812,17 @@ describe("Control Plane control loop integration", () => {
     expect(harness.review.broker.requests).toHaveLength(1);
     expect(harness.review.completionClient.requests).toHaveLength(1);
     expect((await harness.auto.getLoop(goal.loop_id!))?.terminal_decision).toBe("HUMAN_REQUIRED");
+    const owner = { conversation_id: value.conversation_id, client_id: "notification-client",
+      document_id: "notification-document", navigation_epoch: 1 };
+    const notification = await harness.auto.extensionDeliveries.claim(owner);
+    expect(notification?.message).toContain("REVIEW_REQUIRES_HUMAN");
+    expect(notification?.message).toContain("Review 需要用户决策");
+    expect(notification?.message).toContain("submit_goal");
+    await harness.auto.extensionDeliveries.acknowledge({ ...owner, delivery_id: notification!.delivery_id,
+      status: "sent", message_id: "human-required-message" });
+    await harness.goals.recover();
+    expect(await harness.auto.extensionDeliveries.claim(owner)).toBeNull();
+    expect(harness.codex.starts).toHaveLength(1);
     await assertIdentity(harness, value, "task-1");
   });
 

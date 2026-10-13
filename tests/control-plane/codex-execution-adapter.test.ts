@@ -3,6 +3,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CodexExecutionAdapter,
@@ -14,6 +16,8 @@ import {
 import { ExecutionContextService } from "../../src/context/execution-service.js";
 import { TaskContextService } from "../../src/context/service.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
+
+const execFile = promisify(execFileCallback);
 
 const temporaryDirectories: string[] = [];
 const fakeProcesses: FakeProcess[] = [];
@@ -70,9 +74,87 @@ function runnerFor(process: FakeProcess, requests: CodexProcessSpawnRequest[]) {
   };
 }
 
+function gitEnvironment(): NodeJS.ProcessEnv {
+  return {
+    PATH: process.env.PATH ?? "",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
+async function git(cwd: string, ...args: string[]): Promise<void> {
+  await execFile("git", args, {
+    cwd,
+    env: gitEnvironment(),
+    windowsHide: true,
+  });
+}
+
 describe("CodexExecutionAdapter", () => {
+  it("detects a non-git workspace and adds --skip-git-repo-check", async () => {
+    const storageRoot = await mkdtemp(join(tmpdir(), "local-review-mcp-codex-non-git-state-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "local-review-mcp-codex-non-git-workspace-"));
+    const nestedRoot = join(workspaceRoot, "nested");
+    temporaryDirectories.push(storageRoot, workspaceRoot);
+    await mkdir(nestedRoot, { recursive: true });
+    const registry = new WorkspaceRegistry([{ id: "workspace-a", name: "Workspace A", path: nestedRoot }]);
+    await new TaskContextService(storageRoot).createTaskContext({
+      task_id: "task-001",
+      workspace_id: "workspace-a",
+    });
+    const process = new FakeProcess(4110);
+    const requests: CodexProcessSpawnRequest[] = [];
+    const adapter = new CodexExecutionAdapter(registry, {
+      storageRoot,
+      codexExecutable: "codex",
+      processRunner: runnerFor(process, requests),
+    });
+
+    await adapter.start({
+      workspace_id: "workspace-a",
+      task_id: "task-001",
+      execution_id: "execution-non-git",
+      instruction: "run outside git",
+    });
+
+    expect(requests[0]?.args).toEqual(["exec", "--skip-git-repo-check", "--json", "-"]);
+    expect(requests[0]?.cwd).toBe(nestedRoot);
+  });
+
+  it("fails clearly when git worktree detection errors instead of guessing non-git", async () => {
+    const fixture = await makeFixture();
+    let spawnCount = 0;
+    const adapter = new CodexExecutionAdapter(fixture.registry, {
+      storageRoot: fixture.storageRoot,
+      codexExecutable: "codex",
+      processRunner: () => {
+        spawnCount += 1;
+        throw new Error("must not spawn");
+      },
+      gitWorktreeDetection: () => Promise.reject(new Error("safe.directory rejection")),
+    });
+
+    await expect(adapter.start({
+      workspace_id: "workspace-a",
+      task_id: "task-001",
+      execution_id: "execution-git-error",
+      instruction: "do not guess",
+    })).rejects.toThrow(/safe\.directory rejection/iu);
+    expect(spawnCount).toBe(0);
+    await expect(new ExecutionContextService(fixture.storageRoot).getExecutionContext(
+      "workspace-a",
+      "task-001",
+      "execution-git-error",
+    )).resolves.toMatchObject({
+      status: "failed",
+      summary: expect.stringContaining("safe.directory rejection"),
+    });
+  });
+
   it("starts once in the registry workspace and persists process identity", async () => {
     const fixture = await makeFixture();
+    await git(fixture.workspaceRoot, "init", "-b", "main");
     const process = new FakeProcess(4101);
     const requests: CodexProcessSpawnRequest[] = [];
     const adapter = new CodexExecutionAdapter(fixture.registry, {
@@ -105,6 +187,37 @@ describe("CodexExecutionAdapter", () => {
       "task-001",
       "execution-001",
     )).resolves.toMatchObject({ status: "running", process_id: 4101 });
+  });
+
+  it("keeps original codex arguments for a workspace inside a git subdirectory", async () => {
+    const storageRoot = await mkdtemp(join(tmpdir(), "local-review-mcp-codex-subdir-state-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "local-review-mcp-codex-subdir-workspace-"));
+    const nestedRoot = join(workspaceRoot, "nested");
+    temporaryDirectories.push(storageRoot, workspaceRoot);
+    await mkdir(nestedRoot, { recursive: true });
+    await git(workspaceRoot, "init", "-b", "main");
+    const registry = new WorkspaceRegistry([{ id: "workspace-a", name: "Workspace A", path: nestedRoot }]);
+    await new TaskContextService(storageRoot).createTaskContext({
+      task_id: "task-001",
+      workspace_id: "workspace-a",
+    });
+    const process = new FakeProcess(4112);
+    const requests: CodexProcessSpawnRequest[] = [];
+    const adapter = new CodexExecutionAdapter(registry, {
+      storageRoot,
+      codexExecutable: "codex",
+      processRunner: runnerFor(process, requests),
+    });
+
+    await adapter.start({
+      workspace_id: "workspace-a",
+      task_id: "task-001",
+      execution_id: "execution-git-subdir",
+      instruction: "run inside git subdirectory",
+    });
+
+    expect(requests[0]?.args).toEqual(["exec", "--json", "-"]);
+    expect(requests[0]?.cwd).toBe(nestedRoot);
   });
 
   it("coalesces duplicate starts and survives service reconstruction", async () => {

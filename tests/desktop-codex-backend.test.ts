@@ -299,6 +299,8 @@ interface Fixture {
 }
 
 async function fixture(options: {
+  // A supplied Desktop keeps its project path unless projectPath overrides it; positive tests use
+  // desktop.setProjectPath(value.registry.active.manager.canonicalRoot) after fixture creation.
   readonly desktop?: FakeDesktop;
   readonly state?: () => DesktopSyncState;
   readonly projectPath?: string;
@@ -416,8 +418,8 @@ async function seedTask(value: Fixture): Promise<void> {
 
 async function authorizeAndActuate(
   value: Fixture,
-  overrides: Partial<ActuationAuthorizationInput> = {},
-  waitForTerminal = true,
+  overrides: Partial<ActuationAuthorizationInput>,
+  waitFor: "terminal" | "launch",
 ): Promise<void> {
   await seedTask(value);
   const authorization = await value.controlled.authorize({
@@ -434,7 +436,7 @@ async function authorizeAndActuate(
     actuation_id: ACTUATION_ID,
     authorization_id: authorization.authorization_id,
   });
-  if (waitForTerminal) {
+  if (waitFor === "terminal") {
     // The Desktop turn completes asynchronously through the completion observer. Wait for the
     // durable Execution terminal state so assertions observe the committed result, not a snapshot.
     await waitForTerminalExecution(value);
@@ -675,7 +677,7 @@ describe("P5.4.1 route selection", () => {
 
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
     expect(value.cliStart).not.toHaveBeenCalled();
     expect(value.appServerStart).not.toHaveBeenCalled();
     expect(value.desktop.createThreadCount()).toBe(1);
@@ -725,7 +727,7 @@ describe("P5.4.1 Desktop preflight fail-closed", () => {
     const value = await fixture({ desktop, runtimeFactory });
     // The fixture only auto-binds the Desktop project record for its own default fake.
     desktop.setProjectPath(value.registry.active.manager.canonicalRoot);
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
 
     expect(seenPipePaths).toEqual([environmentPipe]);
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
@@ -806,7 +808,7 @@ describe("Desktop interactive Goal model and reasoning effort", () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
 
-    await authorizeAndActuate(value, { model_id: "gpt-5.6-luna", reasoning_effort: "max" });
+    await authorizeAndActuate(value, { model_id: "gpt-5.6-luna", reasoning_effort: "max" }, "terminal");
 
     expect(value.desktop.createThreadCount()).toBe(1);
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
@@ -829,7 +831,7 @@ describe("Desktop interactive Goal model and reasoning effort", () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
 
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
 
     expect(value.desktop.createThreadCount()).toBe(1);
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
@@ -884,7 +886,7 @@ describe("P5.4.1 first turn on a newly created Desktop target", () => {
   it("completes the first turn from an empty baseline and persists durable Desktop identity", async () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 42 }]);
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
 
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
     expect(execution).toMatchObject({ status: "passed", command: "desktop codex_app" });
@@ -914,7 +916,7 @@ describe("P5.4.1 first turn on a newly created Desktop target", () => {
   it("never persists the executor identity into Session, binding, or Execution", async () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
 
     const session = (await value.sessions.listSessions())[0]!;
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
@@ -930,25 +932,26 @@ describe("P5.4.1 first turn on a newly created Desktop target", () => {
     expect(session.thread_id).not.toBe("executor-conversation-1");
   });
 
-  it("fails closed when a newly created target already shows more than one new turn", async () => {
+  it("retains running when a newly created target already shows more than one new turn", async () => {
     const value = await fixture();
     value.desktop.setTurns([
       { id: "turn-1", status: "completed", completedAt: 1 },
       { id: "turn-2", status: "completed", completedAt: 2 },
     ]);
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "launch");
+    await value.backend.whenIdle();
 
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
-    expect(execution?.status).toBe("failed");
+    expect(execution?.status).toBe("running");
     expect(execution?.summary).toContain("ambiguous_new_turn");
-    expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
-    expect(value.terminals).toHaveLength(1);
+    expect((await value.sessions.listSessions())[0]!.status).toBe("active");
+    expect(value.terminals).toHaveLength(0);
   });
 
   it("keeps the Execution running while the Desktop turn is in progress", async () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
-    await authorizeAndActuate(value, {}, false);
+    await authorizeAndActuate(value, {}, "launch");
     await new Promise((resolve) => setTimeout(resolve, 25));
 
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
@@ -974,7 +977,7 @@ describe("P5.4.1 first turn on a newly created Desktop target", () => {
       return original(params);
     };
 
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
 
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
     expect(execution?.status).toBe("passed");
@@ -989,7 +992,7 @@ describe("P5.4.1 first turn on a newly created Desktop target", () => {
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 42 }]);
     // The freshly created target is momentarily unreadable; the first-turn visibility grace retries.
     value.desktop.setReadErrors(1);
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
 
     const execution = await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID);
     expect(execution).toMatchObject({ status: "passed" });
@@ -1006,7 +1009,7 @@ describe("P5.4.1 durable launch identity without a process id", () => {
   it("recovers a Desktop Execution from Session plus DesktopThreadBinding instead of a PID", async () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
 
     const authorization = await value.controlled.authorizationStore.getAuthorizationByActuation(ACTUATION_ID);
     expect(authorization).not.toBeNull();
@@ -1071,7 +1074,7 @@ describe("P5.4.1 StatusQuery and terminal ordering", () => {
   it("reports desktop_codex_app with the Desktop target thread and completed turn", async () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
     const session = (await value.sessions.listSessions())[0]!;
 
     const { StatusQueryService } = await import("../src/control-plane/status-query.js");
@@ -1114,7 +1117,7 @@ describe("P5.4.1 StatusQuery and terminal ordering", () => {
       });
     });
 
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
 
     expect(observed).toEqual([{ execution: "passed", session: "completed", event: true }]);
     // The service has a single terminal listener, so this test's listener replaced the fixture's.
@@ -1146,7 +1149,7 @@ describe("P5.4.1 FIX executor identity is captured exactly once", () => {
       return original(params);
     };
     value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
 
     const toolCalls = value.desktop.calls.filter((call) =>
       call.name === "list_projects"
@@ -1182,7 +1185,7 @@ describe("P5.4.1 FIX executor identity is captured exactly once", () => {
       },
     });
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
 
     // Exactly one capture happens per Execution; the project resolver reuses that value.
     expect(seen).toHaveLength(1);
@@ -1194,7 +1197,116 @@ describe("P5.4.1 FIX executor identity is captured exactly once", () => {
 });
 
 describe("P5.4.1 FIX failure terminal projection", () => {
-  it("fails Desktop orphans after Host restart once without creating or resending a thread", async () => {
+  it.each(["completed", "failed"])("reconnects observation of the same Turn until real %s without dispatching again", async outcome => {
+    const desktop = fakeDesktop();
+    let connections = 0;
+    let broken = false;
+    const original = desktop.runtime.mcpClient.callTool;
+    desktop.runtime.mcpClient.callTool = async params => {
+      if (params.name === "read_thread" && broken && connections === 1) {
+        return { isError: true, content: [{ type: "text", text: "transport unavailable" }] };
+      }
+      return original(params);
+    };
+    const value = await fixture({ desktop, completionTimeoutMs: 10, runtimeFactory: {
+      connect: async () => {
+        connections++;
+        if (connections > 1) desktop.setListTools(desktopTools().filter(tool => tool.name === "read_thread"));
+        return desktop.runtime;
+      },
+    } });
+    desktop.setProjectPath(value.registry.active.manager.canonicalRoot);
+    desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
+    await authorizeAndActuate(value, {}, "launch");
+    const session = (await value.sessions.listSessions())[0]!;
+    await vi.waitFor(async () => expect((await value.events.listEvents(session.session_id))
+      .filter(event => event.event_type === "turn_started")).toHaveLength(1));
+    broken = true;
+    await vi.waitFor(() => expect(connections).toBe(2));
+    desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null },
+      { id: "turn-2", status: "completed", completedAt: 2 }]);
+    await vi.waitFor(async () => expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))?.summary)
+      .toContain('"monitor":"recovered"'));
+    expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))?.status).toBe("running");
+    desktop.setTurns([{ id: "turn-1", status: outcome, completedAt: 1 },
+      { id: "turn-2", status: "completed", completedAt: 2 }]);
+    await value.backend.whenIdle();
+    expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))?.status)
+      .toBe(outcome === "completed" ? "passed" : "failed");
+    const events = await value.events.listEvents(session.session_id);
+    expect(events.filter(event => event.event_type === "turn_started")).toHaveLength(1);
+    expect(events.filter(event => event.event_type === "execution_failed")).toHaveLength(outcome === "failed" ? 1 : 0);
+    expect(desktop.createThreadCount()).toBe(1);
+    expect(desktop.sendCount()).toBe(0);
+    expect(value.terminals).toHaveLength(1);
+    expect(desktop.runtimeCloseCount()).toBe(2);
+  });
+
+  it.each(["existing", "reconcile", "concurrent"])("bounds reconnect failures and lets %s reattach with captured identity", async recovery => {
+    const desktop = fakeDesktop();
+    let connections = 0;
+    let broken = false;
+    const original = desktop.runtime.mcpClient.callTool;
+    desktop.runtime.mcpClient.callTool = async params => {
+      if (params.name === "read_thread" && broken) throw new Error("transport disconnected");
+      return original(params);
+    };
+    const value = await fixture({ desktop, completionTimeoutMs: 10, runtimeFactory: {
+      connect: async () => { connections++; if (broken) throw new Error("runtime unavailable"); return desktop.runtime; },
+    } });
+    desktop.setProjectPath(value.registry.active.manager.canonicalRoot);
+    desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
+    await authorizeAndActuate(value, {}, "launch");
+    const session = (await value.sessions.listSessions())[0]!;
+    await vi.waitFor(async () => expect((await value.events.listEvents(session.session_id))
+      .some(event => event.event_type === "turn_started")).toBe(true));
+    broken = true;
+    await value.backend.whenIdle();
+    expect(connections).toBe(4);
+    expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID)))
+      .toMatchObject({ status: "running", summary: expect.stringContaining('"monitor":"unavailable"') });
+    expect(value.terminals).toHaveLength(0);
+    expect((await value.events.listEvents(session.session_id)).some(event => event.event_type === "execution_failed")).toBe(false);
+    broken = false;
+    desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+    if (recovery === "existing") {
+      expect(await value.backend.start(interactiveRequest())).toMatchObject({ accepted: "existing", thread_id: session.thread_id });
+    } else if (recovery === "reconcile") {
+      await value.backend.reconcileOrphanedExecutions();
+    } else {
+      await Promise.all([value.backend.start(interactiveRequest()), value.backend.reconcileOrphanedExecutions()]);
+    }
+    await value.backend.whenIdle();
+    expect(connections).toBe(5);
+    expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))?.status).toBe("passed");
+    expect(desktop.createThreadCount()).toBe(1);
+    expect(desktop.sendCount()).toBe(0);
+    expect((await value.events.listEvents(session.session_id)).filter(event => event.event_type === "turn_started")).toHaveLength(1);
+  });
+
+  it("keeps a running Execution after process restart despite an unrelated foreground executor", async () => {
+    const value = await fixture();
+    value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
+    await authorizeAndActuate(value, {}, "launch");
+    await value.backend.close();
+    const connect = vi.fn(value.desktop.runtimeFactory.connect);
+    const restarted = new DesktopCodexBackend(value.registry, { storageRoot: value.root,
+      runtimeFactory: { connect }, desktopState: () => desktopState({ currentConversationId: "unrelated-foreground" }),
+    });
+    try {
+      expect(await restarted.start(interactiveRequest())).toMatchObject({ accepted: "existing" });
+      await restarted.reconcileOrphanedExecutions();
+      expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID)))
+        .toMatchObject({ status: "running", summary: expect.stringContaining("executor_identity_unavailable") });
+      expect(connect).not.toHaveBeenCalled();
+      expect(value.desktop.createThreadCount()).toBe(1);
+      expect(value.desktop.sendCount()).toBe(0);
+      const session = (await value.sessions.listSessions())[0]!;
+      expect((await value.events.listEvents(session.session_id)).some(event => event.event_type === "execution_failed")).toBe(false);
+    } finally { await restarted.close(); }
+  });
+
+  it("retains Desktop orphans after Host restart once without creating or resending a thread", async () => {
     const value = await fixture();
     await seedTask(value);
     const session = await value.sessions.createSession({ goal_id: GOAL_ID, task_id: TASK_ID,
@@ -1218,9 +1330,9 @@ describe("P5.4.1 FIX failure terminal projection", () => {
     await value.backend.reconcileOrphanedExecutions();
     await value.backend.reconcileOrphanedExecutions();
     expect(await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))
-      .toMatchObject({ status: "failed", summary: expect.stringContaining("previous runtime shutdown") });
-    expect((await value.sessions.getSession(session.session_id))?.status).toBe("failed");
-    expect(value.terminals).toHaveLength(1);
+      .toMatchObject({ status: "running", summary: expect.stringContaining("executor_identity_unavailable") });
+    expect((await value.sessions.getSession(session.session_id))?.status).toBe("active");
+    expect(value.terminals).toHaveLength(0);
     expect(value.desktop.createThreadCount()).toBe(0);
     expect(value.cliStart).not.toHaveBeenCalled();
   });
@@ -1228,7 +1340,7 @@ describe("P5.4.1 FIX failure terminal projection", () => {
   it("keeps observing the dispatched task when target activation fails without dispatching a second task", async () => {
     const value = await fixture({ openDesktopThread: async () => { throw new Error("activation failed"); } });
     value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
-    await authorizeAndActuate(value, {}, false);
+    await authorizeAndActuate(value, {}, "launch");
     expect(await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))
       .toMatchObject({ status: "running" });
     const session = (await value.sessions.listSessions())[0]!;
@@ -1251,38 +1363,41 @@ describe("P5.4.1 FIX failure terminal projection", () => {
     expect(value.appServerStart).not.toHaveBeenCalled();
   });
 
-  it("fails the Execution when CompletionObserver initialization rejects its configuration", async () => {
+  it("retains the Execution when CompletionObserver initialization rejects its configuration", async () => {
     const value = await fixture({ pollIntervalMs: -1 });
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "launch");
+    await value.backend.whenIdle();
     expect(await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))
-      .toMatchObject({ status: "failed", summary: expect.stringContaining("pollIntervalMs") });
-    expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
+      .toMatchObject({ status: "running", summary: expect.stringContaining("unavailable") });
+    expect((await value.sessions.listSessions())[0]!.status).toBe("active");
   });
 
-  it("fails the Execution when CompletionObserver throws during observation", async () => {
+  it("retains the Execution when CompletionObserver throws during observation", async () => {
     const observer = vi.spyOn(DesktopCompletionObserver.prototype, "waitForCompletion")
       .mockRejectedValue(new Error("observer initialization failed"));
     try {
       const value = await fixture();
-      await authorizeAndActuate(value);
+      await authorizeAndActuate(value, {}, "launch");
+      await value.backend.whenIdle();
       expect(await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))
-        .toMatchObject({ status: "failed", summary: expect.stringContaining("observer initialization failed") });
-      expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
+        .toMatchObject({ status: "running", summary: expect.stringContaining("unavailable") });
+      expect((await value.sessions.listSessions())[0]!.status).toBe("active");
     } finally { observer.mockRestore(); }
   });
 
-  it("bounds repeated first-turn visibility and tool errors instead of leaving Execution running", async () => {
+  it("bounds repeated first-turn visibility errors while retaining Execution running", async () => {
     const observer = vi.spyOn(DesktopCompletionObserver.prototype, "waitForCompletion")
       .mockResolvedValue({ status: "unknown", reason: "first_turn_visibility_unavailable",
         targetThreadId: "target-thread-1", hostId: "local" });
     try {
       const value = await fixture({ completionTimeoutMs: 10 });
-      await authorizeAndActuate(value);
+      await authorizeAndActuate(value, {}, "launch");
+      await value.backend.whenIdle();
       expect(await value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))
-        .toMatchObject({ status: "failed", summary: "Desktop turn completion observation unavailable." });
-      // Timer granularity can require another observation; terminal state, not an exact count, is the contract.
+        .toMatchObject({ status: "running", summary: expect.stringContaining("unavailable") });
+      // Exhausted observation retries retain the Execution without a terminal notification.
       expect(observer.mock.calls.length).toBeGreaterThanOrEqual(2);
-      expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
+      expect((await value.sessions.listSessions())[0]!.status).toBe("active");
     } finally { observer.mockRestore(); }
   });
 
@@ -1355,7 +1470,7 @@ describe("P5.4.1 FIX failure terminal projection", () => {
       });
     });
 
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
 
     expect(observed).toHaveLength(1);
     expect(observed[0]).toMatchObject({
@@ -1363,24 +1478,24 @@ describe("P5.4.1 FIX failure terminal projection", () => {
       session: "failed",
       event: "execution_failed",
     });
-    // A failed turn has no completion event, so it must not be fabricated.
-    expect(observed[0]?.turnId).toBe("absent");
+    // The failed Turn identity is authoritative; no completion event is fabricated.
+    expect(observed[0]?.turnId).toBe("turn-1");
   });
 
-  it("persists an execution_failed event without a fabricated turn id for unknown completion", async () => {
+  it("retains unknown completion without an execution_failed event", async () => {
     const value = await fixture();
     // Two first-seen turns make completion ambiguous, which is an unverifiable completion.
     value.desktop.setTurns([
       { id: "turn-1", status: "completed", completedAt: 1 },
       { id: "turn-2", status: "completed", completedAt: 2 },
     ]);
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "launch");
+    await value.backend.whenIdle();
 
     const session = (await value.sessions.listSessions())[0]!;
     const events = await value.events.listEvents(session.session_id);
     const failure = events.find((event) => event.event_type === "execution_failed");
-    expect(failure).toBeDefined();
-    expect("turn_id" in failure! ? failure!.turn_id : undefined).toBeUndefined();
+    expect(failure).toBeUndefined();
     expect(events.some((event) => event.event_type === "turn_completed")).toBe(false);
   });
 
@@ -1530,7 +1645,7 @@ describe("P5.4.1 FIX Desktop runtime ownership", () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 2 }]);
 
-    await authorizeAndActuate(value);
+    await authorizeAndActuate(value, {}, "terminal");
 
     // The watch owns the runtime: exactly one close, and only after the Execution terminated.
     expect(value.desktop.runtimeCloseCount()).toBe(1);
@@ -1547,7 +1662,7 @@ describe("P5.4.1 FIX Desktop runtime ownership", () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
 
-    await authorizeAndActuate(value, {}, false);
+    await authorizeAndActuate(value, {}, "launch");
     expect(value.desktop.runtimeCloseCount()).toBe(0);
 
     await value.backend.close();
@@ -1558,8 +1673,8 @@ describe("P5.4.1 FIX Desktop runtime ownership", () => {
       TASK_ID,
       EXECUTION_ID,
     );
-    expect(execution?.status).toBe("failed");
-    expect((await value.sessions.listSessions())[0]!.status).toBe("failed");
+    expect(execution?.status).toBe("running");
+    expect((await value.sessions.listSessions())[0]!.status).toBe("active");
   });
 
   it("closes a runtime held in the active map when the backend is shut down", async () => {

@@ -338,7 +338,8 @@ describe("P5.4.1-D failure classification", () => {
       [],
     );
     try {
-      expect(result.observer_reason).toBe("tool_error");
+      expect(result.observer_status).toBe("failed");
+      expect(result.observer_reason).toBeUndefined();
       expect(result.turn_error_observed).toBe(true);
       const report = await readFile(join(artifactDir, "report.md"), "utf8");
       expect(report).toContain("turn_error: true");

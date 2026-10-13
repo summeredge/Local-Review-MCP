@@ -116,6 +116,12 @@ class ExecutionViewModel:
     summary: str | None = None
     session: SessionViewModel | None = None
     events: tuple[SessionEventViewModel, ...] = ()
+    goal_status: str | None = None
+    human_required_info: Mapping[str, object] | None = None
+
+    @property
+    def display_status(self) -> str:
+        return "需人工处理" if self.goal_status == "human_required" else self.status
 
     @property
     def backend_label(self) -> str:
@@ -481,6 +487,10 @@ def build_execution_view_model(
         started_at=_optional_rfc3339_timestamp(document.get("started_at"), "started_at"),
         finished_at=_optional_rfc3339_timestamp(document.get("finished_at"), "finished_at"),
         summary=_summary_text(document),
+        goal_status=_optional_status(document.get("goal_status"), "goal_status",
+                                     {"pending", "running", "completed", "failed", "human_required"}),
+        human_required_info=(None if document.get("human_required_info") is None
+                             else _object(document["human_required_info"], "human_required_info")),
         session=session,
         events=events,
     )

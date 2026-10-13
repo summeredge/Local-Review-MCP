@@ -1,8 +1,10 @@
 import { EventEmitter } from "node:events";
+import { execFile as execFileCallback } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ActuationAuthorizationStore,
@@ -22,6 +24,7 @@ import { WorkspaceRegistry } from "../../src/workspace/registry.js";
 
 const temporaryDirectories: string[] = [];
 const fakeProcesses: FakeProcess[] = [];
+const execFile = promisify(execFileCallback);
 
 class FakeProcess extends EventEmitter implements CodexProcess {
   public readonly stdin = new PassThrough();
@@ -116,6 +119,7 @@ describe("ControlledActuationService", () => {
 
   it("authorizes durably and starts through the Adapter using only the authorization record", async () => {
     const value = await fixture();
+    await execFile("git", ["init", "-b", "main"], { cwd: value.workspaceRoot, windowsHide: true });
     const process = new FakeProcess(5101);
     const requests: CodexProcessSpawnRequest[] = [];
     const service = new ControlledActuationService(value.registry, {

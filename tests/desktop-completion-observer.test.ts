@@ -184,6 +184,21 @@ function context(timeoutMs?: number) {
 }
 
 describe("DesktopCompletionObserver", () => {
+  it("keeps a verified Turn pinned when a replacement observer sees a newer completed Turn", async () => {
+    const setupValue = setup([readPayload([turn(B, "completed"), turn(A, "inProgress")]),
+      readPayload([turn(B, "completed"), turn(A, "completed")])]);
+    await expect(setupValue.observer.waitForCompletion({ ...context(), turnId: A,
+      baseline: { targetThreadId: TARGET_THREAD, hostId: HOST_ID, turnIds: [] },
+    })).resolves.toMatchObject({ status: "completed", turnId: A });
+    expect(setupValue.calls.filter(call => call.name === "read_thread")).toHaveLength(2);
+  });
+
+  it("distinguishes tool isError from an explicit target Turn failure", async () => {
+    const setupValue = setup([readPayload([turn(B, "failed", { error: null })])]);
+    await expect(setupValue.observer.waitForCompletion({ ...context(),
+      baseline: { targetThreadId: TARGET_THREAD, hostId: HOST_ID, turnIds: [] },
+    })).resolves.toMatchObject({ status: "failed", turnId: B });
+  });
   it("polls once per second by default without wait_threads and detects completion on the next read", async () => {
     vi.useFakeTimers();
     try {
@@ -429,9 +444,9 @@ describe("DesktopCompletionObserver", () => {
   });
 
   it.each([
-    ["turn error", turn(B, "completed", { error: { code: "failed" } }), "tool_error"],
+    ["turn error", turn(B, "completed", { error: { code: "failed" } }), "failed"],
     ["missing completedAt", turn(B, "completed", { completedAt: null }), "malformed_response"],
-    ["unknown status", turn(B, "failed"), "status_unrecognized"],
+    ["unknown status", turn(B, "unrecognized"), "status_unrecognized"],
   ])("does not accept %s as completion", async (_label, candidate, reason) => {
     const setupValue = setup([
       readPayload([turn(A, "completed")]),
@@ -440,7 +455,7 @@ describe("DesktopCompletionObserver", () => {
     const captured = await setupValue.observer.captureBaseline(context());
 
     await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: captured }))
-      .resolves.toMatchObject({ status: "unknown", reason });
+      .resolves.toMatchObject(reason === "failed" ? { status: "failed", turnId: B } : { status: "unknown", reason });
   });
 
   it.each([
@@ -689,7 +704,7 @@ describe("DesktopCompletionObserver", () => {
       );
 
       await expect(setupValue.observer.waitForCompletion({ ...context(), baseline: emptyBaseline }))
-        .resolves.toMatchObject({ status: "unknown", reason: "tool_error", turnId: B });
+        .resolves.toMatchObject({ status: "failed", turnId: B });
       expect(setupValue.calls).toHaveLength(1);
     });
 

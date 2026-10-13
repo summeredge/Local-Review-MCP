@@ -61,6 +61,42 @@ afterEach(async () => {
 });
 
 describe("ExtensionDeliveryService", () => {
+  it("delivers a human-required notice when the original conversation reconnects after navigation failure", async () => {
+    const { root, deliveries } = await service();
+    const notice = await deliveries.enqueue(conversation, "需人工处理", "goal-human-required-offline");
+    await deliveries.reportRecoveryFailure({ delivery_id: notice.delivery_id, conversation_id: conversation,
+      code: "TARGET_CONVERSATION_NAVIGATION_FAILED" });
+    const restarted = new ExtensionDeliveryService(root);
+    await expect(restarted.claim({ ...owner, conversation_id: "another-conversation" })).resolves.toBeNull();
+    expect(await restarted.claim(owner)).toMatchObject({ delivery_id: notice.delivery_id });
+    await restarted.acknowledge({ ...owner, delivery_id: notice.delivery_id, status: "sent", message_id: "reconnected-notice" });
+    expect(await restarted.claim(owner)).toBeNull();
+  });
+  it("keeps human-required receipts after queue cleanup and restart, including duplicate ACKs", async () => {
+    const { root, deliveries } = await service();
+    const logicalId = "goal-human-required-breakpoint";
+    const notice = await deliveries.enqueue(conversation, "需人工处理", logicalId);
+    await deliveries.claim(owner);
+    const ack = { ...owner, delivery_id: notice.delivery_id, status: "sent" as const, message_id: "notice-message" };
+    await deliveries.acknowledge(ack);
+    const path = join(root, "control-plane", "extension-deliveries.json");
+    const state = JSON.parse(await readFile(path, "utf8"));
+    const source = state.deliveries[0];
+    state.deliveries = [source, ...Array.from({ length: 999 }, (_, index) => ({
+      delivery_id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+      conversation_id: conversation, message: "queued", created_at: Date.now(), phase: "queued",
+    }))];
+    await writeFile(path, JSON.stringify(state));
+    const full = new ExtensionDeliveryService(root);
+    await full.enqueue(conversation, "another notice");
+    const restarted = new ExtensionDeliveryService(root);
+    expect(await restarted.enqueue(conversation, "需人工处理", logicalId)).toMatchObject({
+      delivery_id: notice.delivery_id, phase: "delivered",
+    });
+    await expect(restarted.acknowledge(ack)).resolves.toMatchObject({ accepted: "existing" });
+    await expect(restarted.acknowledge({ ...ack, message_id: "conflict" })).rejects.toBeInstanceOf(ExtensionDeliveryConflictError);
+    expect((await restarted.recoveryTargets()).some(target => target.delivery_id === notice.delivery_id)).toBe(false);
+  });
   it("durably enqueues, atomically claims, and commits one idempotent sent receipt", async () => {
     const { root, deliveries } = await service();
     const readinessCheckTime = Date.now();

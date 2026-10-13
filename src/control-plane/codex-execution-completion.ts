@@ -710,7 +710,11 @@ export class CodexExecutionCompletionService {
           "Codex process exited without terminal turn evidence.",
         ));
       }
-      return this.fail(current, "Codex process exited without terminal turn evidence.");
+      const diagnostic = await stderrTail(paths.stderr);
+      return this.fail(current, boundedSummary(
+        diagnostic,
+        "Codex process exited without terminal turn evidence.",
+      ));
     }
     return current;
   }

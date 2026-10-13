@@ -27,6 +27,8 @@ import {
 import { ExecutionContextService } from "../../src/context/execution-service.js";
 import { TaskContextService } from "../../src/context/service.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
+import { ExtensionDeliveryService } from "../../src/control-plane/extension-delivery.js";
+import { StatusQueryService } from "../../src/control-plane/status-query.js";
 
 const temporaryDirectories: string[] = [];
 const services: GoalOrchestrationService[] = [];
@@ -130,6 +132,7 @@ async function fixture(auto = new FakeAutoIteration()): Promise<{
   readonly starts: ReturnType<typeof vi.fn>;
   readonly auto: FakeAutoIteration;
   readonly service: GoalOrchestrationService;
+  readonly deliveries: ExtensionDeliveryService;
 }> {
   const root = await mkdtemp(join(tmpdir(), "local-review-mcp-goal-"));
   const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-goal-workspace-"));
@@ -165,6 +168,7 @@ async function fixture(auto = new FakeAutoIteration()): Promise<{
     executionContextService: executions,
     adapter: { start: starts },
   });
+  const deliveries = new ExtensionDeliveryService(root);
   const service = new GoalOrchestrationService(registry, {
     storageRoot: root,
     taskContextService: tasks,
@@ -172,12 +176,107 @@ async function fixture(auto = new FakeAutoIteration()): Promise<{
     authorizationStore: authorizations,
     controlledActuation: controlled,
     autoIteration: auto,
+    extensionDeliveries: deliveries,
   });
   services.push(service);
-  return { root, registry, tasks, executions, authorizations, controlled, starts, auto, service };
+  return { root, registry, tasks, executions, authorizations, controlled, starts, auto, service, deliveries };
 }
 
 describe("Goal terminal persistence failures", () => {
+  it("does not include another conversation's conflicting Loop evidence in the notice", async () => {
+    const f = await fixture();
+    await f.service.createGoal(input());
+    const running = await f.service.startGoal({ goal_id: "goal-1" });
+    const loop = f.auto.terminal(running.loop_id!, "human_required");
+    f.auto.loops.set(loop.loop_id, { ...loop, conversation_id: "another-conversation",
+      terminal_summary: "foreign private evidence" });
+    const stopped = await f.service.advanceGoal("goal-1");
+    expect(stopped.human_required_info).toMatchObject({ terminal_reason: "GOAL_ORCHESTRATION_ERROR" });
+    const [target] = await f.deliveries.recoveryTargets();
+    const notice = await f.deliveries.get(target!.delivery_id);
+    expect(notice?.conversation_id).toBe("conversation-1");
+    expect(notice?.message).not.toContain("foreign private evidence");
+  });
+  it("recovers a persisted human-required Goal when notification enqueue failed, and retries only proven not-sent", async () => {
+    const f = await fixture();
+    await f.service.createGoal(input());
+    const running = await f.service.startGoal({ goal_id: "goal-1" });
+    f.auto.terminal(running.loop_id!, "human_required");
+    const enqueue = vi.spyOn(f.deliveries, "enqueue").mockRejectedValueOnce(new Error("queue unavailable"));
+    expect(await f.service.advanceGoal("goal-1")).toMatchObject({ status: "human_required", human_required_info: {
+      terminal_reason: "TEST_HUMAN_REQUIRED",
+    } });
+    expect(await f.deliveries.recoveryTargets()).toEqual([]);
+    f.service.dispose();
+    enqueue.mockRestore();
+    // Legacy records and a crash before info publication are recovered from the existing Loop.
+    const path = goalOrchestrationStateFile(f.root);
+    const state = JSON.parse(await readFile(path, "utf8"));
+    delete state.goals[0].human_required_info;
+    await writeFile(path, JSON.stringify(state));
+    const restarted = new GoalOrchestrationService(f.registry, { storageRoot: f.root,
+      autoIteration: f.auto, controlledActuation: f.controlled, extensionDeliveries: f.deliveries });
+    services.push(restarted);
+    await restarted.recover();
+    const owner = { conversation_id: "conversation-1", client_id: "client", document_id: "document", navigation_epoch: 1 };
+    const first = (await f.deliveries.claim(owner))!;
+    await f.deliveries.acknowledge({ ...owner, delivery_id: first.delivery_id, status: "not_sent", error: "composer_busy" });
+    await restarted.advanceGoal("goal-1");
+    const retry = (await f.deliveries.claim(owner))!;
+    expect(retry.delivery_id).not.toBe(first.delivery_id);
+    expect(retry.message).toBe(first.message);
+    await f.deliveries.acknowledge({ ...owner, delivery_id: retry.delivery_id, status: "ambiguous", error: "send outcome unknown" });
+    await restarted.recover();
+    expect(await f.deliveries.claim(owner)).toBeNull();
+    expect(f.starts).toHaveBeenCalledTimes(1);
+  });
+  it.each(["REVIEW_REQUIRES_HUMAN", "MAX_ITERATIONS_REACHED", "EXTENSION_NOT_READY"])(
+    "persists and delivers %s to the original conversation without another execution", async reason => {
+      const f = await fixture();
+      await f.service.createGoal(input());
+      const running = await f.service.startGoal({ goal_id: "goal-1" });
+      const loop = { ...f.auto.terminal(running.loop_id!, "human_required"), terminal_reason: reason,
+        terminal_stage: "verdict" as const, review_result_id: "review-result-1" };
+      f.auto.loops.set(loop.loop_id, loop);
+      await f.executions.updateExecutionContext("workspace-a", "task-1", running.execution_id!, {
+        status: "passed", summary: "Implementation and tests completed",
+      });
+      await f.service.onAutoIterationTerminal(loop);
+      const stopped = (await f.service.getGoal("goal-1"))!;
+      expect(stopped).toMatchObject({ status: "human_required", human_required_info: {
+        goal_id: "goal-1", task_id: "task-1", execution_id: loop.execution_id, stage: "verdict",
+        terminal_reason: reason, terminal_summary: "human_required summary", review_result_id: "review-result-1",
+        completed_work: expect.stringContaining("Implementation and tests completed"),
+      } });
+      const deliveries = new ExtensionDeliveryService(f.root);
+      const [target] = await deliveries.recoveryTargets();
+      expect(target?.conversation_id).toBe("conversation-1");
+      const notice = (await deliveries.get(target!.delivery_id))!;
+      expect(notice.message).toContain("请在本 ChatGPT 对话中回复处理决定");
+      expect(notice.message).toContain("submit_goal");
+      expect(notice.message).toContain(reason);
+      expect(notice.message).toContain(reason === "REVIEW_REQUIRES_HUMAN" ? "Review 需要用户决策"
+        : reason === "MAX_ITERATIONS_REACHED" ? "已达到最大迭代次数" : "执行或基础设施异常");
+      const rows = await new StatusQueryService({ storageRoot: f.root, goals: f.service }).listExecutionSummaries();
+      expect(rows[0]).toMatchObject({ goal_status: "human_required", human_required_info: stopped.human_required_info });
+      f.service.dispose();
+      const restarted = new GoalOrchestrationService(f.registry, { storageRoot: f.root, autoIteration: f.auto,
+        controlledActuation: f.controlled, extensionDeliveries: deliveries });
+      services.push(restarted);
+      await restarted.recover();
+      expect(await deliveries.recoveryTargets()).toEqual([target]);
+      const owner = { conversation_id: "conversation-1", client_id: "client", document_id: "document", navigation_epoch: 1 };
+      await expect(deliveries.claim({ ...owner, conversation_id: "another-conversation" })).resolves.toBeNull();
+      expect(await deliveries.claim(owner)).toMatchObject({ delivery_id: notice.delivery_id, message: notice.message });
+      await deliveries.acknowledge({ ...owner, delivery_id: notice.delivery_id, status: "sent", message_id: "notice-message" });
+      await restarted.onAutoIterationTerminal(loop);
+      await restarted.advanceGoal("goal-1");
+      await restarted.recover();
+      expect(await deliveries.recoveryTargets()).toEqual([]);
+      expect(await deliveries.claim(owner)).toBeNull();
+      expect(f.starts).toHaveBeenCalledTimes(1);
+      expect((await restarted.getGoal("goal-1"))!.human_required_info).toEqual(stopped.human_required_info);
+    });
   it.each(["completed", "failed", "human_required"] as const)("recovers %s after retry exhaustion without another execution", async (status) => {
     const f = await fixture();
     await f.service.createGoal(input());
@@ -306,6 +405,9 @@ describe("GoalOrchestrationService", () => {
     f.starts.mockRejectedValue(new ExecutionLaunchIndeterminateError("Desktop stage=session_persistence: disk unavailable"));
     const goal = await f.service.startGoal({ goal_id: plan.goal_id });
     expect(goal).toMatchObject({ status: "human_required", error: expect.stringContaining("disk unavailable") });
+    expect(goal.human_required_info).toMatchObject({ stage: "goal_orchestration",
+      terminal_reason: "GOAL_ORCHESTRATION_ERROR", terminal_summary: expect.stringContaining("disk unavailable"),
+      required_action: expect.stringContaining("执行或基础设施异常") });
     expect(await f.service.getStartEvidence(plan.goal_id)).toMatchObject({ status: "indeterminate" });
     expect(await f.controlled.getActuation(goal.actuation_id!)).toMatchObject({ status: "starting", error: expect.stringContaining("session_persistence") });
     await f.service.recover();

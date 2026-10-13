@@ -228,6 +228,43 @@ describe("CodexExecutionCompletionService", () => {
     });
   });
 
+  it("uses stderr tail as the failure reason when a process exits without terminal evidence", async () => {
+    const root = await storageRoot();
+    const execution = await runningExecution(root);
+    const paths = await stdout(root, execution, "");
+    await writeFile(paths.stderr, "Not inside a trusted directory and --skip-git-repo-check was not specified.\n", "utf8");
+
+    const result = await new CodexExecutionCompletionService(root, { processProbe: () => "alive" })
+      .observeProcessExit({
+        ...identity(execution),
+        process_id: execution.processId,
+        exit_code: 1,
+        signal: null,
+      });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      summary: "Not inside a trusted directory and --skip-git-repo-check was not specified.",
+    });
+  });
+
+  it("keeps the generic failure when stderr is empty after a terminal-evidence-less exit", async () => {
+    const root = await storageRoot();
+    const execution = await runningExecution(root, { executionId: "execution-empty-stderr" });
+    const paths = await stdout(root, execution, "");
+    await writeFile(paths.stderr, "   \n", "utf8");
+
+    const result = await new CodexExecutionCompletionService(root, { processProbe: () => "alive" })
+      .observeProcessExit({
+        ...identity(execution),
+        process_id: execution.processId,
+        exit_code: 1,
+        signal: null,
+      });
+
+    expect(result.summary).toBe("Codex process exited without terminal turn evidence.");
+  });
+
   it("keeps a partial final line running while the process is alive", async () => {
     const root = await storageRoot();
     const execution = await runningExecution(root);

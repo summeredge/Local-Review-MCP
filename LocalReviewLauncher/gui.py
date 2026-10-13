@@ -750,6 +750,7 @@ class LauncherWindow(QMainWindow):
             if (
                 execution.execution_id not in self._cleared_execution_ids
                 or execution.status not in CLEARED_TERMINAL_EXECUTION_STATUSES
+                or execution.goal_status == "human_required"
             )
         )
         self._last_status = replace(status, executions=executions)
@@ -1211,7 +1212,7 @@ class LauncherWindow(QMainWindow):
                     execution.name,
                     execution.display_mode,
                     execution.backend_label,
-                    execution.status,
+                    execution.display_status,
                     execution.workspace_id,
                     self._format_timestamp(execution.started_at),
                     self._format_timestamp(execution.finished_at),
@@ -1221,7 +1222,8 @@ class LauncherWindow(QMainWindow):
                 status_item = self.execution_table.item(row, 3)
                 if status_item is not None:
                     status_item.setForeground(QColor(
-                        EXECUTION_STATUS_COLORS.get(execution.status, UNKNOWN_STATUS_COLOR)
+                        "#b7791f" if execution.goal_status == "human_required"
+                        else EXECUTION_STATUS_COLORS.get(execution.status, UNKNOWN_STATUS_COLOR)
                     ))
             self.execution_table.resizeColumnsToContents()
             self.execution_table.clearSelection()
@@ -1249,10 +1251,18 @@ class LauncherWindow(QMainWindow):
             f"工作区：{execution.workspace_id}",
             f"模式：{execution.display_mode}",
             f"后端：{execution.backend_label}（{execution.backend or '—'}）",
-            f"状态：{execution.status}",
+            f"状态：{execution.display_status}",
             f"开始时间：{self._format_timestamp(execution.started_at)}",
             f"结束时间：{self._format_timestamp(execution.finished_at)}",
             f"摘要：{execution.summary or '—'}",
+            *([
+                f"断点阶段：{execution.human_required_info.get('phase_id', '—')} / {execution.human_required_info.get('stage', '—')}",
+                f"断点原因：{execution.human_required_info.get('terminal_reason', '—')}",
+                f"断点摘要：{execution.human_required_info.get('terminal_summary', '—')}",
+                f"已完成工作：{execution.human_required_info.get('completed_work', '—')}",
+                f"处理要求：{execution.human_required_info.get('required_action', '—')}",
+                "请在原 ChatGPT 对话中回复处理决定。",
+            ] if execution.goal_status == "human_required" and execution.human_required_info else []),
         ]))
         session = execution.session
         # Batch details keep Session and Thread empty while the Execution event stream is independent.

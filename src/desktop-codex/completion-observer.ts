@@ -19,7 +19,7 @@ const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const DEFAULT_VISIBILITY_GRACE_MS = 15_000;
 const DEFAULT_VISIBILITY_POLL_INTERVAL_MS = 500;
 
-export type DesktopCompletionStatus = "completed" | "timed_out" | "unknown";
+export type DesktopCompletionStatus = "completed" | "failed" | "timed_out" | "unknown";
 
 export type DesktopCompletionUnknownReason =
   | "capability_unavailable"
@@ -40,6 +40,8 @@ export interface DesktopCompletionContext {
   readonly hostId: string;
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
+  /** A previously verified target Turn must remain pinned across observer replacement. */
+  readonly turnId?: string;
 }
 
 export interface DesktopCompletionBaseline {
@@ -67,7 +69,8 @@ export interface DesktopCompletionObserverOptions {
   /** Bound continuous read failures without imposing a duration limit on a healthy running turn. */
   readonly readFailureTimeoutMs?: number;
   readonly onTurnStarted?: (turnId: string) => Promise<void>;
-  readonly onSuccessfulRead?: () => void;
+  readonly onSuccessfulRead?: () => void | Promise<void>;
+  readonly onReadFailure?: (code: string) => void;
 }
 
 export class DesktopCompletionObserverError extends Error {
@@ -112,6 +115,7 @@ interface WaitObservation {
 type Evaluation =
   | { readonly kind: "pending"; readonly candidateTurnId?: string }
   | { readonly kind: "completed"; readonly turnId: string }
+  | { readonly kind: "failed"; readonly turnId: string }
   | {
     readonly kind: "unknown";
     readonly reason: DesktopCompletionUnknownReason;
@@ -290,8 +294,9 @@ function evaluate(
   const turn = snapshot.turns.find((value) => value.id === candidate);
   if (turn === undefined) return { kind: "unknown", reason: "turn_identity_unavailable" };
   if (turn.error !== null && turn.error !== undefined) {
-    return { kind: "unknown", reason: "tool_error", turnId: candidate };
+    return { kind: "failed", turnId: candidate };
   }
+  if (turn.status === "failed") return { kind: "failed", turnId: candidate };
   if (turn.status === "completed") {
     if (turn.error === null && turn.completedAt !== null && turn.completedAt !== undefined) {
       return { kind: "completed", turnId: candidate };
@@ -477,7 +482,7 @@ export class DesktopCompletionObserver {
     const visibilityDeadline = this.visibilityGraceMs > 0 && context.baseline.turnIds.length === 0
       ? Date.now() + this.visibilityGraceMs
       : 0;
-    let candidateTurnId: string | undefined;
+    let candidateTurnId: string | undefined = context.turnId;
     let afterCursor: string | undefined;
     let readFailureSince: number | undefined;
     while (true) {
@@ -511,9 +516,9 @@ export class DesktopCompletionObserver {
           context,
         );
         readFailureSince = undefined;
-        this.options.onSuccessfulRead?.();
       } catch (error: unknown) {
         if (isAbort(error, context.signal)) throw abortError();
+        this.options.onReadFailure?.(error instanceof CodexAppRuntimeError ? error.code : errorReason(error));
         if (visibilityActive && transientObservationError(error)) {
           const remainingGrace = Math.min(
             visibilityDeadline - Date.now(),
@@ -556,6 +561,10 @@ export class DesktopCompletionObserver {
       }
 
       const evaluation = evaluate(snapshot, context.baseline, candidateTurnId);
+      if (evaluation.kind !== "unknown") await this.options.onSuccessfulRead?.();
+      if (evaluation.kind === "failed") {
+        return resultFor(context, "failed", { turnId: evaluation.turnId });
+      }
       if (evaluation.kind === "completed") {
         return resultFor(context, "completed", { turnId: evaluation.turnId,
           agentMessages: snapshot.turns.find((turn) => turn.id === evaluation.turnId)?.agentMessages });

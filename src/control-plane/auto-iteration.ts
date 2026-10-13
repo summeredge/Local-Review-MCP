@@ -101,6 +101,7 @@ export const autoIterationSchema = z.object({
   terminal_decision: autoIterationTerminalDecisionSchema.optional(),
   terminal_reason: z.string().min(1).max(4000).optional(),
   terminal_summary: z.string().min(1).max(4000).optional(),
+  terminal_stage: autoIterationStageSchema.optional(),
   created_at: timestampSchema,
   updated_at: timestampSchema,
 }).strict().superRefine((loop, context) => {
@@ -1238,6 +1239,7 @@ export class AutoIterationService {
   ): Promise<AutoIteration> {
     const current = await this.update(loop, {
       stage: "human_required",
+      terminal_stage: loop.stage,
       terminal_decision: "HUMAN_REQUIRED",
       terminal_reason: reason,
       ...(summary === undefined ? {} : { terminal_summary: summary }),

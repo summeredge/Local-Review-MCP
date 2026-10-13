@@ -1233,6 +1233,29 @@ class LauncherDashboardTests(unittest.TestCase):
             ],
         }
 
+    def test_human_required_goal_keeps_execution_status_and_shows_details(self) -> None:
+        info = {"phase_id": "phase-1", "stage": "verdict", "terminal_reason": "REVIEW_REQUIRES_HUMAN",
+                "terminal_summary": "需要确定修改范围", "completed_work": "实现及测试已完成",
+                "required_action": "请确认审查意见"}
+        view = build_execution_view_model({**self._batch_summary(), "status": "passed",
+                                          "goal_status": "human_required", "human_required_info": info})
+        self.assertEqual(view.status, "passed")
+        self.assertEqual(view.display_status, "需人工处理")
+        self.assertEqual(view.human_required_info, info)
+        manager = Mock()
+        manager.load.return_value = LauncherConfig("", "config.production.json", False)
+        with patch("gui.ProductionProcessManager") as process, patch("gui.StatusChecker"), patch.object(
+            LauncherWindow, "refresh_status"
+        ), patch.object(LauncherWindow, "_render_runtime_info"):
+            process.return_value.has_started = False
+            window = LauncherWindow(Path.cwd(), manager)
+            self.addCleanup(window.close)
+        window._render_execution_dashboard((view,))
+        window.execution_table.selectRow(0)
+        self.assertEqual(window.execution_table.item(0, 3).text(), "需人工处理")
+        for text in ("REVIEW_REQUIRES_HUMAN", "需要确定修改范围", "请确认审查意见", "ChatGPT", view.task_id):
+            self.assertIn(text, window.execution_details_label.text())
+
     def test_execution_summary_maps_to_the_execution_view_model(self) -> None:
         view = build_execution_view_model(self._interactive_summary(), self._events())
 

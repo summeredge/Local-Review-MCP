@@ -76,16 +76,20 @@ interface DesktopRuntime {
 }
 
 interface WatchContext {
-  readonly runtime: DesktopRuntime;
+  runtime: DesktopRuntime;
   readonly request: ExecutionBackendStartRequest;
   readonly sessionId: string;
   readonly executorThreadId: string;
   readonly baseline: DesktopCompletionBaseline;
   readonly threadId: string;
   readonly hostId: string;
-  readonly signal: AbortSignal;
+  signal: AbortSignal;
   /** Set once the observer has produced a verifiable turn id for this Execution. */
   resolvedTurnId?: string;
+  lastSuccessfulRead?: string;
+  failureSince?: number;
+  errorCode?: string;
+  reconnectAttempts?: number;
 }
 
 function errorMessage(error: unknown): string {
@@ -121,6 +125,8 @@ export class DesktopCodexBackend implements ExecutionBackend {
   private readonly runtimes = new Map<string, DesktopRuntime>();
   private readonly watchAbortControllers = new Map<string, AbortController>();
   private readonly completions = new Map<string, Promise<void>>();
+  // Retain captured executor/Turn identity only in this process, never substitute the foreground.
+  private readonly watches = new Map<string, WatchContext>();
   private readonly notified = new Set<string>();
   private terminalListener: ExecutionTerminalListener | undefined;
   private closing = false;
@@ -202,17 +208,12 @@ export class DesktopCodexBackend implements ExecutionBackend {
         const identity = { workspace_id: task.workspace_id, task_id: task.task_id, execution_id: execution.execution_id };
         if (this.inFlight.has(requestKey(identity))) continue;
         if (associated === undefined) {
-          await this.projectFailure(identity, undefined, {
-            summary: "Desktop execution has no unambiguous Session or completion observer after runtime shutdown.",
-          });
+          await this.monitoringDiagnostic(identity, undefined, "manual_confirmation_required", "session_identity_unavailable");
           continue;
         }
         const session = associated;
         if (this.completions.has(session.session_id)) continue;
-        await this.projectFailure(identity, session.session_id, {
-          summary: "Desktop execution completion observer was lost by a previous runtime shutdown.",
-          ...(session.thread_id === undefined ? {} : { threadId: session.thread_id }),
-        });
+        await this.resumeObservation(identity, session);
       }
     }
   }
@@ -368,6 +369,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
         signal: abortController.signal,
       };
       this.watchAbortControllers.set(sessionId, abortController);
+      this.watches.set(sessionId, watch);
       const completion = this.watch(watch, client, contracts).catch(() => undefined);
       this.completions.set(sessionId, completion);
       void completion.finally(() => {
@@ -406,7 +408,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
     }
   }
 
-  private async prepare(runtime: DesktopRuntime): Promise<{
+  private async prepare(runtime: DesktopRuntime, observationOnly = false): Promise<{
     readonly commands: DesktopCodexThreadCommands;
     readonly contracts: ReturnType<typeof createCodexAppToolContracts>;
     readonly client: Pick<CodexAppMcpClient, "callTool">;
@@ -430,10 +432,12 @@ export class DesktopCodexBackend implements ExecutionBackend {
     let contracts: ReturnType<typeof createCodexAppToolContracts>;
     try {
       contracts = createCodexAppToolContracts(listed.tools as never);
-      contracts.requireListProjects();
-      contracts.createThreadArguments("probe", "probe");
       contracts.readThreadArguments("probe", "probe");
-      contracts.waitThreadsArguments("probe", "probe", 1);
+      if (!observationOnly) {
+        contracts.requireListProjects();
+        contracts.createThreadArguments("probe", "probe");
+        contracts.waitThreadsArguments("probe", "probe", 1);
+      }
     } catch (error: unknown) {
       throw new DesktopExecutionError(
         "tools_contract_incompatible",
@@ -500,10 +504,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
       );
     }
     if (!this.completions.has(session.session_id)) {
-      await this.projectFailure(request, session.session_id, {
-        summary: "Desktop execution has no live completion observer in this runtime.", threadId: session.thread_id,
-      });
-      throw new DesktopExecutionError("execution_not_recoverable", "Desktop completion observer is unavailable.");
+      await this.resumeObservation(request, session);
     }
     return {
       execution_id: execution.execution_id,
@@ -525,21 +526,108 @@ export class DesktopCodexBackend implements ExecutionBackend {
     return execution === undefined ? null : await sessionForExecution(matches, execution, executions, this.events) ?? null;
   }
 
+  private async requireBinding(
+    request: Pick<ExecutionBackendStartRequest, "workspace_id" | "task_id" | "execution_id">,
+    sessionId: string, threadId: string, hostId: string,
+  ): Promise<void> {
+    const binding = await new DesktopThreadBindingStore(this.storageRoot).load(request.workspace_id, sessionId);
+    const session = await this.sessions.getSession(sessionId);
+    if (binding === undefined || binding.task_id !== request.task_id || binding.target_thread_id !== threadId
+      || binding.host_id !== hostId || session?.thread_id !== threadId || session.task_id !== request.task_id
+      || session.execution_id !== request.execution_id || session.backend_type !== DESKTOP_EXECUTION_BACKEND_IDENTITY
+      || session.workspace !== this.registry.resolve(request.workspace_id).manager.canonicalRoot) {
+      throw new DesktopExecutionError("execution_not_recoverable", "Desktop binding identity cannot be verified.");
+    }
+  }
+
+  private async resumeObservation(
+    request: Pick<ExecutionBackendStartRequest, "workspace_id" | "task_id" | "execution_id">, session: Session,
+  ): Promise<void> {
+    if (this.closing || this.completions.has(session.session_id)) return;
+    const watch = this.watches.get(session.session_id);
+    // executorThreadId intentionally does not survive process restart. Neither a matching project
+    // nor the current foreground proves its relationship to the persisted target/Execution.
+    if (watch === undefined || requestKey(watch.request) !== requestKey(request)) {
+      await this.monitoringDiagnostic(request, session.session_id, "manual_confirmation_required", "executor_identity_unavailable");
+      return;
+    }
+    let observation: Promise<void> | undefined;
+    const setup = (async () => {
+      let runtime: DesktopRuntime | undefined;
+      try {
+        await this.requireBinding(request, session.session_id, watch.threadId, watch.hostId);
+        runtime = await this.connectRuntime();
+        const prepared = await this.prepare(runtime, true);
+        if (this.closing) { await runtime.close(); return; }
+        const controller = new AbortController();
+        watch.runtime = runtime;
+        watch.signal = controller.signal;
+        watch.reconnectAttempts = 0;
+        this.runtimes.set(session.session_id, runtime);
+        this.watchAbortControllers.set(session.session_id, controller);
+        observation = this.watch(watch, prepared.client, prepared.contracts).catch(() => undefined);
+      } catch (error: unknown) {
+        await runtime?.close().catch(() => undefined);
+        await this.monitoringDiagnostic(request, session.session_id, "manual_confirmation_required",
+          error instanceof DesktopExecutionError ? error.code : "binding_or_runtime_unavailable", watch);
+      }
+    })();
+    // Reserve the existing completion slot during connection setup so startup and existing()
+    // cannot both create an observer for the same Execution.
+    const completion = setup.then(() => observation);
+    this.completions.set(session.session_id, completion);
+    void completion.finally(() => {
+      if (this.completions.get(session.session_id) === completion) this.completions.delete(session.session_id);
+    });
+    await setup;
+  }
+
+  private async monitoringDiagnostic(
+    request: Pick<ExecutionBackendStartRequest, "workspace_id" | "task_id" | "execution_id">,
+    sessionId: string | undefined, state: string, code: string, watch?: WatchContext,
+  ): Promise<void> {
+    const session = sessionId === undefined ? null : await this.sessions.getSession(sessionId).catch(() => null);
+    const binding = sessionId === undefined ? undefined
+      : await new DesktopThreadBindingStore(this.storageRoot).load(request.workspace_id, sessionId).catch(() => undefined);
+    const summary = JSON.stringify({ monitor: state, phase: "completion_observation", error_type: code,
+      session_id: sessionId, execution_id: request.execution_id, target_thread_id: watch?.threadId ?? session?.thread_id,
+      host_id: watch?.hostId ?? binding?.host_id, last_successful_read_at: watch?.lastSuccessfulRead ?? null,
+      continuous_failure_ms: watch?.failureSince === undefined ? 0 : Date.now() - watch.failureSince,
+      reconnect_attempts: watch?.reconnectAttempts ?? 0 });
+    try {
+      const current = await this.executions.getExecutionContext(request.workspace_id, request.task_id, request.execution_id);
+      if (current?.status !== "running" || current.summary === summary) return;
+      await this.executions.updateExecutionContext(request.workspace_id, request.task_id, request.execution_id, { summary });
+      console.warn("Desktop completion monitor", summary);
+    } catch {
+      console.warn("Desktop completion monitor diagnostic could not be persisted", request.execution_id, state, code);
+    }
+  }
+
+  private observer(watch: WatchContext, client: Pick<CodexAppMcpClient, "callTool">,
+    contracts: ReturnType<typeof createCodexAppToolContracts>): DesktopCompletionObserver {
+    return new DesktopCompletionObserver({ client, contracts, readFailureTimeoutMs: this.completionTimeoutMs,
+      onTurnStarted: (turnId) => this.recordTurnStarted(watch, turnId),
+      onSuccessfulRead: async () => {
+        const recovered = (watch.reconnectAttempts ?? 0) > 0;
+        watch.lastSuccessfulRead = this.now();
+        if (recovered) await this.monitoringDiagnostic(watch.request, watch.sessionId, "recovered", "none", watch);
+        watch.failureSince = undefined;
+        watch.reconnectAttempts = 0;
+      },
+      onReadFailure: (code) => { watch.failureSince ??= Date.now(); watch.errorCode = code; },
+      ...(this.pollIntervalMs === undefined ? {} : { pollIntervalMs: this.pollIntervalMs }),
+    });
+  }
+
   private async watch(
     watch: WatchContext,
     client: Pick<CodexAppMcpClient, "callTool">,
     contracts: ReturnType<typeof createCodexAppToolContracts>,
   ): Promise<void> {
+    let runtimeOpen = true;
     try {
-      let unavailableSince: number | undefined;
-      const observer = new DesktopCompletionObserver({
-        client,
-        contracts,
-        readFailureTimeoutMs: this.completionTimeoutMs,
-        onTurnStarted: (turnId) => this.recordTurnStarted(watch, turnId),
-        onSuccessfulRead: () => { unavailableSince = undefined; },
-        ...(this.pollIntervalMs === undefined ? {} : { pollIntervalMs: this.pollIntervalMs }),
-      });
+      let observer = this.observer(watch, client, contracts);
       while (!this.closing) {
         const completion = await observer.waitForCompletion({
           executorThreadId: watch.executorThreadId,
@@ -547,43 +635,73 @@ export class DesktopCodexBackend implements ExecutionBackend {
           hostId: watch.hostId,
           signal: watch.signal,
           baseline: watch.baseline,
+          ...(watch.resolvedTurnId === undefined ? {} : { turnId: watch.resolvedTurnId }),
         });
         if (completion.status === "completed") {
           await this.complete(watch, completion);
           return;
         }
-        if (completion.reason === "first_turn_visibility_unavailable"
-          || (completion.reason === "tool_error" && completion.turnId === undefined)) {
-          // Transient visibility errors may recover, but cannot keep an Execution running forever.
-          unavailableSince ??= Date.now();
-          if (Date.now() - unavailableSince >= this.completionTimeoutMs) {
-            await this.fail(watch, "Desktop turn completion observation unavailable.");
-            return;
-          }
+        if (completion.status === "failed" && completion.turnId !== undefined) {
+          await this.recordTurnStarted(watch, completion.turnId);
+          await this.fail(watch, "Desktop turn failed.");
+          return;
+        }
+        const reason = completion.reason ?? completion.status;
+        if (!["capability_unavailable", "tool_error", "first_turn_visibility_unavailable", "timed_out"].includes(reason)) {
+          await this.monitoringDiagnostic(watch.request, watch.sessionId, "manual_confirmation_required", reason, watch);
+          return;
+        }
+        watch.failureSince ??= Date.now();
+        if (Date.now() - watch.failureSince < this.completionTimeoutMs) {
           await delay(Math.min(250, this.completionTimeoutMs), undefined, { signal: watch.signal });
           continue;
         }
-        // Only a verifiable observer turn id is carried into failure projection; never synthesize one.
-        if (completion.turnId !== undefined && completion.reason !== "tool_error") {
-          watch.resolvedTurnId = completion.turnId;
+        if ((watch.reconnectAttempts ?? 0) >= 3) {
+          await this.monitoringDiagnostic(watch.request, watch.sessionId, "unavailable", watch.errorCode ?? reason, watch);
+          return;
         }
-        await this.fail(
-          watch,
-          completion.reason === "tool_error" && completion.turnId !== undefined
-            ? "Desktop turn failed."
-            : completion.status === "timed_out"
-              ? "Desktop turn timed out."
-              : "Desktop turn completion was unverifiable (" + (completion.reason ?? "unknown") + ").",
-        );
-        return;
+        // Retry connection/contract validation with bounded backoff; never dispatch the Goal again.
+        let connected = false;
+        while (!connected && (watch.reconnectAttempts ?? 0) < 3) {
+          watch.reconnectAttempts = (watch.reconnectAttempts ?? 0) + 1;
+          await this.monitoringDiagnostic(watch.request, watch.sessionId, "reconnecting", watch.errorCode ?? reason, watch);
+          await delay(Math.min(30_000, Math.min(1_000, this.completionTimeoutMs) * 2 ** (watch.reconnectAttempts - 1)),
+            undefined, { signal: watch.signal });
+          if (runtimeOpen) { await watch.runtime.close().catch(() => undefined); runtimeOpen = false; }
+          let replacement: DesktopRuntime | undefined;
+          try {
+            await this.requireBinding(watch.request, watch.sessionId, watch.threadId, watch.hostId);
+            replacement = await this.connectRuntime();
+            const prepared = await this.prepare(replacement, true);
+            if (watch.signal.aborted) throw new Error("observer_stopped");
+            const replacementObserver = this.observer(watch, prepared.client, prepared.contracts);
+            watch.runtime = replacement;
+            runtimeOpen = true;
+            this.runtimes.set(watch.sessionId, replacement);
+            observer = replacementObserver;
+            connected = true;
+          } catch (error: unknown) {
+            await replacement?.close().catch(() => undefined);
+            watch.errorCode = error instanceof DesktopExecutionError ? error.code : "reconnect_failed";
+          }
+        }
+        if (!connected) {
+          await this.monitoringDiagnostic(watch.request, watch.sessionId, "unavailable", watch.errorCode ?? reason, watch);
+          return;
+        }
       }
-      await this.fail(watch, "Desktop execution observer stopped before completion.");
+      await this.monitoringDiagnostic(watch.request, watch.sessionId, "stopped", "runtime_closed", watch);
     } catch (error: unknown) {
-      await this.fail(watch, "Desktop turn failed: " + errorMessage(error));
+      await this.monitoringDiagnostic(watch.request, watch.sessionId,
+        watch.signal.aborted ? "stopped" : "unavailable",
+        watch.signal.aborted ? "runtime_closed" : error instanceof Error ? error.name : "observer_error", watch);
     } finally {
       this.watchAbortControllers.delete(watch.sessionId);
       this.runtimes.delete(watch.sessionId);
-      await watch.runtime.close().catch(() => undefined);
+      if (runtimeOpen) await watch.runtime.close().catch(() => undefined);
+      const execution = await this.executions.getExecutionContext(watch.request.workspace_id,
+        watch.request.task_id, watch.request.execution_id).catch(() => null);
+      if (execution !== null && execution.status !== "running") this.watches.delete(watch.sessionId);
     }
   }
 

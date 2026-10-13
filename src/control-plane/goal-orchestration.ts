@@ -31,6 +31,7 @@ import {
 } from "./controlled-actuation.js";
 import { executionModeSchema } from "./execution-service.js";
 import { backupLegacyState, stateRestoreDiagnostic } from "./state-migration.js";
+import { ExtensionDeliveryService, retryableNotSent } from "./extension-delivery.js";
 
 const STATE_VERSION = 2;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
@@ -115,6 +116,19 @@ const phaseSchema = z.object({
   status: goalOrchestrationStatusSchema,
 }).strict();
 
+export const humanRequiredInfoSchema = z.object({
+  goal_id: goalIdSchema,
+  task_id: taskIdSchema,
+  execution_id: executionIdSchema,
+  phase_id: phaseIdSchema,
+  stage: z.string(),
+  terminal_reason: z.string(),
+  terminal_summary: z.string(),
+  completed_work: z.string(),
+  required_action: z.string(),
+  review_result_id: z.string().optional(),
+}).strict();
+
 export const goalOrchestrationSchema = z.object({
   goal_id: goalIdSchema,
   workspace_id: workspaceIdSchema,
@@ -124,6 +138,7 @@ export const goalOrchestrationSchema = z.object({
   reasoning_effort: reasoningEffortValueSchema.optional(),
   review_only: z.boolean().optional(),
   error: z.string().min(1).max(4_000).optional(),
+  human_required_info: humanRequiredInfoSchema.optional(),
   phases: z.array(phaseSchema).min(1).max(1_000),
   status: goalOrchestrationStatusSchema,
   current_phase_id: phaseIdSchema.optional(),
@@ -349,6 +364,7 @@ type ControlledActuationPort = Pick<ControlledActuationService, "authorize" | "a
 };
 type AutoIterationPort = Pick<AutoIterationService, "start" | "advance" | "getLoop"> & {
   readonly storageRoot?: string;
+  readonly extensionDeliveries?: ExtensionDeliveryService;
 };
 
 export interface GoalOrchestrationServiceOptions {
@@ -358,6 +374,7 @@ export interface GoalOrchestrationServiceOptions {
   readonly authorizationStore?: AuthorizationReader;
   readonly controlledActuation?: ControlledActuationPort;
   readonly autoIteration?: AutoIterationPort;
+  readonly extensionDeliveries?: ExtensionDeliveryService;
 }
 
 export class GoalOrchestrationService {
@@ -368,6 +385,7 @@ export class GoalOrchestrationService {
   private readonly authorizations: AuthorizationReader;
   private readonly controlled: ControlledActuationPort;
   private readonly auto: AutoIterationPort;
+  private readonly deliveries: ExtensionDeliveryService;
   private readonly operations = new Map<string, Promise<void>>();
   private readonly recoveryTimers = new Map<string, NodeJS.Timeout>();
   private disposed = false;
@@ -400,12 +418,14 @@ export class GoalOrchestrationService {
       authorizationStore: this.authorizations,
     });
     this.store = new GoalOrchestrationStore(this.storageRoot);
+    this.deliveries = options.extensionDeliveries ?? this.auto.extensionDeliveries ?? new ExtensionDeliveryService(this.storageRoot);
     for (const dependency of [
       this.tasks.storageRoot,
       this.executions.storageRoot,
       this.authorizations.storageRoot,
       this.controlled.storageRoot,
       this.auto.storageRoot,
+      this.deliveries.storageRoot,
     ]) {
       if (dependency !== undefined && resolve(dependency) !== this.storageRoot) {
         throw new Error("Goal Orchestration dependencies must share one storage root.");
@@ -528,7 +548,7 @@ export class GoalOrchestrationService {
   public async recover(): Promise<void> {
     const goals = await this.store.list();
     for (const goal of goals) {
-      if (goal.status !== "running") continue;
+      if (goal.status !== "running" && goal.status !== "human_required") continue;
       try {
         await this.advanceGoal(goal.goal_id);
       } catch (error: unknown) {
@@ -634,6 +654,7 @@ export class GoalOrchestrationService {
 
   private async advanceOnce(goalId: string): Promise<GoalOrchestration> {
     const goal = await this.requiredGoal(goalId);
+    if (goal.status === "human_required") return this.notifyHumanRequired(goal);
     if (goal.status !== "running") return goal;
     return this.drive(goal);
   }
@@ -894,7 +915,63 @@ export class GoalOrchestrationService {
     const phases = goal.phases.map((phase, index) => index === active.phaseIndex
       ? { ...phase, status }
       : phase);
-    return this.update(goal, { status, phases });
+    const terminal = await this.update(goal, { status, phases });
+    return status === "human_required" ? this.notifyHumanRequired(terminal) : terminal;
+  }
+
+  private async notifyHumanRequired(initial: GoalOrchestration): Promise<GoalOrchestration> {
+    let goal = initial;
+    try {
+      if (goal.human_required_info === undefined) {
+        let loop = await this.auto.getLoop(goal.loop_id!).catch((error: unknown) => {
+          if (goal.error === undefined) throw error;
+          return null;
+        });
+        if (loop !== null && (loop.workspace_id !== goal.workspace_id || loop.task_id !== goal.current_task_id
+          || loop.conversation_id !== goal.conversation_id || loop.initial_execution_id !== goal.execution_id)) loop = null;
+        const execution = await this.executions.getExecutionContext(goal.workspace_id, goal.current_task_id!,
+          loop?.execution_id ?? goal.execution_id!).catch((error: unknown) => {
+          if (goal.error === undefined) throw error;
+          return null;
+        });
+        const reason = goal.error === undefined ? loop?.terminal_reason ?? "GOAL_ORCHESTRATION_ERROR" : "GOAL_ORCHESTRATION_ERROR";
+        const decision = reason === "REVIEW_REQUIRES_HUMAN"
+          ? "Review 需要用户决策：请确认审查意见和下一步修改要求。"
+          : reason === "MAX_ITERATIONS_REACHED"
+            ? "已达到最大迭代次数：请决定是否继续，并明确后续范围与迭代上限。"
+            : "执行或基础设施异常：请检查错误详情，处理连接、授权或环境问题后明确是否继续。";
+        const active = this.activeTask(goal);
+        const completedTasks = goal.phases.flatMap(phase => {
+          if (phase.status === "completed") return phase.tasks;
+          return phase.phase_id === goal.current_phase_id ? phase.tasks.slice(0, active.taskIndex) : [];
+        });
+        goal = await this.update(goal, { human_required_info: {
+          goal_id: goal.goal_id, task_id: goal.current_task_id!, execution_id: loop?.execution_id ?? goal.execution_id!,
+          phase_id: goal.current_phase_id!, stage: goal.error === undefined
+            ? loop?.terminal_stage ?? (loop ? "review_loop" : "goal_orchestration") : "goal_orchestration",
+          terminal_reason: reason, terminal_summary: goal.error ?? loop?.terminal_summary ?? "未提供额外错误详情。",
+          completed_work: `已完成任务（${completedTasks.length} 项）：${completedTasks.slice(0, 50).map(task => task.task_id).join("、") || "无"}。当前执行：${execution?.status ?? "执行记录不可用"}；${execution?.summary ?? "未提供执行摘要"}`,
+          required_action: decision,
+          ...(loop?.review_result_id === undefined ? {} : { review_result_id: loop.review_result_id }),
+        } });
+      }
+      const info = goal.human_required_info!;
+      const delivery = await this.deliveries.enqueue(goal.conversation_id, [
+        "LRM 已暂停，需人工处理。",
+        `Goal：${info.goal_id}；Task：${info.task_id}；Execution：${info.execution_id}`,
+        `断点阶段：${info.phase_id} / ${info.stage}`,
+        `原因：${info.terminal_reason}`, `摘要：${info.terminal_summary}`,
+        `已完成工作：${info.completed_work}`, `需要确认：${info.required_action}`,
+        ...(info.review_result_id === undefined ? [] : [`Review 证据：${info.review_result_id}`]),
+        "请在本 ChatGPT 对话中回复处理决定。只有用户明确决定继续或修改任务后，才通过 submit_goal 使用新的 Goal / Task 标识发起后续执行，并在任务要求中保留原 Goal / Task / Execution 和 Review 证据关联，沿用原 Workspace 与对话绑定。保留原 Goal 终止记录，不自动重试或重新提交。",
+      ].join("\n"), stableIdentity("human-required", goal.goal_id, goal.current_phase_id!, goal.current_task_id!));
+      if (delivery.phase === "queued" || delivery.phase === "leased"
+        || (delivery.receipt !== undefined && retryableNotSent(delivery.receipt))) this.scheduleRecovery(goal.goal_id);
+    } catch (error: unknown) {
+      console.warn(`Human-required notification pending for "${goal.goal_id}"`, errorMessage(error));
+      this.scheduleRecovery(goal.goal_id);
+    }
+    return goal;
   }
 
   private async setTaskStatus(goal: GoalOrchestration, taskId: string, status: TaskStatus): Promise<void> {

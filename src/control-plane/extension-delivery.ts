@@ -189,10 +189,11 @@ const deliverySchema = z.object({
 const stateSchema = z.object({
   schema_version: z.literal(STATE_VERSION),
   deliveries: z.array(deliverySchema).max(MAX_DELIVERIES),
+  archived_notifications: z.array(deliverySchema).optional(),
 }).strict().superRefine((value, context) => {
   const ids = new Set<string>();
   const logicalIds = new Set<string>();
-  value.deliveries.forEach((delivery, index) => {
+  [...value.deliveries, ...(value.archived_notifications ?? [])].forEach((delivery, index) => {
     if (ids.has(delivery.delivery_id)) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -212,6 +213,12 @@ const stateSchema = z.object({
       logicalIds.add(delivery.logical_delivery_id);
     }
   });
+  for (const archived of value.archived_notifications ?? []) {
+    if (!archived.logical_delivery_id?.startsWith("goal-human-required-") || !archived.receipt
+      || archived.phase === "ambiguous" || retryableNotSent(archived.receipt)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "archived notification must have a final receipt" });
+    }
+  }
 });
 
 function stateFile(storageRoot: string): string {
@@ -294,6 +301,7 @@ export class TargetConversationDeliveryError extends Error {
 }
 
 export class ExtensionDeliveryService {
+  private archivedNotifications = new Map<string, ExtensionDelivery>();
   public readonly storageRoot: string;
   private readonly file: string;
   private deliveries = new Map<string, ExtensionDelivery>();
@@ -318,6 +326,7 @@ export class ExtensionDeliveryService {
       try {
         const state = stateSchema.parse(JSON.parse(raw));
         this.deliveries = new Map(state.deliveries.map((delivery) => [delivery.delivery_id, delivery]));
+        this.archivedNotifications = new Map((state.archived_notifications ?? []).map(delivery => [delivery.delivery_id, delivery]));
       } catch (error: unknown) {
         throw new ExtensionDeliveryUnavailableError("extension delivery state could not be restored", { cause: error });
       }
@@ -340,6 +349,7 @@ export class ExtensionDeliveryService {
     });
     return this.exclusive(async () => {
       const next = new Map(this.deliveries);
+      const archived = new Map(this.archivedNotifications);
       if (parsed.logical_delivery_id !== undefined) {
         const existing = await this.getByLogicalDeliveryId(parsed.logical_delivery_id);
         if (existing !== null) {
@@ -357,6 +367,12 @@ export class ExtensionDeliveryService {
         for (const candidate of next.values()) {
           if (!candidate.receipt || candidate.receipt.status === "ambiguous" || this.waiters.has(candidate.delivery_id)) continue;
           if (candidate.logical_delivery_id === undefined) {
+            terminal = candidate;
+            break;
+          }
+          if (candidate.logical_delivery_id.startsWith("goal-human-required-")
+            && !retryableNotSent(candidate.receipt)) {
+            archived.set(candidate.delivery_id, candidate);
             terminal = candidate;
             break;
           }
@@ -387,8 +403,9 @@ export class ExtensionDeliveryService {
         phase: "queued",
       };
       next.set(delivery.delivery_id, delivery);
-      await this.persist(next);
+      await this.persist(next, archived);
       this.deliveries = next;
+      this.archivedNotifications = archived;
       return clone(delivery);
     });
   }
@@ -416,7 +433,8 @@ export class ExtensionDeliveryService {
         }
       }
       const delivery = [...next.values()].find((candidate) =>
-        candidate.phase === "queued" && candidate.recovery_error === undefined
+        candidate.phase === "queued" && (candidate.recovery_error === undefined
+          || candidate.logical_delivery_id?.startsWith("goal-human-required-"))
         && candidate.conversation_id === owner.conversation_id);
       if (!delivery) {
         if (changed) {
@@ -493,6 +511,8 @@ export class ExtensionDeliveryService {
     await this.restore();
     const delivery = this.deliveries.get(z.string().uuid().parse(deliveryId));
     if (delivery) return clone(delivery);
+    const archived = this.archivedNotifications.get(deliveryId);
+    if (archived) return clone(archived);
     const review = await findReviewTransport(join(this.storageRoot, REVIEW_DELIVERIES_DIRECTORY), reviewDeliverySchema,
       record => (record.extension_transport as { delivery_id?: string } | undefined)?.delivery_id === deliveryId, undefined, deliveryId);
     if (review) return restoredTransport(review);
@@ -550,6 +570,8 @@ export class ExtensionDeliveryService {
     const delivery = [...this.deliveries.values()].find((candidate) =>
       candidate.logical_delivery_id === parsedId);
     if (delivery) return clone(delivery);
+    const archived = [...this.archivedNotifications.values()].find(candidate => candidate.logical_delivery_id === parsedId);
+    if (archived) return clone(archived);
     const notification = await this.getFailureNotification(parsedId);
     if (notification) return notification;
     if (!reviewDeliveryIdSchema.safeParse(parsedId).success) return null;
@@ -654,12 +676,13 @@ export class ExtensionDeliveryService {
     for (const resolveWait of held) resolveWait(receipt);
   }
 
-  private async persist(deliveries: Map<string, ExtensionDelivery>): Promise<void> {
+  private async persist(deliveries: Map<string, ExtensionDelivery>, archived = this.archivedNotifications): Promise<void> {
     const directory = dirname(this.file);
     const temporary = join(directory, `.extension-deliveries-${process.pid}-${randomUUID()}.tmp`);
     const snapshot = `${JSON.stringify({
       schema_version: STATE_VERSION,
       deliveries: [...deliveries.values()],
+      archived_notifications: [...archived.values()],
     }, null, 2)}\n`;
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await chmod(directory, 0o700);

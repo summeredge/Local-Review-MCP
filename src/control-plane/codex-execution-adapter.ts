@@ -1,9 +1,10 @@
-import { spawn } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { chmod, mkdir } from "node:fs/promises";
 import { createWriteStream, readdirSync, statSync, type WriteStream } from "node:fs";
 import { dirname, resolve, win32 as win32Path } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { finished } from "node:stream/promises";
+import { promisify } from "node:util";
 import { z } from "zod";
 import { ExecutionContextService } from "../context/execution-service.js";
 import {
@@ -30,6 +31,8 @@ export {
 export type { CodexExecutionLogPaths } from "./codex-execution-completion.js";
 
 const CODEX_ARGS = ["exec", "--json", "-"] as const;
+const CODEX_NON_GIT_ARGS = ["exec", "--skip-git-repo-check", "--json", "-"] as const;
+const GIT_DETECTION_TIMEOUT_MS = 10_000;
 
 export interface CodexExecutionStartRequest {
   readonly workspace_id: string;
@@ -74,12 +77,48 @@ export interface CodexExecutionAdapterOptions {
   readonly codexExecutable?: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly completionService?: CodexExecutionCompletionService;
+  readonly gitWorktreeDetection?: GitWorktreeDetection;
 }
 
 export interface CodexExecutableResolutionOptions {
   readonly codexExecutable?: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly platform?: NodeJS.Platform;
+}
+
+export interface GitDetectionRequest {
+  readonly cwd: string;
+}
+
+export type GitWorktreeDetection = (request: GitDetectionRequest) => Promise<boolean>;
+
+async function detectGitWorktree(request: GitDetectionRequest): Promise<boolean> {
+  try {
+    const { stdout } = await promisify(execFileCallback)(
+      "git",
+      ["-C", request.cwd, "rev-parse", "--is-inside-work-tree"],
+      {
+        cwd: request.cwd,
+        windowsHide: true,
+        timeout: GIT_DETECTION_TIMEOUT_MS,
+      },
+    );
+    return stdout.trim() === "true";
+  } catch (error: unknown) {
+    if (
+      error !== null
+      && typeof error === "object"
+      && "stderr" in error
+      && typeof (error as { stderr?: unknown }).stderr === "string"
+      && /not a git repository/iu.test((error as { stderr: string }).stderr)
+    ) {
+      return false;
+    }
+    throw new Error(
+      `Git worktree detection failed for workspace: ${errorMessage(error)}`,
+      { cause: error },
+    );
+  }
 }
 
 export const codexExecutionStartRequestSchema = z.object({
@@ -272,6 +311,7 @@ export class CodexExecutionAdapter {
   private readonly environment: NodeJS.ProcessEnv;
   private readonly codexExecutableOverride: string | undefined;
   private readonly completion: CodexExecutionCompletionService;
+  private readonly detectGitWorktree: GitWorktreeDetection;
   private readonly inFlight = new Map<string, Promise<CodexExecutionStartResult>>();
   public readonly storageRoot: string;
 
@@ -296,6 +336,7 @@ export class CodexExecutionAdapter {
     this.environment = { ...process.env, ...(options.environment ?? {}) };
     this.codexExecutableOverride = options.codexExecutable?.trim() || undefined;
     this.completion = options.completionService ?? new CodexExecutionCompletionService(this.storageRoot);
+    this.detectGitWorktree = options.gitWorktreeDetection ?? detectGitWorktree;
   }
 
   public async start(request: CodexExecutionStartRequest): Promise<CodexExecutionStartResult> {
@@ -355,6 +396,9 @@ export class CodexExecutionAdapter {
     let logStreams: Awaited<ReturnType<typeof prepareLogStreams>> | undefined;
     let child: CodexProcess | undefined;
     try {
+      const insideGitWorktree = await this.detectGitWorktree({
+        cwd: workspace.manager.canonicalRoot,
+      });
       const codexExecutable = resolveCodexExecutable({
         codexExecutable: this.codexExecutableOverride,
         environment: this.environment,
@@ -368,7 +412,7 @@ export class CodexExecutionAdapter {
       logStreams = await prepareLogStreams(logs);
       child = this.processRunner({
         command: codexExecutable,
-        args: CODEX_ARGS,
+        args: insideGitWorktree ? CODEX_ARGS : CODEX_NON_GIT_ARGS,
         cwd: workspace.manager.canonicalRoot,
         environment: this.environment,
       });
