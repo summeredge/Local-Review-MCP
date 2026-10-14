@@ -26,6 +26,7 @@ export interface DesktopThreadBinding {
   readonly backend_identity: "desktop_codex_app";
   readonly target_thread_id: string;
   readonly host_id: string;
+  readonly executor_thread_id?: string;
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -38,6 +39,7 @@ export const desktopThreadBindingSchema: z.ZodType<DesktopThreadBinding> = z.obj
   backend_identity: z.literal("desktop_codex_app"),
   target_thread_id: identitySchema,
   host_id: identitySchema,
+  executor_thread_id: identitySchema.optional(),
   created_at: timestampSchema,
   updated_at: timestampSchema,
 }).strict();

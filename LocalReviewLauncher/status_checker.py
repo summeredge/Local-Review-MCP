@@ -29,7 +29,7 @@ REMOTE_STATUS_URL = "https://review.syqiu.kdns.fr/.well-known/oauth-protected-re
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 MAX_STATUS_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_EVENT_STREAM_ROWS = 500
-EXECUTION_STATUSES = frozenset({"running", "passed", "failed"})
+EXECUTION_STATUSES = frozenset({"running", "passed", "failed", "terminated"})
 EXECUTION_MODES = frozenset({"batch", "interactive"})
 # Internal backend identities. The dashboard shows the friendly label and keeps the identity in
 # the details view, so UI wording never replaces the value stored by the Control Plane.
@@ -118,10 +118,40 @@ class ExecutionViewModel:
     events: tuple[SessionEventViewModel, ...] = ()
     goal_status: str | None = None
     human_required_info: Mapping[str, object] | None = None
+    turn_id: str | None = None
+    manual_resolution: Mapping[str, object] | None = None
+    monitoring_error: str | None = None
+
+    @property
+    def monitoring_status(self) -> str:
+        if self.status != "running":
+            return "已结束"
+        if self.monitoring_error:
+            return f"需人工核实（{self.monitoring_error}）"
+        try:
+            diagnostic = json.loads(self.summary or "{}")
+        except (ValueError, TypeError):
+            diagnostic = {}
+        if isinstance(diagnostic, dict) and diagnostic.get("monitor") in {
+            "manual_confirmation_required", "unavailable", "stopped", "reconnecting"
+        }:
+            return f"需人工核实（{diagnostic.get('error_type', 'unknown')}）"
+        return "监控中"
+
+    @property
+    def is_human_required(self) -> bool:
+        return (
+            self.goal_status == "human_required"
+            and self.human_required_info is not None
+            and self.human_required_info.get("task_id") == self.task_id
+            and self.human_required_info.get("execution_id") == self.execution_id
+        )
 
     @property
     def display_status(self) -> str:
-        return "需人工处理" if self.goal_status == "human_required" else self.status
+        if self.is_human_required:
+            return "需人工处理"
+        return f"{self.status} · 需人工核实" if self.monitoring_status.startswith("需人工核实") else self.status
 
     @property
     def backend_label(self) -> str:
@@ -491,6 +521,10 @@ def build_execution_view_model(
                                      {"pending", "running", "completed", "failed", "human_required"}),
         human_required_info=(None if document.get("human_required_info") is None
                              else _object(document["human_required_info"], "human_required_info")),
+        turn_id=_optional_text(document.get("turn_id"), "turn_id", 256),
+        monitoring_error=_optional_text(document.get("monitoring_error"), "monitoring_error", 256),
+        manual_resolution=(None if document.get("manual_resolution") is None
+                           else _object(document["manual_resolution"], "manual_resolution")),
         session=session,
         events=events,
     )
@@ -921,6 +955,29 @@ class StatusChecker:
         except StatusQueryError:
             return False
         return isinstance(response, Mapping) and isinstance(response.get("state"), str)
+
+    def execution_action(self, execution: ExecutionViewModel, action: str,
+                         outcome: str | None = None, note: str = "") -> Mapping[str, object]:
+        body: dict[str, object] = {"workspace_id": execution.workspace_id, "task_id": execution.task_id,
+                                   "execution_id": execution.execution_id, "action": action}
+        for key, value in (("session_id", execution.session_id), ("thread_id", execution.thread_id),
+                           ("turn_id", execution.turn_id)):
+            if value is not None:
+                body[key] = value
+        if action == "close":
+            body.update(outcome=outcome, note=note, confirmed=True)
+        try:
+            result = self._request_json(self.execution_catalog_url.rsplit("/", 1)[0] + "/execution-action",
+                                        method="POST", body=body, timeout=130)
+        except StatusQueryError as error:
+            if isinstance(error.__cause__, HTTPError):
+                try:
+                    detail = json.loads(error.__cause__.read(MAX_STATUS_RESPONSE_BYTES))
+                    raise StatusQueryError(str(detail.get("message") or detail.get("error"))) from error
+                except (ValueError, AttributeError):
+                    pass
+            raise
+        return _object(result, "Execution action")
 
     def check(self) -> LauncherStatus:
         mcp_running = self._reachable(LOCAL_HEALTH_URL)

@@ -46,6 +46,7 @@ import {
 import type { TunnelProvider, TunnelStatus } from "../tunnel/types.js";
 import { executionIdSchema } from "../context/schema.js";
 import type { LauncherExecutionSummary } from "../control-plane/status-query.js";
+import { desktopExecutionActionSchema, DesktopExecutionError, type DesktopCodexBackend } from "../desktop-codex/desktop-codex-backend.js";
 import { requestIdFromHeader, withInboundRequestOrigin } from "./inbound.js";
 import { createMcpServer, registeredMcpToolsMessage, type McpRuntimeContext } from "./server.js";
 
@@ -78,6 +79,7 @@ type HttpRuntimeContext = Omit<McpRuntimeContext, "statusQuery"> & {
   readonly desktopSyncManager?: Pick<DesktopSyncManager, "getState">;
   readonly desktopToolsPipeHandoff?: DesktopToolsPipeHandoff;
   readonly desktopCodexRuntimeFactory?: DesktopCodexRuntimeProvider;
+  readonly desktopExecutionActions?: Pick<DesktopCodexBackend, "executionAction">;
   /**
    * Read-only Desktop interactive capability check. It reports the same reason the production
    * Goal preflight blocks an interactive Desktop Goal with, so a blocked capability stays
@@ -1335,6 +1337,27 @@ export function createHttpServer(
 
       if (path === LAUNCHER_EXECUTION_CATALOG_PATH) {
         await handleLauncherExecutionCatalogRequest(request, response, context, settings.auth.token);
+        return;
+      }
+
+      if (path === "/launcher/execution-action") {
+        if (!isDirectLoopbackRequest(request)) { request.resume(); sendJson(response, 404, { error: "not_found" }); return; }
+        if (!isAuthenticated(request, settings.auth.token)) { request.resume(); sendUnauthorized(response); return; }
+        if (request.method !== "POST") { request.resume(); sendJson(response, 405, { error: "method_not_allowed" }); return; }
+        if (context.desktopExecutionActions === undefined) { request.resume(); sendJson(response, 503, { error: "desktop_backend_unavailable" }); return; }
+        let body: unknown;
+        try { body = await parseBody(request); }
+        catch (error: unknown) { sendJson(response, error instanceof RequestBodyTooLargeError ? 413 : 400, { error: "invalid_json_body" }); return; }
+        const parsed = desktopExecutionActionSchema.safeParse(body);
+        if (!parsed.success) { sendJson(response, 400, { error: "execution_action_invalid" }); return; }
+        try {
+          sendJson(response, 200, await context.desktopExecutionActions.executionAction(parsed.data), { "cache-control": "no-store" });
+        } catch (error: unknown) {
+          sendJson(response, error instanceof DesktopExecutionError ? 409 : 500, {
+            error: error instanceof DesktopExecutionError ? error.code : "execution_action_failed",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
         return;
       }
 

@@ -59,6 +59,17 @@ const executionCommandSchema = z.string().min(1).max(1000);
 export const EXECUTION_SUMMARY_MAX_LENGTH = 4000;
 const executionSummarySchema = z.string().min(1).max(EXECUTION_SUMMARY_MAX_LENGTH);
 
+export const manualResolutionSchema = z.object({
+  outcome: z.enum(["completed", "incomplete", "unknown"]),
+  note: z.string().max(1000),
+  resolved_at: timestampSchema,
+  session_id: taskIdSchema.optional(),
+  thread_id: z.string().min(1).max(256).optional(),
+  turn_id: z.string().min(1).max(256).optional(),
+  monitoring_summary: z.string().max(4000).optional(),
+  evidence_error: z.string().max(256).optional(),
+}).strict();
+
 export const executionContextSchema = z.object({
   execution_id: executionIdSchema,
   task_id: taskIdSchema,
@@ -70,6 +81,7 @@ export const executionContextSchema = z.object({
   finished_at: timestampSchema.optional(),
   summary: executionSummarySchema.optional(),
   extension_transport: z.record(z.unknown()).optional(),
+  manual_resolution: manualResolutionSchema.optional(),
 }).strict();
 
 export const createExecutionContextInputSchema = z.object({
@@ -83,6 +95,7 @@ export const createExecutionContextInputSchema = z.object({
 }).strict();
 
 export const updateExecutionContextInputSchema = z.object({
+  manual_resolution: manualResolutionSchema.optional(),
   status: executionStatusSchema.optional(),
   process_id: executionProcessIdSchema.optional(),
   command: executionCommandSchema.optional(),

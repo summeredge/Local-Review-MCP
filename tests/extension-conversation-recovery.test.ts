@@ -115,7 +115,7 @@ function background(state: ReturnType<typeof browser>) {
     },
   });
   return {
-    wake() { clock += 5001; alarm({ name: "delivery-conversation-recovery" }); },
+    wake(milliseconds = 5001) { clock += milliseconds; alarm({ name: "delivery-conversation-recovery" }); },
     get requests() { return requests; },
     completed(tabId: number, statusCode: number) {
       onCompleted({ tabId, statusCode, url: `https://chatgpt.com/c/${conversation}` });
@@ -183,6 +183,79 @@ function content(worker: ReturnType<typeof background>, options: {
 }
 
 describe("conversation recovery through the production Extension transport", () => {
+  it("does not open historical human notices on startup, polling or worker restart, but delivers in an opened original conversation", async () => {
+    const f = await setup();
+    const notice = await f.deliveries.enqueue(conversation, "需人工处理", "goal-human-required-historical");
+    await f.deliveries.enqueue("another-old-conversation", "需人工处理", "goal-human-required-another-old");
+    const state = browser();
+    Object.assign(state.storage, { port: bridgePort(), token: f.token });
+    const first = background(state);
+    await vi.waitFor(() => expect(first.requests).toBeGreaterThan(0));
+    first.wake();
+    const second = background(state);
+    await vi.waitFor(() => expect(second.requests).toBeGreaterThan(0));
+    expect(state.created).not.toHaveBeenCalled();
+    expect(await f.deliveries.recoveryTargets()).toEqual([]);
+    state.tabs.push({ id: 1, url: `https://chatgpt.com/c/${conversation}` });
+    const page = content(second, { state });
+    await vi.waitFor(async () => expect((await f.deliveries.get(notice.delivery_id))?.phase).toBe("delivered"));
+    expect(page.dom.send).toHaveBeenCalledOnce();
+    expect(state.created).not.toHaveBeenCalled();
+  });
+
+  for (const kind of ["delivery", "completion"] as const) {
+    it.each(["closed", "home", "worker-restart"])(`does not reopen a ${kind} target after its attempted tab is %s`, async outcome => {
+      const f = await setup();
+      const delivery = kind === "delivery" ? await f.deliveries.enqueue(conversation, f.request.message!, f.request.delivery_id) : undefined;
+      const watch = kind === "completion" ? await f.completions.enqueue({ workspace_id: f.request.workspace_id,
+        task_id: f.request.task_id, review_request_id: f.request.review_request_id, review_delivery_id: f.request.delivery_id,
+        conversation_id: conversation, expected_user_message_id: "user-sent" }) : undefined;
+      const pending = watch === undefined ? undefined : f.completions.awaitResult(watch.completion_id, 5000);
+      const get = () => delivery === undefined ? f.completions.get(watch!.completion_id) : f.deliveries.get(delivery.delivery_id);
+      const state = browser();
+      Object.assign(state.storage, { port: bridgePort(), token: f.token });
+      const first = background(state);
+      await vi.waitFor(() => expect(state.storage.conversationRecoveryTabs).toBeDefined());
+      await vi.waitFor(() => expect(state.created).toHaveBeenCalledOnce());
+      if (outcome === "home") state.tabs[0]!.url = "https://chatgpt.com/";
+      else state.tabs.splice(0);
+      const active = outcome === "worker-restart" ? background(state) : first;
+      active.wake();
+      await vi.waitFor(async () => expect((await get())?.recovery_error).toBe("TARGET_CONVERSATION_NAVIGATION_FAILED"));
+      active.wake(60001);
+      await vi.waitFor(() => expect(active.requests).toBeGreaterThan(1));
+      expect(state.created).toHaveBeenCalledOnce();
+      expect(await f.deliveries.recoveryTargets()).toEqual([]);
+      expect(await f.completions.recoveryTargets()).toEqual([]);
+      if (watch !== undefined) {
+        expect(await f.completions.claim(owner)).not.toBeNull();
+        await f.completions.acknowledge({ ...owner, completion_id: watch.completion_id, status: "completed",
+          assistant_message_id: "manually-reconnected", content: "completed" });
+        expect((await pending)?.status).toBe("completed");
+      }
+    });
+  }
+
+  it.each(["created-loading", "existing-loading", "loading-worker-restart", "existing-unreadable"])("stops a navigation attempt after timeout without repeated reloads: %s", async stateOfPage => {
+    const f = await setup();
+    const delivery = await f.deliveries.enqueue(conversation, f.request.message!, f.request.delivery_id);
+    const state = browser();
+    Object.assign(state.storage, { port: bridgePort(), token: f.token });
+    if (stateOfPage === "existing-unreadable") state.tabs.push({ id: 1, url: `https://chatgpt.com/c/${conversation}`, status: "complete" });
+    else if (stateOfPage !== "created-loading") state.tabs.push({ id: 1, url: `https://chatgpt.com/c/${conversation}`, status: "loading" });
+    const first = background(state);
+    await vi.waitFor(() => expect(state.storage.conversationRecoveryTabs).toBeDefined());
+    if (stateOfPage === "existing-unreadable") await vi.waitFor(() => expect(state.reloaded).toHaveBeenCalledOnce());
+    else if (stateOfPage === "created-loading") await vi.waitFor(() => expect(state.created).toHaveBeenCalledOnce());
+    const active = stateOfPage === "loading-worker-restart" ? background(state) : first;
+    if (stateOfPage === "loading-worker-restart") await vi.waitFor(() => expect(active.requests).toBeGreaterThan(0));
+    active.wake(60001);
+    await vi.waitFor(async () => expect((await f.deliveries.get(delivery.delivery_id))?.recovery_error).toBe("TARGET_CONVERSATION_NAVIGATION_FAILED"));
+    active.wake(60001);
+    expect(state.created).toHaveBeenCalledTimes(stateOfPage === "created-loading" ? 1 : 0);
+    expect(state.reloaded).toHaveBeenCalledTimes(stateOfPage === "existing-unreadable" ? 1 : 0);
+  });
+
   it("does not reopen abandoned diagnostic watches on repeated worker alarms", async () => {
     const f = await setup();
     const watch = await f.completions.enqueue({ workspace_id: f.request.workspace_id, task_id: f.request.task_id,

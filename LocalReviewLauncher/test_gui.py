@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from io import BytesIO
 import tempfile
 import unittest
 from dataclasses import replace
@@ -10,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -1138,6 +1140,10 @@ class LauncherDashboardTests(unittest.TestCase):
         window.event_table = QTableWidget(0, 3)
         window.event_empty_label = QLabel(BATCH_EVENT_EMPTY_TEXT)
         window.open_codex_task_button = QPushButton()
+        window.check_execution_button = QPushButton()
+        window.close_execution_button = QPushButton()
+        window.execution_action_result = QLabel()
+        window._execution_action_worker = None
         window._execution_view_models = ()
         return window
 
@@ -1234,7 +1240,7 @@ class LauncherDashboardTests(unittest.TestCase):
         }
 
     def test_human_required_goal_keeps_execution_status_and_shows_details(self) -> None:
-        info = {"phase_id": "phase-1", "stage": "verdict", "terminal_reason": "REVIEW_REQUIRES_HUMAN",
+        info = {"task_id": "task-batch", "execution_id": "execution-batch", "phase_id": "phase-1", "stage": "verdict", "terminal_reason": "REVIEW_REQUIRES_HUMAN",
                 "terminal_summary": "需要确定修改范围", "completed_work": "实现及测试已完成",
                 "required_action": "请确认审查意见"}
         view = build_execution_view_model({**self._batch_summary(), "status": "passed",
@@ -1255,6 +1261,20 @@ class LauncherDashboardTests(unittest.TestCase):
         self.assertEqual(window.execution_table.item(0, 3).text(), "需人工处理")
         for text in ("REVIEW_REQUIRES_HUMAN", "需要确定修改范围", "请确认审查意见", "ChatGPT", view.task_id):
             self.assertIn(text, window.execution_details_label.text())
+        # Historical executions keep the Goal association without inheriting its breakpoint.
+        earlier_task = replace(view, execution_id="earlier-task", task_id="earlier-task")
+        earlier_iteration = replace(view, execution_id="earlier-iteration")
+        no_info = replace(view, execution_id="no-info", human_required_info=None)
+        for historical in (earlier_task, earlier_iteration, no_info):
+            self.assertFalse(historical.is_human_required)
+            self.assertEqual(historical.display_status, "passed")
+        window._render_execution_dashboard((earlier_iteration,))
+        window.execution_table.selectRow(0)
+        self.assertEqual(window.execution_table.item(0, 3).text(), "passed")
+        self.assertNotIn("断点原因", window.execution_details_label.text())
+        window._cleared_execution_ids = {item.execution_id for item in (view, earlier_task, earlier_iteration, no_info)}
+        window._render_status(LauncherStatus(True, True, True, executions=(view, earlier_task, earlier_iteration, no_info)))
+        self.assertEqual(window._execution_view_models, (view,))
 
     def test_execution_summary_maps_to_the_execution_view_model(self) -> None:
         view = build_execution_view_model(self._interactive_summary(), self._events())
@@ -1349,6 +1369,51 @@ class LauncherDashboardTests(unittest.TestCase):
         window.execution_table.selectRow(0)
         window._render_selected_execution()
         self.assertIn(f"摘要：{summary}", window.execution_details_label.text())
+
+    def test_monitoring_failure_keeps_execution_status_and_exposes_resolution_actions(self) -> None:
+        view = build_execution_view_model({**self._interactive_summary(), "turn_id": "turn-1",
+            "summary": '{"monitor":"manual_confirmation_required","error_type":"executor_identity_unavailable"}'})
+        window = self._window()
+        window._render_execution_dashboard((view,))
+        window.execution_table.selectRow(0)
+        window._render_selected_execution()
+        self.assertEqual(view.status, "running")
+        self.assertIn("需人工核实", window.execution_table.item(0, 3).text())
+        self.assertIn("执行状态：running", window.execution_details_label.text())
+        self.assertIn("executor_identity_unavailable", window.execution_details_label.text())
+        self.assertTrue(window.check_execution_button.isEnabled())
+        self.assertTrue(window.close_execution_button.isEnabled())
+        damaged = replace(view, monitoring_error="event_store_unavailable")
+        window._render_execution_dashboard((damaged,))
+        window.execution_table.selectRow(0)
+        window._render_selected_execution()
+        self.assertIn("需人工核实（event_store_unavailable）", window.execution_details_label.text())
+        closed = build_execution_view_model({**self._interactive_summary(), "status": "terminated",
+            "manual_resolution": {"outcome": "completed", "note": "已人工确认", "resolved_at": "2026-10-13T12:00:00Z",
+                                  "evidence_error": "event_store_unavailable"}})
+        window._render_execution_dashboard((closed,))
+        window.execution_table.selectRow(0)
+        window._render_selected_execution()
+        self.assertIn("人工结果：已完成", window.execution_details_label.text())
+        self.assertIn("证据异常：event_store_unavailable", window.execution_details_label.text())
+        self.assertFalse(window.check_execution_button.isEnabled())
+        self.assertFalse(window.close_execution_button.isEnabled())
+
+    def test_execution_action_uses_selected_identity_and_preserves_http_failure_reason(self) -> None:
+        view = build_execution_view_model({**self._interactive_summary(), "turn_id": "turn-1"})
+        checker = StatusChecker(auth_token="test-token")
+        with patch.object(checker, "_request_json", return_value={"execution": {"status": "terminated"}}) as request:
+            checker.execution_action(view, "close", "unknown", "待复查")
+            self.assertEqual(request.call_args.kwargs["body"], {
+                "workspace_id": "workspace-1", "task_id": "task-1", "execution_id": "execution-1",
+                "session_id": "session-1", "thread_id": "thread-1", "turn_id": "turn-1", "action": "close",
+                "confirmed": True, "outcome": "unknown", "note": "待复查"})
+        error = StatusQueryError("Status Query request failed")
+        error.__cause__ = HTTPError("http://127.0.0.1/launcher/execution-action", 409, "Conflict", {},
+                                    BytesIO(b'{"error":"desktop_target_conflict","message":"identity changed"}'))
+        with patch.object(checker, "_request_json", side_effect=error):
+            with self.assertRaisesRegex(StatusQueryError, "identity changed"):
+                checker.execution_action(view, "check")
 
     def test_execution_summary_contract_keeps_the_dash_placeholder(self) -> None:
         summary = self._interactive_summary()

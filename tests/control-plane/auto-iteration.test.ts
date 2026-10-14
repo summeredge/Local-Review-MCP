@@ -243,6 +243,22 @@ function startInput(overrides: Partial<AutoIterationStartInput> = {}): AutoItera
 }
 
 describe("AutoIterationService", () => {
+  it("routes terminated executions to human_required without Review, including recovery", async () => {
+    const f = await fixture();
+    try {
+      await f.executionService.updateExecutionContext("workspace-a", "task-001", "execution-001", { status: "running" });
+      expect((await f.auto.start(startInput())).stage).toBe("execution");
+      const execution = await f.executionService.updateExecutionContext("workspace-a", "task-001", "execution-001", { status: "terminated" });
+      await f.auto.onExecutionTerminal(execution);
+      expect(await f.auto.getLoop("loop-001")).toMatchObject({ stage: "human_required", terminal_reason: "EXECUTION_TERMINATED" });
+      await f.auto.onExecutionTerminal(execution);
+      await f.auto.recover();
+      expect((await new TaskContextService(f.root).getTaskContext("task-001"))?.status).toBe("human_required");
+      expect(await new ReviewRequestService(f.root).listReviewRequests("workspace-a")).toHaveLength(0);
+      expect(f.deliveryCalls).not.toHaveBeenCalled();
+      expect(f.starts).toHaveLength(0);
+    } finally { f.auto.dispose(); }
+  });
   it.each(["missing", "missing-mode", "missing-goal", "wrong-workspace", "wrong-task", "wrong-execution", "corrupt"])(
     "fails closed after restart when the initial authorization is %s", async (fault) => {
       const value = await fixture(["ITERATE"], "delivered", fault === "missing" ? null : {

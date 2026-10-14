@@ -718,6 +718,13 @@ export class GoalOrchestrationService {
       acceptance_criteria: task.acceptance_criteria,
     });
     this.assertEvidence(goal, task, instruction, authorization, actuation, loop);
+    if (execution?.status === "terminated") {
+      loop = loop === null ? await this.auto.start({ loop_id: loopId, workspace_id: goal.workspace_id,
+        task_id: task.task_id, conversation_id: goal.conversation_id, execution_id: executionId,
+        max_iterations: task.max_iterations }) : await this.auto.advance(loopId);
+      this.assertLoop(goal, task, loop);
+      return "human_required";
+    }
     if (goal.review_only === true && authorization === null && actuation === null && loop === null) {
       if (execution === null) throw new Error("Review Goal Execution is missing.");
       loop = await this.auto.start({

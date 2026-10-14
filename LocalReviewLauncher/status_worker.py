@@ -85,6 +85,21 @@ class StatusCheckSignals(QObject):
     finished = Signal(int, object)
 
 
+class ExecutionActionWorker(QRunnable):
+    def __init__(self, status_checker, execution, action, outcome=None, note=""):
+        super().__init__()
+        self.status_checker, self.execution, self.action = status_checker, execution, action
+        self.outcome, self.note = outcome, note
+        self.signals = StatusCheckSignals()
+
+    def run(self) -> None:
+        try:
+            result = self.status_checker.execution_action(self.execution, self.action, self.outcome, self.note)
+        except Exception as error:
+            result = {"error": str(error)}
+        self.signals.finished.emit(0, result)
+
+
 class StatusCheckWorker(QRunnable):
     def __init__(self, status_checker: StatusChecker, generation: int = 0):
         super().__init__()

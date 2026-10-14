@@ -1160,6 +1160,11 @@
       && typeof target.conversation_id === 'string' && CONVERSATION_ID.test(target.conversation_id);
   }
 
+  function sameRecoveryTarget(left, right) {
+    return left.delivery_id === right.delivery_id && left.completion_id === right.completion_id
+      && left.conversation_id === right.conversation_id;
+  }
+
   async function recoveryFailure(tabId, code) {
     await load();
     const targets = recoveryTabs.get(tabId) || [];
@@ -1192,7 +1197,9 @@
       const targets = result.data.targets.filter(target => target.completion_id === undefined
         ? ready.ok && !ready.blocked && !deliveryRecoveryBlocked : completionReady.ok && !completionRecoveryBlocked);
       if (targets.length === 0) {
+        if (ready.blocked || completionInFlight.some(entry => entry.deadline > Date.now())) return;
         recoveryTabs.clear();
+        recoveryReloads.clear();
         await persistRecoveryTabs();
         return;
       }
@@ -1205,7 +1212,13 @@
           }
         } catch { /* Non-ChatGPT tabs are not delivery candidates. */ }
       }));
-      recoveryTabs.clear();
+      for (const [tabId, pending] of recoveryTabs) {
+        const retained = pending.filter(previous => (ready.blocked && previous.delivery_id !== undefined)
+          || completionInFlight.some(entry => entry.completion_id === previous.completion_id && entry.deadline > Date.now())
+          || targets.some(target => sameRecoveryTarget(target, previous)));
+        if (retained.length > 0) recoveryTabs.set(tabId, retained);
+        else { recoveryTabs.delete(tabId); recoveryReloads.delete(tabId); }
+      }
       for (const target of targets) {
         let tab = tabs.find(candidate => probes.get(candidate.id)?.ok === true
           && probes.get(candidate.id)?.conversation_id === target.conversation_id)
@@ -1213,21 +1226,31 @@
             === target.conversation_id);
         try {
           if (!tab) {
+            // A persisted attempt also fences MV3/Runtime restart and closed/redirected tabs.
+            if ([...recoveryTabs.values()].some(pending => pending.some(previous => sameRecoveryTarget(previous, target)))) {
+              await postBridge('/delivery/recovery-failure', { ...target, code: 'TARGET_CONVERSATION_NAVIGATION_FAILED' });
+              continue;
+            }
             tab = await chrome.tabs.create({ url: `https://chatgpt.com/c/${target.conversation_id}` });
             tabs.push(tab);
+            recoveryReloads.set(tab.id, Date.now());
           }
           if (!Number.isSafeInteger(tab?.id)) throw new Error('navigation did not return a tab');
           const pending = recoveryTabs.get(tab.id) || [];
-          pending.push(target);
+          if (!pending.some(previous => sameRecoveryTarget(previous, target))) pending.push(target);
           recoveryTabs.set(tab.id, pending);
+          const attemptStartedAt = recoveryReloads.get(tab.id) || 0;
+          if (attemptStartedAt === 0) recoveryReloads.set(tab.id, Date.now());
           await persistRecoveryTabs();
-          if (chrome.tabs.reload && (tab.discarded
+          if ((recoveryReloads.get(tab.id) || 0) > 0 && Date.now() - recoveryReloads.get(tab.id) >= 60000
+            && (probes.get(tab.id)?.ok !== true || probes.get(tab.id)?.conversation_id !== target.conversation_id)) {
+            await postBridge('/delivery/recovery-failure', { ...target, code: 'TARGET_CONVERSATION_NAVIGATION_FAILED' });
+            continue;
+          }
+          if (chrome.tabs.reload && attemptStartedAt === 0 && (tab.discarded
             || (tab.status === 'complete' && chrome.tabs.sendMessage
               && (probes.get(tab.id)?.ok !== true
-                || probes.get(tab.id)?.conversation_id !== target.conversation_id)
-              && Date.now() - (recoveryReloads.get(tab.id) || 0) >= 60000))) {
-            recoveryReloads.set(tab.id, Date.now());
-            await persistRecoveryTabs();
+                || probes.get(tab.id)?.conversation_id !== target.conversation_id)))) {
             await chrome.tabs.reload(tab.id);
           }
         } catch {

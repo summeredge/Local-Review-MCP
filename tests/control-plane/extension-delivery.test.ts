@@ -61,6 +61,16 @@ afterEach(async () => {
 });
 
 describe("ExtensionDeliveryService", () => {
+  it("keeps human notices out of automatic navigation after restart while allowing delivery in the original conversation", async () => {
+    const { root, deliveries } = await service();
+    const notice = await deliveries.enqueue(conversation, "需人工处理", "goal-human-required-old-goal");
+    const review = await deliveries.enqueue("review-conversation", "Review", "review-active");
+    const restarted = new ExtensionDeliveryService(root);
+    expect(await restarted.recoveryTargets()).toEqual([{ delivery_id: review.delivery_id, conversation_id: "review-conversation" }]);
+    expect(await restarted.claim(owner)).toMatchObject({ delivery_id: notice.delivery_id });
+    await restarted.acknowledge({ ...owner, delivery_id: notice.delivery_id, status: "sent", message_id: "human-notice" });
+    expect(await restarted.claim(owner)).toBeNull();
+  });
   it("delivers a human-required notice when the original conversation reconnects after navigation failure", async () => {
     const { root, deliveries } = await service();
     const notice = await deliveries.enqueue(conversation, "需人工处理", "goal-human-required-offline");

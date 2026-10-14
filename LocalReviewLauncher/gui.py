@@ -22,6 +22,9 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QFileDialog,
     QGridLayout,
@@ -68,6 +71,7 @@ from status_worker import (
     DoctorCheckWorker,
     StatusCheckScheduler,
     StatusCheckWorker,
+    ExecutionActionWorker,
 )
 
 
@@ -87,11 +91,12 @@ EXECUTION_DASHBOARD_COLUMNS = (
     "开始时间",
     "结束时间",
 )
-CLEARED_TERMINAL_EXECUTION_STATUSES = frozenset({"passed", "failed"})
+CLEARED_TERMINAL_EXECUTION_STATUSES = frozenset({"passed", "failed", "terminated"})
 EXECUTION_STATUS_COLORS = {
     "running": "#946200",
     "passed": "#16803c",
     "failed": "#9b1c1c",
+    "terminated": "#666666",
 }
 UNKNOWN_STATUS_COLOR = "#666666"
 BATCH_EVENT_EMPTY_TEXT = "暂无执行事件"
@@ -241,6 +246,7 @@ class LauncherWindow(QMainWindow):
         self.session_details_label.setWordWrap(True)
         self.execution_details_label = QLabel("执行：—")
         self.execution_details_label.setWordWrap(True)
+        self.execution_details_label.setTextFormat(Qt.TextFormat.PlainText)
         self.event_table = QTableWidget(0, 3)
         self.event_table.setHorizontalHeaderLabels(["时间", "事件类型", "内容"])
         self.event_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -308,6 +314,16 @@ class LauncherWindow(QMainWindow):
         self.open_codex_task_button.setEnabled(False)
         self.session_viewer_toggle = self.open_codex_task_button
         self.session_viewer_toggle.toggled.connect(self._set_session_viewer_expanded)
+        self._execution_action_worker = None
+        self.check_execution_button = QPushButton("核对执行状态")
+        self.close_execution_button = QPushButton("人工结案")
+        self.check_execution_button.setEnabled(False)
+        self.close_execution_button.setEnabled(False)
+        self.check_execution_button.clicked.connect(self.check_execution_status)
+        self.close_execution_button.clicked.connect(self.close_execution_manually)
+        self.execution_action_result = QLabel()
+        self.execution_action_result.setWordWrap(True)
+        self.execution_action_result.setTextFormat(Qt.TextFormat.PlainText)
         self.copy_log_button = QPushButton("复制日志")
         self.clear_log_button = QPushButton("清空显示")
         self.save_log_button = QPushButton("保存日志")
@@ -452,7 +468,13 @@ class LauncherWindow(QMainWindow):
         task_layout.addWidget(self.execution_table)
         task_layout.addWidget(self._row("任务列表范围：", QLabel("所有已注册工作区")))
         task_layout.addWidget(self._row("默认工作区：", self.query_workspace_label))
-        task_layout.addWidget(self.open_codex_task_button)
+        execution_actions = QHBoxLayout()
+        execution_actions.setSpacing(BUTTON_SPACING)
+        execution_actions.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        for button in (self.open_codex_task_button, self.check_execution_button, self.close_execution_button):
+            execution_actions.addWidget(button)
+        task_layout.addLayout(execution_actions)
+        task_layout.addWidget(self.execution_action_result)
         self.session_viewer_content = QWidget()
         session_viewer_layout = QVBoxLayout(self.session_viewer_content)
         session_viewer_layout.setContentsMargins(0, 0, 0, 0)
@@ -489,6 +511,8 @@ class LauncherWindow(QMainWindow):
             self.backup_config_button,
             self.validate_config_button,
             self.open_codex_task_button,
+            self.check_execution_button,
+            self.close_execution_button,
             self.copy_log_button,
             self.clear_log_button,
             self.save_log_button,
@@ -750,7 +774,7 @@ class LauncherWindow(QMainWindow):
             if (
                 execution.execution_id not in self._cleared_execution_ids
                 or execution.status not in CLEARED_TERMINAL_EXECUTION_STATUSES
-                or execution.goal_status == "human_required"
+                or execution.is_human_required
             )
         )
         self._last_status = replace(status, executions=executions)
@@ -1222,7 +1246,7 @@ class LauncherWindow(QMainWindow):
                 status_item = self.execution_table.item(row, 3)
                 if status_item is not None:
                     status_item.setForeground(QColor(
-                        "#b7791f" if execution.goal_status == "human_required"
+                        "#b7791f" if execution.is_human_required
                         else EXECUTION_STATUS_COLORS.get(execution.status, UNKNOWN_STATUS_COLOR)
                     ))
             self.execution_table.resizeColumnsToContents()
@@ -1244,6 +1268,9 @@ class LauncherWindow(QMainWindow):
             return
 
         self.open_codex_task_button.setEnabled(True)
+        actionable = execution.backend == "desktop_codex_app" and execution.status == "running" and self._execution_action_worker is None
+        self.check_execution_button.setEnabled(actionable)
+        self.close_execution_button.setEnabled(actionable)
         self.execution_details_label.setText("\n".join([
             f"执行 ID：{execution.execution_id}",
             f"目标：{execution.goal_name or '—'}（{execution.goal_id or '—'}）",
@@ -1251,10 +1278,18 @@ class LauncherWindow(QMainWindow):
             f"工作区：{execution.workspace_id}",
             f"模式：{execution.display_mode}",
             f"后端：{execution.backend_label}（{execution.backend or '—'}）",
-            f"状态：{execution.display_status}",
+            f"执行状态：{execution.status}",
+            f"监控状态：{execution.monitoring_status}",
+            f"Turn：{execution.turn_id or '—'}",
             f"开始时间：{self._format_timestamp(execution.started_at)}",
             f"结束时间：{self._format_timestamp(execution.finished_at)}",
             f"摘要：{execution.summary or '—'}",
+            *([f"人工结果：{ {'completed': '已完成', 'incomplete': '未完成', 'unknown': '无法确认'}.get(execution.manual_resolution.get('outcome'), '—') }",
+               f"处理说明：{execution.manual_resolution.get('note') or '—'}",
+               f"处理时间：{execution.manual_resolution.get('resolved_at', '—')}",
+               f"原监控诊断：{execution.manual_resolution.get('monitoring_summary', '—')}"]
+              + ([f"证据异常：{execution.manual_resolution['evidence_error']}"] if execution.manual_resolution.get('evidence_error') else [])
+              if execution.manual_resolution else []),
             *([
                 f"断点阶段：{execution.human_required_info.get('phase_id', '—')} / {execution.human_required_info.get('stage', '—')}",
                 f"断点原因：{execution.human_required_info.get('terminal_reason', '—')}",
@@ -1262,7 +1297,7 @@ class LauncherWindow(QMainWindow):
                 f"已完成工作：{execution.human_required_info.get('completed_work', '—')}",
                 f"处理要求：{execution.human_required_info.get('required_action', '—')}",
                 "请在原 ChatGPT 对话中回复处理决定。",
-            ] if execution.goal_status == "human_required" and execution.human_required_info else []),
+            ] if execution.is_human_required else []),
         ]))
         session = execution.session
         # Batch details keep Session and Thread empty while the Execution event stream is independent.
@@ -1311,10 +1346,81 @@ class LauncherWindow(QMainWindow):
 
     def _clear_execution_view(self) -> None:
         self.open_codex_task_button.setEnabled(False)
+        self.check_execution_button.setEnabled(False)
+        self.close_execution_button.setEnabled(False)
         self.session_details_label.setText("请选择执行查看详情。")
         self.execution_details_label.setText("执行：—")
         self.event_empty_label.setVisible(False)
         self.event_table.setRowCount(0)
+
+    def check_execution_status(self) -> None:
+        execution = self._selected_execution()
+        if execution is not None:
+            self._start_execution_action(execution, "check")
+
+    def close_execution_manually(self) -> None:
+        execution = self._selected_execution()
+        if execution is None or execution.status != "running" or execution.backend != "desktop_codex_app":
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("人工结案")
+        layout = QVBoxLayout(dialog)
+        identity = QLabel("\n".join([
+            f"Execution：{execution.execution_id}", f"Goal：{execution.goal_id or '—'}",
+            f"Task：{execution.task_id}", f"Session：{execution.session_id or '—'}",
+            f"Thread：{execution.thread_id or '—'}", f"Turn：{execution.turn_id or '—'}",
+            f"监控状态：{execution.monitoring_status}",
+            "结案只结束 LRM 记录；人工确认不等同于 provider 成功，不自动进入 Review。",
+        ]))
+        identity.setWordWrap(True)
+        identity.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(identity)
+        outcome = QComboBox()
+        for label, value in (("已完成", "completed"), ("未完成", "incomplete"), ("无法确认", "unknown")):
+            outcome.addItem(label, value)
+        outcome.setCurrentIndex(2)
+        layout.addWidget(outcome)
+        note = QPlainTextEdit()
+        note.setPlaceholderText("简短处理说明（可选，最多 1000 字）")
+        note.setMaximumHeight(90)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认结案")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            if len(note.toPlainText()) > 1000:
+                self.execution_action_result.setText("处理说明超过 1000 字，请缩短后提交。")
+                return
+            self._start_execution_action(execution, "close", outcome.currentData(), note.toPlainText())
+
+    def _start_execution_action(self, execution, action, outcome=None, note="") -> None:
+        if self._execution_action_worker is not None or execution.status != "running" or execution.backend != "desktop_codex_app":
+            return
+        worker = ExecutionActionWorker(self.status_checker, execution, action, outcome, note)
+        self._execution_action_worker = worker
+        worker.signals.finished.connect(self._execution_action_finished)
+        self.check_execution_button.setEnabled(False)
+        self.close_execution_button.setEnabled(False)
+        self.execution_action_result.setText(f"正在{'核对' if action == 'check' else '结案'}：{execution.execution_id}")
+        QThreadPool.globalInstance().start(worker)
+
+    @Slot(int, object)
+    def _execution_action_finished(self, _generation, result) -> None:
+        execution_id = self._execution_action_worker.execution.execution_id
+        self._execution_action_worker = None
+        if "error" in result:
+            text = f"操作失败：{result['error']}"
+        else:
+            status = result.get("execution", {}).get("status", "unknown")
+            text = f"执行状态：{status}"
+            if result.get("reason"):
+                text += f"；原因：{result['reason']}"
+        self.execution_action_result.setText(f"{execution_id}：{text}")
+        self._render_selected_execution()
+        self.refresh_status()
 
     def clear_task_cache(self) -> None:
         self._cleared_execution_ids.update(

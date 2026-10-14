@@ -31,6 +31,19 @@ import { DesktopThreadBindingStore } from "./desktop-thread-binding-store.js";
 import { DesktopThreadCoordinator } from "./desktop-thread-coordinator.js";
 import { DesktopCodexThreadCommands } from "./thread-commands.js";
 import { openDesktopThread } from "./desktop-thread-activator.js";
+import { z } from "zod";
+import { workspaceIdSchema, taskIdSchema, executionIdSchema, sessionIdSchema } from "../context/schema.js";
+
+export const desktopExecutionActionSchema = z.object({
+  workspace_id: workspaceIdSchema, task_id: taskIdSchema, execution_id: executionIdSchema,
+  session_id: sessionIdSchema.optional(), thread_id: z.string().min(1).max(256).optional(),
+  turn_id: z.string().min(1).max(256).optional(),
+  action: z.enum(["check", "close"]),
+  outcome: z.enum(["completed", "incomplete", "unknown"]).optional(),
+  note: z.string().max(1000).optional(), confirmed: z.literal(true).optional(),
+}).strict().refine(input => input.action !== "close" || (input.confirmed === true && input.outcome !== undefined),
+  "人工结案需要处理结果及明确确认。");
+export type DesktopExecutionAction = z.infer<typeof desktopExecutionActionSchema>;
 
 /** Stable, honest command label. Desktop executions never claim an app-server command. */
 export const DESKTOP_EXECUTION_COMMAND = "desktop codex_app";
@@ -45,6 +58,9 @@ export type DesktopExecutionErrorCode =
   | "desktop_goal_required"
   | "desktop_disconnected"
   | "executor_identity_unavailable"
+  | "turn_identity_unavailable"
+  | "session_identity_unavailable"
+  | "event_store_unavailable"
   | "desktop_tools_pipe_unavailable"
   | "runtime_connect_failed"
   | "tools_contract_incompatible"
@@ -77,7 +93,7 @@ interface DesktopRuntime {
 
 interface WatchContext {
   runtime: DesktopRuntime;
-  readonly request: ExecutionBackendStartRequest;
+  readonly request: Pick<ExecutionBackendStartRequest, "workspace_id" | "task_id" | "execution_id">;
   readonly sessionId: string;
   readonly executorThreadId: string;
   readonly baseline: DesktopCompletionBaseline;
@@ -125,9 +141,10 @@ export class DesktopCodexBackend implements ExecutionBackend {
   private readonly runtimes = new Map<string, DesktopRuntime>();
   private readonly watchAbortControllers = new Map<string, AbortController>();
   private readonly completions = new Map<string, Promise<void>>();
-  // Retain captured executor/Turn identity only in this process, never substitute the foreground.
+  // The captured identity is also durable in the binding; never substitute the foreground.
   private readonly watches = new Map<string, WatchContext>();
   private readonly notified = new Set<string>();
+  private readonly terminalFlights = new Map<string, Promise<unknown>>();
   private terminalListener: ExecutionTerminalListener | undefined;
   private closing = false;
 
@@ -179,6 +196,130 @@ export class DesktopCodexBackend implements ExecutionBackend {
     this.terminalListener = listener;
   }
 
+  private serial<T>(request: Pick<ExecutionBackendStartRequest, "workspace_id" | "task_id" | "execution_id">,
+    action: () => Promise<T>): Promise<T> {
+    const key = requestKey(request);
+    const next = (this.terminalFlights.get(key) ?? Promise.resolve()).catch(() => undefined).then(action);
+    this.terminalFlights.set(key, next);
+    void next.finally(() => {
+      if (this.terminalFlights.get(key) === next) this.terminalFlights.delete(key);
+    }).catch(() => undefined);
+    return next;
+  }
+
+  public async executionAction(input: DesktopExecutionAction): Promise<{ execution: ExecutionContext; reason?: string }> {
+    const request = desktopExecutionActionSchema.parse(input);
+    const execution = await this.executions.getExecutionContext(request.workspace_id, request.task_id, request.execution_id);
+    if (execution === null || execution.command !== DESKTOP_EXECUTION_COMMAND) {
+      throw new DesktopExecutionError("execution_not_recoverable", "所选记录不是可处理的 Desktop Execution。");
+    }
+    const executions = await this.executions.listExecutions(request.workspace_id, request.task_id);
+    let evidenceError: string | undefined;
+    const candidates = (await this.sessions.listSessions()).filter(candidate =>
+      candidate.task_id === request.task_id && candidate.backend_type === DESKTOP_EXECUTION_BACKEND_IDENTITY
+      && candidate.workspace === this.registry.resolve(request.workspace_id).manager.canonicalRoot);
+    const session = await sessionForExecution(candidates, execution,
+      executions.filter(candidate => candidate.command === DESKTOP_EXECUTION_COMMAND), this.events)
+      .catch(() => { evidenceError = "event_store_unavailable"; return undefined; });
+    const turns = session === undefined ? [] : [...new Set((await this.events.listEvents(session.session_id)
+      .catch(() => { evidenceError = "event_store_unavailable"; return []; }))
+      .filter(event => event.execution_id === request.execution_id && event.thread_id === session.thread_id)
+      .flatMap(event => "turn_id" in event && event.turn_id !== undefined ? [event.turn_id] : []))];
+    const turnId = turns.length === 1 ? turns[0] : undefined;
+    if (request.session_id !== session?.session_id || request.thread_id !== session?.thread_id
+      || (evidenceError === undefined && request.turn_id !== turnId)) {
+      throw new DesktopExecutionError("desktop_target_conflict", "执行身份已变化，请刷新后重新选择。");
+    }
+    if (request.action === "close") return this.serial(request, async () => {
+      if (session === undefined && candidates.some(candidate => candidate.execution_id === undefined
+        || candidate.execution_id === request.execution_id)) {
+        throw new DesktopExecutionError("desktop_target_conflict", "Session 关联无法唯一验证，不能结案；请核实关联身份。");
+      }
+      if (this.inFlight.has(requestKey(request))) {
+        throw new DesktopExecutionError("desktop_target_conflict", "执行尚在启动，请等待启动结果后再结案。");
+      }
+      const current = (await this.executions.getExecutionContext(request.workspace_id, request.task_id, request.execution_id))!;
+      if (current.status !== "running") {
+        await syncTerminalSession(this.sessions, session?.session_id, current);
+        if (current.manual_resolution !== undefined) await this.tasks.updateTaskContext(request.task_id, { status: "human_required" });
+        await this.notifyTerminal(current);
+        return { execution: current, reason: "already_terminal" };
+      }
+      const next = await this.executions.updateExecutionContext(request.workspace_id, request.task_id, request.execution_id, {
+        status: "terminated", summary: "人工结案，需人工处理；未取得 provider 成功证明。",
+        manual_resolution: { outcome: request.outcome!, note: request.note ?? "", resolved_at: this.now(),
+          ...(session === undefined ? {} : { session_id: session.session_id }),
+          ...(session?.thread_id === undefined ? {} : { thread_id: session.thread_id }),
+          ...(turnId === undefined ? {} : { turn_id: turnId }),
+          ...(current.summary === undefined ? {} : { monitoring_summary: current.summary }),
+          ...(evidenceError === undefined ? {} : { evidence_error: evidenceError }) },
+      });
+      if (session !== undefined) this.watchAbortControllers.get(session.session_id)?.abort();
+      await syncTerminalSession(this.sessions, session?.session_id, next);
+      await this.tasks.updateTaskContext(request.task_id, { status: "human_required" });
+      await this.notifyTerminal(next);
+      return { execution: next };
+    });
+    if (execution.status !== "running") return this.serial(request, async () => {
+      await syncTerminalSession(this.sessions, session?.session_id, execution);
+      await this.notifyTerminal(execution);
+      return { execution, reason: "already_terminal" };
+    });
+    let runtime: DesktopRuntime | undefined;
+    try {
+      if (evidenceError !== undefined) throw new DesktopExecutionError("event_store_unavailable", "事件证据无法读取，需人工核实。");
+      if (session === undefined) throw new DesktopExecutionError("session_identity_unavailable", "关联 Session 身份不可用。");
+      const binding = await new DesktopThreadBindingStore(this.storageRoot).load(request.workspace_id, session.session_id);
+      if (this.watches.get(session.session_id)?.executorThreadId === undefined && binding?.executor_thread_id === undefined) {
+        throw new DesktopExecutionError("executor_identity_unavailable", "原执行者身份未持久化，需人工核实。");
+      }
+      runtime = await this.connectRuntime();
+      const prepared = await this.prepare(runtime, true);
+      const watch = await this.restoreWatch(request, session, runtime, new AbortController().signal);
+      const completion = await this.observer(watch, prepared.client, prepared.contracts).checkCompletion({
+        executorThreadId: watch.executorThreadId, targetThreadId: watch.threadId, hostId: watch.hostId,
+        turnId: watch.resolvedTurnId!, timeoutMs: this.completionTimeoutMs,
+      });
+      if (completion.status === "completed") await this.complete(watch, completion);
+      else if (completion.status === "failed") await this.fail(watch, "Desktop turn failed.");
+      else await this.monitoringDiagnostic(request, session.session_id,
+        completion.status === "running" ? "observing" : "manual_confirmation_required", completion.reason ?? completion.status, watch);
+      if (completion.status === "running") await this.resumeObservation(request, session);
+      return { execution: (await this.executions.getExecutionContext(request.workspace_id, request.task_id, request.execution_id))!,
+        ...(completion.reason === undefined ? {} : { reason: completion.reason }) };
+    } catch (error: unknown) {
+      const reason = error instanceof DesktopExecutionError ? error.code : errorMessage(error);
+      await this.monitoringDiagnostic(request, session?.session_id, "manual_confirmation_required", reason);
+      return { execution: (await this.executions.getExecutionContext(request.workspace_id, request.task_id, request.execution_id))!, reason };
+    } finally {
+      await runtime?.close().catch(() => undefined);
+    }
+  }
+
+  private async restoreWatch(
+    request: Pick<ExecutionBackendStartRequest, "workspace_id" | "task_id" | "execution_id">,
+    session: Session, runtime: DesktopRuntime, signal: AbortSignal,
+  ): Promise<WatchContext> {
+    const existing = this.watches.get(session.session_id);
+    const binding = await new DesktopThreadBindingStore(this.storageRoot).load(request.workspace_id, session.session_id);
+    if (binding === undefined) throw new DesktopExecutionError("execution_not_recoverable", "binding_identity_unavailable");
+    await this.requireBinding(request, session.session_id, binding.target_thread_id, binding.host_id);
+    const executorThreadId = existing?.executorThreadId ?? binding.executor_thread_id;
+    if (executorThreadId === undefined || (existing !== undefined && (requestKey(existing.request) !== requestKey(request)
+      || (binding.executor_thread_id !== undefined && binding.executor_thread_id !== existing.executorThreadId)))) {
+      throw new DesktopExecutionError("executor_identity_unavailable", "原执行者身份未持久化，需人工核实。");
+    }
+    const turns = [...new Set((await this.events.listEvents(session.session_id))
+      .filter(event => event.execution_id === request.execution_id && event.thread_id === binding.target_thread_id)
+      .flatMap(event => "turn_id" in event && event.turn_id !== undefined ? [event.turn_id] : []))];
+    const resolvedTurnId = existing?.resolvedTurnId ?? (turns.length === 1 ? turns[0] : undefined);
+    if (resolvedTurnId === undefined) throw new DesktopExecutionError("turn_identity_unavailable", "原 Turn 身份不可用。");
+    return { runtime, signal, sessionId: session.session_id, executorThreadId, resolvedTurnId,
+      request,
+      threadId: binding.target_thread_id, hostId: binding.host_id,
+      baseline: { targetThreadId: binding.target_thread_id, hostId: binding.host_id, turnIds: [] } };
+  }
+
   /**
    * Test/shutdown seam: resolves once every in-flight Desktop execution has finished projecting its
    * terminal Session and Execution state. It never starts work.
@@ -202,6 +343,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
           execution, executions.filter(candidate => candidate.command === DESKTOP_EXECUTION_COMMAND), this.events);
         if (execution.status !== "running") {
           await syncTerminalSession(this.sessions, associated?.session_id, execution);
+          if (execution.manual_resolution !== undefined) await this.tasks.updateTaskContext(task.task_id, { status: "human_required" });
           await this.notifyTerminal(execution);
           continue;
         }
@@ -267,7 +409,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
     );
     if (existing !== null) return this.existing(request, existing);
 
-    // The executor identity is captured once per Execution and never persisted.
+    // Capture once and persist with the target binding for observation after restart.
     const executorThreadId = this.executorIdentity();
 
     const runtime = await this.connectRuntime().catch((error: unknown) => {
@@ -544,10 +686,12 @@ export class DesktopCodexBackend implements ExecutionBackend {
     request: Pick<ExecutionBackendStartRequest, "workspace_id" | "task_id" | "execution_id">, session: Session,
   ): Promise<void> {
     if (this.closing || this.completions.has(session.session_id)) return;
-    const watch = this.watches.get(session.session_id);
-    // executorThreadId intentionally does not survive process restart. Neither a matching project
-    // nor the current foreground proves its relationship to the persisted target/Execution.
-    if (watch === undefined || requestKey(watch.request) !== requestKey(request)) {
+    let watch = this.watches.get(session.session_id);
+    // Only the original captured or durable executor may authorize observation after restart.
+    const binding = await new DesktopThreadBindingStore(this.storageRoot).load(request.workspace_id, session.session_id).catch(() => undefined);
+    if (this.closing || this.completions.has(session.session_id)) return;
+    if ((watch === undefined && binding?.executor_thread_id === undefined)
+      || (watch !== undefined && requestKey(watch.request) !== requestKey(request))) {
       await this.monitoringDiagnostic(request, session.session_id, "manual_confirmation_required", "executor_identity_unavailable");
       return;
     }
@@ -555,16 +699,16 @@ export class DesktopCodexBackend implements ExecutionBackend {
     const setup = (async () => {
       let runtime: DesktopRuntime | undefined;
       try {
-        await this.requireBinding(request, session.session_id, watch.threadId, watch.hostId);
         runtime = await this.connectRuntime();
-        const prepared = await this.prepare(runtime, true);
-        if (this.closing) { await runtime.close(); return; }
         const controller = new AbortController();
-        watch.runtime = runtime;
-        watch.signal = controller.signal;
-        watch.reconnectAttempts = 0;
+        watch = await this.restoreWatch(request, session, runtime, controller.signal);
+        const prepared = await this.prepare(runtime, true);
+        const current = await this.executions.getExecutionContext(request.workspace_id, request.task_id, request.execution_id);
+        if (this.closing || current?.status !== "running") { await runtime.close(); return; }
+        watch.reconnectAttempts = 1;
         this.runtimes.set(session.session_id, runtime);
         this.watchAbortControllers.set(session.session_id, controller);
+        this.watches.set(session.session_id, watch);
         observation = this.watch(watch, prepared.client, prepared.contracts).catch(() => undefined);
       } catch (error: unknown) {
         await runtime?.close().catch(() => undefined);
@@ -583,6 +727,13 @@ export class DesktopCodexBackend implements ExecutionBackend {
   }
 
   private async monitoringDiagnostic(
+    request: Pick<ExecutionBackendStartRequest, "workspace_id" | "task_id" | "execution_id">,
+    sessionId: string | undefined, state: string, code: string, watch?: WatchContext,
+  ): Promise<void> {
+    return this.serial(request, () => this.persistMonitoringDiagnostic(request, sessionId, state, code, watch));
+  }
+
+  private async persistMonitoringDiagnostic(
     request: Pick<ExecutionBackendStartRequest, "workspace_id" | "task_id" | "execution_id">,
     sessionId: string | undefined, state: string, code: string, watch?: WatchContext,
   ): Promise<void> {
@@ -706,6 +857,10 @@ export class DesktopCodexBackend implements ExecutionBackend {
   }
 
   private async complete(watch: WatchContext, completion: DesktopCompletionResult): Promise<void> {
+    return this.serial(watch.request, () => this.completeOnce(watch, completion));
+  }
+
+  private async completeOnce(watch: WatchContext, completion: DesktopCompletionResult): Promise<void> {
     const execution = await this.executions.getExecutionContext(
       watch.request.workspace_id,
       watch.request.task_id,
@@ -761,6 +916,10 @@ export class DesktopCodexBackend implements ExecutionBackend {
   }
 
   private async fail(watch: WatchContext, reason: string): Promise<void> {
+    return this.serial(watch.request, () => this.failOnce(watch, reason));
+  }
+
+  private async failOnce(watch: WatchContext, reason: string): Promise<void> {
     const execution = await this.executions.getExecutionContext(
       watch.request.workspace_id,
       watch.request.task_id,
@@ -846,7 +1005,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
       });
     }
 
-    if (next?.status !== "passed" && values.persistEvent !== false && values.threadId !== undefined && sessionId !== undefined) {
+    if (next?.status === "failed" && values.persistEvent !== false && values.threadId !== undefined && sessionId !== undefined) {
       try {
         await this.recordEvent({
           session_id: sessionId,

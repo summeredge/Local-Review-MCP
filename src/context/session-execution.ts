@@ -8,15 +8,21 @@ export async function sessionForExecution(
   executions: readonly ExecutionContext[], events: Pick<EventStore, "listEvents">,
 ): Promise<Session | undefined> {
   const matches: Session[] = [];
+  let readError: unknown;
   for (const session of sessions) {
     if (session.task_id !== execution.task_id) continue;
-    const ids = session.execution_id === undefined
-      ? [...new Set((await events.listEvents(session.session_id)).map(event => event.execution_id))]
-      : [session.execution_id];
+    let ids: string[];
+    try {
+      ids = session.execution_id === undefined
+        ? [...new Set((await events.listEvents(session.session_id)).map(event => event.execution_id))]
+        : [session.execution_id];
+    } catch (error: unknown) { readError = error; continue; }
     if (ids.length === 1 && ids[0] === execution.execution_id) matches.push(session);
     else if (ids.length === 0 && executions.length === 1 && sessions.length === 1) matches.push(session);
   }
-  return matches.length === 1 ? matches[0] : undefined;
+  if (matches.length > 0) return matches.length === 1 ? matches[0] : undefined;
+  if (readError !== undefined) throw readError;
+  return undefined;
 }
 
 /** Session failures must not suppress a durable Execution's terminal notification. */
@@ -24,7 +30,8 @@ export async function syncTerminalSession(
   sessions: SessionStore, sessionId: string | undefined, execution: ExecutionContext,
 ): Promise<void> {
   if (sessionId === undefined || execution.status === "running") return;
-  const status = execution.status === "passed" ? "completed" : "failed";
+  const status = execution.status === "passed" ? "completed"
+    : execution.status === "terminated" ? "terminated" : "failed";
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const current = await sessions.getSession(sessionId);

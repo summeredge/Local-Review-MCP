@@ -1,5 +1,5 @@
 ﻿import { mkdtempSync, rmSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CallToolRequestParams, CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
@@ -20,7 +20,7 @@ import {
 import { ExecutionContextService } from "../src/context/execution-service.js";
 import { SessionStore } from "../src/context/session-store.js";
 import { TaskContextService } from "../src/context/service.js";
-import { EventStore } from "../src/control-plane/events/store.js";
+import { EventStore, eventsFile } from "../src/control-plane/events/store.js";
 import { DesktopCodexBackend } from "../src/desktop-codex/desktop-codex-backend.js";
 import { CapabilityNegotiator } from "../src/control-plane/capability-negotiation.js";
 import { DesktopThreadBindingStore } from "../src/desktop-codex/desktop-thread-binding-store.js";
@@ -45,6 +45,7 @@ import { GoalSubmissionService } from "../src/control-plane/goal-submission.js";
 import { PendingGoalSubmissionService } from "../src/control-plane/pending-goal-submission.js";
 import { ConversationCorrelationRegistry } from "../src/control-plane/conversation-correlation.js";
 import { DesktopCompletionObserver } from "../src/desktop-codex/completion-observer.js";
+import { ExecutionRoutingService } from "../src/control-plane/execution-routing.js";
 
 /**
  * P5.4.1 acceptance tests for the Desktop codex_app production interactive route.
@@ -393,6 +394,252 @@ const GOAL_ID = "goal-1";
 const TASK_ID = "task-1";
 const EXECUTION_ID = "execution-1";
 const ACTUATION_ID = "actuation-1";
+
+describe("Desktop Execution status checks and manual resolution", () => {
+  it.each(["check", "close"] as const)("converges Goal, Task and Review Loop through existing terminal notifications: %s", async action => {
+    const value = await fixture();
+    value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
+    const review = vi.fn(async request => ({ status: "COMPLETED" as const,
+      content: `<lrm-review-result>${JSON.stringify({ schema_version: 1, review_request_id: request.review_request_id,
+        decision: "APPROVE", summary: "Reviewed" })}</lrm-review-result>` }));
+    const auto = new AutoIterationService(value.registry, { storageRoot: value.root, controlledActuation: value.controlled,
+      browserRouter: new BrowserRouter(value.root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
+      completionRouter: new ReviewCompletionRouter(value.root, { collect: review }) });
+    const goals = new GoalOrchestrationService(value.registry, { storageRoot: value.root,
+      controlledActuation: value.controlled, autoIteration: auto });
+    auto.setTerminalListener(loop => goals.onAutoIterationTerminal(loop));
+    const restarted = new DesktopCodexBackend(value.registry, { storageRoot: value.root, runtimeFactory: value.desktop.runtimeFactory });
+    const routing = new ExecutionRoutingService(value.registry, { storageRoot: value.root, autoIteration: auto, goalOrchestration: goals });
+    restarted.setTerminalListener(execution => routing.onExecutionTerminal(execution));
+    try {
+      await goals.createGoal({ goal_id: GOAL_ID, workspace_id: "workspace-a", conversation_id: "conversation-1",
+        execution_mode: "interactive", phases: [{ phase_id: "phase-1", objective: "Implement", tasks: [{
+          task_id: TASK_ID, goal: "Fix the change", requirements: ["Keep it small"], acceptance_criteria: ["Tests pass"], max_iterations: 2,
+        }] }] });
+      const goal = await goals.startGoal({ goal_id: GOAL_ID });
+      const session = (await value.sessions.listSessions())[0]!;
+      await vi.waitFor(async () => expect((await value.events.listEvents(session.session_id))
+        .some(event => event.event_type === "turn_started")).toBe(true));
+      await value.backend.close();
+      value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+      const input = { action, workspace_id: "workspace-a", task_id: TASK_ID, execution_id: goal.execution_id!,
+        session_id: session.session_id, thread_id: session.thread_id!, turn_id: "turn-1",
+        ...(action === "close" ? { outcome: "completed" as const, confirmed: true as const, note: "人工确认" } : {}) };
+      await restarted.executionAction(input);
+      await vi.waitFor(async () => expect((await goals.getGoal(GOAL_ID))?.status).toBe(action === "check" ? "completed" : "human_required"));
+      expect((await new TaskContextService(value.root).getTaskContext(TASK_ID))?.status).toBe(action === "check" ? "completed" : "human_required");
+      expect((await auto.getLoop(goal.loop_id!))?.stage).toBe(action === "check" ? "completed" : "human_required");
+      await restarted.executionAction(input);
+      await restarted.reconcileOrphanedExecutions();
+      await auto.recover();
+      await goals.recover();
+      expect(review).toHaveBeenCalledTimes(action === "check" ? 1 : 0);
+      const rows = await new StatusQueryService({ storageRoot: value.root, goals }).listExecutionSummaries();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ status: action === "check" ? "passed" : "terminated", turn_id: "turn-1" });
+      if (action === "close") expect(rows[0]?.manual_resolution?.outcome).toBe("completed");
+      expect(value.desktop.createThreadCount()).toBe(1);
+    } finally { goals.dispose(); auto.dispose(); await restarted.close(); await value.backend.close(); }
+  });
+
+  async function suspended() {
+    const value = await fixture();
+    value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
+    await authorizeAndActuate(value, {}, "launch");
+    const session = (await value.sessions.listSessions())[0]!;
+    await vi.waitFor(async () => expect((await value.events.listEvents(session.session_id))
+      .some(event => event.event_type === "turn_started")).toBe(true));
+    await value.backend.close();
+    const restarted = new DesktopCodexBackend(value.registry, { storageRoot: value.root,
+      runtimeFactory: value.desktop.runtimeFactory,
+      desktopState: () => desktopState({ currentConversationId: "unrelated-foreground" }) });
+    const notified = vi.fn(async () => undefined);
+    restarted.setTerminalListener(notified);
+    const identity = { workspace_id: "workspace-a", task_id: TASK_ID, execution_id: EXECUTION_ID,
+      session_id: session.session_id, thread_id: session.thread_id!, turn_id: "turn-1" };
+    return { value, session, restarted, notified, identity };
+  }
+
+  it.each(["completed", "failed", "inProgress"])("checks only the durable original Turn after restart: %s", async status => {
+    const f = await suspended();
+    try {
+      f.value.desktop.setTurns([{ id: "turn-1", status, completedAt: status === "inProgress" ? null : 1 },
+        { id: "turn-2", status: "completed", completedAt: 2 }]);
+      const result = await f.restarted.executionAction({ ...f.identity, action: "check" });
+      expect(result.execution.status).toBe(status === "completed" ? "passed" : status === "failed" ? "failed" : "running");
+      expect(f.value.desktop.calls.filter(call => call.name === "read_thread").at(-1)?._meta?.["openai/threadId"])
+        .toBe("executor-conversation-1");
+      await f.restarted.executionAction({ ...f.identity, action: "check" });
+      expect(f.notified).toHaveBeenCalledTimes(status === "inProgress" ? 0 : 1);
+      expect((await f.value.sessions.getSession(f.session.session_id))?.status)
+        .toBe(status === "completed" ? "completed" : status === "failed" ? "failed" : "active");
+      expect((await f.value.events.listEvents(f.session.session_id)).filter(event => event.event_type === "turn_completed"))
+        .toHaveLength(status === "completed" ? 1 : 0);
+      expect(f.value.desktop.createThreadCount()).toBe(1);
+      expect(f.value.desktop.sendCount()).toBe(0);
+    } finally { await f.restarted.close(); }
+  });
+
+  it("restores a background observer using the original durable executor", async () => {
+    const f = await suspended();
+    try {
+      f.value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+      await Promise.all([f.restarted.reconcileOrphanedExecutions(), f.restarted.reconcileOrphanedExecutions()]);
+      await f.restarted.whenIdle();
+      expect((await f.value.executions.getExecutionContext("workspace-a", TASK_ID, EXECUTION_ID))?.status).toBe("passed");
+      expect(f.notified).toHaveBeenCalledTimes(1);
+      expect(f.value.desktop.createThreadCount()).toBe(1);
+    } finally { await f.restarted.close(); }
+  });
+
+  it("preserves running and the precise diagnostic when executor identity is unavailable", async () => {
+    const f = await suspended();
+    try {
+      const binding = (await new DesktopThreadBindingStore(f.value.root).load("workspace-a", f.session.session_id))!;
+      const { executor_thread_id: _executor, ...legacy } = binding;
+      await writeFile(join(f.value.root, ".task", "desktop_thread_bindings", "workspace-a", f.session.session_id + ".json"), JSON.stringify(legacy));
+      expect(await f.restarted.executionAction({ ...f.identity, action: "check" }))
+        .toMatchObject({ reason: "executor_identity_unavailable", execution: { status: "running", summary: expect.stringContaining("manual_confirmation_required") } });
+      expect(f.notified).not.toHaveBeenCalled();
+      expect(f.value.desktop.createThreadCount()).toBe(1);
+    } finally { await f.restarted.close(); }
+  });
+
+  it("does not let duplicate checks or a manual close overwrite a trusted terminal", async () => {
+    const f = await suspended();
+    try {
+      f.value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+      await Promise.all([f.restarted.executionAction({ ...f.identity, action: "check" }),
+        f.restarted.executionAction({ ...f.identity, action: "check" })]);
+      const closed = await f.restarted.executionAction({ ...f.identity, action: "close", confirmed: true, outcome: "unknown" });
+      expect(closed.execution).toMatchObject({ status: "passed" });
+      expect(closed.execution.manual_resolution).toBeUndefined();
+      expect(f.notified).toHaveBeenCalledTimes(1);
+      expect((await f.value.events.listEvents(f.session.session_id)).filter(event => event.event_type === "turn_completed")).toHaveLength(1);
+    } finally { await f.restarted.close(); }
+  });
+
+  it("persists manual resolution once and defeats a late original provider completion", async () => {
+    const f = await suspended();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let readStarted = false;
+    const original = f.value.desktop.runtime.mcpClient.callTool;
+    f.value.desktop.runtime.mcpClient.callTool = async params => {
+      if (params.name === "read_thread") { readStarted = true; await gate; }
+      return original(params);
+    };
+    try {
+      f.value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+      const checking = f.restarted.executionAction({ ...f.identity, action: "check" });
+      await vi.waitFor(() => expect(readStarted).toBe(true));
+      const close = { ...f.identity, action: "close" as const, outcome: "completed" as const, confirmed: true as const, note: "工程师人工确认" };
+      const [first, repeated] = await Promise.all([f.restarted.executionAction(close), f.restarted.executionAction(close)]);
+      expect(repeated.execution.manual_resolution).toEqual(first.execution.manual_resolution);
+      release();
+      expect((await checking).execution.status).toBe("terminated");
+      expect((await f.value.sessions.getSession(f.session.session_id))?.status).toBe("terminated");
+      expect(first.execution.manual_resolution).toMatchObject({ outcome: "completed", note: "工程师人工确认",
+        session_id: f.session.session_id, thread_id: f.session.thread_id, turn_id: "turn-1",
+        monitoring_summary: expect.stringContaining("runtime_closed") });
+      expect(f.notified).toHaveBeenCalledTimes(1);
+      expect((await f.value.events.listEvents(f.session.session_id)).some(event => ["turn_completed", "execution_failed"].includes(event.event_type))).toBe(false);
+      await expect(f.restarted.executionAction({ ...close, thread_id: "foreign-thread" })).rejects.toMatchObject({ code: "desktop_target_conflict" });
+      await f.restarted.close();
+      const restartedAgain = new DesktopCodexBackend(f.value.registry, { storageRoot: f.value.root,
+        runtimeFactory: { connect: async () => { throw new Error("must not reconnect closed records"); } } });
+      try {
+        await restartedAgain.reconcileOrphanedExecutions();
+        expect((await restartedAgain.executionAction(close)).execution.manual_resolution).toEqual(first.execution.manual_resolution);
+        expect(await f.value.executions.listExecutions("workspace-a", TASK_ID)).toHaveLength(1);
+      } finally { await restartedAgain.close(); }
+    } finally { release(); await f.restarted.close(); }
+  });
+
+  it.each(["legacy", "corrupt"])("keeps the catalog and manual close usable when evidence is %s", async evidence => {
+    const f = await suspended();
+    try {
+      const eventFile = eventsFile(f.value.root, f.session.session_id);
+      if (evidence === "legacy") {
+        const { execution_id: _execution, ...legacy } = f.session;
+        await writeFile(join(f.value.root, ".task", "sessions", f.session.session_id + ".json"), JSON.stringify(legacy));
+        await writeFile(eventFile, "[]");
+      } else await writeFile(eventFile, "{broken events");
+      const rows = await new StatusQueryService({ storageRoot: f.value.root }).listExecutionSummaries();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ execution_id: EXECUTION_ID, session_id: f.session.session_id, thread_id: f.session.thread_id });
+      expect(rows[0]?.turn_id).toBeUndefined();
+      if (evidence === "corrupt") expect(rows[0]?.monitoring_error).toBe("event_store_unavailable");
+      const identity = { ...f.identity, turn_id: undefined };
+      const checked = await f.restarted.executionAction({ ...identity, action: "check" });
+      expect(checked.execution.status).toBe("running");
+      expect(checked.reason).toBe(evidence === "corrupt" ? "event_store_unavailable" : "execution_not_recoverable");
+      const closed = await f.restarted.executionAction({
+        ...(evidence === "corrupt" ? f.identity : identity), action: "close", outcome: "unknown", confirmed: true,
+      });
+      expect(closed.execution.status).toBe("terminated");
+      expect(closed.execution.manual_resolution?.turn_id).toBeUndefined();
+      if (evidence === "corrupt") expect(closed.execution.manual_resolution?.evidence_error).toBe("event_store_unavailable");
+      expect((await f.value.sessions.getSession(f.session.session_id))?.status).toBe("terminated");
+      expect(await readFile(eventFile, "utf8")).toBe(evidence === "corrupt" ? "{broken events" : "[]");
+      await f.restarted.executionAction({ ...identity, action: "close", outcome: "unknown", confirmed: true });
+      expect(f.notified).toHaveBeenCalledTimes(1);
+    } finally { await f.restarted.close(); }
+  });
+
+  it("does not use the unique legacy fallback when another execution exists", async () => {
+    const f = await suspended();
+    try {
+      const { execution_id: _execution, ...legacy } = f.session;
+      await writeFile(join(f.value.root, ".task", "sessions", f.session.session_id + ".json"), JSON.stringify(legacy));
+      await writeFile(eventsFile(f.value.root, f.session.session_id), "[]");
+      await f.value.executions.createExecutionContext({ workspace_id: "workspace-a", task_id: TASK_ID,
+        execution_id: "execution-2", command: "desktop codex_app" });
+      const rows = await new StatusQueryService({ storageRoot: f.value.root }).listExecutionSummaries();
+      expect(rows).toHaveLength(2);
+      expect(rows.every(row => row.session_id === undefined)).toBe(true);
+      await expect(f.restarted.executionAction({ ...f.identity, turn_id: undefined, action: "close", outcome: "unknown", confirmed: true }))
+        .rejects.toMatchObject({ code: "desktop_target_conflict" });
+      expect((await f.value.sessions.getSession(f.session.session_id))?.status).toBe("active");
+    } finally { await f.restarted.close(); }
+  });
+
+  it("retains the independently verified current Session when an unrelated legacy Session is damaged", async () => {
+    const f = await suspended();
+    try {
+      const older = await f.value.sessions.createSession({ task_id: TASK_ID, goal_id: GOAL_ID,
+        workspace: f.value.registry.active.manager.canonicalRoot, backend_type: "desktop_codex_app", status: "active", thread_id: "old-thread" });
+      const oldEvents = eventsFile(f.value.root, older.session_id);
+      await writeFile(oldEvents, "{broken old events");
+      const rows = await new StatusQueryService({ storageRoot: f.value.root }).listExecutionSummaries();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ session_id: f.session.session_id, thread_id: f.session.thread_id, turn_id: "turn-1" });
+      const closed = await f.restarted.executionAction({ ...f.identity, action: "close", outcome: "unknown", confirmed: true });
+      expect(closed.execution).toMatchObject({ status: "terminated", manual_resolution: {
+        session_id: f.session.session_id, thread_id: f.session.thread_id, turn_id: "turn-1" } });
+      expect((await f.value.sessions.getSession(f.session.session_id))?.status).toBe("terminated");
+      expect((await f.value.sessions.getSession(older.session_id))?.status).toBe("active");
+      expect(await readFile(oldEvents, "utf8")).toBe("{broken old events");
+      await f.restarted.reconcileOrphanedExecutions();
+      expect(f.notified).toHaveBeenCalledTimes(1);
+    } finally { await f.restarted.close(); }
+  });
+
+  it("does not pick a latest Session when two Sessions prove the same Execution identity", async () => {
+    const f = await suspended();
+    try {
+      await f.value.sessions.createSession({ execution_id: EXECUTION_ID, task_id: TASK_ID, goal_id: GOAL_ID,
+        workspace: f.value.registry.active.manager.canonicalRoot, backend_type: "desktop_codex_app", status: "active", thread_id: "duplicate-thread" });
+      const rows = await new StatusQueryService({ storageRoot: f.value.root }).listExecutionSummaries();
+      expect(rows[0]?.session_id).toBeUndefined();
+      await expect(f.restarted.executionAction({ ...f.identity, action: "close", outcome: "unknown", confirmed: true }))
+        .rejects.toMatchObject({ code: "desktop_target_conflict" });
+      await expect(f.restarted.executionAction({ workspace_id: "workspace-a", task_id: TASK_ID, execution_id: EXECUTION_ID,
+        action: "close", outcome: "unknown", confirmed: true })).rejects.toMatchObject({ code: "desktop_target_conflict" });
+      expect((await f.value.sessions.getSession(f.session.session_id))?.status).toBe("active");
+    } finally { await f.restarted.close(); }
+  });
+});
 const INSTRUCTION = "Only return LRM_DESKTOP_BACKEND_PASS";
 
 function interactiveRequest(
@@ -913,7 +1160,7 @@ describe("P5.4.1 first turn on a newly created Desktop target", () => {
     expect(events.map((event) => event.event_type)).toContain("turn_completed");
   });
 
-  it("never persists the executor identity into Session, binding, or Execution", async () => {
+  it("persists the original executor only in its trusted target binding", async () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
     await authorizeAndActuate(value, {}, "terminal");
@@ -928,7 +1175,7 @@ describe("P5.4.1 first turn on a newly created Desktop target", () => {
 
     expect(sessionRaw).not.toContain("executor-conversation-1");
     expect(JSON.stringify(execution)).not.toContain("executor-conversation-1");
-    expect(JSON.stringify(binding)).not.toContain("executor-conversation-1");
+    expect(binding?.executor_thread_id).toBe("executor-conversation-1");
     expect(session.thread_id).not.toBe("executor-conversation-1");
   });
 
@@ -1289,6 +1536,10 @@ describe("P5.4.1 FIX failure terminal projection", () => {
     value.desktop.setTurns([{ id: "turn-1", status: "inProgress", completedAt: null }]);
     await authorizeAndActuate(value, {}, "launch");
     await value.backend.close();
+    const sessionBeforeRestart = (await value.sessions.listSessions())[0]!;
+    const binding = (await new DesktopThreadBindingStore(value.root).load("workspace-a", sessionBeforeRestart.session_id))!;
+    const { executor_thread_id: _executor, ...legacyBinding } = binding;
+    await writeFile(join(value.root, ".task", "desktop_thread_bindings", "workspace-a", sessionBeforeRestart.session_id + ".json"), JSON.stringify(legacyBinding));
     const connect = vi.fn(value.desktop.runtimeFactory.connect);
     const restarted = new DesktopCodexBackend(value.registry, { storageRoot: value.root,
       runtimeFactory: { connect }, desktopState: () => desktopState({ currentConversationId: "unrelated-foreground" }),

@@ -610,6 +610,7 @@ export class AutoIterationService {
         if (execution === null) return this.humanRequired(loop, "EXECUTION_MISSING");
         if (execution.status === "failed") return this.failed(loop, "EXECUTION_FAILED", execution.summary);
         if (execution.status === "running") return loop;
+        if (execution.status === "terminated") return this.humanRequired(loop, "EXECUTION_TERMINATED", execution.summary);
       }
 
       switch (loop.stage) {
@@ -708,6 +709,7 @@ export class AutoIterationService {
     if (execution.status === "failed") {
       return this.failed(loop, "EXECUTION_FAILED", execution.summary);
     }
+    if (execution.status === "terminated") return this.humanRequired(loop, "EXECUTION_TERMINATED", execution.summary);
     return this.update(loop, { stage: "review_request" });
   }
 

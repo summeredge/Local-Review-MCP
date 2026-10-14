@@ -17,6 +17,7 @@ import { SessionStore } from "../context/session-store.js";
 import { sessionFile } from "../context/session.js";
 import { defaultTaskContextStorageRoot, taskContextFile } from "../context/task.js";
 import { TaskContextService } from "../context/service.js";
+import { sessionForExecution } from "../context/session-execution.js";
 import type { ExecutionContext, Session, SessionBackendType } from "../context/types.js";
 import type { ExecutionMode } from "./execution-service.js";
 import { GoalOrchestrationUnavailableError, type GoalOrchestrationService, type GoalOrchestration } from "./goal-orchestration.js";
@@ -164,6 +165,9 @@ export interface LauncherSessionSummary {
  * a Session exists.
  */
 export interface LauncherExecutionSummary {
+  readonly monitoring_error?: string;
+  readonly turn_id?: string;
+  readonly manual_resolution?: ExecutionContext["manual_resolution"];
   readonly goal_status?: GoalOrchestration["status"];
   readonly human_required_info?: GoalOrchestration["human_required_info"];
   readonly execution_id: string;
@@ -480,16 +484,6 @@ export class StatusQueryService {
     const authorizations = new ActuationAuthorizationStore(this.storageRoot);
     const goals = await this.availableGoals();
     const sessions = await this.availableSessions();
-    const sessionExecutions = new Map<string, Set<string>>();
-    for (const session of sessions) {
-      try {
-        sessionExecutions.set(session.session_id, new Set(
-          (await this.events.listEvents(session.session_id)).map((event) => event.execution_id),
-        ));
-      } catch {
-        // Missing association evidence leaves only this Session unbound.
-      }
-    }
     const summaries: LauncherExecutionSummary[] = [];
     for (const target of await this.executionTargets(workspaceId)) {
       let executions: ExecutionContext[];
@@ -500,7 +494,7 @@ export class StatusQueryService {
       }
       for (const execution of executions) {
         try {
-          summaries.push(await this.executionSummary(execution, goals, sessions, sessionExecutions, authorizations));
+          summaries.push(await this.executionSummary(execution, goals, sessions, executions, authorizations));
         } catch {
           continue;
         }
@@ -513,12 +507,18 @@ export class StatusQueryService {
     execution: ExecutionContext,
     goals: readonly GoalOrchestration[],
     sessions: readonly Session[],
-    sessionExecutions: ReadonlyMap<string, ReadonlySet<string>>,
+    executions: readonly ExecutionContext[],
     authorizations: ActuationAuthorizationStore,
   ): Promise<LauncherExecutionSummary> {
     const goal = await this.goalForExecution(execution, goals);
-    const session = execution.command === CODEX_EXECUTION_COMMAND
-      ? undefined : this.sessionFor(execution, goal, sessions, sessionExecutions);
+    let monitoringError: string | undefined;
+    const candidates = sessions.filter(session => session.task_id === execution.task_id
+      && (goal === undefined || session.goal_id === goal.goal_id)
+      && (execution.command !== DESKTOP_EXECUTION_COMMAND || session.backend_type === "desktop_codex_app")
+      && (execution.command !== APP_SERVER_COMMAND || session.backend_type === "codex_app_server"));
+    const session = execution.command === CODEX_EXECUTION_COMMAND ? undefined
+      : await sessionForExecution(candidates, execution, executions.filter(candidate => candidate.command === execution.command), this.events)
+        .catch(() => { monitoringError = "event_store_unavailable"; return undefined; });
     const authorization = await authorizations.getAuthorizationByExecution(
       execution.workspace_id, execution.task_id, execution.execution_id,
     ).catch(() => null);
@@ -534,6 +534,14 @@ export class StatusQueryService {
     const mode = backend === undefined ? undefined : backend === "cli" ? "batch" : "interactive";
     const model = session?.model_id ?? authorization?.model_id;
     const effort = session?.reasoning_effort ?? authorization?.reasoning_effort;
+    const executionTurns = session === undefined ? [] : [...new Set((await this.events.listEvents(session.session_id)
+      .catch(() => { monitoringError = "event_store_unavailable"; return []; }))
+      .filter(event => event.execution_id === execution.execution_id && event.thread_id === session.thread_id)
+      .flatMap(event => "turn_id" in event && event.turn_id !== undefined ? [event.turn_id] : []))];
+    const humanRequiredInfo = goal?.status === "human_required"
+      && goal.human_required_info?.task_id === execution.task_id
+      && goal.human_required_info.execution_id === execution.execution_id
+      ? goal.human_required_info : undefined;
     return {
       execution_id: execution.execution_id,
       workspace_id: execution.workspace_id,
@@ -541,7 +549,7 @@ export class StatusQueryService {
       ...(goal === undefined ? {} : {
         goal_id: goal.goal_id,
         goal_status: goal.status,
-        ...(goal.human_required_info === undefined ? {} : { human_required_info: goal.human_required_info }),
+        ...(humanRequiredInfo === undefined ? {} : { human_required_info: humanRequiredInfo }),
       }),
       ...(mode === undefined ? {} : { execution_mode: mode }),
       ...(model === undefined ? {} : modelStatusFields(model)),
@@ -551,6 +559,9 @@ export class StatusQueryService {
       task_name: taskName,
       ...(backend === undefined ? {} : { backend }),
       status: execution.status,
+      ...(monitoringError === undefined ? {} : { monitoring_error: monitoringError }),
+      ...(executionTurns.length !== 1 ? {} : { turn_id: executionTurns[0] }),
+      ...(execution.manual_resolution === undefined ? {} : { manual_resolution: execution.manual_resolution }),
       started_at: execution.started_at,
       ...(execution.finished_at === undefined ? {} : { finished_at: execution.finished_at }),
       ...(execution.summary === undefined ? {} : { summary: execution.summary }),
@@ -559,29 +570,9 @@ export class StatusQueryService {
         backend_type: session.backend_type,
         ...(session.thread_id === undefined ? {} : { thread_id: session.thread_id }),
       }),
-      updated_at: goal?.status === "human_required" ? goal.updated_at
+      updated_at: humanRequiredInfo !== undefined ? goal!.updated_at
         : session?.updated_at ?? execution.finished_at ?? execution.started_at,
     };
-  }
-
-  /**
-   * A Session must have durable event evidence for this exact Execution, in addition to Task/Goal.
-   */
-  private sessionFor(
-    execution: ExecutionContext,
-    goal: GoalOrchestration | undefined,
-    sessions: readonly Session[],
-    sessionExecutions: ReadonlyMap<string, ReadonlySet<string>>,
-  ): Session | undefined {
-    const matches = sessions.filter((session) => session.task_id === execution.task_id
-      && sessionExecutions.get(session.session_id)?.has(execution.execution_id)
-      && (goal === undefined || session.goal_id === goal.goal_id));
-    return matches.reduce<Session | undefined>(
-      (latest, candidate) => latest === undefined || candidate.updated_at > latest.updated_at
-        ? candidate
-        : latest,
-      undefined,
-    );
   }
 
   /** Damaged Goal state degrades the Execution catalog; it never fails the whole query. */

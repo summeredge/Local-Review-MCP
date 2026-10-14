@@ -192,8 +192,7 @@ describe("Goal terminal persistence failures", () => {
       terminal_summary: "foreign private evidence" });
     const stopped = await f.service.advanceGoal("goal-1");
     expect(stopped.human_required_info).toMatchObject({ terminal_reason: "GOAL_ORCHESTRATION_ERROR" });
-    const [target] = await f.deliveries.recoveryTargets();
-    const notice = await f.deliveries.get(target!.delivery_id);
+    const notice = await f.deliveries.getByLogicalDeliveryId(identity("human-required", "goal-1", "phase-1", "task-1"));
     expect(notice?.conversation_id).toBe("conversation-1");
     expect(notice?.message).not.toContain("foreign private evidence");
   });
@@ -249,9 +248,9 @@ describe("Goal terminal persistence failures", () => {
         completed_work: expect.stringContaining("Implementation and tests completed"),
       } });
       const deliveries = new ExtensionDeliveryService(f.root);
-      const [target] = await deliveries.recoveryTargets();
-      expect(target?.conversation_id).toBe("conversation-1");
-      const notice = (await deliveries.get(target!.delivery_id))!;
+      expect(await deliveries.recoveryTargets()).toEqual([]);
+      const notice = (await deliveries.getByLogicalDeliveryId(identity("human-required", "goal-1", "phase-1", "task-1")))!;
+      expect(notice.conversation_id).toBe("conversation-1");
       expect(notice.message).toContain("请在本 ChatGPT 对话中回复处理决定");
       expect(notice.message).toContain("submit_goal");
       expect(notice.message).toContain(reason);
@@ -264,7 +263,8 @@ describe("Goal terminal persistence failures", () => {
         controlledActuation: f.controlled, extensionDeliveries: deliveries });
       services.push(restarted);
       await restarted.recover();
-      expect(await deliveries.recoveryTargets()).toEqual([target]);
+      expect(await deliveries.recoveryTargets()).toEqual([]);
+      expect((await deliveries.getByLogicalDeliveryId(notice.logical_delivery_id!))?.delivery_id).toBe(notice.delivery_id);
       const owner = { conversation_id: "conversation-1", client_id: "client", document_id: "document", navigation_epoch: 1 };
       await expect(deliveries.claim({ ...owner, conversation_id: "another-conversation" })).resolves.toBeNull();
       expect(await deliveries.claim(owner)).toMatchObject({ delivery_id: notice.delivery_id, message: notice.message });
@@ -525,6 +525,35 @@ describe("GoalOrchestrationService", () => {
     expect(goal.status).toBe("completed");
     expect(goal.phases.map((phase) => phase.status)).toEqual(["completed", "completed"]);
     expect((await f.tasks.getTaskContext("task-3"))!.status).toBe("completed");
+  });
+
+  it("attaches human-required details only to the breakpoint execution, not historical tasks or iterations", async () => {
+    const f = await fixture();
+    await f.service.createGoal(input([{
+      phase_id: "phase-1", objective: "Phase", tasks: [
+        { task_id: "task-1", goal: "One", requirements: ["Do one"], acceptance_criteria: ["One passes"], max_iterations: 2 },
+        { task_id: "task-2", goal: "Two", requirements: ["Do two"], acceptance_criteria: ["Two passes"], max_iterations: 2 },
+      ],
+    }]));
+    const first = await f.service.startGoal({ goal_id: "goal-1" });
+    await f.executions.updateExecutionContext("workspace-a", "task-1", first.execution_id!, { status: "passed" });
+    f.auto.terminal(first.loop_id!, "completed");
+    const next = await f.service.advanceGoal("goal-1");
+    await f.executions.createExecutionContext({ workspace_id: "workspace-a", task_id: "task-2",
+      execution_id: "earlier-task-2", command: "codex exec --json -", process_id: 9000 });
+    await f.executions.updateExecutionContext("workspace-a", "task-2", "earlier-task-2", { status: "passed" });
+    f.auto.terminal(next.loop_id!, "human_required");
+    const stopped = await f.service.advanceGoal("goal-1");
+    const rows = await new StatusQueryService({ storageRoot: f.root, goals: f.service }).listExecutionSummaries();
+    expect(rows).toHaveLength(3);
+    expect(rows.find(row => row.execution_id === next.execution_id)).toMatchObject({
+      goal_status: "human_required", human_required_info: stopped.human_required_info, updated_at: stopped.updated_at,
+    });
+    for (const row of rows.filter(row => row.execution_id !== next.execution_id)) {
+      expect(row).toMatchObject({ goal_id: "goal-1", goal_status: "human_required", status: "passed" });
+      expect(row.human_required_info).toBeUndefined();
+      expect(row.updated_at).toBe(row.finished_at);
+    }
   });
 
   it.each(["failed", "human_required"] as const)("propagates %s and never starts the next task", async (terminal) => {

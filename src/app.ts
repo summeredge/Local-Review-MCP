@@ -388,6 +388,7 @@ export async function startApp(
       desktopSyncManager,
       desktopToolsPipeHandoff,
       desktopCodexRuntimeFactory,
+      ...(desktopBackend === undefined ? {} : { desktopExecutionActions: desktopBackend }),
       desktopInteractivePreflight: () => desktopInteractivePreflight.check(),
       doctorRunner,
     }, {

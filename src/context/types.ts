@@ -42,6 +42,7 @@ export const EXECUTION_STATUSES = [
 export type ExecutionStatus = typeof EXECUTION_STATUSES[number];
 
 export interface ExecutionContext {
+  readonly manual_resolution?: ManualResolution;
   readonly execution_id: string;
   readonly task_id: string;
   readonly workspace_id: string;
@@ -66,10 +67,22 @@ export interface CreateExecutionContextInput {
 }
 
 export interface UpdateExecutionContextInput {
+  readonly manual_resolution?: ManualResolution;
   readonly status?: ExecutionStatus;
   readonly process_id?: number;
   readonly command?: string;
   readonly summary?: string;
+}
+
+export interface ManualResolution {
+  readonly outcome: "completed" | "incomplete" | "unknown";
+  readonly note: string;
+  readonly resolved_at: string;
+  readonly session_id?: string;
+  readonly thread_id?: string;
+  readonly turn_id?: string;
+  readonly monitoring_summary?: string;
+  readonly evidence_error?: string;
 }
 
 export const SESSION_BACKEND_TYPES = [

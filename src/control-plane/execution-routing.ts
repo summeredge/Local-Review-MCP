@@ -263,6 +263,10 @@ export class ExecutionRoutingService {
   public async onExecutionTerminal(execution: ExecutionContext): Promise<void> {
     if (execution.status === "running") return;
     await this.auto.onExecutionTerminal(execution);
+    if (execution.status === "terminated") {
+      const match = await this.findGoal(execution.workspace_id, execution.task_id, execution.execution_id);
+      if (match !== null) await this.goals.advanceGoal(match.goal.goal_id);
+    }
   }
 
   public notifyExecutionTerminal(execution: ExecutionContext): Promise<void> {

@@ -134,6 +134,7 @@ export class ExecutionContextService {
     const parsed = updateExecutionContextInputSchema.parse(patch);
     const next = executionContextSchema.parse({
       ...current,
+      ...(parsed.manual_resolution === undefined ? {} : { manual_resolution: parsed.manual_resolution }),
       ...(parsed.status === undefined ? {} : { status: parsed.status }),
       ...(parsed.process_id === undefined ? {} : { process_id: parsed.process_id }),
       ...(parsed.command === undefined ? {} : { command: parsed.command }),

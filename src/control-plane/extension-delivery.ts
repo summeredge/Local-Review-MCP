@@ -542,6 +542,8 @@ export class ExtensionDeliveryService {
       .filter((delivery) => (delivery.phase === "queued"
         || (delivery.phase === "leased" && delivery.lease !== undefined && delivery.lease.deadline <= Date.now()))
         && delivery.logical_delivery_id !== undefined
+        // Human notices wait for the user's original conversation; never open historical tabs.
+        && !delivery.logical_delivery_id.startsWith("goal-human-required-")
         && delivery.recovery_error === undefined)
       .map(({ delivery_id, conversation_id }) => ({ delivery_id, conversation_id }));
   }

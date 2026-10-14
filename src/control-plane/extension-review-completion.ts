@@ -401,7 +401,7 @@ export class ExtensionReviewCompletionService {
       // Restored diagnostics must not reopen pages without a live result collector.
       .filter(completion => this.waiters.has(completion.completion_id) && (completion.phase === "queued"
         || (completion.phase === "leased" && completion.lease!.deadline <= Date.now()))
-        && (completion.recovery_error === undefined || completion.recovery_error === "TARGET_CONVERSATION_NAVIGATION_FAILED"))
+        && completion.recovery_error === undefined)
       .map(({ completion_id, conversation_id }) => ({ completion_id, conversation_id }));
   }
 

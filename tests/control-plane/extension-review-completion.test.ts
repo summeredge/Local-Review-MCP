@@ -60,7 +60,9 @@ describe("ExtensionReviewCompletionService", () => {
     const restarted = new ExtensionReviewCompletionService(root);
     expect(await restarted.recoveryTargets()).toEqual([]);
     const recovered = restarted.awaitResult(queued.completion_id, 120_000);
-    await vi.waitFor(async () => expect(await restarted.recoveryTargets()).toHaveLength(1));
+    await vi.waitFor(async () => expect((await restarted.get(queued.completion_id))?.recovery_error)
+      .toBe("TARGET_CONVERSATION_NAVIGATION_FAILED"));
+    expect(await restarted.recoveryTargets()).toEqual([]);
     await restarted.claim({ ...owner, document_id: "recovered-document" });
     await restarted.acknowledge({ ...owner, document_id: "recovered-document", completion_id: queued.completion_id,
       status: "completed", assistant_message_id: "assistant-final", content: "collected" });

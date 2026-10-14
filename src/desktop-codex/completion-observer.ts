@@ -19,7 +19,7 @@ const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const DEFAULT_VISIBILITY_GRACE_MS = 15_000;
 const DEFAULT_VISIBILITY_POLL_INTERVAL_MS = 500;
 
-export type DesktopCompletionStatus = "completed" | "failed" | "timed_out" | "unknown";
+export type DesktopCompletionStatus = "completed" | "failed" | "running" | "timed_out" | "unknown";
 
 export type DesktopCompletionUnknownReason =
   | "capability_unavailable"
@@ -458,6 +458,23 @@ export class DesktopCompletionObserver {
       if (isAbort(error, context.signal)) throw abortError();
       if (error instanceof DesktopCompletionObserverError) throw error;
       throw new DesktopCompletionObserverError(errorReason(error));
+    }
+  }
+
+  /** Recheck exactly the durable original Turn using the same trusted response parser. */
+  public async checkCompletion(context: DesktopCompletionContext & { readonly turnId: string }): Promise<DesktopCompletionResult> {
+    assertContext(context);
+    if (!this.readAvailable) return resultFor(context, "unknown", { reason: "capability_unavailable" });
+    try {
+      const snapshot = readSnapshot(await this.read(context, timeoutFor(context)), context);
+      const evaluation = evaluate(snapshot, { targetThreadId: context.targetThreadId, hostId: context.hostId, turnIds: [] }, context.turnId);
+      if (evaluation.kind === "unknown") return resultFor(context, "unknown", { reason: evaluation.reason });
+      return resultFor(context, evaluation.kind === "pending" ? "running" : evaluation.kind, {
+        turnId: context.turnId,
+        agentMessages: snapshot.turns.find(turn => turn.id === context.turnId)?.agentMessages,
+      });
+    } catch (error: unknown) {
+      return resultFor(context, "unknown", { reason: errorReason(error) });
     }
   }
 

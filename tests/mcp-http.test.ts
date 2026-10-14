@@ -25,6 +25,30 @@ import { REGISTERED_TOOL_NAMES as EXPECTED_REGISTERED_TOOL_NAMES } from "../src/
 const runningServers: import("node:http").Server[] = [];
 const temporaryDirectories: string[] = [];
 
+it("keeps Execution actions in the authenticated loopback Control Plane and requires close confirmation", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "lrm-execution-action-"));
+  temporaryDirectories.push(workspace);
+  const registry = new WorkspaceRegistry([{ id: "workspace-a", name: "Workspace", path: workspace }]);
+  const executionAction = vi.fn(async () => ({ reason: "executor_identity_unavailable", execution: {
+    workspace_id: "workspace-a", task_id: "task-a", execution_id: "execution-a", status: "running" as const,
+    started_at: new Date().toISOString(),
+  } }));
+  const server = createHttpServer({ host: "127.0.0.1", port: 0, workspace, auth: { token: "test-token" },
+    remote: { enabled: false, endpoint: "" }, supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 } },
+    { registry, desktopExecutionActions: { executionAction } });
+  runningServers.push(server);
+  const url = `http://127.0.0.1:${await listen(server)}/launcher/execution-action`;
+  const headers = { authorization: "Bearer test-token", "content-type": "application/json" };
+  const input = { action: "check", workspace_id: "workspace-a", task_id: "task-a", execution_id: "execution-a" };
+  expect((await fetch(url, { method: "POST", body: JSON.stringify(input) })).status).toBe(401);
+  expect((await fetch(url, { method: "POST", headers: { ...headers, "x-forwarded-for": "127.0.0.1" }, body: JSON.stringify(input) })).status).toBe(404);
+  expect((await fetch(url, { method: "POST", headers, body: JSON.stringify({ ...input, action: "close", outcome: "completed" }) })).status).toBe(400);
+  const result = await fetch(url, { method: "POST", headers, body: JSON.stringify(input) });
+  expect(result.status).toBe(200);
+  expect(await result.json()).toMatchObject({ reason: "executor_identity_unavailable" });
+  expect(executionAction).toHaveBeenCalledTimes(1);
+});
+
 afterEach(async () => {
   await Promise.all(runningServers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));

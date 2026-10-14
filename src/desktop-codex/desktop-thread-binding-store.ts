@@ -52,7 +52,8 @@ function sameIdentity(
     && left.session_id === right.session_id
     && left.backend_identity === right.backend_identity
     && left.target_thread_id === right.target_thread_id
-    && left.host_id === right.host_id;
+    && left.host_id === right.host_id
+    && left.executor_thread_id === right.executor_thread_id;
 }
 
 export class DesktopThreadBindingStore {

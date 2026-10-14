@@ -100,6 +100,7 @@ export class DesktopThreadCoordinator {
         backend_identity: "desktop_codex_app",
         target_thread_id: created.targetThreadId,
         host_id: created.hostId,
+        executor_thread_id: input.executorThreadId,
         created_at: now,
         updated_at: now,
       });
