@@ -8,6 +8,7 @@ import {
   CliExecutionBackend,
   ExecutionBackendRouter,
   ExecutionService,
+  ExecutionLaunchIndeterminateError,
   type ExecutionBackend,
   type ExecutionBackendStartRequest,
   type ExecutionStartResult,
@@ -19,9 +20,11 @@ import {
 } from "../src/control-plane/controlled-actuation.js";
 import { ExecutionContextService } from "../src/context/execution-service.js";
 import { SessionStore } from "../src/context/session-store.js";
+import { sessionFile } from "../src/context/session.js";
 import { TaskContextService } from "../src/context/service.js";
 import { EventStore, eventsFile } from "../src/control-plane/events/store.js";
 import { DesktopCodexBackend } from "../src/desktop-codex/desktop-codex-backend.js";
+import { CodexAppRuntimeError } from "../src/desktop-codex/codex-app-runtime.js";
 import { CapabilityNegotiator } from "../src/control-plane/capability-negotiation.js";
 import { DesktopThreadBindingStore } from "../src/desktop-codex/desktop-thread-binding-store.js";
 import { DesktopToolsPipeHandoff } from "../src/desktop-codex/desktop-tools-pipe-handoff.js";
@@ -33,7 +36,7 @@ import {
 import type { DesktopSyncState } from "../src/desktop-sync/desktop-sync-state.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
 import type { ExecutionContext } from "../src/context/types.js";
-import { AutoIterationService } from "../src/control-plane/auto-iteration.js";
+import { AutoIterationService, AutoIterationStore } from "../src/control-plane/auto-iteration.js";
 import { GoalOrchestrationService } from "../src/control-plane/goal-orchestration.js";
 import { StatusQueryService } from "../src/control-plane/status-query.js";
 import { BrowserRouter } from "../src/router/browser-router.js";
@@ -77,6 +80,9 @@ const OTHER_WORKSPACE_PATH = "C:\\work\\project";
 function desktopTools(): Tool[] {
   return [
     { name: "list_projects", inputSchema: { type: "object", properties: {} } },
+    { name: "send_message_to_thread", inputSchema: { type: "object", properties: {
+      threadId: { type: "string" }, hostId: { type: "string" }, prompt: { type: "string" },
+    }, required: ["threadId", "hostId", "prompt"] } },
     {
       name: "create_thread",
       inputSchema: {
@@ -189,6 +195,7 @@ function fakeDesktop(options: {
   readonly turns?: readonly Turn[];
   readonly projectPath?: string;
   readonly uniqueThreads?: boolean;
+  readonly turnLimit?: number;
 } = {}): FakeDesktop {
   const threadId = options.threadId ?? "target-thread-1";
   const hostId = options.hostId ?? "local";
@@ -226,7 +233,7 @@ function fakeDesktop(options: {
           return jsonResult({
             thread: { id: options.uniqueThreads ? params.arguments?.threadId : threadId,
               hostId, status: { type: "idle" } },
-            turns: turns.map((turn) => ({
+            turns: (options.turnLimit === undefined ? turns : turns.slice(-options.turnLimit)).map((turn) => ({
               error: null,
               startedAt: 1,
               durationMs: turn.status === "completed" ? 1 : null,
@@ -710,6 +717,142 @@ async function waitForTerminalExecution(value: Fixture): Promise<void> {
 }
 
 describe("P5.4.1 route selection", () => {
+  it("continues on the original thread when the first Turn is outside the latest ten Turns", async () => {
+    const desktop = fakeDesktop({ turnLimit: 10 });
+    const value = await fixture({ desktop });
+    desktop.setProjectPath(value.registry.active.manager.canonicalRoot);
+    try {
+      await seedTask(value);
+      desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+      const first = await value.backend.start(interactiveRequest());
+      await value.backend.whenIdle();
+      const history = Array.from({ length: 12 }, (_, index) => ({
+        id: `turn-${index + 1}`, status: "completed", completedAt: index + 1,
+      }));
+      desktop.setTurns(history);
+      const now = new Date().toISOString();
+      await new AutoIterationStore(value.root).put({ loop_id: "reuse-loop", workspace_id: "workspace-a",
+        task_id: TASK_ID, conversation_id: "conversation-1", initial_execution_id: EXECUTION_ID,
+        execution_id: "execution-2", iteration: 2, max_iterations: 3, stage: "execution",
+        created_at: now, updated_at: now });
+      const readsBefore = desktop.calls.filter(call => call.name === "read_thread").length;
+      const second = await value.backend.start(interactiveRequest({ execution_id: "execution-2" }));
+      await vi.waitFor(() => expect(desktop.calls.filter(call => call.name === "read_thread").length)
+        .toBeGreaterThan(readsBefore + 1));
+      expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, "execution-2"))?.status).toBe("running");
+      expect((await value.events.listEvents(second.session_id!)).some(event => event.event_type === "turn_completed")).toBe(false);
+      expect(second.thread_id).toBe(first.thread_id);
+      expect(second.session_id).not.toBe(first.session_id);
+      expect(desktop.createThreadCount()).toBe(1);
+      expect(desktop.sendCount()).toBe(1);
+      expect(desktop.calls.filter(call => call.name === "read_thread").every(call => call.arguments?.turnLimit === 10)).toBe(true);
+
+      desktop.setTurns([...history, { id: "turn-13", status: "inProgress", completedAt: null }]);
+      await vi.waitFor(async () => expect((await value.events.listEvents(second.session_id!))
+        .some(event => event.event_type === "turn_started" && event.turn_id === "turn-13")).toBe(true));
+      expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, "execution-2"))?.status).toBe("running");
+      desktop.setTurns([...history, { id: "turn-13", status: "completed", completedAt: 13 }]);
+      await value.backend.whenIdle();
+      expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, "execution-2"))?.status).toBe("passed");
+      expect((await value.events.listEvents(second.session_id!)).filter(event => event.event_type === "turn_completed"))
+        .toEqual([expect.objectContaining({ execution_id: "execution-2", thread_id: first.thread_id, turn_id: "turn-13" })]);
+    } finally { await value.service.close(); }
+  });
+
+  it.each(["known-turn", "unknown-turn", "uncertain-send"])("recovers continuation without resending: %s", async recovery => {
+    const value = await fixture();
+    let restarted: DesktopCodexBackend | undefined;
+    try {
+      await seedTask(value);
+      const history = { id: "turn-1", status: "completed", completedAt: 1 };
+      value.desktop.setTurns([history]);
+      await value.backend.start(interactiveRequest());
+      await value.backend.whenIdle();
+      const now = new Date().toISOString();
+      await new AutoIterationStore(value.root).put({ loop_id: "reuse-loop", workspace_id: "workspace-a",
+        task_id: TASK_ID, conversation_id: "conversation-1", initial_execution_id: EXECUTION_ID,
+        execution_id: "execution-2", iteration: 2, max_iterations: 3, stage: "execution",
+        created_at: now, updated_at: now });
+      const request = interactiveRequest({ execution_id: "execution-2" });
+      if (recovery === "uncertain-send") {
+        const call = value.desktop.runtime.mcpClient.callTool;
+        vi.spyOn(value.desktop.runtime.mcpClient, "callTool").mockImplementation(async params => {
+          const result = await call(params);
+          if (params.name === "send_message_to_thread") throw new CodexAppRuntimeError("transport_failed", "lost acknowledgement");
+          return result;
+        });
+        await expect(value.backend.start(request)).rejects.toBeInstanceOf(ExecutionLaunchIndeterminateError);
+      } else {
+        await value.backend.start(request);
+      }
+      const session = (await value.sessions.listSessions()).find(candidate => candidate.execution_id === "execution-2")!;
+      if (recovery === "known-turn") {
+        value.desktop.setTurns([history, { id: "turn-2", status: "inProgress", completedAt: null }]);
+        await vi.waitFor(async () => expect((await value.events.listEvents(session.session_id))
+          .some(event => event.event_type === "turn_started" && event.turn_id === "turn-2")).toBe(true));
+      }
+      await value.backend.close();
+      restarted = new DesktopCodexBackend(value.registry, { storageRoot: value.root,
+        runtimeFactory: value.desktop.runtimeFactory, desktopState: () => desktopState(),
+        openDesktopThread: async () => undefined, pollIntervalMs: 5 });
+      await Promise.all([restarted.start(request), restarted.start(request)]);
+      if (recovery === "known-turn") {
+        value.desktop.setTurns([history, { id: "turn-2", status: "completed", completedAt: 2 }]);
+        await restarted.whenIdle();
+        expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, "execution-2"))?.status).toBe("passed");
+      } else {
+        expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, "execution-2"))?.status).toBe("running");
+        expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, "execution-2"))?.summary)
+          .toContain("manual_confirmation_required");
+      }
+      expect(value.desktop.sendCount()).toBe(1);
+      expect(value.desktop.createThreadCount()).toBe(1);
+    } finally { await restarted?.close(); await value.service.close(); }
+  });
+
+  it.each(["host", "thread", "goal", "missing", "missing-completion"])("refuses continuation with invalid %s evidence", async fault => {
+    const value = await fixture();
+    try {
+      await seedTask(value);
+      value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+      const first = await value.backend.start(interactiveRequest());
+      await value.backend.whenIdle();
+      const now = new Date().toISOString();
+      await new AutoIterationStore(value.root).put({ loop_id: "reuse-loop", workspace_id: "workspace-a",
+        task_id: TASK_ID, conversation_id: "conversation-1", initial_execution_id: EXECUTION_ID,
+        execution_id: "execution-2", iteration: 2, max_iterations: 3, stage: "execution",
+        created_at: now, updated_at: now });
+      const file = join(value.root, ".task", "desktop_thread_bindings", "workspace-a", first.session_id! + ".json");
+      const binding = (await new DesktopThreadBindingStore(value.root).load("workspace-a", first.session_id!))!;
+      if (fault === "host") await writeFile(file, JSON.stringify({ ...binding, host_id: "other-host" }));
+      if (fault === "thread") await writeFile(file, JSON.stringify({ ...binding, target_thread_id: "other-thread" }));
+      if (fault === "goal") await writeFile(sessionFile(value.root, first.session_id!), JSON.stringify({
+        ...(await value.sessions.getSession(first.session_id!)), goal_id: "other-goal",
+      }));
+      if (fault === "missing") await writeFile(file, "{}");
+      if (fault === "missing-completion") await writeFile(eventsFile(value.root, first.session_id!), "[]");
+      await expect(value.backend.start(interactiveRequest({ execution_id: "execution-2" }))).rejects.toThrow();
+      expect(value.desktop.createThreadCount()).toBe(1);
+      expect(value.desktop.sendCount()).toBe(0);
+    } finally { await value.service.close(); }
+  });
+
+  it("creates separate threads for different Goals on the same Task", async () => {
+    const desktop = fakeDesktop({ uniqueThreads: true, turns: [{ id: "turn-1", status: "completed", completedAt: 1 }] });
+    const value = await fixture({ desktop });
+    desktop.setProjectPath(value.registry.active.manager.canonicalRoot);
+    try {
+      await seedTask(value);
+      const first = await value.backend.start(interactiveRequest());
+      await value.backend.whenIdle();
+      const second = await value.backend.start(interactiveRequest({ goal_id: "goal-2", execution_id: "execution-2" }));
+      await value.backend.whenIdle();
+      expect(first.thread_id).not.toBe(second.thread_id);
+      expect(desktop.createThreadCount()).toBe(2);
+      expect(desktop.sendCount()).toBe(0);
+    } finally { await value.service.close(); }
+  });
+
   it.each(["transport", "session_persistence", "binding_persistence"] as const)("keeps %s launch uncertainty without redispatch", async failure => {
     const value = await fixture();
     const originalCall = value.desktop.runtime.mcpClient.callTool;
@@ -823,7 +966,8 @@ describe("P5.4.1 route selection", () => {
 
   it.each(["interactive", "batch"] as const)("preserves %s Goal routing across three rounds and restart", async (mode) => {
     const desktop = fakeDesktop({ uniqueThreads: true });
-    const value = await fixture({ desktop });
+    const openThread = vi.fn(async (_url: string) => undefined);
+    const value = await fixture({ desktop, openDesktopThread: openThread });
     desktop.setProjectPath(value.registry.active.manager.canonicalRoot);
     let reviews = 0;
     const browserRouter = new BrowserRouter(value.root, {
@@ -859,9 +1003,10 @@ describe("P5.4.1 route selection", () => {
       const first = await goals.startGoal({ goal_id: GOAL_ID });
       expect(await query.listExecutionSummaries()).toHaveLength(1);
       for (let round = 1; round <= 3; round += 1) {
-        desktop.setTurns([{ id: `turn-${round}`, status: "completed", completedAt: 1 }]);
+        desktop.setTurns(Array.from({ length: round }, (_, index) => ({
+          id: `turn-${index + 1}`, status: "completed", completedAt: 1,
+        })));
         await value.backend.whenIdle();
-        desktop.setTurns([]);
         const loop = (await auto.getLoop(first.loop_id!))!;
         expect(loop.iteration).toBe(round);
         const authorization = await new ActuationAuthorizationStore(value.root).getAuthorizationByExecution(
@@ -879,17 +1024,32 @@ describe("P5.4.1 route selection", () => {
           goals = makeGoals();
         }
         await goals.advanceGoal(GOAL_ID);
+        if (mode === "interactive" && round < 3) {
+          const nextLoop = (await auto.getLoop(first.loop_id!))!;
+          expect((await value.executions.getExecutionContext("workspace-a", TASK_ID, nextLoop.execution_id))?.status).toBe("running");
+          expect(reviews).toBe(round);
+          await Promise.all([value.backend.start({ ...interactiveRequest(), execution_id: nextLoop.execution_id }),
+            value.backend.start({ ...interactiveRequest(), execution_id: nextLoop.execution_id })]);
+          expect(desktop.sendCount()).toBe(round);
+        }
       }
       expect((await goals.getGoal(GOAL_ID))?.status).toBe("completed");
       const sessions = await value.sessions.listSessions();
       expect(sessions).toHaveLength(mode === "interactive" ? 3 : 0);
-      expect(desktop.createThreadCount()).toBe(mode === "interactive" ? 3 : 0);
+      expect(desktop.createThreadCount()).toBe(mode === "interactive" ? 1 : 0);
+      expect(desktop.sendCount()).toBe(mode === "interactive" ? 2 : 0);
       expect(value.cliStart).toHaveBeenCalledTimes(mode === "batch" ? 3 : 0);
       if (mode === "interactive") {
-        expect(new Set(sessions.map((session) => session.thread_id)).size).toBe(3);
+        expect(new Set(sessions.map((session) => session.thread_id)).size).toBe(1);
+        expect(new Set(sessions.map((session) => session.execution_id)).size).toBe(3);
+        expect(new Set(sessions.map((session) => session.session_id)).size).toBe(3);
         for (const call of desktop.calls.filter((call) => call.name === "create_thread")) {
           expect(call.arguments).toMatchObject({ model: "gpt-5.6-luna", thinking: "max" });
         }
+        for (const call of desktop.calls.filter((call) => call.name === "send_message_to_thread")) {
+          expect(call.arguments).toMatchObject({ threadId: sessions[0]!.thread_id, hostId: "local" });
+        }
+        expect(openThread.mock.calls.map(([url]) => url)).toEqual(Array(3).fill(`codex://threads/${sessions[0]!.thread_id}`));
       }
       const rows = await query.listExecutionSummaries();
       expect(rows).toHaveLength(3);
@@ -902,6 +1062,7 @@ describe("P5.4.1 route selection", () => {
         } else expect(row.session_id).toBeUndefined();
       }
       if (mode === "interactive") expect(new Set(rows.map((row) => row.session_id)).size).toBe(3);
+      if (mode === "interactive") expect(new Set(rows.map((row) => row.turn_id))).toEqual(new Set(["turn-1", "turn-2", "turn-3"]));
     } finally {
       auto.dispose();
       await value.service.close();

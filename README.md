@@ -4,6 +4,8 @@ Local Review MCP 将 ChatGPT 网页端、本地项目和本地 Codex 任务执�
 
 ## 项目解决什么问题
 
+文件访问推荐使用显式指定 `workspace_id` 的 `workspace_list_files`、`workspace_read_file`、`workspace_search`。旧接口因目录类型、读取预算和高级搜索差异继续保留，当前公开工具为 22 个；详见[工具兼容审计与迁移清单](docs/tool-contract.md#文件工具选择与兼容审计任务-b)。
+
 ChatGPT 网页端的对话和本地项目彼此分开，通常看不到电脑上的源文件和改动。Codex 虽然能在本地项目中执行任务，但网页对话里的需求、约束和 Review 结论需要经过明确交接。手动复制文件、反复解释背景、再把执行结果贴回网页，会增加遗漏和误解。
 
 Local Review MCP 让这两部分围绕同一个授权项目协作：
@@ -186,4 +188,4 @@ ChatGPT 连接完成后即可读取项目并做 Review。若要从网页对话�
 - 本地 Codex 负责按明确提交的目标执行代码修改及必要检查。
 - Local Review MCP 提供授权项目内容，并关联任务、执行状态和 Review 上下文。
 
-网页端提交的是有明确目标、范围和验收条件的任务，由本地 Codex 执行；Local Review MCP 的项目读取和 Review 能力保持只读。执行结果出现“已接收”时，只表示请求已进入处理流程，不代表修改和检查已经完成。请等待结果返回后再复查。
+网页端提交的是有明确目标、范围和验收条件的任务，由本地 Codex 执行；Local Review MCP 的项目读取和 Review 能力保持只读。唯一受控文件写入例外为 `workspace_edit_file`：手动注册 Workspace 即授权受控编辑；每次必须明确 `workspace_id` 和原始字节哈希。先调用 `workspace_read_file` 取得完整原始字节的 `sha256`，再提交 `{workspace_id,path,expected_sha256,edits:[{old_text,new_text}]}`，同步获得真实落盘结果与前后哈希。限已存在的 1 MiB UTF-8 文件及 1–5 项唯一、不重叠替换；Windows 需可用的 PowerShell 目录租约辅助进程，其他平台暂拒绝编辑。BOM 与未替换字节保持原样，跨行替换需使用原始 CRLF/LF；自定义 ACL、扩展属性和 ADS 不保留，Windows 继承目录 ACL，不提供跨进程原子 CAS。详见[工具契约](docs/tool-contract.md#workspace_edit_file)。原有任务执行结果出现“已接收”时，只表示请求已进入处理流程，不代表修改和检查已经完成。请等待结果返回后再复查。

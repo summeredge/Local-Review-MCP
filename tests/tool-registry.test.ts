@@ -17,7 +17,7 @@ afterEach(async () => {
 });
 
 describe("MCP tool registry", () => {
-  it("exposes all registered read-only tools", async () => {
+  it("exposes all registered tools", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-registry-"));
     temporaryDirectories.push(workspace);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -29,8 +29,23 @@ describe("MCP tool registry", () => {
     const result = await client.listTools();
     const names = result.tools.map((tool) => tool.name).sort();
 
-    expect(names).toHaveLength(21);
+    expect(names).toHaveLength(22);
     expect(names).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
+    for (const [legacy, preferred] of [
+      ["list_files", "workspace_list_files"],
+      ["read_file", "workspace_read_file"],
+      ["search_text", "workspace_search"],
+    ]) {
+      const oldTool = result.tools.find((tool) => tool.name === legacy)!;
+      const standard = result.tools.find((tool) => tool.name === preferred)!;
+      expect(oldTool.description).toContain(`prefer ${preferred}`);
+      expect(standard.description).toContain("Recommended");
+      expect(standard.inputSchema.required).toContain("workspace_id");
+      expect(oldTool.inputSchema.required ?? []).not.toContain("workspace_id");
+      for (const tool of [oldTool, standard]) {
+        expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+      }
+    }
     expect(result.tools.find((tool) => tool.name === "workspace_info")?.outputSchema).toMatchObject({
       type: "object",
       properties: {

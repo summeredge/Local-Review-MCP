@@ -242,7 +242,7 @@ export function buildAutoIterationInstruction(iteration: ReviewVerdictIteration)
 
 export class AutoIterationUnavailableError extends Error {}
 
-class AutoIterationStore {
+export class AutoIterationStore {
   private readonly file: string;
   private state = emptyState();
   private restorePromise: Promise<void> | null = null;

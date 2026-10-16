@@ -34,6 +34,7 @@ export const workspaceReviewListFilesOutputSchema = z.object({
 });
 
 export const workspaceReviewReadFileOutputSchema = z.object({
+  sha256: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
   workspace_id: workspaceIdSchema,
   path: workspaceRelativePathSchema,
   content: z.string(),

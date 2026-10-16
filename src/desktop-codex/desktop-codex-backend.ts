@@ -1,5 +1,6 @@
 import { sessionForExecution, syncTerminalSession } from "../context/session-execution.js";
 import { ExecutionLaunchIndeterminateError } from "../control-plane/execution-service.js";
+import { AutoIterationStore } from "../control-plane/auto-iteration.js";
 ﻿import { resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { ExecutionContextService } from "../context/execution-service.js";
@@ -28,6 +29,7 @@ import {
 } from "./completion-observer.js";
 import { resolveDesktopProject } from "./desktop-project-resolver.js";
 import { DesktopThreadBindingStore } from "./desktop-thread-binding-store.js";
+import type { DesktopThreadBinding } from "./desktop-thread-binding.js";
 import { DesktopThreadCoordinator } from "./desktop-thread-coordinator.js";
 import { DesktopCodexThreadCommands } from "./thread-commands.js";
 import { openDesktopThread } from "./desktop-thread-activator.js";
@@ -409,6 +411,25 @@ export class DesktopCodexBackend implements ExecutionBackend {
     );
     if (existing !== null) return this.existing(request, existing);
 
+    const loops = (await new AutoIterationStore(this.storageRoot).list()).filter(loop =>
+      loop.workspace_id === request.workspace_id && loop.task_id === request.task_id
+      && loop.execution_id === request.execution_id);
+    if (loops.length > 1) throw new DesktopExecutionError("desktop_target_conflict", "Desktop iteration identity is ambiguous.");
+    const initialExecutionId = loops[0]?.initial_execution_id;
+    let originalBinding: DesktopThreadBinding | undefined;
+    if (initialExecutionId !== undefined && initialExecutionId !== request.execution_id) {
+      const initial = await this.executions.getExecutionContext(request.workspace_id, request.task_id, initialExecutionId);
+      const original = await this.findSession({ ...request, execution_id: initialExecutionId });
+      if (initial?.command !== DESKTOP_EXECUTION_COMMAND || initial.status !== "passed"
+        || original === null || original.thread_id === undefined) {
+        throw new DesktopExecutionError("execution_not_recoverable", "Initial Desktop execution cannot authorize continuation.");
+      }
+      originalBinding = await new DesktopThreadBindingStore(this.storageRoot).load(request.workspace_id, original.session_id);
+      if (originalBinding === undefined) throw new DesktopExecutionError("execution_not_recoverable", "Initial Desktop binding is unavailable.");
+      await this.requireBinding({ ...request, execution_id: initialExecutionId }, original.session_id,
+        originalBinding.target_thread_id, originalBinding.host_id);
+    }
+
     // Capture once and persist with the target binding for observation after restart.
     const executorThreadId = this.executorIdentity();
 
@@ -421,14 +442,15 @@ export class DesktopCodexBackend implements ExecutionBackend {
     // Runtime ownership starts here and moves to the completion watch exactly once. Until the
     // transfer happens, this frame is responsible for closing the runtime on every exit path.
     let runtimeOwnedByWatch = false;
-    let threadCreated = false;
+    let turnDispatched = false;
     let stage = "tools/list";
     try {
       const { commands, contracts, client } = await this.prepare(runtime);
       // Every codex_app tools/call in this Execution must use the executor captured above, so the
       // value is threaded through instead of being re-read from the current Desktop foreground.
       stage = "project_resolution";
-      const projectId = await this.resolveProject(commands, cwd, executorThreadId);
+      const projectId = originalBinding === undefined
+        ? await this.resolveProject(commands, cwd, executorThreadId) : undefined;
 
       stage = "session_persistence";
       session = await this.sessions.createSession({
@@ -451,38 +473,66 @@ export class DesktopCodexBackend implements ExecutionBackend {
         command: DESKTOP_EXECUTION_COMMAND,
       });
 
+      const bindings = new DesktopThreadBindingStore(this.storageRoot);
       const coordinator = new DesktopThreadCoordinator({
         commands,
-        bindings: new DesktopThreadBindingStore(this.storageRoot),
+        bindings,
       });
-      stage = "create_thread";
-      const created = await coordinator.createOrReuseThread({
-        workspace_id: request.workspace_id,
-        task_id: request.task_id,
-        session_id: session.session_id,
-        executorThreadId,
-        projectId,
-        prompt: request.instruction,
-        ...(request.model_id === undefined ? {} : { model_id: request.model_id }),
-        ...(request.reasoning_effort === undefined ? {} : { reasoning_effort: request.reasoning_effort }),
-      });
-      if (!created.created) {
-        throw new DesktopExecutionError(
-          "execution_not_recoverable",
-          'Desktop target for Session "' + session.session_id + '" already existed; refusing to resend.',
-        );
+      let baseline: DesktopCompletionBaseline;
+      let binding;
+      if (originalBinding !== undefined) {
+        const original = originalBinding;
+        stage = "continuation_baseline";
+        baseline = await new DesktopCompletionObserver({ client, contracts }).captureBaseline({
+          executorThreadId, targetThreadId: originalBinding.target_thread_id,
+          hostId: originalBinding.host_id, timeoutMs: this.completionTimeoutMs,
+        });
+        const completedTurns = (await this.events.listEvents(original.session_id)).filter(event =>
+          event.execution_id === initialExecutionId && event.thread_id === original.target_thread_id
+          && event.event_type === "turn_completed");
+        if (completedTurns.length !== 1 || !("turn_id" in completedTurns[0]!)
+          || completedTurns[0]!.turn_id === undefined) {
+          throw new DesktopExecutionError("turn_identity_unavailable", "Initial completed Turn has no durable identity.");
+        }
+        stage = "thread_binding_persistence";
+        binding = await bindings.createIfAbsent({ ...originalBinding, session_id: session.session_id,
+          executor_thread_id: executorThreadId, created_at: this.now(), updated_at: this.now() });
+        session = await this.sessions.updateSession(session.session_id, { thread_id: binding.target_thread_id });
+        stage = "send_message_to_thread";
+        await coordinator.sendToBoundThread({ workspace_id: request.workspace_id, task_id: request.task_id,
+          session_id: session.session_id, executorThreadId, prompt: request.instruction });
+      } else {
+        stage = "create_thread";
+        const created = await coordinator.createOrReuseThread({
+          workspace_id: request.workspace_id,
+          task_id: request.task_id,
+          session_id: session.session_id,
+          executorThreadId,
+          projectId: projectId!,
+          prompt: request.instruction,
+          ...(request.model_id === undefined ? {} : { model_id: request.model_id }),
+          ...(request.reasoning_effort === undefined ? {} : { reasoning_effort: request.reasoning_effort }),
+        });
+        if (!created.created) {
+          throw new DesktopExecutionError(
+            "execution_not_recoverable",
+            'Desktop target for Session "' + session.session_id + '" already existed; refusing to resend.',
+          );
+        }
+        binding = created.binding;
+        baseline = { targetThreadId: binding.target_thread_id, hostId: binding.host_id, turnIds: [] };
       }
 
-      threadCreated = true;
-      const threadId = created.binding.target_thread_id;
-      const hostId = created.binding.host_id;
+      turnDispatched = true;
+      const threadId = binding.target_thread_id;
+      const hostId = binding.host_id;
       const abortController = new AbortController();
       stage = "session_persistence";
       session = await this.sessions.updateSession(session.session_id, {
         status: "active",
         thread_id: threadId,
       });
-      // create_thread has already dispatched the task. Navigation is only a UI hint and must
+      // The turn is already dispatched. Navigation is only a UI hint and must
       // not prevent observation or incorrectly fail an execution that is still running.
       try {
         await this.openThread(`codex://threads/${encodeURIComponent(threadId)}`);
@@ -505,7 +555,7 @@ export class DesktopCodexBackend implements ExecutionBackend {
         request,
         sessionId,
         executorThreadId,
-        baseline: { targetThreadId: threadId, hostId, turnIds: [] },
+        baseline,
         threadId,
         hostId,
         signal: abortController.signal,
@@ -533,8 +583,8 @@ export class DesktopCodexBackend implements ExecutionBackend {
         error.message = `Desktop stage=${stage} model=${request.model_id ?? "default"} reasoning_effort=${request.reasoning_effort ?? "default"}: ${error.message}`;
       }
       if (session !== undefined) this.runtimes.delete(session.session_id);
-      if (threadCreated || error instanceof ExecutionLaunchIndeterminateError
-        || (stage === "create_thread" && error instanceof CodexAppRuntimeError
+      if (turnDispatched || error instanceof ExecutionLaunchIndeterminateError
+        || (["create_thread", "send_message_to_thread"].includes(stage) && error instanceof CodexAppRuntimeError
           && (["tool_call_timeout", "tool_call_aborted", "transport_failed", "thread_identity_missing"].includes(error.code)
             || (error.code === "tool_call_failed" && error.cause instanceof Error)))) {
         throw new ExecutionLaunchIndeterminateError(errorMessage(error), { cause: error });

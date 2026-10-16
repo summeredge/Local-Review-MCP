@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, createReadStream } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat, open } from "node:fs/promises";
+import { Readable } from "node:stream";
 import { createInterface } from "node:readline";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -47,7 +48,8 @@ import { validateWorkspaceIdentityConsistency } from "../workspace/identity.js";
 import { WorkspaceManager, WorkspacePathError } from "../workspace/manager.js";
 import type { WorkspaceRegistry, WorkspaceSelection } from "../workspace/registry.js";
 import { searchText } from "../workspace/search.js";
-import { containsNullByte } from "../workspace/text.js";
+import { containsNullByte, readBoundedBytes } from "../workspace/text.js";
+import { editWorkspaceFile, editFileInputSchema, editFileOutputSchema } from "../workspace/edit.js";
 import { structuredResponse } from "./respond.js";
 import { inboundRequestOrigin } from "./inbound.js";
 import { correlationKeySchema, ROOT_ALIAS } from "./schema/common.js";
@@ -136,6 +138,7 @@ export const REGISTERED_TOOL_NAMES = [
   ...WORKSPACE_REGISTRY_TOOL_NAMES,
   ...REVIEW_CONTEXT_TOOL_NAMES,
   ...WORKSPACE_REVIEW_TOOL_NAMES,
+  "workspace_edit_file",
   ...CONTROL_PLANE_TOOL_NAMES,
   ...STATUS_QUERY_TOOL_NAMES,
   ...DIAGNOSTIC_TOOL_NAMES,
@@ -465,6 +468,7 @@ function truncateUtf8(value: string, maxBytes: number): string {
 async function readFilePage(
   workspace: WorkspaceManager,
   input: z.infer<z.ZodObject<typeof readFileInputSchema>>,
+  snapshot?: Buffer,
 ) {
   const resolved = workspace.resolveExisting(input.path);
   let stats;
@@ -485,7 +489,9 @@ async function readFilePage(
     throw new WorkspacePathError("BINARY_FILE", "Binary files are not supported.", resolved.relativePath);
   }
 
-  const inputStream = createReadStream(resolved.absolutePath, { encoding: "utf8" });
+  const inputStream = snapshot === undefined
+    ? createReadStream(resolved.absolutePath, { encoding: "utf8" })
+    : Readable.from([snapshot.toString("utf8")]);
   const lines = createInterface({ input: inputStream, crlfDelay: Infinity });
   const output: string[] = [];
   let currentLine = 0;
@@ -722,7 +728,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "list_files",
     {
-      description: "List non-sensitive files and directories within the authorized workspace.",
+      description: "Compatibility interface for typed file/directory entries and entry pagination; prefer workspace_list_files for file paths with explicit workspace_id. Omitted workspace_id uses the active workspace.",
       inputSchema: listFilesInputSchema,
       outputSchema: listFilesOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
@@ -739,7 +745,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "read_file",
     {
-      description: "Read a bounded range of a non-sensitive text file in the authorized workspace.",
+      description: "Compatibility interface for max_lines/max_bytes budgets; prefer workspace_read_file for explicit workspace_id, line ranges and optional original-byte SHA-256. Omitted workspace_id uses the active workspace.",
       inputSchema: readFileInputSchema,
       outputSchema: readFileOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
@@ -756,7 +762,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "search_text",
     {
-      description: "Search non-sensitive text files within the authorized workspace using bounded literal or regular-expression matching.",
+      description: "Compatibility interface for regex, glob, case_sensitive, match columns and engine metadata; prefer workspace_search for literal case-insensitive search with explicit workspace_id. Omitted workspace_id uses the active workspace.",
       inputSchema: searchTextInputSchema,
       outputSchema: searchTextOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
@@ -800,7 +806,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "workspace_list_files",
     {
-      description: "List workspace-relative non-sensitive files below a directory in one explicitly authorized workspace.",
+      description: "Recommended file-path listing in one explicitly authorized workspace. Defaults to depth 4; offset/limit count file and directory entries before filtering to files. Use list_files when typed directory entries are needed.",
       inputSchema: workspaceReviewListFilesInputSchema,
       outputSchema: workspaceReviewListFilesOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
@@ -824,7 +830,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "workspace_read_file",
     {
-      description: "Read at most 200 lines by default and 1000 lines per call from a non-sensitive workspace text file.",
+      description: "Recommended text reading with explicit workspace_id: 200 lines by default, at most 1000 lines/256 KiB per call and 8 MiB scanned. Files <=8 MiB include same-snapshot original-byte sha256; larger files use bounded streaming without sha256. Continue via next_start_line.",
       inputSchema: workspaceReviewReadFileInputSchema,
       outputSchema: workspaceReviewReadFileOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
@@ -837,17 +843,28 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
           throw new WorkspacePathError("INVALID_PATH", "Requested line range must contain between 1 and 1000 lines.");
         }
         const selection = registry.resolve(input.workspace_id);
+        const resolved = selection.manager.resolveExisting(input.path);
+        const stats = await stat(resolved.absolutePath);
+        if (!stats.isFile()) throw new WorkspacePathError("UNSAFE_EDIT_TARGET", "Expected a regular file.");
+        let snapshot: Buffer | undefined;
+        if (stats.size <= MAX_READ_SCAN_BYTES) {
+          const handle = await open(resolved.absolutePath, "r");
+          try { snapshot = await readBoundedBytes(handle, MAX_READ_SCAN_BYTES); } finally { await handle.close(); }
+          if (snapshot.length > MAX_READ_SCAN_BYTES) snapshot = undefined;
+        }
+        if (snapshot?.includes(0)) throw new WorkspacePathError("BINARY_FILE", "Binary file.");
         const output = await readFilePage(selection.manager, {
           workspace_id: input.workspace_id,
           path: input.path,
           start_line: input.start_line,
           max_lines: maxLines,
           max_bytes: 256 * 1024,
-        });
+        }, snapshot);
         return structuredResponse(workspaceReviewReadFileOutputSchema, {
           workspace_id: selection.id,
           path: output.path,
           content: output.content,
+          ...(snapshot === undefined ? {} : { sha256: createHash("sha256").update(snapshot).digest("hex") }),
           start_line: output.start_line,
           end_line: output.end_line,
           truncated: output.has_more,
@@ -859,10 +876,21 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
   );
 
+  server.registerTool("workspace_edit_file", {
+    description: "Precisely replace 1–5 unique non-overlapping text matches in one existing UTF-8 file (<=1 MiB). Manual workspace registration authorizes controlled editing. Requires explicit registered workspace_id and original-byte expected_sha256. No cross-process CAS guarantee.",
+    inputSchema: editFileInputSchema.shape,
+    outputSchema: editFileOutputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: true },
+  }, async (input) => {
+    try {
+      return structuredResponse(editFileOutputSchema, await editWorkspaceFile(registry.resolve(input.workspace_id), input));
+    } catch (error: unknown) { return toToolError(error); }
+  });
+
   server.registerTool(
     "workspace_search",
     {
-      description: "Search bounded non-sensitive text within one explicitly authorized workspace.",
+      description: "Recommended bounded literal, case-insensitive text search with explicit workspace_id, optional path and limit. Returns path, line, text and truncated; use search_text for regex, glob, case-sensitive search or match columns.",
       inputSchema: workspaceReviewSearchInputSchema,
       outputSchema: workspaceReviewSearchOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
