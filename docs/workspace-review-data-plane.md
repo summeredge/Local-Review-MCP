@@ -25,7 +25,7 @@ The data plane reuses the existing `WorkspaceRegistry`, `WorkspaceManager`, text
 
 ## Tools
 
-- `workspace_edit_file`: opt-in precise single-file replacement; see [tool contract](tool-contract.md#workspace_edit_file).
+- `workspace_edit_file`: manual Workspace registration authorizes controlled editing; each call requires an explicit `workspace_id` and original-byte hash for a precise single-file replacement; see [tool contract](tool-contract.md#workspace_edit_file).
 
 - `workspace_get_info`: branch and clean/dirty state for an authorized workspace.
 - `workspace_list_files`: bounded workspace-relative file listing below a directory.

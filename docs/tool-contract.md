@@ -4,7 +4,7 @@ The runtime registers 22 tools: 20 read-only tools, the `submit_goal` Control Pl
 
 | Tool | Scope | Permission |
 | --- | --- | --- |
-| `workspace_edit_file` | explicit workspace | opt-in precise replacement |
+| `workspace_edit_file` | explicit workspace | Workspace registration; explicit `workspace_id` and original-byte hash per call |
 | `workspace_list` | global | read-only |
 | `workspace_info` | workspace | read-only |
 | `list_files` | workspace | read-only |
