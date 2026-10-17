@@ -67,7 +67,7 @@ type ReviewRequestPort = Pick<ReviewRequestService, "getReviewRequest" | "listRe
 };
 type GoalPort = Pick<
   GoalOrchestrationService,
-  "listGoals" | "advanceGoal" | "startReviewGoal"
+  "listGoals" | "advanceGoal" | "scheduleRecovery" | "startReviewGoal"
 > & { readonly storageRoot?: string };
 type AutoIterationPort = Pick<
   AutoIterationService,
@@ -265,7 +265,13 @@ export class ExecutionRoutingService {
     await this.auto.onExecutionTerminal(execution);
     if (execution.status === "terminated") {
       const match = await this.findGoal(execution.workspace_id, execution.task_id, execution.execution_id);
-      if (match !== null) await this.goals.advanceGoal(match.goal.goal_id);
+      if (match !== null) {
+        // The active Goal operation must release this serial queue before its terminal follow-up can run.
+        void this.goals.advanceGoal(match.goal.goal_id).catch((error: unknown) => {
+          console.warn(`Goal terminal notification failed for "${match.goal.goal_id}"`, error);
+          this.goals.scheduleRecovery(match.goal.goal_id);
+        });
+      }
     }
   }
 

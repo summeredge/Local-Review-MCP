@@ -9,10 +9,12 @@ import {
   parseInitializeResult,
   parseModelListPage,
   parseThreadStartResult,
+  parseThreadSnapshot,
   parseTurnStartResult,
   type AppServerInitializeResult,
   type AppServerModel,
   type AppServerThread,
+  type AppServerThreadSnapshot,
   type AppServerTurn,
   type CodexAppServerClientOptions,
   type CodexAppServerExit,
@@ -22,6 +24,7 @@ import {
 } from "./models.js";
 import {
   CodexAppServerProtocolError,
+  CodexAppServerNotDispatchedError,
   CodexAppServerRpcError,
   isRpcRequest,
   isRpcResponse,
@@ -256,9 +259,14 @@ export class CodexAppServerClient {
   }
 
   public async startTurn(input: StartTurnInput): Promise<AppServerTurn> {
-    await this.initialize();
-    if (input.threadId.trim() === "") throw new Error("threadId is required.");
-    if (input.text.trim() === "") throw new Error("turn text is required.");
+    try {
+      await this.initialize();
+      if (input.threadId.trim() === "") throw new Error("threadId is required.");
+      if (input.text.trim() === "") throw new Error("turn text is required.");
+      this.ensureUsable();
+    } catch (error: unknown) {
+      throw new CodexAppServerNotDispatchedError(errorMessage(error), { cause: error });
+    }
     const params: Record<string, unknown> = {
       threadId: input.threadId,
       input: [{ type: "text", text: input.text, text_elements: [] }],
@@ -266,6 +274,27 @@ export class CodexAppServerClient {
     if (input.model?.trim() !== undefined && input.model.trim() !== "") params.model = input.model.trim();
     if (input.effort?.trim() !== undefined && input.effort.trim() !== "") params.effort = input.effort.trim();
     return parseTurnStartResult(await this.request<unknown>("turn/start", params));
+  }
+
+  public async readThread(input: { readonly threadId: string; readonly includeTurns: boolean }): Promise<AppServerThreadSnapshot> {
+    await this.initialize();
+    if (input.threadId.trim() === "") throw new Error("threadId is required.");
+    return parseThreadSnapshot(await this.request<unknown>("thread/read", {
+      threadId: input.threadId,
+      includeTurns: input.includeTurns,
+    }), "thread/read");
+  }
+
+  public async resumeThread(input: {
+    readonly threadId: string;
+    readonly cwd: string;
+  }): Promise<AppServerThreadSnapshot> {
+    await this.initialize();
+    if (input.threadId.trim() === "") throw new Error("threadId is required.");
+    return parseThreadSnapshot(await this.request<unknown>("thread/resume", {
+      threadId: input.threadId,
+      cwd: resolve(input.cwd),
+    }), "thread/resume");
   }
 
   public close(): Promise<CodexAppServerExit> {
@@ -324,7 +353,7 @@ export class CodexAppServerClient {
           ...(params === undefined ? {} : { params }),
         });
       } catch (error: unknown) {
-        pending.reject(error);
+        pending.reject(new CodexAppServerNotDispatchedError(errorMessage(error), { cause: error }));
       }
     });
   }

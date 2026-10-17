@@ -45,6 +45,9 @@ export type CapabilityFailureReason =
   /** The AFK fallback window expired with no user action, so standalone was chosen for them. */
   | "afk_fallback_timeout";
 
+/** A continuation start was refused before any dispatch; never a Desktop or standalone failure. */
+export const CONTINUATION_REFUSED_FAILURE_REASON = "standalone_execution_failed" as const;
+
 export interface CapabilityNegotiationTimestamps {
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -213,6 +216,8 @@ interface StoredCapabilityNegotiationContext {
   actions: readonly CapabilityAction[];
   timestamps: CapabilityNegotiationTimestamps;
   lastError: unknown;
+  /** Refusal reason for an already refused continuation; guards the context forever. */
+  continuationRefusal?: string;
 }
 
 function requestKey(request: ExecutionBackendStartRequest): string {
@@ -427,6 +432,39 @@ export class CapabilityNegotiator implements ExecutionBackend {
     request: ExecutionBackendStartRequest,
     context: StoredCapabilityNegotiationContext,
   ): Promise<ExecutionStartResult> {
+    // A continuation carries the initial Execution's backend. Selecting another backend here would
+    // create a new Thread and break iteration continuity, so route it directly and fail closed.
+    if (request.backend !== undefined) {
+      // The refusal is final for this Execution: record it like other settled outcomes so the
+      // launcher snapshot never stays "initializing", and keep the context bound to it.
+      if (context.continuationRefusal !== undefined) {
+        const refused = new Error(context.continuationRefusal);
+        this.setState(context, "fallback_ready", "standalone",
+          CONTINUATION_REFUSED_FAILURE_REASON, [], refused, "continuation_refused");
+        throw new CapabilityExecutionError("standalone", refused);
+      }
+      if (request.execution_mode !== "interactive"
+        || (request.backend === "codex_app_server" && request.thread_id === undefined)) {
+        const message = "Continuation backend identity is incomplete; resubmitting would create a new Thread.";
+        this.setState(context, "fallback_ready", "standalone",
+          CONTINUATION_REFUSED_FAILURE_REASON, [], new Error(message), "continuation_refused");
+        context.continuationRefusal = message;
+        throw new CapabilityExecutionError("standalone", new Error(message));
+      }
+      const provider = request.backend === "desktop_codex_app" ? this.desktop : this.standalone;
+      try {
+        const result = await provider.start(request);
+        this.setState(context, "fallback_running", provider.source, null, [], undefined);
+        return result;
+      } catch (error: unknown) {
+        const wrapped = error instanceof CapabilityExecutionError
+          ? error
+          : new CapabilityExecutionError(provider.source, error);
+        this.setState(context, "fallback_ready", provider.source,
+          errorReason(provider.source), [], wrapped, "continuation_refused");
+        throw wrapped;
+      }
+    }
     if (this.consumeAction(context, "standalone")) return this.startStandalone(request, context);
 
     while (true) {

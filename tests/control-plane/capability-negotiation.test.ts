@@ -11,6 +11,7 @@ import {
   type CapabilityPreparation,
   StandaloneCapabilityProvider,
 } from "../../src/control-plane/capability-negotiation.js";
+import { ExecutionLaunchIndeterminateError } from "../../src/control-plane/execution-service.js";
 import { CapabilityTimeline } from "../../src/control-plane/capability-timeline.js";
 import type { ResolvedSettings } from "../../src/config/settings.js";
 import {
@@ -472,6 +473,77 @@ describe("P5.9.1 capability negotiation", () => {
       current_state: "fallback_running",
       event: "fallback_running",
     });
+  });
+
+  it.each(["desktop_codex_app", "codex_app_server"] as const)(
+    "routes a %s continuation directly without Desktop negotiation",
+    async (backend) => {
+      const desktopStart = vi.fn(async (value: ExecutionBackendStartRequest) => startedFor(value));
+      const standaloneStart = vi.fn(async (value: ExecutionBackendStartRequest) => startedFor(value));
+      const desktop = provider("desktop", { ready: false, reason: "desktop_handoff_failed" });
+      desktop.start = desktopStart;
+      const negotiator = new CapabilityNegotiator({
+        desktop,
+        standalone: { ...provider("standalone", { ready: true }), start: standaloneStart },
+      });
+      const continuation = {
+        ...request,
+        backend,
+        thread_id: backend === "codex_app_server" ? "thread-001" : undefined,
+      };
+      await expect(negotiator.start(continuation)).resolves.toMatchObject({
+        execution_id: request.execution_id,
+      });
+      expect(backend === "desktop_codex_app" ? desktopStart : standaloneStart).toHaveBeenCalledOnce();
+      expect(desktop.prepare).not.toHaveBeenCalled();
+    },
+  );
+
+  it("never falls back to another backend when a continuation is refused", async () => {
+    const desktopStart = vi.fn(async (value: ExecutionBackendStartRequest) => startedFor(value));
+    const standaloneStart = vi.fn(async () => {
+      throw new ExecutionLaunchIndeterminateError("Original Thread cannot be verified.");
+    });
+    const desktop = provider("desktop", { ready: false, reason: "desktop_handoff_failed" });
+    desktop.start = desktopStart;
+    const negotiator = new CapabilityNegotiator({
+      desktop,
+      standalone: { ...provider("standalone", { ready: true }), start: standaloneStart },
+    });
+    await expect(negotiator.start({ ...request, backend: "codex_app_server", thread_id: "thread-001" }))
+      .rejects.toMatchObject({ provider: "standalone", cause: expect.any(ExecutionLaunchIndeterminateError) });
+    expect(desktopStart).not.toHaveBeenCalled();
+    expect(standaloneStart).toHaveBeenCalledOnce();
+    expect(desktop.prepare).not.toHaveBeenCalled();
+  });
+
+  it("settles the negotiation snapshot for continuation outcomes instead of staying initializing", async () => {
+    const desktopStart = vi.fn(async (value: ExecutionBackendStartRequest) => startedFor(value));
+    const standaloneStart = vi.fn(async (value: ExecutionBackendStartRequest) => startedFor(value));
+    const desktop = provider("desktop", { ready: false, reason: "desktop_handoff_failed" });
+    desktop.start = desktopStart;
+    const negotiator = new CapabilityNegotiator({
+      desktop,
+      standalone: { ...provider("standalone", { ready: true }), start: standaloneStart },
+    });
+    const succeeded = { ...request, backend: "codex_app_server" as const, thread_id: "thread-001" };
+    await negotiator.start(succeeded);
+    expect(negotiator.snapshot(request.execution_id)).toMatchObject({
+      state: "fallback_running", source: "standalone", actions: [],
+    });
+
+    const refusedRequest = requestFor("execution-refused", "task-refused");
+    await expect(negotiator.start({ ...refusedRequest, backend: "codex_app_server" }))
+      .rejects.toMatchObject({ provider: "standalone" });
+    expect(negotiator.snapshot(refusedRequest.execution_id)).toMatchObject({
+      state: "fallback_ready", source: "standalone", actions: [],
+    });
+    // A repeated start keeps the refusal instead of redispatching or renegotiating.
+    await expect(negotiator.start({ ...refusedRequest, backend: "codex_app_server", thread_id: "thread-001" }))
+      .rejects.toMatchObject({ provider: "standalone" });
+    expect(desktopStart).not.toHaveBeenCalled();
+    expect(standaloneStart).toHaveBeenCalledOnce();
+    expect(desktop.prepare).not.toHaveBeenCalled();
   });
 
   it("keeps two concurrent executions isolated", async () => {

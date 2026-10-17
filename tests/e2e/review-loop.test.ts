@@ -132,6 +132,12 @@ class FakeAppServerClient {
     status: "in_progress",
   }));
   public readonly stream = new FakeEventStream();
+  public readonly readThread = vi.fn(async (input: { threadId: string }) => ({
+    thread_id: input.threadId, cwd: "", turns: [],
+  }));
+  public readonly resumeThread = vi.fn(async (input: { threadId: string; cwd: string }) => ({
+    thread_id: input.threadId, cwd: input.cwd, turns: [],
+  }));
   public readonly close = vi.fn(async (): Promise<CodexAppServerExit> => {
     this.stream.close();
     return {

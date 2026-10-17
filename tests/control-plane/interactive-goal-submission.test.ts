@@ -1,10 +1,13 @@
 import { PendingGoalSubmissionService } from "../../src/control-plane/pending-goal-submission.js";
 import { ConversationCorrelationRegistry } from "../../src/control-plane/conversation-correlation.js";
+import { BrowserRouter } from "../../src/router/browser-router.js";
+import { ReviewCompletionRouter } from "../../src/router/review-completion-router.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  AutoIterationService,
   autoIterationSchema,
   type AutoIteration,
   type AutoIterationStartInput,
@@ -25,8 +28,10 @@ import type { CodexAppServerEvent } from "../../src/backends/codex_app_server/ev
 import type { CodexAppServerExit, CodexAppServerProcessInfo, AppServerModel, AppServerThread, AppServerTurn } from "../../src/backends/codex_app_server/models.js";
 import { GoalOrchestrationService } from "../../src/control-plane/goal-orchestration.js";
 import type { GoalPreflightInput, GoalPreflightResult } from "../../src/control-plane/goal-preflight.js";
-import { GoalSubmissionService, type GoalSubmissionRequest } from "../../src/control-plane/goal-submission.js";
+import { ExecutionRoutingService } from "../../src/control-plane/execution-routing.js";
+import { GoalStartError, GoalSubmissionService, type GoalSubmissionRequest } from "../../src/control-plane/goal-submission.js";
 import { ExecutionContextService } from "../../src/context/execution-service.js";
+import type { ExecutionContext } from "../../src/context/types.js";
 import { SessionStore } from "../../src/context/session-store.js";
 import { TaskContextService } from "../../src/context/service.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
@@ -92,6 +97,12 @@ class FakeAppServerClient {
     status: "in_progress",
   }));
   public readonly stream = new FakeEventStream();
+  public readonly readThread = vi.fn(async (input: { threadId: string }) => ({
+    thread_id: input.threadId, cwd: "", turns: [],
+  }));
+  public readonly resumeThread = vi.fn(async (input: { threadId: string; cwd: string }) => ({
+    thread_id: input.threadId, cwd: input.cwd, turns: [],
+  }));
   public readonly close = vi.fn(async (): Promise<CodexAppServerExit> => {
     this.stream.close();
     return {
@@ -162,7 +173,7 @@ async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<voi
   }
 }
 
-async function fixture(): Promise<{
+async function fixture(options: { readonly terminalRouting?: boolean } = {}): Promise<{
   readonly root: string;
   readonly workspaceRoot: string;
   readonly executions: ExecutionContextService;
@@ -171,6 +182,10 @@ async function fixture(): Promise<{
   readonly appClient: FakeAppServerClient;
   readonly appFactory: ReturnType<typeof vi.fn>;
   readonly executionService: ExecutionService;
+  readonly goals: GoalOrchestrationService;
+  readonly controlled: ControlledActuationService;
+  readonly auto: AutoIterationService | undefined;
+  readonly terminalListener: ReturnType<typeof vi.fn>;
   readonly submit: GoalSubmissionService;
 }> {
   const root = await mkdtemp(join(tmpdir(), "local-review-mcp-interactive-goal-"));
@@ -222,7 +237,27 @@ async function fixture(): Promise<{
     adapter: executionService,
   });
   const loops = new Map<string, AutoIteration>();
-  const auto = {
+  const runtimeAuto = options.terminalRouting ? new AutoIterationService(registry, {
+    storageRoot: root,
+    taskContextService: tasks,
+    executionContextService: executions,
+    controlledActuation: controlled,
+    browserRouter: new BrowserRouter(root, {
+      deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }),
+    }),
+    completionRouter: new ReviewCompletionRouter(root, {
+      collect: async ({ review_request_id }) => ({
+        status: "COMPLETED",
+        content: `<lrm-review-result>${JSON.stringify({
+          schema_version: 1,
+          review_request_id,
+          decision: "APPROVE",
+          summary: "The completed execution passed review.",
+        })}</lrm-review-result>`,
+      }),
+    }),
+  }) : undefined;
+  const auto = runtimeAuto ?? {
     start: vi.fn(async (input: AutoIterationStartInput): Promise<AutoIteration> => {
       const existing = loops.get(input.loop_id);
       if (existing !== undefined) return structuredClone(existing);
@@ -249,6 +284,19 @@ async function fixture(): Promise<{
     controlledActuation: controlled,
     autoIteration: auto,
   });
+  let router: ExecutionRoutingService | undefined;
+  const terminalListener = vi.fn((execution: ExecutionContext) => router!.onExecutionTerminal(execution));
+  if (runtimeAuto !== undefined) {
+    runtimeAuto.setTerminalListener((loop) => orchestration.onAutoIterationTerminal(loop));
+    router = new ExecutionRoutingService(registry, {
+      storageRoot: root,
+      taskContextService: tasks,
+      executionContextService: executions,
+      autoIteration: runtimeAuto,
+      goalOrchestration: orchestration,
+    });
+    executionService.setTerminalListener(terminalListener);
+  }
   return {
     root,
     workspaceRoot,
@@ -258,6 +306,10 @@ async function fixture(): Promise<{
     appClient,
     appFactory,
     executionService,
+    goals: orchestration,
+    controlled,
+    auto: runtimeAuto,
+    terminalListener,
     submit: new GoalSubmissionService(orchestration, { checkGoalPreflight: async (input) => preflight(input) }),
   };
 }
@@ -352,6 +404,105 @@ describe("interactive Goal submission", () => {
       submitted.execution_id,
     )).resolves.toMatchObject({ status: "passed" });
     await value.executionService.close();
+  });
+
+  it("queues an initial terminated Goal callback without waiting on its active start operation", async () => {
+    const value = await fixture({ terminalRouting: true });
+    const actualAdvance = value.goals.advanceGoal.bind(value.goals);
+    const advance = vi.spyOn(value.goals, "advanceGoal")
+      .mockImplementation((goalId) => actualAdvance(goalId));
+    const recovery = vi.spyOn(value.goals, "scheduleRecovery");
+    value.appClient.turn.mockRejectedValueOnce(new Error("turn/start response lost"));
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = Symbol("start timeout");
+    try {
+      const outcome = await Promise.race([
+        value.submit.submitExternalGoal({ ...request(), execution_mode: "interactive" })
+          .then((result) => ({ result }), (error: unknown) => ({ error })),
+        new Promise<typeof timeout>((resolve) => {
+          timer = setTimeout(() => resolve(timeout), 1_000);
+        }),
+      ]);
+      if (timer !== undefined) clearTimeout(timer);
+      expect(outcome).not.toBe(timeout);
+      if (outcome === timeout) throw new Error("Initial Goal start waited on its terminal callback");
+      expect("error" in outcome && outcome.error).toBeInstanceOf(GoalStartError);
+      if (!("error" in outcome) || !(outcome.error instanceof GoalStartError)) {
+        throw new Error("Expected an indeterminate initial Goal start");
+      }
+      const { goal_id, task_id, execution_id } = outcome.error.result;
+      const goal = await value.goals.getGoal(goal_id);
+      expect(goal).toMatchObject({ status: "human_required" });
+      expect(value.terminalListener).toHaveBeenCalledOnce();
+      expect(value.terminalListener).toHaveBeenCalledWith(expect.objectContaining({ status: "terminated" }));
+      expect(advance).toHaveBeenCalledExactlyOnceWith(goal_id);
+      await expect(advance.mock.results[0]!.value).resolves.toMatchObject({ status: "human_required" });
+      await expect(value.executions.getExecutionContext("workspace-a", task_id, execution_id))
+        .resolves.toMatchObject({ status: "terminated", summary: expect.stringContaining("outcome unknown; no retry") });
+      await expect(value.controlled.getActuation(goal!.actuation_id!)).resolves.toMatchObject({ status: "starting" });
+      await expect(value.sessions.listSessions()).resolves.toMatchObject([
+        expect.objectContaining({ goal_id, thread_id: "thread-001", status: "terminated" }),
+      ]);
+      await expect(value.goals.startGoal({ goal_id })).resolves.toMatchObject({ status: "human_required" });
+      expect(value.appClient.thread).toHaveBeenCalledTimes(1);
+      expect(value.appClient.turn).toHaveBeenCalledTimes(1);
+
+      advance.mockImplementationOnce(async () => { throw new Error("temporary Goal read failure"); });
+      const terminal = await value.executions.getExecutionContext("workspace-a", task_id, execution_id);
+      await value.terminalListener(terminal!);
+      expect(recovery).toHaveBeenCalledWith(goal_id);
+      await expect(advance.mock.results[1]!.value).rejects.toThrow("temporary Goal read failure");
+      await vi.waitFor(() => expect(advance).toHaveBeenCalledTimes(3), { timeout: 2_500 });
+      await expect(advance.mock.results[2]!.value).resolves.toMatchObject({ status: "human_required" });
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      value.auto?.dispose();
+      value.goals.dispose();
+      await value.executionService.close();
+    }
+  });
+
+  it("keeps an explicit initial AppServer failure on the failed Goal path", async () => {
+    const value = await fixture({ terminalRouting: true });
+    value.appClient.turn.mockResolvedValueOnce({ turn_id: "turn-001", status: "failed" });
+    try {
+      const error = await value.submit.submitExternalGoal({ ...request(), execution_mode: "interactive" })
+        .then(() => undefined, (caught: unknown) => caught);
+      expect(error).toBeInstanceOf(GoalStartError);
+      if (!(error instanceof GoalStartError)) throw new Error("Expected explicit Goal start failure");
+      const { goal_id, task_id, execution_id } = error.result;
+      expect(error.state).toBe("failed");
+      await expect(value.goals.getGoal(goal_id)).resolves.toMatchObject({ status: "failed" });
+      await expect(value.executions.getExecutionContext("workspace-a", task_id, execution_id))
+        .resolves.toMatchObject({ status: "failed" });
+      expect(value.terminalListener).toHaveBeenCalledWith(expect.objectContaining({ status: "failed" }));
+      expect(value.appClient.turn).toHaveBeenCalledTimes(1);
+    } finally {
+      value.auto?.dispose();
+      value.goals.dispose();
+      await value.executionService.close();
+    }
+  });
+
+  it("advances a normally completed initial AppServer Goal through Review", async () => {
+    const value = await fixture({ terminalRouting: true });
+    try {
+      const submitted = await value.submit.submitExternalGoal({ ...request(), execution_mode: "interactive" });
+      const session = (await value.sessions.listSessions())[0]!;
+      value.appClient.stream.push({ type: "turn_completed", thread_id: "thread-001", turn_id: "turn-001" });
+      await waitFor(async () => (await value.goals.getGoal(submitted.goal_id))?.status === "completed");
+      await expect(value.executions.getExecutionContext("workspace-a", submitted.task_id, submitted.execution_id))
+        .resolves.toMatchObject({ status: "passed" });
+      await expect(value.goals.getGoal(submitted.goal_id)).resolves.toMatchObject({ status: "completed" });
+      expect(value.terminalListener).toHaveBeenCalledWith(expect.objectContaining({ status: "passed" }));
+      expect(value.appClient.thread).toHaveBeenCalledTimes(1);
+      expect(value.appClient.turn).toHaveBeenCalledTimes(1);
+      expect((await value.sessions.getSession(session.session_id))?.thread_id).toBe("thread-001");
+    } finally {
+      value.auto?.dispose();
+      value.goals.dispose();
+      await value.executionService.close();
+    }
   });
 });
 

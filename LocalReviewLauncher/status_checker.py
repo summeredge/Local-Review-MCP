@@ -1069,6 +1069,7 @@ class StatusChecker:
                     session_events = self._session_events(
                         _identifier(summary.get("session_id"), "session_id"),
                         _optional_text(summary.get("thread_id"), "thread_id"),
+                        _identifier(summary.get("workspace_id"), "workspace_id"),
                     )
                 except StatusQueryError:
                     session_events = None
@@ -1085,7 +1086,9 @@ class StatusChecker:
             "task_id": task_id,
         })
 
-    def _session_events(self, session_id: str, thread_id: str | None) -> dict[str, object]:
+    def _session_events(
+        self, session_id: str, thread_id: str | None, workspace_id: str | None,
+    ) -> dict[str, object]:
         events: list[object] = []
         after_sequence = 0
         session = {"session_id": session_id, "thread_id": thread_id}
@@ -1093,7 +1096,7 @@ class StatusChecker:
             page = self._call_tool("list_session_events", {
                 "session_id": session_id,
                 "after_sequence": after_sequence,
-                **({"workspace_id": self.workspace_id} if self.workspace_id else {}),
+                **({"workspace_id": workspace_id} if workspace_id else {}),
             })
             parsed = _parse_events(page, session)
             if any(event.sequence <= after_sequence for event in parsed):

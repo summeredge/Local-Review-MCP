@@ -24,6 +24,8 @@ import {
 import { ExtensionDeliveryService } from "../../src/control-plane/extension-delivery.js";
 import { DispatchCommandBroker } from "../../src/control-plane/dispatch-command-broker.js";
 import { ExecutionContextService } from "../../src/context/execution-service.js";
+import { SessionStore } from "../../src/context/session-store.js";
+import { ExecutionLaunchIndeterminateError } from "../../src/control-plane/execution-service.js";
 import { ConversationRoutingService } from "../../src/context/conversation-routing-service.js";
 import { ReviewDeliveryService } from "../../src/context/review-delivery-service.js";
 import { ReviewRequestService } from "../../src/context/review-request-service.js";
@@ -321,6 +323,110 @@ describe("AutoIterationService", () => {
       });
       expect(value.starts).toHaveLength(0);
     } finally { restarted.dispose(); }
+  });
+
+  it("carries the initial interactive backend and Thread into the next iteration", async () => {
+    const value = await fixture(["ITERATE", "APPROVE"], "delivered", {
+      goal_id: "goal-1", execution_mode: "interactive", model_id: "gpt-5.6-luna", reasoning_effort: "max",
+    });
+    await new SessionStore(value.root).createSession({
+      execution_id: "execution-001", goal_id: "goal-1", task_id: "task-001",
+      backend_type: "codex_app_server", status: "completed", workspace: value.root, thread_id: "thread-001",
+    });
+    try {
+      const loop = await value.auto.start(startInput());
+      expect(loop).toMatchObject({ stage: "execution", iteration: 2 });
+      const authorization = await new ActuationAuthorizationStore(value.root)
+        .getAuthorizationByActuation(loop.actuation_id!);
+      expect(authorization).toMatchObject({
+        backend: "codex_app_server", thread_id: "thread-001", execution_mode: "interactive",
+        goal_id: "goal-1", model_id: "gpt-5.6-luna", reasoning_effort: "max",
+      });
+    } finally { value.auto.dispose(); }
+  });
+
+  it("routes an unverified interactive continuation to human handling without a replacement Execution", async () => {
+    const value = await fixture(["APPROVE"], "delivered", {
+      goal_id: "goal-1", execution_mode: "interactive",
+    });
+    await new SessionStore(value.root).createSession({
+      execution_id: "execution-001", goal_id: "goal-1", task_id: "task-001",
+      backend_type: "codex_app_server", status: "completed", workspace: value.root, thread_id: "thread-001",
+    });
+    const pending = { goal: "Fix", requirements: ["Preserve routing"], acceptance_criteria: ["Tests pass"] };
+    const noStart = vi.fn(async () => {
+      throw new ExecutionLaunchIndeterminateError("Original AppServer Thread cannot be verified.");
+    });
+    const controlled = new ControlledActuationService(value.registry, {
+      storageRoot: value.root, adapter: { start: noStart },
+    });
+    const authorization = await controlled.authorize({
+      actuation_id: "actuation-unverified", workspace_id: "workspace-a", task_id: "task-001",
+      execution_id: "execution-unverified", instruction: buildAutoIterationInstruction(pending),
+      execution_mode: "interactive", goal_id: "goal-1", backend: "codex_app_server", thread_id: "thread-001",
+    });
+    const auto = new AutoIterationService(value.registry, {
+      storageRoot: value.root, controlledActuation: controlled,
+    });
+    try {
+      await persistLoop(value.root, checkpoint({
+        loop_id: "loop-unverified", iteration: 2, execution_id: "execution-unverified",
+        actuation_id: authorization.actuation_id, authorization_id: authorization.authorization_id,
+        pending_iteration: pending, stage: "actuation",
+      }));
+      await auto.recover();
+      await expect(auto.getLoop("loop-unverified")).resolves.toMatchObject({
+        stage: "human_required", terminal_reason: "INITIAL_EXECUTION_NOT_CONTINUABLE",
+      });
+      expect(noStart).toHaveBeenCalledOnce();
+      expect(await value.executionService.getExecutionContext(
+        "workspace-a", "task-001", "execution-unverified",
+      )).toBeNull();
+    } finally { auto.dispose(); value.auto.dispose(); }
+  });
+
+  it("reports ACTUATION_UNCERTAIN when a continuation turn is dispatched but its result is unknown", async () => {
+    const value = await fixture(["APPROVE"], "delivered", {
+      goal_id: "goal-1", execution_mode: "interactive",
+    });
+    await new SessionStore(value.root).createSession({
+      execution_id: "execution-001", goal_id: "goal-1", task_id: "task-001",
+      backend_type: "codex_app_server", status: "completed", workspace: value.root, thread_id: "thread-001",
+    });
+    const pending = { goal: "Fix", requirements: ["Preserve routing"], acceptance_criteria: ["Tests pass"] };
+    const controlled = new ControlledActuationService(value.registry, {
+      storageRoot: value.root,
+      adapter: { start: vi.fn(async (request) => {
+        // Simulate a lost turn/start response after the backend materialized its Execution.
+        await value.executionService.createExecutionContext({
+          execution_id: request.execution_id, task_id: request.task_id, workspace_id: request.workspace_id,
+          status: "running", process_id: 9100, command: "codex app-server --listen stdio://",
+        });
+        throw new ExecutionLaunchIndeterminateError("AppServer stage=turn/start: response lost.");
+      }) },
+    });
+    const authorization = await controlled.authorize({
+      actuation_id: "actuation-uncertain", workspace_id: "workspace-a", task_id: "task-001",
+      execution_id: "execution-uncertain", instruction: buildAutoIterationInstruction(pending),
+      execution_mode: "interactive", goal_id: "goal-1", backend: "codex_app_server", thread_id: "thread-001",
+    });
+    const auto = new AutoIterationService(value.registry, {
+      storageRoot: value.root, controlledActuation: controlled,
+    });
+    try {
+      await persistLoop(value.root, checkpoint({
+        loop_id: "loop-uncertain", iteration: 2, execution_id: "execution-uncertain",
+        actuation_id: authorization.actuation_id, authorization_id: authorization.authorization_id,
+        pending_iteration: pending, stage: "actuation",
+      }));
+      await auto.recover();
+      await expect(auto.getLoop("loop-uncertain")).resolves.toMatchObject({
+        stage: "human_required", terminal_reason: "ACTUATION_UNCERTAIN",
+      });
+      expect(await value.executionService.getExecutionContext(
+        "workspace-a", "task-001", "execution-uncertain",
+      )).toMatchObject({ status: "running" });
+    } finally { auto.dispose(); value.auto.dispose(); }
   });
 
   it("exhausts the real broker's unclaimed recovery budget instead of staying running", async () => {

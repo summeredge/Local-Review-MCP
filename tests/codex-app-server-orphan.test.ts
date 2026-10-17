@@ -1,7 +1,7 @@
 import { EventStore } from "../src/control-plane/events/store.js";
 import { ControlledActuationService } from "../src/control-plane/controlled-actuation.js";
 import { ReviewRequestService } from "../src/context/review-request-service.js";
-import { AutoIterationService } from "../src/control-plane/auto-iteration.js";
+import { AutoIterationService, AutoIterationStore } from "../src/control-plane/auto-iteration.js";
 import { BrowserRouter } from "../src/router/browser-router.js";
 import { ReviewCompletionRouter } from "../src/router/review-completion-router.js";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -9,11 +9,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  APP_SERVER_COMMAND,
   BACKEND_CLOSED_SUMMARY,
   CodexAppServerBackend,
   ORPHANED_EXECUTION_SUMMARY,
   type AppServerClientFactory,
 } from "../src/backends/codex_app_server/backend.js";
+import { ExecutionLaunchIndeterminateError } from "../src/control-plane/execution-service.js";
+import { CodexAppServerNotDispatchedError, CodexAppServerRpcError } from "../src/backends/codex_app_server/protocol.js";
 import type { CodexAppServerEvent } from "../src/backends/codex_app_server/events.js";
 import type {
   AppServerModel,
@@ -65,6 +68,8 @@ class FakeEventStream implements AsyncIterable<CodexAppServerEvent>, AsyncIterat
 }
 
 class FakeAppServerClient {
+  public constructor(private cwd = "") {}
+  public get cwdValue(): string { return this.cwd; }
   public readonly processInfo: CodexAppServerProcessInfo = {
     process_id: 9_001,
     codex_version: "fake",
@@ -73,14 +78,27 @@ class FakeAppServerClient {
   };
   public readonly stream = new FakeEventStream();
   public readonly listModels = vi.fn(async (): Promise<readonly AppServerModel[]> => []);
-  public readonly startThread = vi.fn(async (input: { cwd: string; model?: string }): Promise<AppServerThread> => ({
+  public readonly startThread = vi.fn(async (input: { cwd: string; model?: string }): Promise<AppServerThread> => {
+    this.cwd = input.cwd;
+    return {
     thread_id: "thread-001",
     session_id: "provider-session-001",
     cwd: input.cwd,
-  }));
+    };
+  });
   public readonly startTurn = vi.fn(async (): Promise<AppServerTurn> => ({
     turn_id: "turn-001",
     status: "in_progress",
+  }));
+  public readonly readThread = vi.fn(async (input: { threadId: string }) => ({
+    thread_id: input.threadId,
+    cwd: this.cwd,
+    turns: [{ turn_id: "turn-001", status: "completed" as const }],
+  }));
+  public readonly resumeThread = vi.fn(async (input: { threadId: string; cwd: string }) => ({
+    thread_id: input.threadId,
+    cwd: input.cwd,
+    turns: [{ turn_id: "turn-001", status: "completed" as const }],
   }));
   public readonly close = vi.fn(async (): Promise<CodexAppServerExit> => {
     this.stream.close();
@@ -125,6 +143,70 @@ async function harness(): Promise<Harness> {
 async function executionState(root: string) {
   return new ExecutionContextService(root).getExecutionContext("workspace-1", "task-1", "execution-1");
 }
+
+it.each(["failed response", "rpc rejection", "not dispatched", "lost response"])(
+  "keeps launch records consistent for %s without resending", async outcome => {
+    const { root, backend, client } = await harness();
+    if (outcome === "failed response") client.startTurn.mockResolvedValue({ turn_id: "turn-001", status: "failed" });
+    else client.startTurn.mockRejectedValue(outcome === "rpc rejection"
+      ? new CodexAppServerRpcError(-32000, "rejected")
+      : outcome === "not dispatched" ? new CodexAppServerNotDispatchedError("closed before dispatch")
+      : new Error("response lost"));
+    const registry = new WorkspaceRegistry([{ id: "workspace-1", name: "Workspace", path: root }]);
+    const controlled = new ControlledActuationService(registry, { storageRoot: root, adapter: backend });
+    const auth = await controlled.authorize({ ...startRequest, actuation_id: "launch-actuation" });
+    try {
+      const error = await controlled.actuate({ actuation_id: auth.actuation_id, authorization_id: auth.authorization_id })
+        .catch(error => error);
+      expect(error instanceof ExecutionLaunchIndeterminateError).toBe(outcome === "lost response");
+      expect(error).toBeInstanceOf(Error);
+      const status = outcome === "lost response" ? "terminated" : "failed";
+      expect(await executionState(root)).toMatchObject({ status });
+      expect((await new SessionStore(root).listSessions())[0]).toMatchObject({ status });
+      if (outcome === "lost response") expect((await executionState(root))?.summary).toMatch(/outcome unknown; no retry/);
+      expect((await controlled.authorizationStore.getActuation(auth.actuation_id))?.status)
+        .toBe(outcome === "lost response" ? "starting" : "failed");
+      await controlled.actuate({ actuation_id: auth.actuation_id, authorization_id: auth.authorization_id }).catch(() => undefined);
+      expect(client.startTurn).toHaveBeenCalledOnce();
+      expect(client.close).toHaveBeenCalledOnce();
+    } finally { await backend.close(); }
+  },
+);
+
+it.each(["authorized thread", "session lookup", "session persistence", "execution persistence", "model validation"]
+  .flatMap(failure => [false, true].map(borrowed => ({ failure, borrowed }))))(
+  "handles continuation ownership on $failure failure, borrowed=$borrowed", async ({ failure, borrowed }) => {
+    const { root, backend, client, terminal } = await harness();
+    await backend.start(startRequest);
+    client.stream.push({ type: "turn_completed", thread_id: "thread-001", turn_id: "turn-001" });
+    await vi.waitFor(() => expect(terminal).toHaveBeenCalledOnce());
+    const timestamp = new Date().toISOString();
+    await new AutoIterationStore(root).put({ loop_id: "ownership-loop", initial_execution_id: "execution-1",
+      workspace_id: "workspace-1", task_id: "task-1", conversation_id: "conversation-1", max_iterations: 2,
+      iteration: 2, execution_id: "execution-2", stage: "execution", created_at: timestamp, updated_at: timestamp });
+    const registry = new WorkspaceRegistry([{ id: "workspace-1", name: "Workspace", path: root }]);
+      const fresh = new FakeAppServerClient();
+      fresh.readThread.mockResolvedValue({ thread_id: "thread-001", cwd: root,
+        turns: [{ turn_id: "turn-001", status: "completed" }] });
+      const active = borrowed ? backend : new CodexAppServerBackend(registry, { storageRoot: root, clientFactory: async () => fresh });
+      const spy = failure === "session persistence" ? vi.spyOn(SessionStore.prototype, "createSession").mockRejectedValue(new Error("session persistence"))
+        : failure === "execution persistence" ? vi.spyOn(ExecutionContextService.prototype, "createExecutionContext").mockRejectedValue(new Error("execution persistence"))
+        : undefined;
+      if (failure === "session lookup") {
+        await new SessionStore(root).createSession({ execution_id: "execution-2", goal_id: "goal-1", task_id: "task-1",
+          backend_type: "codex_app_server", workspace: root });
+      }
+      try {
+        await expect(active.start({ ...startRequest, execution_id: "execution-2",
+          thread_id: failure === "authorized thread" ? "wrong-thread" : "thread-001",
+          ...(failure === "model validation" ? { model_id: "missing-model" } : {}) })).rejects.toThrow();
+        expect(client.close).not.toHaveBeenCalled();
+        expect(fresh.close).toHaveBeenCalledTimes(borrowed || failure === "authorized thread" ? 0 : 1);
+        expect(fresh.startTurn).not.toHaveBeenCalled();
+      } finally { spy?.mockRestore(); if (!borrowed) await active.close(); }
+    await backend.close();
+  },
+);
 
 describe("Codex AppServer shutdown and orphan reconciliation", () => {
   it("A. fails a running turn and its Session when the backend closes mid-turn", async () => {
@@ -307,8 +389,16 @@ it("starts a separate ITERATE execution after the previous turn passed", async (
     const first = await backend.start(startRequest);
     client.stream.push({ type: "turn_completed", thread_id: "thread-001", turn_id: "turn-001" });
     await vi.waitFor(() => expect(terminal).toHaveBeenCalledOnce());
-    const second = await backend.start({ ...startRequest, execution_id: "execution-2" });
+    const timestamp = new Date().toISOString();
+    await new AutoIterationStore(root).put({
+      loop_id: "iterate-loop", initial_execution_id: "execution-1", workspace_id: "workspace-1",
+      task_id: "task-1", conversation_id: "conversation-1", max_iterations: 2, iteration: 2,
+      execution_id: "execution-2", stage: "execution", created_at: timestamp, updated_at: timestamp,
+    });
+    const second = await backend.start({ ...startRequest, execution_id: "execution-2", thread_id: "thread-001" });
     expect(second.session_id).not.toBe(first.session_id);
+    expect(second.thread_id).toBe(first.thread_id);
+    expect(client.startThread).toHaveBeenCalledOnce();
     expect(await backend.start({ ...startRequest, execution_id: "execution-2" })).toMatchObject({ accepted: "existing", session_id: second.session_id });
     expect(client.startTurn).toHaveBeenCalledTimes(2);
     const sessions = await new SessionStore(root).listSessions();
@@ -375,6 +465,58 @@ describe("terminal Session recovery", () => {
     });
 });
 
+it.each(["failed response", "lost response", "completed response"])(
+  "settles reentrant AppServer actuation and terminal callbacks for %s", async outcome => {
+    const { root, backend, client } = await harness();
+    const registry = new WorkspaceRegistry([{ id: "workspace-1", name: "Workspace", path: root }]);
+    const controlled = new ControlledActuationService(registry, { storageRoot: root, adapter: backend });
+    const initial = await controlled.authorize({ ...startRequest, actuation_id: "initial-actuation" });
+    let reviews = 0;
+    const auto = new AutoIterationService(registry, { storageRoot: root, controlledActuation: controlled,
+      browserRouter: new BrowserRouter(root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
+      completionRouter: new ReviewCompletionRouter(root, { collect: async input => ({ status: "COMPLETED",
+        content: '<lrm-review-result>' + JSON.stringify({ schema_version: 1, review_request_id: input.review_request_id,
+          decision: ++reviews === 1 ? "ITERATE" : "APPROVE", summary: "Reviewed",
+          ...(reviews === 1 ? { iteration: { goal: "Fix", requirements: ["Fix"], acceptance_criteria: ["Pass"] } } : {}),
+        }) + '</lrm-review-result>' }) }),
+    });
+    const listener = vi.fn(execution => auto.onExecutionTerminal(execution));
+    backend.setTerminalListener(listener);
+    try {
+      client.startTurn.mockResolvedValueOnce({ turn_id: "turn-001", status: "completed" });
+      await controlled.actuate({ actuation_id: initial.actuation_id, authorization_id: initial.authorization_id });
+      if (outcome === "lost response") client.startTurn.mockRejectedValueOnce(new Error("turn/start response lost"));
+      else client.startTurn.mockResolvedValueOnce({ turn_id: "turn-002",
+        status: outcome === "failed response" ? "failed" : "completed" });
+      // Backend -> terminal listener -> AutoIteration runs inside this same loop's actuation.
+      await auto.start({ loop_id: "reentrant-loop", workspace_id: "workspace-1", task_id: "task-1",
+        conversation_id: "conversation-1", execution_id: "execution-1", max_iterations: 2 });
+      const loop = (await auto.getLoop("reentrant-loop"))!;
+      expect(loop.stage).toBe(outcome === "lost response" ? "human_required"
+        : outcome === "failed response" ? "failed" : "completed");
+      if (outcome === "lost response") expect(loop.terminal_reason).toBe("ACTUATION_UNCERTAIN");
+      const execution = (await new ExecutionContextService(root).getExecutionContext(
+        "workspace-1", "task-1", loop.execution_id))!;
+      const status = outcome === "lost response" ? "terminated" : outcome === "failed response" ? "failed" : "passed";
+      expect(execution.status).toBe(status);
+      expect((await new SessionStore(root).listSessions()).find(session => session.execution_id === loop.execution_id)?.status)
+        .toBe(status === "passed" ? "completed" : status);
+      expect((await controlled.getActuation(loop.actuation_id!))?.status)
+        .toBe(outcome === "lost response" ? "starting" : outcome === "failed response" ? "failed" : "started");
+      if (outcome === "lost response") expect(execution.summary).toMatch(/outcome unknown; no retry/);
+      expect(listener).toHaveBeenCalledTimes(2);
+      await Promise.all(listener.mock.results.map(result => result.value));
+      await auto.onExecutionTerminal(execution);
+      await auto.recover();
+      await auto.advance(loop.loop_id);
+      expect((await auto.getLoop(loop.loop_id))?.stage).toBe(loop.stage);
+      expect(client.startTurn).toHaveBeenCalledTimes(2);
+      expect(reviews).toBe(outcome === "completed response" ? 2 : 1);
+      expect((await new TaskContextService(root).getTaskContext("task-1"))?.status).toBe(loop.stage);
+    } finally { auto.dispose(); await backend.close(); }
+  }, 5_000,
+);
+
 it("runs AppServer through ITERATE and reviews each execution exactly once", async () => {
   const { root, backend, client } = await harness();
   const registry = new WorkspaceRegistry([{ id: "workspace-1", name: "Workspace", path: root }]);
@@ -412,6 +554,106 @@ it("runs AppServer through ITERATE and reviews each execution exactly once", asy
     expect(reviews).toBe(2);
     expect(client.startTurn).toHaveBeenCalledTimes(2);
   } finally { auto.dispose(); await backend.close(); }
+});
+
+it("continues the original AppServer Thread for the next ITERATE turn", async () => {
+  const value = await harness();
+  const registry = new WorkspaceRegistry([{ id: "workspace-1", name: "Workspace", path: value.root }]);
+  const controlled = new ControlledActuationService(registry, { storageRoot: value.root, adapter: value.backend });
+  const initial = await controlled.authorize({ ...startRequest, actuation_id: "initial-actuation" });
+  let reviews = 0;
+  const makeAuto = () => new AutoIterationService(registry, { storageRoot: value.root,
+    controlledActuation: controlled,
+    browserRouter: new BrowserRouter(value.root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
+    completionRouter: new ReviewCompletionRouter(value.root, { collect: async input => ({
+      status: "COMPLETED", content: '<lrm-review-result>' + JSON.stringify({ schema_version: 1,
+        review_request_id: input.review_request_id, decision: ++reviews === 1 ? "ITERATE" : "APPROVE", summary: "Reviewed",
+        ...(reviews === 1 ? { iteration: { goal: "Fix", requirements: ["Fix"], acceptance_criteria: ["Pass"] } } : {}) },
+      ) + '</lrm-review-result>',
+    }) }),
+  });
+  const auto = makeAuto();
+  try {
+    value.backend.setTerminalListener(execution => auto.onExecutionTerminal(execution));
+    await controlled.actuate({ actuation_id: initial.actuation_id, authorization_id: initial.authorization_id });
+    await auto.start({ loop_id: "restart-iterate", workspace_id: "workspace-1", task_id: "task-1",
+      conversation_id: "conversation-1", execution_id: "execution-1", max_iterations: 2 });
+    const firstSession = (await new SessionStore(value.root).listSessions())[0]!;
+    value.client.stream.push({ type: "turn_completed", thread_id: "thread-001", turn_id: "turn-001" });
+    await vi.waitFor(async () => expect((await new SessionStore(value.root).getSession(firstSession.session_id))?.status)
+      .toBe("completed"));
+    expect((await new ExecutionContextService(value.root)
+      .getExecutionContext("workspace-1", "task-1", "execution-1"))?.status).toBe("passed");
+    value.client.startTurn.mockImplementation(async () => ({ turn_id: "turn-002", status: "in_progress" }));
+    await auto.advance("restart-iterate");
+    await vi.waitFor(() => expect(value.client.startTurn).toHaveBeenCalledTimes(2), { timeout: 5_000 });
+    const loop = (await auto.getLoop("restart-iterate"))!;
+    expect(value.client.resumeThread).toHaveBeenCalledWith(expect.objectContaining({ threadId: "thread-001" }));
+    expect(value.client.startThread).toHaveBeenCalledOnce();
+    const second = (await new ExecutionContextService(value.root).getExecutionContext(
+      "workspace-1", "task-1", loop.execution_id))!;
+    expect(second).toMatchObject({ status: "running", command: APP_SERVER_COMMAND });
+    value.client.stream.push({ type: "turn_completed", thread_id: "thread-001", turn_id: "turn-002" });
+    await vi.waitFor(async () => expect((await auto.getLoop("restart-iterate"))?.stage)
+      .toBe("completed"), { timeout: 5_000 });
+    const secondSession = (await new SessionStore(value.root).listSessions())
+      .find(session => session.execution_id === loop.execution_id)!;
+    expect(secondSession.thread_id).toBe("thread-001");
+    expect(await new ExecutionContextService(value.root).getExecutionContext(
+      "workspace-1", "task-1", loop.execution_id)).toMatchObject({ status: "passed" });
+  } finally { auto.dispose(); await value.backend.close().catch(() => undefined); }
+});
+
+it.each([
+  ["missing completed turn", (client: FakeAppServerClient) => client.readThread.mockImplementation(async (input: { threadId: string }) => ({
+    thread_id: input.threadId, cwd: client.cwdValue, turns: [],
+  }))],
+  ["different resumed thread", (client: FakeAppServerClient) => client.resumeThread.mockImplementation(async () => ({
+    thread_id: "thread-other", cwd: client.cwdValue, turns: [],
+  }))],
+  ["different completed turn", (client: FakeAppServerClient) => client.readThread.mockImplementation(async (input: { threadId: string }) => ({
+    thread_id: input.threadId, cwd: client.cwdValue, turns: [{ turn_id: "unrelated-turn", status: "completed" as const }],
+  }))],
+  ["different resumed turn", (client: FakeAppServerClient) => client.resumeThread.mockImplementation(async (input: { threadId: string }) => ({
+    thread_id: input.threadId, cwd: client.cwdValue, turns: [{ turn_id: "unrelated-turn", status: "completed" as const }],
+  }))],
+])("refuses AppServer continuation when %s", async (name, mutate) => {
+  const value = await harness();
+  const registry = new WorkspaceRegistry([{ id: "workspace-1", name: "Workspace", path: value.root }]);
+  const controlled = new ControlledActuationService(registry, { storageRoot: value.root, adapter: value.backend });
+  const initial = await controlled.authorize({ ...startRequest, actuation_id: "initial-actuation" });
+  try {
+    await controlled.actuate({ actuation_id: initial.actuation_id, authorization_id: initial.authorization_id });
+    const timestamp = new Date().toISOString();
+    await new AutoIterationStore(value.root).put({
+      loop_id: "evidence-iterate", initial_execution_id: "execution-1", workspace_id: "workspace-1",
+      task_id: "task-1", conversation_id: "conversation-1", max_iterations: 2, iteration: 2,
+      execution_id: "execution-2", stage: "execution", created_at: timestamp, updated_at: timestamp,
+    });
+    value.client.stream.push({ type: "turn_completed", thread_id: "thread-001", turn_id: "turn-001" });
+    await vi.waitFor(async () => expect((await new ExecutionContextService(value.root)
+      .getExecutionContext("workspace-1", "task-1", "execution-1"))?.status).toBe("passed"));
+    const resumed = new FakeAppServerClient(value.root);
+    resumed.startThread.mockRejectedValue(new Error("new Thread must not be created"));
+    resumed.readThread.mockResolvedValue({ thread_id: "thread-001", cwd: value.root,
+      turns: [{ turn_id: "turn-001", status: "completed" }] });
+    resumed.resumeThread.mockResolvedValue({ thread_id: "thread-001", cwd: value.root,
+      turns: [{ turn_id: "turn-001", status: "completed" }] });
+    mutate(resumed);
+    const restarted = new CodexAppServerBackend(registry, { storageRoot: value.root,
+      clientFactory: (async () => resumed) as AppServerClientFactory });
+    try {
+      await expect(restarted.start({ ...startRequest, execution_id: "execution-2", thread_id: "thread-001" }))
+        .rejects.toBeInstanceOf(ExecutionLaunchIndeterminateError);
+      expect(resumed.startTurn).not.toHaveBeenCalled();
+      expect(resumed.startThread).not.toHaveBeenCalled();
+      expect(resumed.close).toHaveBeenCalledOnce();
+      expect(resumed.readThread).toHaveBeenCalledOnce();
+      expect(resumed.resumeThread).toHaveBeenCalledTimes(name.includes("resumed") ? 1 : 0);
+      await expect(new ExecutionContextService(value.root)
+        .getExecutionContext("workspace-1", "task-1", "execution-2")).resolves.toBeNull();
+    } finally { await restarted.close(); }
+  } finally { await value.backend.close().catch(() => undefined); }
 });
 
 it.each([true, false])("protects Session residue with explicit execution identity=%s", async explicit => {

@@ -41,6 +41,9 @@ export const executionBackendStartRequestSchema = z.object({
   execution_mode: executionModeSchema,
   model_id: executionModelIdSchema.optional(),
   reasoning_effort: reasoningEffortValueSchema.optional(),
+  /** Set only for continuation; backend selection is then fixed instead of renegotiated. */
+  backend: z.enum(["desktop_codex_app", "codex_app_server"]).optional(),
+  thread_id: z.string().min(1).max(256).optional(),
 }).strict();
 
 export type ExecutionBackendStartRequest = z.input<typeof executionBackendStartRequestSchema>;

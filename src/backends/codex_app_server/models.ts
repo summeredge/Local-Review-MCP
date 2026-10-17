@@ -51,6 +51,12 @@ export interface AppServerTurn {
   readonly error?: string;
 }
 
+export interface AppServerThreadSnapshot {
+  readonly thread_id: string;
+  readonly cwd: string;
+  readonly turns: readonly AppServerTurn[];
+}
+
 export interface StartThreadInput {
   readonly cwd?: string;
   readonly model?: string;
@@ -163,5 +169,33 @@ export function parseTurnStartResult(value: unknown): AppServerTurn {
       : status === "inProgress"
         ? "in_progress"
         : "unknown",
+  };
+}
+
+function parsedTurns(value: unknown, field: string): readonly AppServerTurn[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error(`Codex app-server response has an invalid ${field}.`);
+  return value.map((entry, index) => {
+    const turn = requiredRecord(entry, `${field}[${index}]`);
+    const status = optionalString(turn.status);
+    return {
+      turn_id: requiredString(turn.id, `${field}[${index}].id`),
+      status: status === "completed" || status === "interrupted" || status === "failed"
+        ? status
+        : status === "inProgress"
+          ? "in_progress"
+          : "unknown",
+      ...(optionalString(turn.error) === undefined ? {} : { error: turn.error as string }),
+    };
+  });
+}
+
+export function parseThreadSnapshot(value: unknown, method: string): AppServerThreadSnapshot {
+  const record = requiredRecord(value, `${method} result`);
+  const thread = requiredRecord(record.thread, `${method} thread`);
+  return {
+    thread_id: requiredString(thread.id, `${method} thread.id`),
+    cwd: requiredString(thread.cwd, `${method} thread.cwd`),
+    turns: parsedTurns(thread.turns, `${method} thread.turns`),
   };
 }

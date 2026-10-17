@@ -14,7 +14,7 @@ vi.mock("node:child_process", async () => {
 
 import { CodexAppServerClient } from "../src/backends/codex_app_server/client.js";
 import { parseCodexAppServerNotification } from "../src/backends/codex_app_server/events.js";
-import { parseRpcLine } from "../src/backends/codex_app_server/protocol.js";
+import { CodexAppServerNotDispatchedError, CodexAppServerRpcError, parseRpcLine } from "../src/backends/codex_app_server/protocol.js";
 import { CodexAppServerBackend } from "../src/backends/codex_app_server/backend.js";
 import { ExecutionContextService } from "../src/context/execution-service.js";
 import { SessionStore } from "../src/context/session-store.js";
@@ -217,6 +217,26 @@ describe("CodexAppServerClient protocol handling", () => {
       }
     }, 20);
     await expect(timeout.client.listModels()).rejects.toThrow(/request timed out: model\/list/iu);
+  });
+
+  it.each(["invalid input", "closed stdin", "rpc rejection", "timeout"])("classifies turn/start %s", async outcome => {
+    const { client, process } = await startFakeServer((request, fakeProcess) => {
+      if (request.method === "initialize") fakeProcess.respond({ id: request.id, result: initializeResult() });
+      if (request.method === "turn/start" && outcome === "rpc rejection") {
+        fakeProcess.respond({ id: request.id, error: { code: -32000, message: "turn rejected" } });
+      }
+    }, 20);
+    await client.initialize();
+    if (outcome === "closed stdin") process.stdin.destroy();
+    const error = await client.startTurn({ threadId: "thread-1", text: outcome === "invalid input" ? " " : "hello" })
+      .catch(error => error);
+    expect(error).toBeInstanceOf(Error);
+    expect(error instanceof CodexAppServerNotDispatchedError).toBe(["invalid input", "closed stdin"].includes(outcome));
+    expect(error instanceof CodexAppServerRpcError).toBe(outcome === "rpc rejection");
+    expect(process.requests.filter(request => request.method === "turn/start"))
+      .toHaveLength(["rpc rejection", "timeout"].includes(outcome) ? 1 : 0);
+    if (outcome === "timeout") expect(error.message).toMatch(/timed out: turn\/start/);
+    if (outcome === "closed stdin") process.closeProcess(0, null);
   });
 
   it("keeps model and effort in their respective thread and turn payloads", async () => {

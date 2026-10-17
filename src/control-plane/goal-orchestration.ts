@@ -443,7 +443,8 @@ export class GoalOrchestrationService {
     this.recoveryTimers.clear();
   }
 
-  private scheduleRecovery(goalId: string): void {
+  public scheduleRecovery(goalId: string): void {
+    goalIdSchema.parse(goalId);
     if (this.disposed || this.recoveryTimers.has(goalId)) return;
     const timer = setTimeout(() => {
       this.recoveryTimers.delete(goalId);

@@ -403,6 +403,12 @@ describe("Codex Event Adapter and LRM event stream", () => {
         status: "in_progress",
       }),
       events: (): AsyncIterable<CodexAppServerEvent> => stream,
+      readThread: async (input: { threadId: string }) => ({
+        thread_id: input.threadId, cwd: "", turns: [],
+      }),
+      resumeThread: async (input: { threadId: string; cwd: string }) => ({
+        thread_id: input.threadId, cwd: input.cwd, turns: [],
+      }),
       close: async (): Promise<CodexAppServerExit> => {
         stream.close();
         return { process_id: 9_001, exit_code: 0, signal: null, stdout: "", stderr: "" };

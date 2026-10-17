@@ -41,6 +41,9 @@ export class CodexAppServerRpcError extends Error {
   }
 }
 
+/** The transport has not submitted this request to the provider. */
+export class CodexAppServerNotDispatchedError extends Error {}
+
 export function jsonRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>

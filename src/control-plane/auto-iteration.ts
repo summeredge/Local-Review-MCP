@@ -16,6 +16,8 @@ import { ReviewRequestService } from "../context/review-request-service.js";
 import { ConversationRoutingService } from "../context/conversation-routing-service.js";
 import { ReviewDeliveryService } from "../context/review-delivery-service.js";
 import { ReviewResultService } from "../context/review-result-service.js";
+import { SessionStore } from "../context/session-store.js";
+import { sessionForExecution } from "../context/session-execution.js";
 import { reviewRequestIdSchema } from "../context/review-schema.js";
 import { conversationRoutingIdSchema } from "../context/conversation-routing-schema.js";
 import { reviewDeliveryIdSchema } from "../context/review-delivery-schema.js";
@@ -29,6 +31,7 @@ import {
   type ControlledActuationResult,
 } from "./controlled-actuation.js";
 import { DispatchCommandBroker } from "./dispatch-command-broker.js";
+import { ExecutionLaunchIndeterminateError } from "./execution-service.js";
 import {
   ExtensionDeliveryService,
   type ExtensionDeliveryReadinessCheck,
@@ -49,6 +52,7 @@ import {
 } from "../control/review-verdict-schema.js";
 import type { ReviewVerdict, ReviewVerdictIteration } from "../control/review-verdict.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
+import { EventStore } from "./events/store.js";
 
 const STATE_VERSION = 1;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
@@ -383,6 +387,8 @@ export class AutoIterationService {
   private readonly results: ReviewResultService;
   private readonly parser: Pick<ReviewVerdictParser, "parse">;
   private readonly authorizationStore: AuthorizationReader;
+  private readonly sessions: SessionStore;
+  private readonly events: Pick<EventStore, "listEvents">;
   private readonly flights = new Map<string, Promise<AutoIteration>>();
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
   private readonly infrastructureRetries = new Map<string, number>();
@@ -414,6 +420,8 @@ export class AutoIterationService {
     this.routings = options.routingService ?? new ConversationRoutingService(this.storageRoot);
     this.deliveries = options.reviewDeliveryService ?? new ReviewDeliveryService(this.storageRoot);
     this.results = options.reviewResultService ?? new ReviewResultService(this.storageRoot);
+    this.sessions = new SessionStore(this.storageRoot);
+    this.events = new EventStore(this.storageRoot);
     this.extensionDeliveries = options.extensionDeliveries ?? new ExtensionDeliveryService(this.storageRoot);
     const broker = options.dispatchCommandBroker ?? new DispatchCommandBroker(this.extensionDeliveries, {
       readiness: options.extensionDeliveryReadiness ?? conversationDeliveryReadiness,
@@ -504,7 +512,14 @@ export class AutoIterationService {
         && loop.workspace_id === parsed.workspace_id
         && loop.task_id === parsed.task_id
         && loop.execution_id === parsed.execution_id)
-      .map((loop) => this.advanceNotifiedLoop(loop, parsed)));
+      .map((loop) => {
+        if (this.flights.has(loop.loop_id)) {
+          // The active actuation may be awaiting this callback; follow up without awaiting it back.
+          void this.advanceNotifiedLoop(loop, parsed);
+          return;
+        }
+        return this.advanceNotifiedLoop(loop, parsed);
+      }));
   }
 
   public notifyExecutionTerminal(execution: ExecutionContext): Promise<void> {
@@ -1066,6 +1081,7 @@ export class AutoIterationService {
         ...(initial.model_id === undefined ? {} : { model_id: initial.model_id }),
         ...(initial.reasoning_effort === undefined ? {} : { reasoning_effort: initial.reasoning_effort }),
       };
+      const continuation = await this.continuation(loop, initial);
       let authorization: ActuationAuthorization | null = loop.authorization_id === undefined
         ? await this.authorizationStore.getAuthorizationByActuation(actuationId)
         : await this.authorizationStore.getAuthorization(loop.authorization_id);
@@ -1077,6 +1093,9 @@ export class AutoIterationService {
         try {
           authorization = await this.controlledActuation.authorize({
             ...configuration,
+            ...(continuation.kind === "verified"
+              ? { backend: continuation.backend, thread_id: continuation.thread_id }
+              : {}),
             actuation_id: actuationId,
             workspace_id: loop.workspace_id,
             task_id: loop.task_id,
@@ -1089,6 +1108,17 @@ export class AutoIterationService {
           authorization = recovered;
         }
       }
+      if (continuation.kind === "unverified") {
+        const claims = authorization.backend !== undefined
+          || authorization.thread_id !== undefined
+          || authorization.model_id !== initial.model_id
+          || authorization.reasoning_effort !== initial.reasoning_effort
+          || authorization.goal_id !== initial.goal_id;
+        await this.humanRequired(loop,
+          claims ? "AUTHORIZATION_IDENTITY_INVALID" : continuation.reason);
+        return;
+      }
+      const continuationIdentity = continuation.kind === "verified" ? continuation : undefined;
       if (authorization.actuation_id !== actuationId
         || authorization.workspace_id !== loop.workspace_id
         || authorization.task_id !== loop.task_id
@@ -1097,7 +1127,9 @@ export class AutoIterationService {
         || authorization.goal_id !== configuration.goal_id
         || authorization.execution_mode !== configuration.execution_mode
         || authorization.model_id !== configuration.model_id
-        || authorization.reasoning_effort !== configuration.reasoning_effort) {
+        || authorization.reasoning_effort !== configuration.reasoning_effort
+        || authorization.backend !== continuationIdentity?.backend
+        || authorization.thread_id !== continuationIdentity?.thread_id) {
         await this.humanRequired(loop, "AUTHORIZATION_IDENTITY_INVALID");
         return;
       }
@@ -1123,7 +1155,14 @@ export class AutoIterationService {
           current.task_id,
           current.execution_id,
         );
-        if (execution?.status === "failed") {
+        // A continuation that could not prove the original Thread is unrecoverable, not a failed
+        // backend attempt: route it to human handling so another Thread is never started.
+        if (execution === null && continuationIdentity !== undefined) {
+          await this.humanRequired(current, "INITIAL_EXECUTION_NOT_CONTINUABLE", errorMessage(error));
+        } else if (error instanceof ExecutionLaunchIndeterminateError
+          || (error instanceof Error && error.cause instanceof ExecutionLaunchIndeterminateError)) {
+          await this.humanRequired(current, "ACTUATION_UNCERTAIN", errorMessage(error));
+        } else if (execution?.status === "failed") {
           await this.failed(current, "ACTUATION_FAILED", execution.summary);
         } else {
           await this.humanRequired(current, "ACTUATION_UNCERTAIN", errorMessage(error));
@@ -1159,6 +1198,42 @@ export class AutoIterationService {
     }
     this.notifyTerminal(current);
     return current;
+  }
+
+  /**
+   * The initial interactive Session is the only trusted record of the backend and Thread the first
+   * Execution actually used. A missing or inconsistent pair must not be renegotiated.
+   */
+  private async continuation(
+    loop: AutoIteration,
+    initial: ActuationAuthorization,
+  ): Promise<
+    | { readonly kind: "none" }
+    | { readonly kind: "verified"; readonly backend: "desktop_codex_app" | "codex_app_server"; readonly thread_id: string }
+    | { readonly kind: "unverified"; readonly reason: "INITIAL_EXECUTION_NOT_CONTINUABLE" | "AUTHORIZATION_IDENTITY_INVALID" }
+  > {
+    if (initial.execution_mode !== "interactive") return { kind: "none" };
+    const execution = await this.executions.getExecutionContext(
+      loop.workspace_id, loop.task_id, loop.initial_execution_id,
+    );
+    const session = execution === null || initial.goal_id === undefined ? undefined : await sessionForExecution(
+      (await this.sessions.listSessions()).filter((candidate) =>
+        candidate.goal_id === initial.goal_id
+        && candidate.task_id === loop.task_id
+        && candidate.backend_type !== "cli"),
+      execution,
+      await this.executions.listExecutions(loop.workspace_id, loop.task_id),
+      this.events,
+    );
+    if (execution?.status !== "passed" || session === undefined) {
+      return { kind: "unverified", reason: "INITIAL_EXECUTION_NOT_CONTINUABLE" };
+    }
+    if (session.execution_id !== loop.initial_execution_id
+      || session.thread_id === undefined
+      || session.backend_type === "cli") {
+      return { kind: "unverified", reason: "INITIAL_EXECUTION_NOT_CONTINUABLE" };
+    }
+    return { kind: "verified", backend: session.backend_type, thread_id: session.thread_id };
   }
 
   private async advanceNotifiedLoop(

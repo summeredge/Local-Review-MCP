@@ -1683,9 +1683,9 @@ class LauncherDashboardTests(unittest.TestCase):
                 {**payload["events"][-1], "sequence": 4},
             ]},
         ]
-        checker = StatusChecker(workspace_id="workspace-1")
+        checker = StatusChecker(workspace_id="workspace-default")
         with patch.object(checker, "_call_tool", side_effect=pages) as query:
-            events = checker._session_events("session-1", "thread-1")
+            events = checker._session_events("session-1", "thread-1", "workspace-1")
         self.assertEqual([call.args[1]["after_sequence"] for call in query.call_args_list], [0, 2])
         self.assertTrue(all(call.args[1]["workspace_id"] == "workspace-1" for call in query.call_args_list))
         view = build_execution_view_model(summary, events)
@@ -1700,7 +1700,7 @@ class LauncherDashboardTests(unittest.TestCase):
                         {**pages[0], "events": []}):
             with self.subTest(page=invalid), patch.object(checker, "_call_tool", side_effect=[pages[0], invalid]):
                 with self.assertRaises(StatusQueryError):
-                    checker._session_events("session-1", "thread-1")
+                    checker._session_events("session-1", "thread-1", "workspace-1")
 
 
 class SingleInstanceAndTrayTests(unittest.TestCase):

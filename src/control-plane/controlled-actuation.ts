@@ -62,6 +62,10 @@ export interface ActuationAuthorizationInput {
   readonly execution_mode: ExecutionMode;
   readonly model_id?: string;
   readonly reasoning_effort?: ReasoningEffortValue;
+  /** Exact backend of the initial Execution. ITERATE reuses it instead of renegotiating. */
+  readonly backend?: "desktop_codex_app" | "codex_app_server";
+  /** Original Thread of the initial Execution; required for interactive continuation. */
+  readonly thread_id?: string;
 }
 
 export interface ActuationAuthorization extends ActuationAuthorizationInput {
@@ -102,6 +106,8 @@ export const actuationAuthorizationInputSchema = z.object({
   execution_mode: executionModeSchema,
   model_id: z.string().min(1).max(256).optional(),
   reasoning_effort: reasoningEffortValueSchema.optional(),
+  backend: z.enum(["desktop_codex_app", "codex_app_server"]).optional(),
+  thread_id: z.string().min(1).max(256).optional(),
 }).strict();
 
 export const actuationAuthorizationSchema = actuationAuthorizationInputSchema.extend({
@@ -697,6 +703,8 @@ export class ControlledActuationService {
         ...(authorization.reasoning_effort === undefined
           ? {}
           : { reasoning_effort: authorization.reasoning_effort }),
+        ...(authorization.backend === undefined ? {} : { backend: authorization.backend }),
+        ...(authorization.thread_id === undefined ? {} : { thread_id: authorization.thread_id }),
       };
       started = await this.adapter.start(request);
     } catch (error: unknown) {

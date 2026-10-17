@@ -2,6 +2,7 @@ import { sessionForExecution, syncTerminalSession } from "../../context/session-
 import { resolve } from "node:path";
 import { ExecutionContextService } from "../../context/execution-service.js";
 import { SessionStore } from "../../context/session-store.js";
+import { AutoIterationStore, type AutoIteration } from "../../control-plane/auto-iteration.js";
 import { TaskContextService } from "../../context/service.js";
 import type { ExecutionContext, Session } from "../../context/types.js";
 import { defaultTaskContextStorageRoot } from "../../context/task.js";
@@ -12,6 +13,7 @@ import { EventStore } from "../../control-plane/events/store.js";
 import type { LrmEvent } from "../../control-plane/events/model.js";
 import { CodexEventAdapter } from "./event-adapter.js";
 import { CodexAppServerClient } from "./client.js";
+import { CodexAppServerNotDispatchedError, CodexAppServerRpcError } from "./protocol.js";
 import type {
   AppServerModel,
   CodexAppServerClientOptions,
@@ -20,6 +22,7 @@ import type {
 } from "./models.js";
 import {
   executionBackendStartRequestSchema,
+  ExecutionLaunchIndeterminateError,
   type ExecutionBackend,
   type ExecutionBackendStartRequest,
   type ExecutionStartResult,
@@ -50,8 +53,15 @@ interface WatcherEntry {
 
 type AppServerClient = Pick<
   CodexAppServerClient,
-  "processInfo" | "listModels" | "startThread" | "startTurn" | "events" | "close"
+  "processInfo" | "listModels" | "startThread" | "startTurn" | "readThread" | "resumeThread" | "events" | "close"
 >;
+
+interface ContinuationTarget {
+  readonly threadId: string;
+  readonly turnId: string;
+  /** Present only when this runtime still holds the exact Client that started the prior Turn. */
+  readonly client?: AppServerClient;
+}
 
 export type AppServerClientFactory = (
   options: CodexAppServerClientOptions,
@@ -216,17 +226,25 @@ export class CodexAppServerBackend implements ExecutionBackend {
       request.execution_id,
     );
     if (existing !== null) return this.existing(request, existing);
-
-    const staleSession = await this.findSession(request);
-    if (staleSession !== null) {
-      throw new Error(`Interactive Session "${staleSession.session_id}" exists without its Execution.`);
-    }
+    const loop = await this.iterationLoop(request);
+    // Nothing has been dispatched yet, so a refused continuation is not a failed backend attempt.
+    // Report it as indeterminate so AutoIteration stops for a human instead of recording failure.
+    const continuation = loop === undefined ? undefined : await this.resumeContinuation(
+      request, cwd, loop,
+    ).catch((error: unknown) => {
+      throw new ExecutionLaunchIndeterminateError(errorMessage(error), { cause: error });
+    });
 
     let session: Session | undefined;
     let execution: ExecutionContext | undefined;
-    let client: AppServerClient | undefined;
+    let client = continuation?.client;
+    const borrowedClient = client !== undefined && [...this.clients.values()].includes(client);
     let stage = "backend_connect";
     try {
+      const staleSession = await this.findSession(request);
+      if (staleSession !== null) {
+        throw new Error(`Interactive Session "${staleSession.session_id}" exists without its Execution.`);
+      }
       session = await this.sessions.createSession({
         execution_id: request.execution_id,
         goal_id: request.goal_id!,
@@ -244,12 +262,13 @@ export class CodexAppServerBackend implements ExecutionBackend {
         command: APP_SERVER_COMMAND,
       });
 
-      client = await this.clientFactory({
+      client ??= continuation?.client ?? await this.clientFactory({
         cwd,
         ...(this.executable === undefined ? {} : { executable: this.executable }),
         environment: this.environment,
         ...(this.requestTimeoutMs === undefined ? {} : { requestTimeoutMs: this.requestTimeoutMs }),
       });
+      if (client === undefined) throw new Error("Codex app-server continuation has no client.");
       const processId = client.processInfo.process_id;
       if (!Number.isInteger(processId) || processId <= 0) {
         throw new Error("Codex app-server did not expose a valid process identity.");
@@ -272,32 +291,35 @@ export class CodexAppServerBackend implements ExecutionBackend {
         ...(effort === undefined ? {} : { reasoning_effort: effort }),
       });
 
-      stage = "thread/start";
-      const thread = await client.startThread(threadInput(cwd, model));
+      stage = continuation === undefined ? "thread/start" : "thread/reuse";
+      const threadId = continuation === undefined
+        ? (await client.startThread(threadInput(cwd, model))).thread_id
+        : continuation.thread_id;
       session = await this.sessions.updateSession(session.session_id, {
         status: "active",
-        thread_id: thread.thread_id,
+        thread_id: threadId,
       });
 
       stage = "turn/start";
-      const turn = await client.startTurn(turnInput(thread.thread_id, request.instruction, model, effort));
+      const turn = await client.startTurn(turnInput(threadId, request.instruction, model, effort));
+      stage = "turn/result";
       const eventAdapter = new CodexEventAdapter({
         session_id: session.session_id,
         execution_id: request.execution_id,
-        thread_id: thread.thread_id,
+        thread_id: threadId,
         turn_id: turn.turn_id,
       });
       if (turn.status === "completed") {
         await this.recordEvent(eventAdapter.adapt({
           type: "turn_completed",
-          thread_id: thread.thread_id,
+          thread_id: threadId,
           turn_id: turn.turn_id,
         }));
-        await this.complete(request, session.session_id, thread.thread_id, turn.turn_id);
+        await this.complete(request, session.session_id, threadId, turn.turn_id);
       } else if (turn.status === "failed") {
         await this.recordEvent(eventAdapter.adapt({
           type: "turn_failed",
-          thread_id: thread.thread_id,
+          thread_id: threadId,
           turn_id: turn.turn_id,
         }));
         await this.fail(request, session.session_id, turn.turn_id);
@@ -307,7 +329,7 @@ export class CodexAppServerBackend implements ExecutionBackend {
           client,
           request,
           session.session_id,
-          thread.thread_id,
+          threadId,
           turn.turn_id,
           eventAdapter,
         );
@@ -319,7 +341,7 @@ export class CodexAppServerBackend implements ExecutionBackend {
         started_at: execution.started_at,
         accepted: "new",
         session_id: session.session_id,
-        thread_id: thread.thread_id,
+        thread_id: threadId,
         turn_id: turn.turn_id,
       };
     } catch (error: unknown) {
@@ -327,7 +349,15 @@ export class CodexAppServerBackend implements ExecutionBackend {
         error.message = `AppServer stage=${stage} model=${request.model_id ?? "default"} reasoning_effort=${request.reasoning_effort ?? "default"}: ${error.message}`;
       }
       if (client !== undefined && session !== undefined) this.clients.delete(session.session_id);
-      await client?.close().catch(() => undefined);
+      if (!borrowedClient) await client?.close().catch(() => undefined);
+      // The request may have reached the provider before the response was lost. There is no turn
+      // identity to observe, so the honest outcome is "unknown": stop for a human, never resend.
+      if (stage === "turn/start" && !(error instanceof CodexAppServerRpcError)
+        && !(error instanceof CodexAppServerNotDispatchedError)) {
+        if (execution !== undefined) await this.terminate(execution, session?.session_id,
+          `AppServer turn/start outcome unknown; no retry: ${errorMessage(error)}`, "terminated");
+        throw new ExecutionLaunchIndeterminateError(errorMessage(error), { cause: error });
+      }
       await this.failLaunch(request, session, execution, error);
       throw error;
     }
@@ -362,6 +392,116 @@ export class CodexAppServerBackend implements ExecutionBackend {
       session_id: session.session_id,
       thread_id: session.thread_id,
     };
+  }
+
+  /**
+   * ITERATE target resolution. The initial Session carries the Thread the first Execution used;
+   * a running prior Turn or a missing Session is not proof that another Turn may be submitted.
+   * A live Client is reused only when it is still tracked for a Session of this same Thread.
+   */
+  private async continuationTarget(
+    request: ExecutionBackendStartRequest,
+    cwd: string,
+    loop: AutoIteration,
+  ): Promise<ContinuationTarget | undefined> {
+    const initialId = loop.initial_execution_id;
+    if (initialId === request.execution_id) return undefined;
+    const initial = await this.executions.getExecutionContext(
+      request.workspace_id, request.task_id, initialId,
+    );
+    const sessions = await this.sessions.listSessions();
+    const initialSession = initial === null ? undefined : await sessionForExecution(
+      sessions.filter((session) => session.backend_type === "codex_app_server"
+        && session.goal_id === request.goal_id
+        && session.task_id === request.task_id),
+      initial,
+      await this.executions.listExecutions(request.workspace_id, request.task_id),
+      this.events,
+    );
+    if (initial?.command !== APP_SERVER_COMMAND || initial.status !== "passed"
+      || initialSession === null || initialSession === undefined
+      || initialSession.execution_id !== initialId
+      || initialSession.backend_type !== "codex_app_server"
+      || initialSession.thread_id === undefined) {
+      throw new Error(
+        "Initial AppServer Execution has no verified completed Turn and original Thread; continuation requires human handling.",
+      );
+    }
+    const threadId = initialSession.thread_id;
+    if (request.thread_id !== threadId) {
+      throw new Error("Authorized Thread differs from the initial AppServer Session Thread.");
+    }
+    const turns = (await this.events.listEvents(initialSession.session_id))
+      .filter((event) => event.execution_id === initialId
+        && event.thread_id === threadId
+        && event.event_type === "turn_completed");
+    if (turns.length !== 1 || !("turn_id" in turns[0]!) || turns[0]!.turn_id === undefined) {
+      throw new Error("Initial AppServer Execution has no durable completed Turn; refusing to resend.");
+    }
+    const sessionIds = new Set((await this.sessions.listSessions())
+      .filter((session) => session.backend_type === "codex_app_server"
+        && session.task_id === request.task_id
+        && session.thread_id === threadId)
+      .map((session) => session.session_id));
+    const live = [...this.clients.entries()].find(([sessionId]) => sessionIds.has(sessionId))?.[1];
+    return { threadId, turnId: turns[0]!.turn_id, ...(live === undefined ? {} : { client: live }) };
+  }
+
+  private async iterationLoop(request: ExecutionBackendStartRequest): Promise<AutoIteration | undefined> {
+    const loops = (await new AutoIterationStore(this.storageRoot).list()).filter((loop) =>
+      loop.workspace_id === request.workspace_id
+      && loop.task_id === request.task_id
+      && loop.execution_id === request.execution_id);
+    if (loops.length > 1) throw new Error("AppServer iteration identity is ambiguous.");
+    return loops[0];
+  }
+
+  /** Verify both persisted and provider-visible thread identity before submitting a new Turn. */
+  private async verifyContinuation(
+    client: AppServerClient,
+    target: ContinuationTarget,
+    cwd: string,
+  ): Promise<void> {
+    const persisted = await client.readThread({ threadId: target.threadId, includeTurns: true });
+    if (persisted.thread_id !== target.threadId || resolve(persisted.cwd) !== resolve(cwd)
+      || !persisted.turns.some((turn) => turn.turn_id === target.turnId && turn.status === "completed")) {
+      throw new Error("Original AppServer Thread identity or completed Turn cannot be verified.");
+    }
+    const resumed = await client.resumeThread({ threadId: target.threadId, cwd });
+    if (resumed.thread_id !== target.threadId || resolve(resumed.cwd) !== resolve(cwd)
+      || !resumed.turns.some((turn) => turn.turn_id === target.turnId && turn.status === "completed")) {
+      throw new Error("Codex app-server resumed a different Thread; refusing to continue.");
+    }
+  }
+
+  /**
+   * Reuse a live client in this runtime; otherwise reconnect and resume the exact persisted Thread.
+   * The extra read verifies the provider's stored cwd and a completed Turn before any new input.
+   */
+  private async resumeContinuation(
+    request: ExecutionBackendStartRequest,
+    cwd: string,
+    loop: AutoIteration,
+  ): Promise<{ readonly client: AppServerClient; readonly thread_id: string }> {
+    const target = await this.continuationTarget(request, cwd, loop);
+    if (target === undefined) throw new Error("AppServer continuation has no initial Thread.");
+    if (target.client !== undefined) {
+      await this.verifyContinuation(target.client, target, cwd);
+      return { client: target.client, thread_id: target.threadId };
+    }
+    const client = await this.clientFactory({
+      cwd,
+      ...(this.executable === undefined ? {} : { executable: this.executable }),
+      environment: this.environment,
+      ...(this.requestTimeoutMs === undefined ? {} : { requestTimeoutMs: this.requestTimeoutMs }),
+    });
+    try {
+      await this.verifyContinuation(client, target, cwd);
+    } catch (error: unknown) {
+      await client.close().catch(() => undefined);
+      throw error;
+    }
+    return { client, thread_id: target.threadId };
   }
 
   /**
@@ -577,20 +717,21 @@ export class CodexAppServerBackend implements ExecutionBackend {
 
   /**
    * Single terminal write for every path where the turn will not produce further evidence:
-   * backend shutdown and startup orphan reconciliation. A non-running Execution is left alone, so
+   * unknown launch, backend shutdown and startup orphan reconciliation. A non-running Execution is left alone, so
    * an already terminal record is never downgraded and never notified twice.
    */
   private async terminate(
     execution: ExecutionContext,
     sessionId: string | undefined,
     summary: string,
+    status: "failed" | "terminated" = "failed",
   ): Promise<ExecutionContext | null> {
     if (execution.status !== "running") return null;
     const next = await this.executions.updateExecutionContext(
       execution.workspace_id,
       execution.task_id,
       execution.execution_id,
-      { status: "failed", summary: boundedSummary(summary, summary) },
+      { status, summary: boundedSummary(summary, summary) },
     );
     if (sessionId !== undefined) {
       await syncTerminalSession(this.sessions, sessionId, next);

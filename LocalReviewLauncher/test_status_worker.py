@@ -810,7 +810,7 @@ class StatusCheckerTests(unittest.TestCase):
         }
         app_server = {
             "execution_id": "execution-app-server",
-            "workspace_id": "workspace-1",
+            "workspace_id": "workspace-2",
             "task_id": "task-app-server",
             "goal_id": "goal-app-server",
             "name": "AppServer fallback",
@@ -839,7 +839,9 @@ class StatusCheckerTests(unittest.TestCase):
         ) as execution_events, patch.object(
             checker,
             "_session_events",
-            side_effect=lambda session_id, thread_id: {"session_id": session_id, "events": []},
+            side_effect=lambda session_id, thread_id, workspace_id: {
+                "session_id": session_id, "events": [],
+            },
         ) as session_events:
             result = checker.dashboard_executions()
 
@@ -852,6 +854,8 @@ class StatusCheckerTests(unittest.TestCase):
                          ["CLI Batch", "Desktop", "AppServer"])
         self.assertEqual([execution.display_mode for execution in result],
                          ["batch", "interactive", "interactive"])
+        self.assertEqual([execution.workspace_id for execution in result],
+                         ["workspace-1", "workspace-1", "workspace-2"])
 
         # A batch Execution owns no Session or Thread; its own event source may be empty.
         self.assertIsNone(result[0].session)
@@ -876,7 +880,8 @@ class StatusCheckerTests(unittest.TestCase):
         self.assertFalse(result[2].can_open_codex_task)
         self.assertEqual(
             [call.args for call in session_events.call_args_list],
-            [("session-1", "thread-1"), ("session-2", "thread-2")],
+            [("session-1", "thread-1", "workspace-1"),
+             ("session-2", "thread-2", "workspace-2")],
         )
         execution_events.assert_called_once_with(
             execution_id="execution-batch", workspace_id="workspace-1", task_id="task-batch",
