@@ -80,6 +80,10 @@ function isDefaultSensitive(relativePath: string): boolean {
   const segments = relativePath === "." ? [] : relativePath.split("/");
   const names = segments.map(comparable);
 
+  if (names[0] === "config.production.json" || names[0] === "config.e2e.json"
+    || /^config\.production\.backup-.*\.json$/u.test(names[0] ?? "")
+    || (names[0] === comparable("LocalReviewLauncher") && names[1] === "launcher.config.json")) return true;
+
   for (const name of names) {
     if (name === ".git" || name === ".ssh" || name === ".aws"
       || name === ".gnupg" || name === ".cloudflared") return true;
