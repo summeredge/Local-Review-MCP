@@ -1241,7 +1241,7 @@ describe("Desktop interactive Goal model and reasoning effort", () => {
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
     await authorizeAndActuate(value, { instruction: withLegacyExecutionContext(INSTRUCTION) }, "terminal");
     const createThread = value.desktop.calls.find((call) => call.name === "create_thread")!;
-    expect(createThread.arguments.prompt).toBe(INSTRUCTION);
+    expect(createThread.arguments!.prompt).toBe(INSTRUCTION);
   });
 
   it("keeps the Desktop route unchanged when no provider model is given", async () => {
