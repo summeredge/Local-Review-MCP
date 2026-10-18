@@ -9,6 +9,7 @@ import {
   ExecutionBackendRouter,
   ExecutionService,
   ExecutionLaunchIndeterminateError,
+  withLegacyExecutionContext,
   type ExecutionBackend,
   type ExecutionBackendStartRequest,
   type ExecutionStartResult,
@@ -1233,6 +1234,14 @@ describe("Desktop interactive Goal model and reasoning effort", () => {
     // The Session keeps the canonical model selection; only the provider call renames it.
     const session = (await value.sessions.listSessions())[0]!;
     expect(session).toMatchObject({ model_id: "gpt-5.6-luna", reasoning_effort: "max" });
+  });
+
+  it("strips only the exact historical role prefix before Codex dispatch", async () => {
+    const value = await fixture();
+    value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
+    await authorizeAndActuate(value, { instruction: withLegacyExecutionContext(INSTRUCTION) }, "terminal");
+    const createThread = value.desktop.calls.find((call) => call.name === "create_thread")!;
+    expect(createThread.arguments.prompt).toBe(INSTRUCTION);
   });
 
   it("keeps the Desktop route unchanged when no provider model is given", async () => {

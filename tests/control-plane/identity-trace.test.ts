@@ -92,10 +92,12 @@ describe("IdentityTraceService", () => {
     const registry = WorkspaceRegistry.fromManager(new WorkspaceManager(workspace));
     const correlations = new ConversationCorrelationRegistry(root);
     const trace = new IdentityTraceService(root);
+    let now = Date.now();
     const submitGoal = vi.fn(async (request: GoalSubmissionRequest) => result(request));
     const pending = new PendingGoalSubmissionService(correlations, { submitGoal }, {
       storageRoot: root,
       identityTrace: trace,
+      now: () => now,
     });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const server = createMcpServer({
@@ -113,6 +115,8 @@ describe("IdentityTraceService", () => {
       arguments: { ...input(KEY_A, registry.active.id), execution_mode: "interactive" },
     });
     expect(accepted.isError).not.toBe(true);
+    const waiting = await client.callTool({ name: "get_identity_trace", arguments: { correlation_key: KEY_A } });
+    expect(waiting.structuredContent).toMatchObject({ submission: { correlation_key: KEY_A, state: "pending_identity" } });
 
     const currentEvidence = evidence(KEY_A, "conversation-a");
     trace.record({
@@ -131,6 +135,9 @@ describe("IdentityTraceService", () => {
       arguments: { correlation_key: KEY_A },
     });
     const events = (queried.structuredContent as { events: Array<Record<string, unknown>> }).events;
+    expect(queried.structuredContent).toMatchObject({ submission: {
+      correlation_key: KEY_A, state: "started", goal_id: "goal-conversation-a", execution_id: "execution-trace",
+    } });
     expect(events.map((event) => event.event)).toEqual([
       "submit_goal_received",
       "pending_created",
@@ -157,6 +164,19 @@ describe("IdentityTraceService", () => {
     expect(contents).not.toContain(KEY_A);
     expect(contents).not.toContain('"conversation_id":"conversation-a"');
     expect(events.every((event) => !("correlation_key" in event) && !("conversation_id" in event))).toBe(true);
+
+    await pending.accept(input(KEY_B, registry.active.id), { source: "authenticated_mcp_invocation" });
+    now += PENDING_GOAL_SUBMISSION_TTL_MS;
+    await pending.expire(KEY_B);
+    const failed = await client.callTool({ name: "get_identity_trace", arguments: { correlation_key: KEY_B } });
+    expect(failed.structuredContent).toMatchObject({ submission: {
+      correlation_key: KEY_B, state: "failed", error: "pending_identity_expired",
+      message: expect.stringContaining("不代表其他 Codex 会话未启动"),
+    } });
+    expect((failed.structuredContent as { submission: object }).submission).not.toHaveProperty("goal_id");
+    const original = await client.callTool({ name: "get_identity_trace", arguments: { correlation_key: KEY_A } });
+    expect(original.structuredContent).toMatchObject({ submission: { correlation_key: KEY_A, state: "started" } });
+    expect(submitGoal).toHaveBeenCalledTimes(1);
   });
 
   it("records the pending expiry boundary", async () => {

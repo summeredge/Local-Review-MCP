@@ -31,7 +31,7 @@ import {
   type ControlledActuationResult,
 } from "./controlled-actuation.js";
 import { DispatchCommandBroker } from "./dispatch-command-broker.js";
-import { ExecutionLaunchIndeterminateError } from "./execution-service.js";
+import { ExecutionLaunchIndeterminateError, withLegacyExecutionContext } from "./execution-service.js";
 import {
   ExtensionDeliveryService,
   type ExtensionDeliveryReadinessCheck,
@@ -226,7 +226,7 @@ export function executionFailureNotificationId(loop: Pick<AutoIteration, "loop_i
   return `auto-failure-notification-${digest}`;
 }
 
-function iterationInstruction(iteration: ReviewVerdictIteration): string {
+export function iterationInstruction(iteration: ReviewVerdictIteration): string {
   const parsed = reviewVerdictIterationSchema.parse(iteration);
   return [
     "## 修改目标",
@@ -1052,7 +1052,7 @@ export class AutoIterationService {
         await this.humanRequired(loop, "ITERATION_PAYLOAD_MISSING");
         return;
       }
-      const instruction = iterationInstruction(pendingIteration);
+      const instruction = buildAutoIterationInstruction(pendingIteration);
       // The initial authorization is the durable routing baseline, even after a restart.
       let initial: ActuationAuthorization | null;
       try {
@@ -1123,7 +1123,8 @@ export class AutoIterationService {
         || authorization.workspace_id !== loop.workspace_id
         || authorization.task_id !== loop.task_id
         || authorization.execution_id !== loop.execution_id
-        || authorization.instruction !== instruction
+        || (authorization.instruction !== instruction
+          && authorization.instruction !== withLegacyExecutionContext(instruction))
         || authorization.goal_id !== configuration.goal_id
         || authorization.execution_mode !== configuration.execution_mode
         || authorization.model_id !== configuration.model_id

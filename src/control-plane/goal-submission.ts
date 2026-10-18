@@ -47,7 +47,12 @@ export const goalSubmissionRequestSchema = z.object({
 export const goalSubmissionToolInputSchema = goalSubmissionRequestSchema
   .omit({ workspace_id: true, conversation_id: true })
   .extend({ workspace_id: z.string().min(1).max(128).optional() })
-  .extend({ correlation_key: correlationKeySchema })
+  .extend({
+    correlation_key: correlationKeySchema,
+    goal: submissionTextSchema.describe("Code change objective for Codex; do not include LRM dispatch or session creation steps."),
+    requirements: submissionItemsSchema.describe("Implementation requirements only; put workspace, execution mode and model in their dedicated fields."),
+    acceptance_criteria: submissionItemsSchema.describe("Verifiable outcomes of the code change, not task routing instructions."),
+  })
   .strict();
 
 export const resolvedGoalSubmissionRequestSchema = goalSubmissionRequestSchema

@@ -8,9 +8,26 @@ import {
   autoIterationSchema,
   autoIterationStateFile,
   buildAutoIterationInstruction,
+  iterationInstruction,
   type AutoIteration,
   type AutoIterationStartInput,
 } from "../../src/control-plane/auto-iteration.js";
+import { withLegacyExecutionContext } from "../../src/control-plane/execution-service.js";
+
+it("builds a plain business instruction without an execution role prefix", () => {
+  const task = {
+    goal: "修复 submit_goal 工具的状态回执代码",
+    requirements: ["保留 correlation_key 和原有状态查询行为"],
+    acceptance_criteria: ["状态回归测试通过"],
+  };
+  const instruction = buildAutoIterationInstruction(task);
+  expect(instruction).toBe([
+    "## 修改目标", task.goal, "", "## 修改要求",
+    ...task.requirements.map((item) => `- ${item}`), "", "## 验收标准",
+    ...task.acceptance_criteria.map((item) => `- ${item}`),
+  ].join("\n"));
+  expect(instruction).not.toContain("你当前处于 Local Review MCP 已派发");
+});
 import {
   ActuationAuthorizationStore,
   ControlledActuationService,
@@ -1429,7 +1446,7 @@ describe("AutoIterationService", () => {
       requirements: ["Keep the launch idempotent"],
       acceptance_criteria: ["Only one process is started"],
     };
-    const instruction = buildAutoIterationInstruction(pendingIteration);
+    const instruction = withLegacyExecutionContext(iterationInstruction(pendingIteration));
     const authorization = await value.auto.controlledActuation.authorize({
       actuation_id: "actuation-recovery",
       workspace_id: "workspace-a",

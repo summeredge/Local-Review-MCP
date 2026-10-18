@@ -115,6 +115,15 @@ export const identityTraceQueryInputSchema = z.object({
 
 export const identityTraceOutputSchema = z.object({
   events: z.array(identityTraceQueryEventSchema).max(10_000),
+  submission: z.object({
+    correlation_key: correlationKeySchema,
+    state: z.enum(["pending_identity", "starting", "started", "failed", "indeterminate"]),
+    error: z.string().max(4_000).optional(),
+    goal_id: traceIdSchema.optional(),
+    task_id: traceIdSchema.optional(),
+    execution_id: traceIdSchema.optional(),
+    message: z.string(),
+  }).strict().optional(),
 }).strict();
 
 export type IdentityTraceQueryInput = z.input<typeof identityTraceQueryInputSchema>;

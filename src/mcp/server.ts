@@ -84,7 +84,7 @@ export interface McpRuntimeContext {
   readonly registry: WorkspaceRegistry;
   readonly correlations?: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">;
   readonly goalSubmission?: Pick<GoalSubmissionService, "submitExternalGoal">;
-  readonly pendingGoalSubmission?: Pick<PendingGoalSubmissionService, "accept">;
+  readonly pendingGoalSubmission?: Pick<PendingGoalSubmissionService, "accept"> & Partial<Pick<PendingGoalSubmissionService, "get">>;
   readonly identityTrace?: Pick<IdentityTraceService, "getIdentityTrace" | "record">;
   readonly evidenceTransportTrace?: Pick<
     EvidenceTransportTraceService,
@@ -1131,7 +1131,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "get_identity_trace",
     {
-      description: "Read hashed identity evidence trace events for one submit_goal correlation key.",
+      description: "Read identity evidence events and the durable submission state for exactly one submit_goal correlation_key. A pending_identity_expired failure applies only to this request, never to other Goals or Codex Sessions. For a started submission, use its execution_id with get_execution_status to read the associated Session and thread. Do not retry or resubmit automatically.",
       inputSchema: identityTraceQueryInputSchema,
       outputSchema: identityTraceOutputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
@@ -1141,7 +1141,22 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
         if (context.identityTrace === undefined) {
           return toToolError(new Error("Identity trace runtime is unavailable."));
         }
-        return structuredResponse(identityTraceOutputSchema, await context.identityTrace.getIdentityTrace(input));
+        const trace = await context.identityTrace.getIdentityTrace(input);
+        const record = await context.pendingGoalSubmission?.get?.(input.correlation_key);
+        const result = record?.state === "started" ? record
+          : record?.state === "failed" || record?.state === "indeterminate" ? record.result : undefined;
+        return structuredResponse(identityTraceOutputSchema, {
+          ...trace,
+          ...(record == null ? {} : { submission: {
+            correlation_key: record.correlation_key,
+            state: record.state,
+            ...("error" in record ? { error: record.error } : {}),
+            ...(result === undefined ? {} : {
+              goal_id: result.goal_id, task_id: result.task_id, execution_id: result.execution_id,
+            }),
+            message: "本状态仅适用于此 correlation_key；pending_identity 表示等待网页身份证据，starting 表示身份已匹配，started 表示 Goal 启动已确认。身份超时不代表其他 Codex 会话未启动；不要自动重试或重新派发。",
+          } }),
+        });
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -1174,7 +1189,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "submit_goal",
     {
-      description: "Control Plane: durably accept a Goal for the current ChatGPT conversation. Resolve workspace_id from the explicitly requested project or the project associated with this conversation using workspace_list; only a uniquely registered workspace may be inferred when omitted. Never substitute the active/default workspace for an ambiguous target. execution_mode defaults to interactive (Desktop/AppServer); explicit batch uses the CLI. The model must generate a new UUID v4 correlation_key for every invocation and never reuse one; users do not need to provide it manually. The Goal starts asynchronously after exact canonical Extension evidence proves the conversation.",
+      description: "Web ChatGPT Control Plane only; a dispatched Codex execution must directly edit/test its Workspace and must not call this tool. Durably accept a Goal for the current web conversation. accepted=true means receipt only, not Goal or Codex Session startup; query get_identity_trace with this correlation_key for progress. Put implementable code changes only in goal, requirements and acceptance_criteria. Workspace, model, execution_mode and dispatch mechanics are Control Plane parameters, never Codex task steps. Resolve workspace_id from the explicitly requested project or the project associated with this conversation using workspace_list; only a uniquely registered workspace may be inferred when omitted. Never substitute the active/default workspace for an ambiguous target. execution_mode defaults to interactive (Desktop/AppServer); explicit batch uses the CLI. The model must generate a new UUID v4 correlation_key for every invocation and never reuse one; users do not need to provide it manually. The Goal starts asynchronously only after exact canonical Extension evidence proves this call's web conversation. OAuth authentication or an online Extension alone is not web identity proof. A failure applies only to this correlation_key; never automatically retry or resubmit.",
       inputSchema: goalSubmissionToolInputSchema,
       outputSchema: goalSubmissionAcceptedSchema,
     },

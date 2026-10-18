@@ -139,12 +139,28 @@ export class ExecutionBackendRouter implements ExecutionBackend {
   }
 }
 
+// Exact legacy prefix retained only for historical authorization compatibility.
+const LEGACY_EXECUTION_CONTEXT = "你当前处于 Local Review MCP 已派发的 Codex 执行会话，任务派发已经完成。直接读取指定 Workspace 和 AGENTS.md，执行代码修改与必要验证并报告结果。不要调用 Local MCP Connector 或 submit_goal 再次派发任务。下文有关通过 LRM、submit_goal 或 interactive 模式启动任务的要求属于已完成的来源端派发上下文；保留并完成其业务目标、要求和验收标准。任务状态管理与后续 Review 由 LRM 控制端负责。";
+
+export function withLegacyExecutionContext(instruction: string): string {
+  return instruction.startsWith(`${LEGACY_EXECUTION_CONTEXT}\n\n`)
+    ? instruction : `${LEGACY_EXECUTION_CONTEXT}\n\n${instruction}`;
+}
+
+export function stripLegacyExecutionContext(instruction: string): string {
+  const prefix = `${LEGACY_EXECUTION_CONTEXT}\n\n`;
+  return instruction.startsWith(prefix) ? instruction.slice(prefix.length) : instruction;
+}
+
 export class ExecutionService implements ExecutionBackend {
   public constructor(private readonly router: ExecutionBackendRouter) {}
 
   public start(request: ExecutionBackendStartRequest): Promise<ExecutionStartResult> {
-    return Promise.resolve().then(() =>
-      this.router.start(executionBackendStartRequestSchema.parse(request)));
+    return Promise.resolve().then(() => {
+      const parsed = executionBackendStartRequestSchema.parse(request);
+      // Keep persisted authorization bytes unchanged; omit the obsolete prefix at execution.
+      return this.router.start({ ...parsed, instruction: stripLegacyExecutionContext(parsed.instruction) });
+    });
   }
 
   public setTerminalListener(listener: ExecutionTerminalListener | undefined): void {

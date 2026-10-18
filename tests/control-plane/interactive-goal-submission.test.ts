@@ -1,4 +1,4 @@
-import { PendingGoalSubmissionService } from "../../src/control-plane/pending-goal-submission.js";
+import { PendingGoalSubmissionService, PENDING_GOAL_SUBMISSION_TTL_MS } from "../../src/control-plane/pending-goal-submission.js";
 import { ConversationCorrelationRegistry } from "../../src/control-plane/conversation-correlation.js";
 import { BrowserRouter } from "../../src/router/browser-router.js";
 import { ReviewCompletionRouter } from "../../src/router/review-completion-router.js";
@@ -38,6 +38,47 @@ import { WorkspaceRegistry } from "../../src/workspace/registry.js";
 import { CapabilityNegotiator, StandaloneCapabilityProvider } from "../../src/control-plane/capability-negotiation.js";
 
 const temporaryDirectories: string[] = [];
+
+it("expires a repeated authenticated submission without changing the running Goal, Execution or Session", async () => {
+  const value = await fixture();
+  let now = Date.now();
+  const pending = new PendingGoalSubmissionService(new ConversationCorrelationRegistry(value.root), value.submit, {
+    storageRoot: value.root, now: () => now,
+    browserReadiness: () => ({ ready: true, readiness_state: "ready" }),
+  });
+  const keyA = "00000000-0000-4000-8000-000000000091";
+  const keyB = "00000000-0000-4000-8000-000000000092";
+  const payload = { workspace_id: "workspace-a", title: "Same task", goal: "Fix the same code",
+    requirements: ["Preserve contracts"], acceptance_criteria: ["Tests pass"], execution_mode: "interactive" as const };
+  try {
+    await pending.accept({ ...payload, correlation_key: keyA });
+    await pending.receiveIdentityEvidence({ request_id: keyA, conversation_id: "conversation-001", document_id: "document-1", navigation_epoch: 1 });
+    await vi.waitFor(async () => expect((await pending.get(keyA))?.state).toBe("started"));
+    const first = (await pending.get(keyA))!;
+    if (first.state !== "started") throw new Error("first submission did not start");
+    const goal = await value.goals.getGoal(first.goal_id);
+    const execution = await value.executions.getExecutionContext("workspace-a", first.task_id, first.execution_id);
+    const sessions = await value.sessions.listSessions();
+    expect(sessions).toHaveLength(1);
+    await pending.accept({ ...payload, correlation_key: keyB }, { source: "authenticated_mcp_invocation" });
+    await pending.resolve(keyB);
+    expect((await pending.get(keyB))?.state).toBe("pending_identity");
+    now += PENDING_GOAL_SUBMISSION_TTL_MS;
+    await pending.expire(keyB);
+    await pending.resolve(keyB);
+    await pending.receiveIdentityEvidence({ request_id: keyB, conversation_id: "conversation-001", document_id: "document-1", navigation_epoch: 1 });
+    expect(await pending.get(keyB)).toMatchObject({ state: "failed", error: "pending_identity_expired" });
+    expect(await pending.get(keyA)).toEqual(first);
+    expect(await value.goals.getGoal(first.goal_id)).toEqual(goal);
+    expect(await value.executions.getExecutionContext("workspace-a", first.task_id, first.execution_id)).toEqual(execution);
+    expect(await value.sessions.listSessions()).toEqual(sessions);
+    expect(value.appClient.thread).toHaveBeenCalledTimes(1);
+    expect(value.appClient.turn).toHaveBeenCalledTimes(1);
+  } finally {
+    value.goals.dispose();
+    await value.executionService.close();
+  }
+});
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {

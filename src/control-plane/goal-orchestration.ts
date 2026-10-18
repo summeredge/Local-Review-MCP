@@ -29,7 +29,7 @@ import {
   type ActuationAuthorization,
   type ControlledActuation,
 } from "./controlled-actuation.js";
-import { executionModeSchema } from "./execution-service.js";
+import { executionModeSchema, withLegacyExecutionContext } from "./execution-service.js";
 import { backupLegacyState, stateRestoreDiagnostic } from "./state-migration.js";
 import { ExtensionDeliveryService, retryableNotSent } from "./extension-delivery.js";
 
@@ -865,7 +865,8 @@ export class GoalOrchestrationService {
       || authorization.workspace_id !== goal.workspace_id
       || authorization.task_id !== task.task_id
       || authorization.execution_id !== goal.execution_id
-      || authorization.instruction !== instruction
+      || (authorization.instruction !== instruction
+        && authorization.instruction !== withLegacyExecutionContext(instruction))
       || authorization.execution_mode !== goal.execution_mode
       || authorization.model_id !== goal.model_id
       || authorization.reasoning_effort !== goal.reasoning_effort

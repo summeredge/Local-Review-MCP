@@ -1,4 +1,4 @@
-import { ExecutionLaunchIndeterminateError } from "../../src/control-plane/execution-service.js";
+import { ExecutionLaunchIndeterminateError, withLegacyExecutionContext } from "../../src/control-plane/execution-service.js";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   autoIterationSchema,
+  buildAutoIterationInstruction,
   type AutoIteration,
   type AutoIterationStartInput,
 } from "../../src/control-plane/auto-iteration.js";
@@ -475,16 +476,9 @@ describe("GoalOrchestrationService", () => {
     expect(left.current_task_id).toBe("task-1");
     expect(f.starts).toHaveBeenCalledTimes(1);
     expect(f.auto.start).toHaveBeenCalledTimes(1);
-    expect(f.starts.mock.calls[0]![0].instruction).toBe([
-      "## 修改目标",
-      "Make the change",
-      "",
-      "## 修改要求",
-      "- Keep it small",
-      "",
-      "## 验收标准",
-      "- Tests pass",
-    ].join("\n"));
+    expect(f.starts.mock.calls[0]![0].instruction).toBe(buildAutoIterationInstruction({
+      goal: "Make the change", requirements: ["Keep it small"], acceptance_criteria: ["Tests pass"],
+    }));
   });
 
   it("runs tasks and phases strictly in order and completes the Goal", async () => {
@@ -619,7 +613,7 @@ describe("GoalOrchestrationService", () => {
     expect(f.auto.start).toHaveBeenCalledTimes(1);
   });
 
-  it("recovers an existing authorization without creating another authorization or execution", async () => {
+  it.each(["plain", "legacy"] as const)("recovers existing %s authorization without duplicate execution", async (variant) => {
     const f = await fixture();
     const plan = input();
     const checkpoint = runningGoal(plan);
@@ -628,22 +622,16 @@ describe("GoalOrchestrationService", () => {
       workspace_id: plan.workspace_id,
       conversation_id: plan.conversation_id,
     });
+    const instruction = buildAutoIterationInstruction({
+      goal: "Make the change", requirements: ["Keep it small"], acceptance_criteria: ["Tests pass"],
+    });
     const authorization = await f.controlled.authorize({
       actuation_id: checkpoint.actuation_id!,
       workspace_id: plan.workspace_id,
       task_id: "task-1",
       execution_id: checkpoint.execution_id!,
       execution_mode: plan.execution_mode,
-      instruction: [
-        "## 修改目标",
-        "Make the change",
-        "",
-        "## 修改要求",
-        "- Keep it small",
-        "",
-        "## 验收标准",
-        "- Tests pass",
-      ].join("\n"),
+      instruction: variant === "legacy" ? withLegacyExecutionContext(instruction) : instruction,
     });
     await persistGoal(f.root, checkpoint);
 
