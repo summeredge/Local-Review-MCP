@@ -1,5 +1,55 @@
 # Browser identity evidence: persistent diagnostics
 
+## 连续用户消息导致身份采集退出（2026-10-18）
+
+失败 key `1f5e6a2c-89b1-4c34-93b5-d870ba16e402` 于北京时间 15:58:43
+创建 Pending，16:00:43 到期。该会话同一 document/epoch 的扫描在提交前后报告
+`user_conflict`、`searched_turn_count=0`；随后用户发起新的查询，工具才落入历史范围。
+这些无 key 诊断本身不构成 Goal 身份证据。
+
+只读检查原失败 turn 的 Fiber，确认一个 timeline entry 中依次存在两条不同 ID 的
+用户消息（重新派发、使用默认模型），之后为 reasoning group 内的
+submit_goal / get_identity_trace / submit_goal；最后一个调用携带上述失败 key。
+`timelineMessagesOf` 原先保留全部用户消息，`userIdentityOf` 因不同消息 ID
+返回 conflict，尚未搜索工具便退出。这是已复现的阻断条件，不据此归因所有历史超时。
+
+修复仅在 timeline 身份适配时保留最后一条用户消息作为当前锚点；工具顺序保持原样，
+最后用户消息之前的调用继续由现有边界检查拒绝。canonical Fiber 身份、精确路由、
+导航 epoch、文档授权、最新调用参数检查、legacy 路径、Completion 和 120 秒 TTL 均未修改。
+
+新增 3 项回归测试在修改前失败、修改后通过，覆盖 linked/direct 调用及 Content 转发，
+并检查稳定/无 ID 的末尾用户边界、旧 key 隔离、最新无效参数、历史视口与身份冲突。
+5 个相关测试文件共 198 项通过，TypeScript typecheck、脚本语法及 diff 空白检查通过。
+
+### 真实连续用户消息启动验收通过
+
+用户重新加载扩展并刷新原会话后，通过 Debugger 只读取得实际注入的 `fiber.js`，
+确认包含 `index !== lastUserIndex` 修复。版本标签仍为 0.1.5，未用标签代替代码检查。
+在同一回复期间连续发送两条用户消息；现场 Fiber 确认同一 current timeline entry
+包含两条不同 ID 的 user-message，以及其后的唯一 submit_goal。未修改页面 Fiber
+或伪造身份证据，未重新提交旧 key。
+
+新 key：`34e38c61-c805-4e48-bef8-7f8b9bf7dbe2`。以下均为北京时间：
+
+| 事件 | 时间 / 结果 |
+| --- | --- |
+| submit_goal_received | 16:13:32.757 |
+| evidence_match_success | 16:13:36.817，约 4.06 秒 |
+| goal_started | 16:13:41.715，约 8.96 秒 |
+| Desktop Execution | 16:14:10.641，passed |
+| Session | completed |
+
+Goal：`goal-a333372b-c85c-488f-b780-401cdd2b2ef3`。
+Execution：`goal-execution-ee06f5dccafc098abfed4d2594ab65c8`。
+Desktop thread：`01a14e12-d54e-79f2-a5f6-a65a21ceae22`。
+
+原始 Desktop turn 的 commandExecution 记录确认，仅执行了 `git status --short`
+和 `node --version`，退出码均为 0；Node 输出 v24.14.0，最终回复包含
+`LRM_IDENTITY_STARTUP_OK`。该 key 仅提交一次、仅启动一个 Execution。
+关联扫描为 selected，canonical 身份、路由与授权均通过；没有触发 user_conflict。
+本次完成默认 interactive 模式的真实启动和只读执行验收，不宣称其他历史间歇故障
+具有相同根因，也未将 Review Completion 扩展为本次修复目标。
+
 ## 0.1.5：选择前结构摘要
 
 扩展直接加载仓库 `extension` 下的文件，没有独立打包产物。安装目录一致不能

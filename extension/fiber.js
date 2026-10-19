@@ -626,8 +626,13 @@
         ordered.push(...item.items);
       } else ordered.push(item);
     }
-    for (const item of ordered) {
+    // A timeline entry can contain consecutive users; only the last anchors this exchange.
+    // Keep earlier tools so the selector still rejects calls before that user boundary.
+    const lastUserIndex = ordered.findLastIndex((item) => item?.type === 'user-message');
+    for (let index = 0; index < ordered.length; index += 1) {
+      const item = ordered[index];
       if (item?.type === 'user-message') {
+        if (index !== lastUserIndex) continue;
         messages.push({ id: item.messageId, author: { role: 'user' } });
       } else if (item?.type === 'mcp-tool-call') {
         const call = timelineSubmitGoalArgumentsOf(item);

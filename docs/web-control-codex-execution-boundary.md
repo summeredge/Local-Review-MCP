@@ -9,11 +9,9 @@
 - Pending 解析必须匹配该 correlation_key 的证据后才能调用 GoalSubmission。`authenticated_mcp_invocation` 只供 connector preflight 使用，不绕过身份门禁；没有对应证据不创建 Goal/Execution/Thread，超时后迟到证据也不重新启动。
 - 接收请求可以先创建 Pending。现有接口没有足以在 Pending 创建之前可靠区分网页/Codex 的可信预授权，也没有 Desktop `create_thread` 的会话级 MCP 禁用参数。因此本修复不宣称严格来源隔离或工具卸载，提示词也不是服务端授权机制。
 
-## 执行指令与恢复
+## 执行指令
 
 网页端提交任务时，`workspace_id`、`execution_mode`、`model` 等通过结构化控制参数传递；`goal`、`requirements` 和 `acceptance_criteria` 仅填写可执行的代码修改与验收要求。首次执行和后续迭代直接使用业务任务文本，不添加重复的职责声明，也不根据 `LRM` 或 `submit_goal` 等关键词删除可能合法的业务内容。
-
-历史持久化授权仍只接受与当前业务任务精确匹配的原始指令或上一版带职责前缀的完整指令。执行入口只在匹配到上一版完整前缀时移除该前缀，不更改持久化授权，也不改写业务内容。Desktop、AppServer fallback 和 batch 共用这一入口。
 
 ## 本次提交状态
 

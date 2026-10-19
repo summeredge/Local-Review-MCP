@@ -9,7 +9,6 @@ import {
   ExecutionBackendRouter,
   ExecutionService,
   ExecutionLaunchIndeterminateError,
-  withLegacyExecutionContext,
   type ExecutionBackend,
   type ExecutionBackendStartRequest,
   type ExecutionStartResult,
@@ -1236,12 +1235,13 @@ describe("Desktop interactive Goal model and reasoning effort", () => {
     expect(session).toMatchObject({ model_id: "gpt-5.6-luna", reasoning_effort: "max" });
   });
 
-  it("strips only the exact historical role prefix before Codex dispatch", async () => {
+  it("passes business instructions containing LRM and submit_goal unchanged to Codex", async () => {
     const value = await fixture();
     value.desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
-    await authorizeAndActuate(value, { instruction: withLegacyExecutionContext(INSTRUCTION) }, "terminal");
+    const instruction = "修复 LRM 中 submit_goal 的任务状态回执处理，并保留原始业务要求。";
+    await authorizeAndActuate(value, { instruction }, "terminal");
     const createThread = value.desktop.calls.find((call) => call.name === "create_thread")!;
-    expect(createThread.arguments!.prompt).toBe(INSTRUCTION);
+    expect(createThread.arguments!.prompt).toBe(instruction);
   });
 
   it("keeps the Desktop route unchanged when no provider model is given", async () => {

@@ -476,6 +476,34 @@ describe("Extension submit_goal correlation evidence", () => {
     expect(reply.scan_diagnostic.current_turn_present).toBe(true);
   });
 
+  it.each([timelineCall, directTimelineCall])('captures submit_goal after consecutive users in a multi-user timeline turn', async (call) => {
+    // Production failure: two user messages followed by submit/diagnostic/submit in one entry.
+    const reply = scanTimeline([
+      { type: 'user-message', messageId: 'user-dispatch' },
+      { type: 'user-message', messageId: 'user-default-model' },
+      { type: 'chatgpt-reasoning-group', items: [call(KEY_A),
+        { type: 'mcp-tool-call', functionName: 'Local_MCP_Connector.get_identity_trace' }, call(KEY_B)] },
+      { type: 'assistant-message' },
+    ]);
+    expect(reply.evidence).toEqual([{ request_id: KEY_B, fiber_conversation_id: CONVERSATION }]);
+    expect(reply.scan_diagnostic).toMatchObject({ snapshot_selection_reason: 'selected', anchor_state: 'stable' });
+    expect((await contentMessages(reply)).filter(message => message.type === 'identity_evidence')).toEqual([
+      expect.objectContaining({ request_id: KEY_B, conversation_id: CONVERSATION, navigation_epoch: 0 }),
+    ]);
+  });
+
+  it('keeps the latest user boundary and malformed-call rejection in a multi-user timeline turn', () => {
+    for (const user of [{ type: 'user-message', messageId: 'user-latest' }, { type: 'user-message' }]) {
+      const prefix = [{ type: 'user-message', messageId: 'user-first' }, timelineCall(KEY_A), user];
+      expect(scanTimeline(prefix).evidence).toEqual([]);
+      expect(scanTimeline([...prefix, timelineCall(KEY_B)]).evidence)
+        .toEqual([{ request_id: KEY_B, fiber_conversation_id: CONVERSATION }]);
+      expect(scanTimeline([...prefix, timelineCall(KEY_B), timelineCall('invalid')]).evidence).toEqual([]);
+      expect(scanTimeline([...prefix, timelineCall(KEY_B)], { current: false }).evidence).toEqual([]);
+      expect(scanTimeline([...prefix, timelineCall(KEY_B)], { parentConversation: CONVERSATION_B }).evidence).toEqual([]);
+    }
+  });
+
   it('does not claim a virtualized historical timeline viewport', () => {
     expect(scanTimeline([timelineCall()], { current: false }).evidence).toEqual([]);
   });

@@ -1,4 +1,4 @@
-import { ExecutionLaunchIndeterminateError, withLegacyExecutionContext } from "../../src/control-plane/execution-service.js";
+import { ExecutionLaunchIndeterminateError } from "../../src/control-plane/execution-service.js";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -613,7 +613,7 @@ describe("GoalOrchestrationService", () => {
     expect(f.auto.start).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["plain", "legacy"] as const)("recovers existing %s authorization without duplicate execution", async (variant) => {
+  it("recovers an existing authorization without duplicate execution", async () => {
     const f = await fixture();
     const plan = input();
     const checkpoint = runningGoal(plan);
@@ -631,7 +631,7 @@ describe("GoalOrchestrationService", () => {
       task_id: "task-1",
       execution_id: checkpoint.execution_id!,
       execution_mode: plan.execution_mode,
-      instruction: variant === "legacy" ? withLegacyExecutionContext(instruction) : instruction,
+      instruction,
     });
     await persistGoal(f.root, checkpoint);
 

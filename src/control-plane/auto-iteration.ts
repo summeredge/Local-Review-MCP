@@ -31,7 +31,7 @@ import {
   type ControlledActuationResult,
 } from "./controlled-actuation.js";
 import { DispatchCommandBroker } from "./dispatch-command-broker.js";
-import { ExecutionLaunchIndeterminateError, withLegacyExecutionContext } from "./execution-service.js";
+import { ExecutionLaunchIndeterminateError } from "./execution-service.js";
 import {
   ExtensionDeliveryService,
   type ExtensionDeliveryReadinessCheck,
@@ -1123,8 +1123,7 @@ export class AutoIterationService {
         || authorization.workspace_id !== loop.workspace_id
         || authorization.task_id !== loop.task_id
         || authorization.execution_id !== loop.execution_id
-        || (authorization.instruction !== instruction
-          && authorization.instruction !== withLegacyExecutionContext(instruction))
+        || authorization.instruction !== instruction
         || authorization.goal_id !== configuration.goal_id
         || authorization.execution_mode !== configuration.execution_mode
         || authorization.model_id !== configuration.model_id
