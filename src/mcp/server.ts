@@ -26,6 +26,8 @@ import {
 import {
   goalSubmissionToolInputSchema,
   goalSubmissionAcceptedSchema,
+  assertExecutableTaskOnly,
+  ExecutionTaskContainsDispatchInstructionError,
   resolveGoalModelFields,
   type GoalSubmissionService,
 } from "../control-plane/goal-submission.js";
@@ -354,6 +356,13 @@ export function toToolError(error: unknown) {
       }) }],
       isError: true as const,
     };
+  }
+  if (error instanceof ExecutionTaskContainsDispatchInstructionError) {
+    return { content: [{ type: "text" as const, text: JSON.stringify({
+      error: "DISPATCH_SETTINGS_IN_TASK",
+      field: error.field,
+      message: error.message,
+    }) }], isError: true as const };
   }
   if (error instanceof StatusQueryError) {
     return { content: [{ type: "text" as const, text: JSON.stringify({ error: error.code, message: error.message }) }], isError: true as const };
@@ -1189,7 +1198,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
   server.registerTool(
     "submit_goal",
     {
-      description: "Web ChatGPT Control Plane only; a dispatched Codex execution must directly edit/test its Workspace and must not call this tool. Durably accept a Goal for the current web conversation. accepted=true means receipt only, not Goal or Codex Session startup; query get_identity_trace with this correlation_key for progress. Put implementable code changes only in goal, requirements and acceptance_criteria. Workspace, model, execution_mode and dispatch mechanics are Control Plane parameters, never Codex task steps. Resolve workspace_id from the explicitly requested project or the project associated with this conversation using workspace_list; only a uniquely registered workspace may be inferred when omitted. Never substitute the active/default workspace for an ambiguous target. execution_mode defaults to interactive (Desktop/AppServer); explicit batch uses the CLI. The model must generate a new UUID v4 correlation_key for every invocation and never reuse one; users do not need to provide it manually. The Goal starts asynchronously only after exact canonical Extension evidence proves this call's web conversation. OAuth authentication or an online Extension alone is not web identity proof. A failure applies only to this correlation_key; never automatically retry or resubmit.",
+      description: "Submit a Goal for the current web conversation in a registered workspace. accepted=true acknowledges receipt, not execution startup; query get_identity_trace with the same correlation_key for progress. Write concrete project changes, tests and verification outcomes in goal, requirements and acceptance_criteria. Provide workspace_id, execution_mode, model and reasoning_effort as separate tool arguments. Resolve workspace_id from the explicitly requested project or the project associated with this conversation using workspace_list; when no unique workspace is identifiable, request clarification instead of selecting a default. execution_mode defaults to interactive; batch explicitly selects the CLI. Generate a fresh UUID v4 correlation_key for each new submission. The Goal starts asynchronously after matching browser identity evidence; authentication or online presence alone is insufficient. Errors belong to their correlation_key; inspect status before any new submission.",
       inputSchema: goalSubmissionToolInputSchema,
       outputSchema: goalSubmissionAcceptedSchema,
     },
@@ -1202,6 +1211,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
       }
 
       try {
+        assertExecutableTaskOnly(input);
         const selection = registry.resolveForSubmission(input.workspace_id);
         const correlation = context.correlations?.correlation(input.correlation_key);
         context.identityTrace?.record({

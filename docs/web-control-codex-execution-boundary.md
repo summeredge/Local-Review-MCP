@@ -11,7 +11,7 @@
 
 ## 执行指令
 
-网页端提交任务时，`workspace_id`、`execution_mode`、`model` 等通过结构化控制参数传递；`goal`、`requirements` 和 `acceptance_criteria` 仅填写可执行的代码修改与验收要求。首次执行和后续迭代直接使用业务任务文本，不添加重复的职责声明，也不根据 `LRM` 或 `submit_goal` 等关键词删除可能合法的业务内容。
+网页端提交任务时，`workspace_id`、`execution_mode`、`model` 等通过结构化控制参数传递；`goal`、`requirements` 和 `acceptance_criteria` 仅填写可执行的代码修改与验收要求。接收入口识别明显的控制端配置行（如目标 Workspace、执行载体、要求绑定执行环境），直接拒绝含此类指令的提交，不创建 Pending；由网页端重新提交干净的业务字段。首次执行和后续迭代直接使用业务任务文本，不附加职责声明，也不按产品或工具名称关键词改写合法任务。
 
 ## 本次提交状态
 

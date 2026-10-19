@@ -157,6 +157,31 @@ function toolJson(result: unknown): Record<string, unknown> {
 }
 
 describe("submit_goal MCP tool", () => {
+  it.each([
+    ["goal", { goal: "验证 PCA-LLM\n目标 Workspace：PCA-LLM，workspace_id=d52ae9d83400" }],
+    ["goal", { goal: "验证 PCA-LLM\n执行载体：ChatGPT.exe Desktop（interactive）" }],
+    ["requirements", { requirements: ["必须在 ChatGPT.exe Desktop interactive 模式执行，明确绑定 workspace_id=d52ae9d83400"] }],
+    ["acceptance_criteria", { acceptance_criteria: ["执行载体：Desktop interactive"] }],
+  ] as const)("rejects %s dispatch metadata before creating pending state", async (field, patch) => {
+    const { client, pending, submitGoal } = await fixture();
+    const result = await callFor(client, { ...goalArguments(), ...patch });
+    expect(result.isError).toBe(true);
+    expect(toolJson(result)).toMatchObject({ error: "DISPATCH_SETTINGS_IN_TASK", field });
+    expect(await pending.list()).toEqual([]);
+    expect(submitGoal).not.toHaveBeenCalled();
+  });
+
+  it("keeps actionable work about connector code in business fields", async () => {
+    const { client, pending } = await fixture();
+    const result = await callFor(client, {
+      ...goalArguments(),
+      goal: "修复工具处理状态回执的代码",
+      requirements: ["测试 submit_goal 在不同状态下的处理结果"],
+    });
+    expect(result.isError).not.toBe(true);
+    expect((await pending.get(CORRELATION_A))?.state).toBe("pending_identity");
+  });
+
   it("rejects ambiguous Workspace before accepting or binding a Goal", async () => {
     const a = await mkdtemp(join(tmpdir(), "lrm-submit-a-"));
     const b = await mkdtemp(join(tmpdir(), "lrm-submit-b-"));

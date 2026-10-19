@@ -49,11 +49,39 @@ export const goalSubmissionToolInputSchema = goalSubmissionRequestSchema
   .extend({ workspace_id: z.string().min(1).max(128).optional() })
   .extend({
     correlation_key: correlationKeySchema,
-    goal: submissionTextSchema.describe("Code change objective for Codex; do not include LRM dispatch or session creation steps."),
-    requirements: submissionItemsSchema.describe("Implementation requirements only; put workspace, execution mode and model in their dedicated fields."),
-    acceptance_criteria: submissionItemsSchema.describe("Verifiable outcomes of the code change, not task routing instructions."),
+    goal: submissionTextSchema.describe("Concrete implementation or verification objective in the selected project."),
+    requirements: submissionItemsSchema.describe("Concrete implementation or verification steps; execution settings are separate tool arguments."),
+    acceptance_criteria: submissionItemsSchema.describe("Observable tests, results and completion criteria for the work."),
   })
   .strict();
+
+// Only task objectives and acceptance evidence reach the executor. Dispatch options are
+// resolved from separate submission fields before the execution instruction is built.
+const CONTROL_DIRECTIVE_LINES = [
+  /^\s*目标\s*(?:Workspace|工作区)\s*[:：]/iu,
+  /^\s*执行载体\s*[:：]/u,
+  /^\s*(?:必须|请|要求)[^\n]{0,100}(?:ChatGPT\.exe\s*Desktop|绑定\s*workspace_id\s*=)[^\n]{0,100}(?:interactive|batch|CLI|workspace_id\s*=)/iu,
+  /^\s*(?:不得|禁止)\s*(?:静默)?(?:换工作区|回退\s*CLI|回退\s*默认\s*Workspace)/iu,
+] as const;
+
+export class ExecutionTaskContainsDispatchInstructionError extends Error {
+  public constructor(public readonly field: "goal" | "requirements" | "acceptance_criteria") {
+    super(`The ${field} field contains dispatch settings. Submit implementation and verification steps only; use dedicated execution fields for routing.`);
+    this.name = "ExecutionTaskContainsDispatchInstructionError";
+  }
+}
+
+export function assertExecutableTaskOnly(input: Pick<z.infer<typeof goalSubmissionToolInputSchema>,
+  "goal" | "requirements" | "acceptance_criteria">): void {
+  for (const field of ["goal", "requirements", "acceptance_criteria"] as const) {
+    const value = input[field];
+    const entries = typeof value === "string" ? [value] : value;
+    if (entries.some((entry) => entry.split(/\r?\n/u).some((line) =>
+      CONTROL_DIRECTIVE_LINES.some((pattern) => pattern.test(line))))) {
+      throw new ExecutionTaskContainsDispatchInstructionError(field);
+    }
+  }
+}
 
 export const resolvedGoalSubmissionRequestSchema = goalSubmissionRequestSchema
   .omit({ model: true, reasoning_effort: true })
