@@ -55,6 +55,32 @@ function expectCode(content: string, code: ReviewVerdictParseError["code"]): voi
 }
 
 describe("ReviewVerdictParser", () => {
+  const plainBlock = (payload = iteratePayload()) =>
+    `Review.\nLRM_REVIEW_VERDICT_BEGIN\n${JSON.stringify(payload)}\nLRM_REVIEW_VERDICT_END`;
+
+  it("accepts plain text boundaries and preserves all schema and identity checks", () => {
+    expect(parser.parse(result(plainBlock()))).toMatchObject({ decision: "ITERATE" });
+    expectCode(plainBlock({ ...iteratePayload(), review_request_id: "other" }), "REVIEW_REQUEST_MISMATCH");
+    expectCode(plainBlock({ ...iteratePayload(), schema_version: 2 }), "VERDICT_SCHEMA_INVALID");
+    expectCode(plainBlock({ ...iteratePayload(), decision: "APPROVE" }), "VERDICT_SCHEMA_INVALID");
+    expectCode(plainBlock({ ...iteratePayload(), decision: "RETRY" }), "VERDICT_SCHEMA_INVALID");
+    expectCode(`${plainBlock()}\nextra`, "VERDICT_BLOCK_NOT_FINAL");
+    expectCode("LRM_REVIEW_VERDICT_BEGIN\n{bad}\nLRM_REVIEW_VERDICT_END", "VERDICT_JSON_INVALID");
+    expectCode(`${plainBlock()}\n${block(iteratePayload())}`, "VERDICT_BLOCK_MULTIPLE");
+    expectCode(`${plainBlock()}\n${plainBlock()}`, "VERDICT_BLOCK_MULTIPLE");
+  });
+
+  it.each([
+    "<lrm-review-result>{}", "{}</lrm-review-result>",
+    "</lrm-review-result>{}<lrm-review-result>",
+    "LRM_REVIEW_VERDICT_BEGIN\n{}", "{}\nLRM_REVIEW_VERDICT_END",
+    "LRM_REVIEW_VERDICT_END\n{}\nLRM_REVIEW_VERDICT_BEGIN",
+    "LRM_REVIEW_VERDICT_BEGIN\n{}</lrm-review-result>",
+    "<lrm-review-result>{}\nLRM_REVIEW_VERDICT_END",
+  ])("distinguishes incomplete or mixed boundaries from missing verdicts: %s", content => {
+    expectCode(content, "VERDICT_BLOCK_INCOMPLETE");
+  });
+
   it("parses APPROVE, ITERATE, and HUMAN_REQUIRED without changing ReviewResult", () => {
     const approve = parser.parse(result(block({
       schema_version: 1,
@@ -179,7 +205,8 @@ describe("buildReviewMessage", () => {
     expect(message).toContain("Do not put either part in a separate Page");
     expect(message).toContain("A prose APPROVE alone is not a verdict");
     expect(message).toContain('"review_request_id": "review-001"');
-    expect(message.indexOf("<lrm-review-result>")).toBeGreaterThan(-1);
-    expect(message.indexOf("</lrm-review-result>")).toBe(message.length - "</lrm-review-result>".length);
+    expect(message).not.toContain("<lrm-review-result>");
+    expect(message.indexOf("LRM_REVIEW_VERDICT_BEGIN")).toBeGreaterThan(-1);
+    expect(message.endsWith("LRM_REVIEW_VERDICT_END")).toBe(true);
   });
 });

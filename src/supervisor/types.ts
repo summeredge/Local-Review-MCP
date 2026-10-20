@@ -1,6 +1,14 @@
 import type { RuntimeState } from "./state.js";
 
 export const SUPERVISOR_LOG_EVENTS = [
+  "host started",
+  "host shutdown",
+  "host exited",
+  "runtime exited",
+  "restart succeeded",
+  "restart failed",
+  "resource failed",
+  "stop requested",
   "runtime started",
   "runtime stopped",
   "health failed",
@@ -15,7 +23,20 @@ export interface RuntimeProcessStatus {
   readonly pid?: number;
 }
 
+export interface SupervisorLogDetails {
+  readonly pid?: number;
+  readonly code?: number | null;
+  readonly signal?: NodeJS.Signals | null;
+  readonly expected?: boolean;
+  readonly attempt?: number;
+  readonly stage?: "runtime-start" | "health-check" | "tunnel-start" | "stop";
+  readonly stderr?: string;
+}
+
 export interface RuntimeProcessExit {
+  readonly pid?: number;
+  readonly expected?: boolean;
+  readonly stderr?: string;
   readonly code: number | null;
   readonly signal: NodeJS.Signals | null;
 }
@@ -47,7 +68,7 @@ export interface SupervisorTunnel {
 }
 
 export interface SupervisorLogger {
-  info(event: SupervisorLogEvent): void;
+  info(event: SupervisorLogEvent, details?: SupervisorLogDetails): void;
 }
 
 export interface SupervisorStatus {

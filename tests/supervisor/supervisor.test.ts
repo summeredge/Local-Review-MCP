@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { FileSupervisorLogger } from "../../src/supervisor/logger.js";
+import { HealthMonitor } from "../../src/supervisor/health-monitor.js";
 import { Supervisor } from "../../src/supervisor/supervisor.js";
 import type {
   HealthMonitorLike,
@@ -10,6 +11,8 @@ import type {
   RuntimeProcessManager,
   RuntimeProcessStatus,
   SupervisorLogger,
+  SupervisorLogEvent,
+  SupervisorLogDetails,
   SupervisorTunnel,
 } from "../../src/supervisor/types.js";
 
@@ -46,13 +49,15 @@ class FakeProcessManager implements RuntimeProcessManager {
 
   public exit(): void {
     this.running = false;
-    for (const listener of this.listeners) listener({ code: 1, signal: null });
+    for (const listener of this.listeners) listener({ code: 1, signal: null, pid: 321, expected: false });
   }
 }
 
 class FakeHealthMonitor implements HealthMonitorLike {
   public checks: boolean[] = [true];
   private listener: ((healthy: boolean) => void | Promise<void>) | undefined;
+
+  public get running(): boolean { return this.listener !== undefined; }
 
   public async check(): Promise<boolean> {
     return this.checks.shift() ?? true;
@@ -62,7 +67,7 @@ class FakeHealthMonitor implements HealthMonitorLike {
     this.listener = listener;
   }
 
-  public stop(): void {}
+  public stop(): void { this.listener = undefined; }
 
   public async trigger(healthy: boolean): Promise<void> {
     await this.listener?.(healthy);
@@ -97,7 +102,10 @@ class FakeTunnel implements SupervisorTunnel {
 class MemoryLogger implements SupervisorLogger {
   public readonly events: string[] = [];
 
-  public info(event: "runtime started" | "runtime stopped" | "health failed" | "restart triggered" | "tunnel state changed"): void {
+  public readonly details: (SupervisorLogDetails | undefined)[] = [];
+
+  public info(event: SupervisorLogEvent, details?: SupervisorLogDetails): void {
+    this.details.push(details);
     this.events.push(event);
   }
 }
@@ -120,6 +128,52 @@ function makeSupervisor(
 }
 
 describe("supervisor", () => {
+  it("automatically retries using the real monitor without overlapping recovery", async () => {
+    vi.useFakeTimers();
+    const pm = new FakeProcessManager();
+    const health = new HealthMonitor({ healthUrl: "http://127.0.0.1/health", intervalSeconds: 1, check: async () => pm.running });
+    const supervisor = new Supervisor({ processManager: pm, healthMonitor: health, tunnel: new FakeTunnel(), maxRestartAttempts: 3 });
+    try {
+      await supervisor.start();
+      pm.failNextStart = true;
+      pm.exit();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(supervisor.state).toBe("DEGRADED");
+      expect(health.running).toBe(true);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(supervisor.state).toBe("RUNNING");
+      expect(pm.starts).toBe(3);
+      expect(vi.getTimerCount()).toBe(1);
+      await supervisor.stop();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(pm.starts).toBe(3);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      supervisor.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not restart when stopped during recovery cleanup", async () => {
+    const pm = new FakeProcessManager();
+    const health = new FakeHealthMonitor();
+    const tunnel = new FakeTunnel();
+    const supervisor = makeSupervisor(pm, health, tunnel);
+    await supervisor.start();
+    let finish!: () => void;
+    tunnel.stop = () => new Promise<void>((resolve) => { finish = resolve; });
+    await health.trigger(false);
+    await health.trigger(false);
+    const recovery = health.trigger(false);
+    const stopped = supervisor.stop();
+    finish();
+    await recovery;
+    await stopped;
+    await health.trigger(false);
+    expect(pm.starts).toBe(1);
+    expect(supervisor.state).toBe("STOPPED");
+    expect(health.running).toBe(false);
+  });
   it("moves STOPPED through STARTING to RUNNING and stops cleanly", async () => {
     const processManager = new FakeProcessManager();
     const tunnel = new FakeTunnel();
@@ -142,6 +196,7 @@ describe("supervisor", () => {
     expect(logger.events).toEqual([
       "runtime started",
       "tunnel state changed",
+      "stop requested",
       "tunnel state changed",
       "runtime stopped",
     ]);
@@ -172,7 +227,8 @@ describe("supervisor", () => {
     const tunnel = new FakeTunnel();
     tunnel.failNextStart = true;
     const processManager = new FakeProcessManager();
-    const supervisor = makeSupervisor(processManager, new FakeHealthMonitor(), tunnel);
+    const logger = new MemoryLogger();
+    const supervisor = makeSupervisor(processManager, new FakeHealthMonitor(), tunnel, logger);
 
     await expect(supervisor.start()).rejects.toMatchObject({
       message: "Supervisor failed to start",
@@ -180,6 +236,7 @@ describe("supervisor", () => {
     });
     expect(tunnel.stops).toBe(1);
     expect(processManager.stops).toBe(1);
+    expect(logger.details[logger.events.indexOf("resource failed")]).toEqual({ stage: "tunnel-start" });
   });
 
   it("recovers when the tunnel connector becomes unhealthy", async () => {
@@ -265,27 +322,70 @@ describe("supervisor", () => {
     expect(logger.events).toContain("restart triggered");
     expect(processManager.starts).toBe(2);
 
-    processManager.failNextStart = true;
     await healthMonitor.trigger(false);
     expect(processManager.starts).toBe(3);
-    expect(supervisor.state).toBe("DEGRADED");
+    expect(supervisor.state).toBe("RUNNING");
+    await supervisor.stop();
+    await healthMonitor.trigger(false);
+    expect(processManager.starts).toBe(3);
   });
 
   it("enters ERROR after the configured restart limit", async () => {
     const processManager = new FakeProcessManager();
     const healthMonitor = new FakeHealthMonitor();
-    const supervisor = makeSupervisor(processManager, healthMonitor, new FakeTunnel(), new MemoryLogger(), 1);
+    const supervisor = makeSupervisor(processManager, healthMonitor, new FakeTunnel(), new MemoryLogger(), 2);
     await supervisor.start();
     processManager.failNextStart = true;
 
     processManager.exit();
-    await vi.waitFor(() => expect(supervisor.state).toBe("ERROR"));
+    await vi.waitFor(() => {
+      expect(supervisor.state).toBe("DEGRADED");
+      expect(healthMonitor.running).toBe(true);
+    });
+    processManager.failNextStart = true;
+    await healthMonitor.trigger(false);
+    expect(supervisor.state).toBe("ERROR");
+    await healthMonitor.trigger(false);
+    expect(processManager.starts).toBe(3);
 
     await expect(supervisor.status()).resolves.toMatchObject({
       state: "ERROR",
-      restartAttempts: 1,
-      maxRestartAttempts: 1,
+      restartAttempts: 2,
+      maxRestartAttempts: 2,
     });
+  });
+
+  it("records exit identity and failure stage, and respects disposal", async () => {
+    const pm = new FakeProcessManager();
+    const health = new FakeHealthMonitor();
+    const logger = new MemoryLogger();
+    const supervisor = makeSupervisor(pm, health, new FakeTunnel(), logger);
+    await supervisor.start();
+    pm.failNextStart = true;
+    pm.exit();
+    await vi.waitFor(() => {
+      expect(supervisor.state).toBe("DEGRADED");
+      expect(health.running).toBe(true);
+    });
+    expect(logger.details[logger.events.indexOf("runtime exited")]).toMatchObject({ code: 1, signal: null, pid: 321, expected: false });
+    expect(logger.details[logger.events.indexOf("restart failed")]).toEqual({ attempt: 1, stage: "runtime-start" });
+    supervisor.dispose();
+    await health.trigger(false);
+    expect(pm.starts).toBe(2);
+  });
+
+  it("does not replace a runtime whose stop failed", async () => {
+    const pm = new FakeProcessManager();
+    const health = new FakeHealthMonitor();
+    const supervisor = makeSupervisor(pm, health);
+    await supervisor.start();
+    pm.stop = async () => { throw new Error("timeout"); };
+    await health.trigger(false);
+    await health.trigger(false);
+    await health.trigger(false);
+    expect(pm.starts).toBe(1);
+    expect(supervisor.state).toBe("DEGRADED");
+    supervisor.dispose();
   });
 
   it("writes only fixed, non-sensitive supervisor events", async () => {
@@ -295,14 +395,20 @@ describe("supervisor", () => {
       logger.info("runtime started");
       logger.info("health failed");
       logger.info("restart triggered");
+      logger.info("runtime exited", { code: 1, signal: "SIGTERM", pid: 4321, expected: false,
+        stderr: "Authorization: Bearer secret-one OAuth token=secret-two Cloudflare token=secret-three EADDRINUSE\nprivate-unlabelled-secret" });
       const content = await readFile(logger.filePath, "utf8");
 
       expect(content).toContain("runtime started");
       expect(content).toContain("health failed");
+      expect(content).toContain("EADDRINUSE");
+      expect(content).toContain('"signal":"SIGTERM"');
+      expect(content).not.toContain("secret");
       expect(content).not.toContain("token");
       expect(content).not.toContain("credential");
       expect(content).not.toContain("Authorization");
       expect(content).not.toContain(directory);
+      expect(() => new FileSupervisorLogger(logger.filePath).info("host started", { pid: 123 })).not.toThrow();
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

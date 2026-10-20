@@ -64,6 +64,7 @@ export class HealthMonitor {
   private readonly timeoutMs: number;
   private readonly authToken: string | undefined;
   private readonly injectedCheck: (() => Promise<boolean>) | undefined;
+  private checking = false;
   private timer: NodeJS.Timeout | undefined;
 
   public constructor(options: HealthMonitorOptions) {
@@ -95,11 +96,15 @@ export class HealthMonitor {
 
   public start(listener: (healthy: boolean) => void | Promise<void>): void {
     if (this.timer !== undefined) return;
-    this.timer = setInterval(() => {
+    const timer = setInterval(() => {
+      if (this.checking) return;
+      this.checking = true;
       void this.check()
-        .then((healthy) => listener(healthy))
-        .catch(() => undefined);
+        .then((healthy) => { if (this.timer === timer) return listener(healthy); })
+        .catch(() => undefined)
+        .finally(() => { this.checking = false; });
     }, this.intervalMs);
+    this.timer = timer;
   }
 
   public stop(): void {

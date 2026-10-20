@@ -660,10 +660,20 @@ describe("AutoIterationService", () => {
     await vi.waitFor(() => expect(recoveredListener).toHaveBeenCalledWith(terminal));
   });
 
-  it("completes an approved execution without starting another Codex process", async () => {
+  it.each(["xml", "plain"])("completes a first %s verdict without another Review or Codex process", async format => {
     const value = await fixture(["APPROVE"]);
-
-    const loop = await value.auto.start(startInput());
+    const collect = vi.fn(async (_conversationId: string, requestId: string) => ({
+      conversationId: "conversation-001", status: "COMPLETED" as const,
+      content: format === "xml" ? verdict(requestId, "APPROVE")
+        : verdict(requestId, "APPROVE").replace("<lrm-review-result>", "LRM_REVIEW_VERDICT_BEGIN\n")
+          .replace("</lrm-review-result>", "\nLRM_REVIEW_VERDICT_END"),
+      extractedAt: new Date().toISOString(),
+    }));
+    const auto = new AutoIterationService(value.registry, { storageRoot: value.root,
+      browserRouter: value.auto.browserRouter, controlledActuation: value.auto.controlledActuation,
+      completionRouter: new ReviewCompletionRouter(value.root,
+        new BrowserWorkerReviewCompletionAdapter({ collectCompletion: collect })) });
+    const loop = await auto.start(startInput());
 
     expect(loop).toMatchObject({
       loop_id: "loop-001",
@@ -676,6 +686,10 @@ describe("AutoIterationService", () => {
       review_result_id: expect.any(String),
     });
     expect(value.starts).toHaveLength(0);
+    expect(collect).toHaveBeenCalledTimes(1);
+    expect(value.deliveryCalls).toHaveBeenCalledTimes(1);
+    expect(loop.verdict_recovery).toBeUndefined();
+    expect(await value.executionService.listExecutions("workspace-a", "task-001")).toHaveLength(1);
     await expect(new TaskContextService(value.root).getTaskContext("task-001"))
       .resolves.toMatchObject({ status: "completed" });
   });
@@ -741,6 +755,11 @@ describe("AutoIterationService", () => {
       name: "machine verdict missing",
       content: "最终决定：APPROVE。",
       reason: "INVALID_VERDICT_VERDICT_BLOCK_MISSING",
+    },
+    {
+      name: "incomplete verdict boundaries",
+      content: "LRM_REVIEW_VERDICT_BEGIN\n{}",
+      reason: "INVALID_VERDICT_VERDICT_BLOCK_INCOMPLETE",
     },
     {
       name: "malformed JSON",

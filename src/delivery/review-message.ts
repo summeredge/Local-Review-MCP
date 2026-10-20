@@ -1,5 +1,6 @@
 import type { ReviewDeliveryRequest } from "./review-delivery-adapter.js";
 import type { ReviewResult } from "../context/review-result.js";
+import { REVIEW_VERDICT_BEGIN, REVIEW_VERDICT_END } from "../control/review-verdict-parser.js";
 
 export function buildReviewMessage(
   request: Pick<ReviewDeliveryRequest,
@@ -31,15 +32,16 @@ export function buildReviewMessage(
     "HUMAN_REQUIRED means the result needs user decision or clarification, is outside the current task scope, or cannot be safely decided by the current iteration. Do not expand the iteration for out-of-scope issues.",
     "Do not output controller, retry, transport, or lifecycle states as verdict decisions.",
     "For ITERATE, include the exact additional field \"iteration\": {\"goal\": \"...\", \"requirements\": [\"...\"], \"acceptance_criteria\": [\"...\"] }.",
-    "Before sending, check that the complete block is present after the review, its review_request_id matches exactly, and nothing follows its closing tag. A prose APPROVE alone is not a verdict.",
+    "Before sending, check that the complete block is present after the review, its review_request_id matches exactly, and nothing follows its end marker. A prose APPROVE alone is not a verdict.",
+    "Write the boundary markers as literal plain text on separate lines; do not use XML or HTML tags.",
     "Use the template below with your actual decision and summary (add iteration only for ITERATE); preserve schema_version and review_request_id exactly:",
-    "<lrm-review-result>",
+    REVIEW_VERDICT_BEGIN,
     "{",
     '  "schema_version": 1,',
     `  "review_request_id": "${request.review_request_id}",`,
     '  "decision": "APPROVE",',
     '  "summary": "..."',
     "}",
-    "</lrm-review-result>",
+    REVIEW_VERDICT_END,
   ].join("\n");
 }

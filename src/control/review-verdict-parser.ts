@@ -4,10 +4,13 @@ import type { ReviewVerdict } from "./review-verdict.js";
 
 export const REVIEW_VERDICT_OPEN_TAG = "<lrm-review-result>";
 export const REVIEW_VERDICT_CLOSE_TAG = "</lrm-review-result>";
+export const REVIEW_VERDICT_BEGIN = "LRM_REVIEW_VERDICT_BEGIN";
+export const REVIEW_VERDICT_END = "LRM_REVIEW_VERDICT_END";
 
 export const REVIEW_VERDICT_PARSE_ERROR_CODES = [
   "REVIEW_RESULT_NOT_COMPLETED",
   "VERDICT_BLOCK_MISSING",
+  "VERDICT_BLOCK_INCOMPLETE",
   "VERDICT_BLOCK_MULTIPLE",
   "VERDICT_BLOCK_NOT_FINAL",
   "VERDICT_JSON_INVALID",
@@ -48,30 +51,35 @@ export class ReviewVerdictParser {
     }
 
     const content = result.content;
-    const openingCount = countOccurrences(content, REVIEW_VERDICT_OPEN_TAG);
-    const closingCount = countOccurrences(content, REVIEW_VERDICT_CLOSE_TAG);
-    if (openingCount === 0 || closingCount === 0) {
+    const boundaries = [
+      [REVIEW_VERDICT_BEGIN, REVIEW_VERDICT_END],
+      [REVIEW_VERDICT_OPEN_TAG, REVIEW_VERDICT_CLOSE_TAG],
+    ] as const;
+    const openingCount = boundaries.reduce((sum, [open]) => sum + countOccurrences(content, open), 0);
+    const closingCount = boundaries.reduce((sum, [, close]) => sum + countOccurrences(content, close), 0);
+    if (openingCount === 0 && closingCount === 0) {
       throw new ReviewVerdictParseError(
         "VERDICT_BLOCK_MISSING",
         "Review result does not contain one complete verdict block.",
       );
     }
-    if (openingCount !== 1 || closingCount !== 1) {
+    if (openingCount > 1 || closingCount > 1) {
       throw new ReviewVerdictParseError(
         "VERDICT_BLOCK_MULTIPLE",
         "Review result contains more than one verdict block.",
       );
     }
 
-    const start = content.indexOf(REVIEW_VERDICT_OPEN_TAG) + REVIEW_VERDICT_OPEN_TAG.length;
-    const end = content.indexOf(REVIEW_VERDICT_CLOSE_TAG, start);
-    if (end < start) {
+    const [open, close] = boundaries.find(([opening]) => content.includes(opening)) ?? boundaries[0];
+    const start = content.indexOf(open) + open.length;
+    const end = content.indexOf(close, start);
+    if (openingCount !== 1 || closingCount !== 1 || end < start) {
       throw new ReviewVerdictParseError(
-        "VERDICT_BLOCK_MISSING",
-        "Review result does not contain one ordered verdict block.",
+        "VERDICT_BLOCK_INCOMPLETE",
+        "Verdict boundaries are incomplete, mixed, or out of order; generation or collection may be incomplete.",
       );
     }
-    const closeTagEnd = end + REVIEW_VERDICT_CLOSE_TAG.length;
+    const closeTagEnd = end + close.length;
     if (content.slice(closeTagEnd).trim() !== "") {
       throw new ReviewVerdictParseError(
         "VERDICT_BLOCK_NOT_FINAL",

@@ -28,6 +28,7 @@ import {
 } from "./control-plane/chatgpt-connector.js";
 import { registeredMcpToolsMessage } from "./mcp/server.js";
 import { createStartupManager } from "./supervisor/startup.js";
+import { FileSupervisorLogger } from "./supervisor/logger.js";
 import { createSupervisor } from "./supervisor/supervisor.js";
 import { WindowsTrayApp } from "./supervisor/tray.js";
 import { WorkspaceManager } from "./workspace/manager.js";
@@ -246,18 +247,35 @@ try {
     const cli = parseCliArgs(argv);
     const settings = await loadSettings(argv);
     if (settings.supervisor?.enabled && !cli.runtimeOnly) {
+      const supervisorLogger = new FileSupervisorLogger();
+      let closing = false;
+      supervisorLogger.info("host started", { pid: process.pid });
+      process.once("exit", (code) => supervisorLogger.info("host exited", { pid: process.pid, code, expected: closing }));
       const supervisor = createSupervisor(settings, {
+        logger: supervisorLogger,
         runtimeScript: process.argv[1],
         runtimeConfigPath: cli.configPath,
       });
       const tray = new WindowsTrayApp(supervisor, {
+        onExit: () => {
+          closing = true;
+          supervisorLogger.info("host shutdown", { pid: process.pid, expected: true });
+        },
         startupManager: createStartupManager(settings, {
           configPath: cli.configPath,
           runtimeScript: process.argv[1],
         }),
       });
+      const close = (signal: NodeJS.Signals): void => {
+        if (closing) return;
+        closing = true;
+        supervisorLogger.info("host shutdown", { pid: process.pid, signal });
+        void tray.stop().finally(() => supervisor.stop()).catch(() => undefined);
+      };
+      process.once("SIGINT", () => close("SIGINT"));
+      process.once("SIGTERM", () => close("SIGTERM"));
       await supervisor.start();
-      void tray.start().catch((error: unknown) => {
+      if (!closing) void tray.start().catch((error: unknown) => {
         console.warn("Windows tray failed to start; continuing without tray");
         printErrorDetails(error, true);
       });
@@ -270,14 +288,6 @@ try {
         `Workspace Name: ${workspace?.name ?? "unknown"}`,
         registeredMcpToolsMessage(),
       ].join("\n"));
-      let closing = false;
-      const close = (): void => {
-        if (closing) return;
-        closing = true;
-        void tray.stop().then(() => supervisor.stop()).catch(() => undefined);
-      };
-      process.once("SIGINT", close);
-      process.once("SIGTERM", close);
     } else {
       const context = createAppContext(settings);
       const server = await startApp(settings, context);

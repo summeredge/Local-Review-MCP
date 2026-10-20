@@ -14,6 +14,8 @@ import { RuntimeStateStore, type RuntimeState } from "./state.js";
 import type {
   HealthMonitorLike,
   RuntimeProcessExitListener,
+  RuntimeProcessExit,
+  SupervisorLogDetails,
   RuntimeProcessManager,
   SupervisorLogger,
   SupervisorOptions,
@@ -87,6 +89,8 @@ export class Supervisor {
   private lastTunnelState: string | undefined;
   private restartAttempts = 0;
   private healthFailures = 0;
+  private monitoringEnabled = false;
+  private stage: SupervisorLogDetails["stage"] = "runtime-start";
 
   public constructor(options: SupervisorOptions) {
     if (!Number.isSafeInteger(options.maxRestartAttempts) || options.maxRestartAttempts < 0) {
@@ -100,7 +104,7 @@ export class Supervisor {
     this.logDirectoryValue = options.logDirectory;
     this.maxRestartAttempts = options.maxRestartAttempts;
     if (this.processManager.onExit !== undefined) {
-      const listener: RuntimeProcessExitListener = () => this.handleRuntimeExit();
+      const listener: RuntimeProcessExitListener = (exit) => this.handleRuntimeExit(exit);
       this.removeExitListener = this.processManager.onExit(listener);
     }
   }
@@ -130,6 +134,7 @@ export class Supervisor {
       if (this.stateStore.value === "RUNNING") return this.status();
     }
 
+    this.monitoringEnabled = true;
     const operation = this.startInternal();
     this.lifecycle = operation;
     try {
@@ -141,6 +146,9 @@ export class Supervisor {
   }
 
   public async stop(): Promise<SupervisorStatus> {
+    this.monitoringEnabled = false;
+    this.healthMonitor.stop();
+    this.logger.info("stop requested");
     if (this.state === "STOPPED") return this.status();
     if (this.lifecycle !== undefined) await this.lifecycle.catch(() => undefined);
     if (this.recovery !== undefined) await this.recovery.catch(() => undefined);
@@ -185,6 +193,7 @@ export class Supervisor {
   }
 
   public dispose(): void {
+    this.monitoringEnabled = false;
     this.removeExitListener?.();
     this.removeExitListener = undefined;
     this.healthMonitor.stop();
@@ -208,7 +217,7 @@ export class Supervisor {
     this.setState("STARTING");
     try {
       await this.startResources(true);
-      this.healthMonitor.start((healthy) => this.handleHealth(healthy));
+      this.startMonitoring();
     } catch (error: unknown) {
       await this.stopResources().catch(() => undefined);
       this.setState("ERROR");
@@ -216,14 +225,24 @@ export class Supervisor {
     }
   }
 
+  private startMonitoring(): void {
+    if (this.monitoringEnabled) this.healthMonitor.start((healthy) => this.handleHealth(healthy));
+  }
+
   private async startResources(waitForRuntimeHealth = false): Promise<void> {
     this.setState("STARTING");
+    this.stage = "runtime-start";
     const process = await this.processManager.start().catch((error: unknown) => {
+      this.logger.info("resource failed", { stage: this.stage });
       throw new Error("Runtime process failed to start", { cause: error });
     });
-    if (!process.running) throw new Error("Runtime process failed to start");
+    if (!process.running) {
+      this.logger.info("resource failed", { stage: this.stage });
+      throw new Error("Runtime process failed to start");
+    }
     this.runtimeStarted = true;
-    this.logger.info("runtime started");
+    this.logger.info("runtime started", { pid: process.pid });
+    this.stage = "health-check";
 
     const healthy = waitForRuntimeHealth
       ? await waitForHealthy(() => this.healthMonitor.check())
@@ -231,12 +250,14 @@ export class Supervisor {
     if (!healthy) {
       this.healthFailures += 1;
       this.setState("DEGRADED");
-      this.logger.info("health failed");
+      this.logger.info("health failed", { stage: "health-check" });
       throw new Error("Runtime health check failed");
     }
 
+    this.stage = "tunnel-start";
     this.tunnelStarted = true;
     await this.tunnel.start().catch((error: unknown) => {
+      this.logger.info("resource failed", { stage: this.stage });
       throw new Error("Tunnel failed to start", { cause: error });
     });
     await this.recordTunnelState();
@@ -260,15 +281,17 @@ export class Supervisor {
       await this.recordTunnelState();
     }
 
-    const shouldStopRuntime = this.runtimeStarted || this.processManager.status().running;
+    const process = this.processManager.status();
+    const shouldStopRuntime = this.runtimeStarted || process.running || process.pid !== undefined;
     this.runtimeStarted = false;
     if (shouldStopRuntime) {
       try {
         await this.processManager.stop();
+        this.logger.info("runtime stopped", { pid: process.pid });
       } catch {
         failure = true;
+        this.logger.info("resource failed", { stage: "stop", pid: process.pid });
       }
-      this.logger.info("runtime stopped");
     }
 
     if (failure) throw new Error("Supervisor failed to stop");
@@ -276,7 +299,10 @@ export class Supervisor {
 
   private async handleHealth(healthy: boolean): Promise<void> {
     if (this.state !== "RUNNING" && this.state !== "DEGRADED") return;
-    if (healthy && await this.isTunnelHealthy()) {
+    if (!this.monitoringEnabled || this.recovery !== undefined) return;
+    const tunnelHealthy = healthy && await this.isTunnelHealthy();
+    if (!this.monitoringEnabled || this.recovery !== undefined) return;
+    if (healthy && this.processManager.status().running && tunnelHealthy) {
       this.healthFailures = 0;
       this.restartAttempts = 0;
       this.setState("RUNNING");
@@ -307,7 +333,7 @@ export class Supervisor {
   }
 
   private async recoverIfAllowed(): Promise<void> {
-    if (this.recovery !== undefined) return;
+    if (!this.monitoringEnabled || this.recovery !== undefined) return;
     if (this.restartAttempts >= this.maxRestartAttempts) {
       await this.enterError();
       return;
@@ -332,15 +358,21 @@ export class Supervisor {
 
   private async recover(): Promise<void> {
     this.restartAttempts += 1;
-    this.logger.info("restart triggered");
-    await this.stopResources().catch(() => undefined);
+    const attempt = this.restartAttempts;
+    this.logger.info("restart triggered", { attempt });
     try {
+      this.stage = "stop";
+      await this.stopResources();
+      if (!this.monitoringEnabled) return;
       await this.startResources(true);
-      this.healthMonitor.start((healthy) => this.handleHealth(healthy));
+      this.startMonitoring();
+      this.logger.info("restart succeeded", { attempt });
     } catch {
+      this.logger.info("restart failed", { attempt, stage: this.stage });
       await this.stopResources().catch(() => undefined);
       this.setState(this.restartAttempts >= this.maxRestartAttempts ? "ERROR" : "DEGRADED");
       if (this.state === "ERROR") this.healthMonitor.stop();
+      else this.startMonitoring();
     }
   }
 
@@ -350,8 +382,9 @@ export class Supervisor {
     this.setState("ERROR");
   }
 
-  private handleRuntimeExit(): void {
-    if (!this.runtimeStarted || this.state === "STOPPED" || this.state === "STOPPING") return;
+  private handleRuntimeExit(exit: RuntimeProcessExit): void {
+    this.logger.info("runtime exited", { ...exit, expected: exit.expected ?? !this.runtimeStarted });
+    if (exit.expected || !this.runtimeStarted || this.state === "STOPPED" || this.state === "STOPPING") return;
     this.runtimeStarted = false;
     this.logger.info("runtime stopped");
     void this.handleHealth(false).catch(() => undefined);

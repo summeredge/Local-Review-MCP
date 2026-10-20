@@ -1,4 +1,5 @@
 import { spawn as defaultSpawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { summarizeRuntimeStderr } from "./logger.js";
 import type {
   RuntimeProcessExit,
   RuntimeProcessExitListener,
@@ -22,6 +23,8 @@ export class ProcessManager implements RuntimeProcessManager {
   private readonly spawnProcess: typeof defaultSpawn;
   private child: ChildProcess | undefined;
   private running = false;
+  private stopping: Promise<void> | undefined;
+  private readonly expectedExits = new WeakSet<ChildProcess>();
   private starting: Promise<RuntimeProcessStatus> | undefined;
   private cancelStarting: (() => void) | undefined;
   private readonly exitListeners = new Set<RuntimeProcessExitListener>();
@@ -35,6 +38,10 @@ export class ProcessManager implements RuntimeProcessManager {
   }
 
   public start(): Promise<RuntimeProcessStatus> {
+    if (this.stopping !== undefined) return this.stopping.then(() => this.start());
+    if (this.child !== undefined && !this.running && this.starting === undefined) {
+      return Promise.reject(new Error("Previous runtime has not exited"));
+    }
     if (this.running) return Promise.resolve(this.status());
     if (this.starting !== undefined) return this.starting;
 
@@ -42,6 +49,7 @@ export class ProcessManager implements RuntimeProcessManager {
       let child: ChildProcess | undefined;
       let settled = false;
       let exited = false;
+      let stderr = "";
 
       const clear = (): void => {
         if (this.child === child) {
@@ -53,7 +61,7 @@ export class ProcessManager implements RuntimeProcessManager {
       const fail = (cause?: unknown): void => {
         if (settled) return;
         settled = true;
-        clear();
+        if (child === undefined || child.pid === undefined || exited) clear();
         reject(cause === undefined
           ? new Error("Runtime process failed to start")
           : new Error("Runtime process failed to start", { cause }));
@@ -64,7 +72,10 @@ export class ProcessManager implements RuntimeProcessManager {
         if (this.child === child) {
           this.child = undefined;
           this.running = false;
-          const exit: RuntimeProcessExit = { code, signal };
+          const exit: RuntimeProcessExit = { code, signal, pid: child?.pid,
+            expected: child !== undefined && this.expectedExits.has(child),
+            ...(stderr === "" ? {} : { stderr: summarizeRuntimeStderr(stderr) }),
+          };
           for (const listener of this.exitListeners) {
             try {
               listener(exit);
@@ -87,11 +98,13 @@ export class ProcessManager implements RuntimeProcessManager {
           env: this.environment,
           shell: false,
           windowsHide: true,
-          stdio: "ignore",
+          stdio: ["ignore", "ignore", "pipe"],
           ...(this.cwd === undefined ? {} : { cwd: this.cwd }),
         };
         child = this.spawnProcess(this.command, this.args, spawnOptions);
         this.child = child;
+        child.stderr?.setEncoding("utf8");
+        child.stderr?.on("data", (chunk: string) => { stderr = (stderr + chunk.slice(-4096)).slice(-4096); });
         child.once("spawn", started);
         child.once("error", (error) => fail(error));
         child.once("exit", markExited);
@@ -111,13 +124,41 @@ export class ProcessManager implements RuntimeProcessManager {
     return promise;
   }
 
-  public async stop(): Promise<void> {
+  public stop(): Promise<void> {
+    if (this.stopping !== undefined) return this.stopping;
+    const child = this.child;
     this.cancelStarting?.();
     this.cancelStarting = undefined;
-    const child = this.child;
-    this.child = undefined;
-    this.running = false;
-    if (child !== undefined && !child.killed) child.kill();
+    if (child === undefined) return Promise.resolve();
+    this.expectedExits.add(child);
+    const operation = new Promise<void>((resolve, reject) => {
+      const finish = (): void => {
+        clearTimeout(timer);
+        child.removeListener("exit", finish);
+        child.removeListener("close", finish);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        child.removeListener("exit", finish);
+        child.removeListener("close", finish);
+        reject(new Error("Runtime process stop timed out"));
+      }, 5000);
+      child.once("exit", finish);
+      child.once("close", finish);
+      try {
+        if (!child.killed) child.kill();
+      } catch {
+        clearTimeout(timer);
+        child.removeListener("exit", finish);
+        child.removeListener("close", finish);
+        reject(new Error("Runtime process stop failed"));
+      }
+    });
+    this.stopping = operation;
+    void operation.finally(() => {
+      if (this.stopping === operation) this.stopping = undefined;
+    }).catch(() => undefined);
+    return operation;
   }
 
   public status(): RuntimeProcessStatus {

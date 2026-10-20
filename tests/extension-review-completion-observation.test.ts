@@ -244,12 +244,15 @@ describe("MAIN-world review completion observation", () => {
     expect(timelineReply([u, { ...u, messageId: 'new-user' }, a])).toMatchObject({ status: 'ambiguous' });
   });
 
-  it('resolves a terminal content reference to its exact rendered body and preserves verdict JSON', () => {
+  it.each([
+    ['<lrm-review-result>', '</lrm-review-result>'],
+    ['LRM_REVIEW_VERDICT_BEGIN', 'LRM_REVIEW_VERDICT_END'],
+  ])('resolves a terminal content reference with %s to its exact rendered body and preserves verdict JSON', (open, close) => {
     const id = 'answer-001';
     const u = { type: 'user-message', messageId: EXPECTED_USER, serverMessageId: EXPECTED_USER };
     const verdict = { schema_version: 1 as const, review_request_id: 'review-request-001',
       decision: 'APPROVE' as const, summary: 'Checked C:\\path_with_underscore\\file and "quotes".' };
-    const text = `审查通过\n<lrm-review-result>\n${JSON.stringify(verdict)}\n</lrm-review-result>`;
+    const text = `审查通过\n${open}\n${JSON.stringify(verdict)}\n${close}`;
     const root = (source = id, index = '0', innerText = text): Section => ({
       innerText, getAttribute: name => name === 'data-dil-source-message-id' ? source
         : name === 'data-chatgpt-copy-reference' ? index : null,
