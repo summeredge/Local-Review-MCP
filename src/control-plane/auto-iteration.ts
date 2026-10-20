@@ -39,6 +39,7 @@ import {
 import { conversationDeliveryReadiness } from "./bridge.js";
 import { ExtensionDeliveryAdapter } from "../delivery/extension-delivery-adapter.js";
 import { buildExecutionFailureMessage } from "../delivery/execution-failure-message.js";
+import { buildReviewMessage } from "../delivery/review-message.js";
 import type { ReviewDeliveryAdapter } from "../delivery/review-delivery-adapter.js";
 import { BrowserRouter } from "../router/browser-router.js";
 import { ReviewCompletionRouter } from "../router/review-completion-router.js";
@@ -96,6 +97,10 @@ export const autoIterationSchema = z.object({
   routing_id: conversationRoutingIdSchema.optional(),
   delivery_id: reviewDeliveryIdSchema.optional(),
   review_result_id: reviewResultIdSchema.optional(),
+  verdict_recovery: z.object({
+    original_result_id: reviewResultIdSchema,
+    error: z.string().min(1).max(4000),
+  }).strict().optional(),
   actuation_id: actuationIdSchema.optional(),
   authorization_id: z.string().uuid().optional(),
   pending_iteration: pendingIterationSchema.optional(),
@@ -878,7 +883,17 @@ export class AutoIterationService {
 
       let delivered: ReviewDelivery;
       try {
-        delivered = await this.browserRouter.deliver(current.workspace_id, routingId);
+        let message: string | undefined;
+        if (current.verdict_recovery !== undefined) {
+          const original = await this.results.getReviewResult(current.workspace_id, current.verdict_recovery.original_result_id);
+          const originalRequest = original === null ? null
+            : await this.reviewRequests.getReviewRequest(current.workspace_id, original.review_request_id);
+          if (original === null || original.status !== "COMPLETED" || original.task_id !== current.task_id
+            || originalRequest === null) throw new Error("Verdict recovery source is unavailable or inconsistent.");
+          this.assertReviewRequest(current, originalRequest);
+          message = buildReviewMessage({ ...current, review_request_id: reviewRequestId, routing_id: routingId }, original);
+        }
+        delivered = await this.browserRouter.deliver(current.workspace_id, routingId, message);
       } catch (error: unknown) {
         if (transientInfrastructureError(error)) throw error;
         await this.humanRequired(current, "REVIEW_TRANSPORT_EXCEPTION", errorMessage(error));
@@ -984,13 +999,32 @@ export class AutoIterationService {
         await this.humanRequired(loop, "REVIEW_RESULT_NOT_COMPLETED");
         return;
       }
+      if (result.workspace_id !== loop.workspace_id || result.task_id !== loop.task_id
+        || result.review_request_id !== reviewRequestId || result.delivery_id !== loop.delivery_id) {
+        await this.humanRequired(loop, "REVIEW_RESULT_IDENTITY_INVALID");
+        return;
+      }
 
       let verdict: ReviewVerdict;
       try {
         verdict = this.parser.parse(result);
       } catch (error: unknown) {
         const code = error instanceof ReviewVerdictParseError ? error.code : "VERDICT_INVALID";
-        await this.humanRequired(loop, `INVALID_VERDICT_${code}`, errorMessage(error));
+        if (code === "VERDICT_BLOCK_MISSING" && loop.verdict_recovery === undefined) {
+          // One durable follow-up uses the existing Review transport, never the Execution path.
+          await this.update(loop, {
+            verdict_recovery: { original_result_id: result.result_id, error: errorMessage(error) },
+            review_request_id: stableIdentity("verdict-review", loop.loop_id, loop.iteration),
+            routing_id: stableIdentity("verdict-routing", loop.loop_id, loop.iteration),
+            delivery_id: stableIdentity("verdict-delivery", loop.loop_id, loop.iteration),
+            review_result_id: undefined,
+            completion_attempt_count: undefined,
+            stage: "review_request",
+          });
+          return;
+        }
+        await this.humanRequired(loop, `INVALID_VERDICT_${code}`,
+          `Review 内容已返回（COMPLETED），但 Verdict 协议无效；尚未确认审查通过。原始证据：${result.result_id}；review_request_id：${reviewRequestId}。${errorMessage(error)}`);
         return;
       }
       const parsed = reviewVerdictSchema.safeParse(verdict);
@@ -1027,6 +1061,7 @@ export class AutoIterationService {
         routing_id: undefined,
         delivery_id: undefined,
         review_result_id: undefined,
+        verdict_recovery: undefined,
         completion_attempt_count: undefined,
         actuation_id: nextActuationId,
         authorization_id: undefined,

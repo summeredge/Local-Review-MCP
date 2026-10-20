@@ -947,7 +947,9 @@ export class GoalOrchestrationService {
           ? "Review 需要用户决策：请确认审查意见和下一步修改要求。"
           : reason === "MAX_ITERATIONS_REACHED"
             ? "已达到最大迭代次数：请决定是否继续，并明确后续范围与迭代上限。"
-            : "执行或基础设施异常：请检查错误详情，处理连接、授权或环境问题后明确是否继续。";
+            : reason.startsWith("INVALID_VERDICT_")
+              ? "Review 内容已返回，但 Verdict 格式无效，不能确认审查通过；缺失块会自动补充一次，仍失败才暂停。请检查原 Review 与补充结果，不重新执行 Codex 代码任务。"
+              : "执行或基础设施异常：请检查错误详情，处理连接、授权或环境问题后明确是否继续。";
         const active = this.activeTask(goal);
         const completedTasks = goal.phases.flatMap(phase => {
           if (phase.status === "completed") return phase.tasks;
@@ -971,7 +973,9 @@ export class GoalOrchestrationService {
         `原因：${info.terminal_reason}`, `摘要：${info.terminal_summary}`,
         `已完成工作：${info.completed_work}`, `需要确认：${info.required_action}`,
         ...(info.review_result_id === undefined ? [] : [`Review 证据：${info.review_result_id}`]),
-        "请在本 ChatGPT 对话中回复处理决定。只有用户明确决定继续或修改任务后，才通过 submit_goal 使用新的 Goal / Task 标识发起后续执行，并在任务要求中保留原 Goal / Task / Execution 和 Review 证据关联，沿用原 Workspace 与对话绑定。保留原 Goal 终止记录，不自动重试或重新提交。",
+        info.terminal_reason.startsWith("INVALID_VERDICT_")
+          ? "请在本 ChatGPT 对话中回复处理决定。补充 Verdict 时引用原 Goal / Task / Execution、Review Result 和 review_request_id，保留原 Review 内容与错误记录。补充结果不自动覆盖原记录或恢复 Goal；原 Goal 保持 human_required，不调用 submit_goal 重跑代码任务。"
+          : "请在本 ChatGPT 对话中回复处理决定。只有用户明确决定继续或修改任务后，才通过 submit_goal 使用新的 Goal / Task 标识发起后续执行，并在任务要求中保留原 Goal / Task / Execution 和 Review 证据关联，沿用原 Workspace 与对话绑定。保留原 Goal 终止记录，不自动重试或重新提交。",
       ].join("\n"), stableIdentity("human-required", goal.goal_id, goal.current_phase_id!, goal.current_task_id!));
       if (delivery.phase === "queued" || delivery.phase === "leased"
         || (delivery.receipt !== undefined && retryableNotSent(delivery.receipt))) this.scheduleRecovery(goal.goal_id);

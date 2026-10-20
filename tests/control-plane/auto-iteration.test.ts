@@ -152,7 +152,7 @@ async function fixture(
       };
     }),
   }));
-  const deliveryCalls = vi.fn(async () => {
+  const deliveryCalls = vi.fn(async (_request: import("../../src/delivery/review-delivery-adapter.js").ReviewDeliveryRequest) => {
     if (delivery === "delivered") {
       return { status: "delivered" as const, delivered_at: new Date().toISOString() };
     }
@@ -739,7 +739,7 @@ describe("AutoIterationService", () => {
   it.each([
     {
       name: "machine verdict missing",
-      content: "ordinary review prose without a machine block",
+      content: "最终决定：APPROVE。",
       reason: "INVALID_VERDICT_VERDICT_BLOCK_MISSING",
     },
     {
@@ -778,11 +778,82 @@ describe("AutoIterationService", () => {
       browserRouter: invalid.auto.browserRouter,
       controlledActuation: invalid.auto.controlledActuation,
     });
-    await expect(invalidAuto.start(startInput())).resolves.toMatchObject({
+    const stopped = await invalidAuto.start(startInput());
+    expect(stopped).toMatchObject({
       stage: "human_required",
       terminal_reason: reason,
     });
+    const results = await new ReviewResultService(invalid.root).listReviewResults("workspace-a");
+    expect(results).toHaveLength(reason.endsWith("VERDICT_BLOCK_MISSING") ? 2 : 1);
+    expect(results.every(result => result.status === "COMPLETED" && result.content === content)).toBe(true);
+    expect(stopped.terminal_summary).toContain("Review 内容已返回（COMPLETED）");
+    await invalidAuto.advance(stopped.loop_id);
+    expect(await new ReviewResultService(invalid.root).listReviewResults("workspace-a")).toEqual(results);
+    expect(await invalid.executionService.getExecutionContext("workspace-a", "task-001", "execution-001"))
+      .toMatchObject({ status: "passed" });
     expect(invalid.starts).toHaveLength(0);
+  });
+
+  it.each(["APPROVE", "HUMAN_REQUIRED", "wrong-id"] as const)(
+    "automatically requests only the missing Verdict and validates %s without executing Codex", async decision => {
+      const f = await fixture();
+      const collect = vi.fn(async (_conversationId: string, requestId: string) => ({
+        conversationId: "conversation-001", status: "COMPLETED" as const,
+        content: collect.mock.calls.length === 1 ? "最终决定：APPROVE。"
+          : verdict(decision === "wrong-id" ? "wrong-review" : requestId, decision === "HUMAN_REQUIRED" ? decision : "APPROVE"),
+        extractedAt: new Date().toISOString(),
+      }));
+      const completion = new ReviewCompletionRouter(f.root, new BrowserWorkerReviewCompletionAdapter({ collectCompletion: collect }));
+      const auto = new AutoIterationService(f.registry, { storageRoot: f.root, browserRouter: f.auto.browserRouter,
+        completionRouter: completion, controlledActuation: f.auto.controlledActuation });
+      const loop = await auto.start(startInput());
+      expect(loop).toMatchObject({ execution_id: "execution-001", iteration: 1,
+        stage: decision === "APPROVE" ? "completed" : "human_required" });
+      if (decision === "wrong-id") expect(loop.terminal_reason).toBe("INVALID_VERDICT_REVIEW_REQUEST_MISMATCH");
+      if (decision === "HUMAN_REQUIRED") expect(loop.terminal_reason).toBe("REVIEW_REQUIRES_HUMAN");
+      expect(collect).toHaveBeenCalledTimes(2);
+      expect(f.deliveryCalls).toHaveBeenCalledTimes(2);
+      const recovery = f.deliveryCalls.mock.calls[1]![0];
+      expect(recovery.message).toContain("Do not rerun Codex");
+      expect(recovery.message).toContain("最终决定：APPROVE。");
+      expect(recovery.message).toContain(`\"review_request_id\": \"${loop.review_request_id}\"`);
+      const original = await new ReviewResultService(f.root).getReviewResult("workspace-a", loop.verdict_recovery!.original_result_id);
+      expect(original).toMatchObject({ status: "COMPLETED", content: "最终决定：APPROVE。" });
+      expect(recovery.message).toContain(original!.review_request_id);
+      expect(recovery.message).toContain(original!.result_id);
+      expect(loop.verdict_recovery!.error).toContain("VERDICT_BLOCK_MISSING");
+      await auto.advance(loop.loop_id);
+      expect(collect).toHaveBeenCalledTimes(2);
+      expect(f.starts).toHaveLength(0);
+      expect(await f.executionService.listExecutions("workspace-a", "task-001")).toHaveLength(1);
+    });
+
+  it("resumes the same Verdict follow-up after a completion timeout and restart", async () => {
+    const f = await fixture();
+    const collect = vi.fn(async (_conversationId: string, requestId: string) => {
+      if (collect.mock.calls.length === 2) return { conversationId: "conversation-001",
+        status: "TIMEOUT" as const, error: "not finished yet" };
+      return { conversationId: "conversation-001", status: "COMPLETED" as const,
+        content: collect.mock.calls.length === 1 ? "APPROVE" : verdict(requestId, "APPROVE"),
+        extractedAt: new Date().toISOString() };
+    });
+    const completion = new ReviewCompletionRouter(f.root, new BrowserWorkerReviewCompletionAdapter({ collectCompletion: collect }));
+    const options = { storageRoot: f.root, browserRouter: f.auto.browserRouter, completionRouter: completion,
+      controlledActuation: f.auto.controlledActuation, retryDelayMs: 60_000 };
+    const first = new AutoIterationService(f.registry, options);
+    const waiting = await first.start(startInput());
+    expect(waiting).toMatchObject({ stage: "review_completion", completion_attempt_count: 1,
+      verdict_recovery: { error: expect.stringContaining("VERDICT_BLOCK_MISSING") } });
+    first.dispose();
+    await persistLoop(f.root, { ...waiting, retry_at: new Date(0).toISOString() });
+    const restarted = new AutoIterationService(f.registry, options);
+    const completed = await restarted.advance(waiting.loop_id);
+    expect(completed).toMatchObject({ stage: "completed", review_request_id: waiting.review_request_id,
+      verdict_recovery: waiting.verdict_recovery, execution_id: "execution-001" });
+    expect(collect.mock.calls[2]![1]).toBe(collect.mock.calls[1]![1]);
+    expect(f.deliveryCalls).toHaveBeenCalledTimes(2);
+    expect(f.starts).toHaveLength(0);
+    restarted.dispose();
   });
 
   it.each(["FAILED"] as const)(

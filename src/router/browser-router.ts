@@ -30,11 +30,11 @@ export class BrowserRouter {
     this.deliveries = new ReviewDeliveryService(storageRoot, runtimeIdentity);
   }
 
-  public async deliver(workspaceId: string, routingId: string): Promise<ReviewDelivery> {
+  public async deliver(workspaceId: string, routingId: string, message?: string): Promise<ReviewDelivery> {
     const key = `${this.deliveries.storageRoot}\0${workspaceId}\0${routingId}`;
     const pending = deliveryFlights.get(key);
     if (pending) return pending;
-    const operation = this.deliverOnce(workspaceId, routingId);
+    const operation = this.deliverOnce(workspaceId, routingId, message);
     deliveryFlights.set(key, operation);
     void operation.finally(() => {
       if (deliveryFlights.get(key) === operation) deliveryFlights.delete(key);
@@ -42,7 +42,7 @@ export class BrowserRouter {
     return operation;
   }
 
-  private async deliverOnce(workspaceId: string, routingId: string): Promise<ReviewDelivery> {
+  private async deliverOnce(workspaceId: string, routingId: string, message?: string): Promise<ReviewDelivery> {
     const routing = await this.routings.getRouting(workspaceId, routingId);
     if (routing === null) throw new Error(`Conversation routing "${routingId}" was not found.`);
     await this.routings.validateRouting(routing);
@@ -68,6 +68,7 @@ export class BrowserRouter {
       review_request_id: attempt.review_request_id,
       routing_id: attempt.routing_id,
       conversation_id: attempt.conversation_id,
+      ...(message === undefined ? {} : { message }),
       ...(routing.execution_id === undefined ? {} : { execution_id: routing.execution_id }),
     };
 

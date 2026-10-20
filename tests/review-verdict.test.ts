@@ -176,6 +176,8 @@ describe("buildReviewMessage", () => {
     expect(message).toContain("HUMAN_REQUIRED");
     expect(message).toContain("must not force ITERATE");
     expect(message).toContain("exactly one machine-readable verdict block");
+    expect(message).toContain("Do not put either part in a separate Page");
+    expect(message).toContain("A prose APPROVE alone is not a verdict");
     expect(message).toContain('"review_request_id": "review-001"');
     expect(message.indexOf("<lrm-review-result>")).toBeGreaterThan(-1);
     expect(message.indexOf("</lrm-review-result>")).toBe(message.length - "</lrm-review-result>".length);
