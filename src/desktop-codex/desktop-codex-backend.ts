@@ -430,8 +430,8 @@ export class DesktopCodexBackend implements ExecutionBackend {
         originalBinding.target_thread_id, originalBinding.host_id);
     }
 
-    // Capture once and persist with the target binding for observation after restart.
-    const executorThreadId = this.executorIdentity();
+    // A prior start opens its target in Desktop, so continuation must reuse the saved executor.
+    const executorThreadId = originalBinding?.executor_thread_id ?? this.executorIdentity();
 
     const runtime = await this.connectRuntime().catch((error: unknown) => {
       if (error instanceof Error) error.message = `Desktop stage=backend_connection: ${error.message}`;

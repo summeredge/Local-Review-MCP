@@ -719,13 +719,16 @@ async function waitForTerminalExecution(value: Fixture): Promise<void> {
 describe("P5.4.1 route selection", () => {
   it("continues on the original thread when the first Turn is outside the latest ten Turns", async () => {
     const desktop = fakeDesktop({ turnLimit: 10 });
-    const value = await fixture({ desktop });
+    let foregroundConversationId = "executor-conversation-1";
+    const value = await fixture({ desktop,
+      state: () => desktopState({ currentConversationId: foregroundConversationId }) });
     desktop.setProjectPath(value.registry.active.manager.canonicalRoot);
     try {
       await seedTask(value);
       desktop.setTurns([{ id: "turn-1", status: "completed", completedAt: 1 }]);
       const first = await value.backend.start(interactiveRequest());
       await value.backend.whenIdle();
+      foregroundConversationId = first.thread_id!;
       const history = Array.from({ length: 12 }, (_, index) => ({
         id: `turn-${index + 1}`, status: "completed", completedAt: index + 1,
       }));
@@ -745,6 +748,8 @@ describe("P5.4.1 route selection", () => {
       expect(second.session_id).not.toBe(first.session_id);
       expect(desktop.createThreadCount()).toBe(1);
       expect(desktop.sendCount()).toBe(1);
+      expect(desktop.calls.find(call => call.name === "send_message_to_thread")?._meta)
+        .toMatchObject({ "openai/threadId": "executor-conversation-1" });
       expect(desktop.calls.filter(call => call.name === "read_thread").every(call => call.arguments?.turnLimit === 10)).toBe(true);
 
       desktop.setTurns([...history, { id: "turn-13", status: "inProgress", completedAt: null }]);
