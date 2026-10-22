@@ -327,6 +327,8 @@ async function receiveIdentityEvidence(
   if (!parsed.success) {
     traceEvidenceTransport({
       event: "bridge_evidence_rejected",
+      http_status: 400,
+      error_code: "invalid_identity_evidence",
       correlation_key: correlationKey,
       conversation_id: conversationId,
     });
@@ -348,12 +350,12 @@ async function receiveIdentityEvidence(
     if (ack?.accepted !== true || ack.durable !== true) throw new Error("identity evidence was not durably accepted");
     json(response, 202, ack, origin);
   } catch (error) {
-    if (error instanceof ReviewVerdictSubmissionError) {
-      json(response, 409, { error: error.code }, origin);
-      return;
-    }
-    json(response, error instanceof IdentityEvidenceConflictError ? 409 : 503,
-      { error: error instanceof IdentityEvidenceConflictError ? "identity_evidence_conflict" : "identity_evidence_unavailable" }, origin);
+    const status = error instanceof ReviewVerdictSubmissionError || error instanceof IdentityEvidenceConflictError ? 409 : 503;
+    const code = error instanceof ReviewVerdictSubmissionError ? error.code
+      : error instanceof IdentityEvidenceConflictError ? "identity_evidence_conflict" : "identity_evidence_unavailable";
+    traceEvidenceTransport({ event: "bridge_evidence_rejected", correlation_key: parsed.data.request_id,
+      conversation_id: parsed.data.conversation_id, http_status: status, error_code: code });
+    json(response, status, { error: code }, origin);
   }
 }
 

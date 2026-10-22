@@ -420,6 +420,10 @@ describe("ReviewCompletionRouter", () => {
     expect(failed).toMatchObject({ status: "TIMEOUT", error: "assistant did not finish" });
     expect(completed).toMatchObject({ status: "COMPLETED", content: "review result" });
     expect(completed.result_id).toBe(failed.result_id);
+    expect(completed.created_at).toBe(failed.created_at);
+    expect(failed.completed_at).toBeUndefined();
+    expect(Date.parse(completed.completed_at!)).toBeGreaterThanOrEqual(Date.parse(completed.created_at));
+    expect(await router.collect("workspace-a", routing.routing_id)).toEqual(completed);
     await expect(new ReviewResultService(storageRoot).listReviewResults("workspace-a"))
       .resolves.toHaveLength(1);
     await expect(new ReviewRequestService(storageRoot)

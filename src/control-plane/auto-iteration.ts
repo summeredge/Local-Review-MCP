@@ -37,6 +37,7 @@ import {
   type ExtensionDeliveryReadinessCheck,
 } from "./extension-delivery.js";
 import { conversationDeliveryReadiness } from "./bridge.js";
+import type { ExtensionReviewCompletionService } from "./extension-review-completion.js";
 import { ExtensionDeliveryAdapter } from "../delivery/extension-delivery-adapter.js";
 import { buildExecutionFailureMessage } from "../delivery/execution-failure-message.js";
 import { buildReviewMessage } from "../delivery/review-message.js";
@@ -365,6 +366,7 @@ export interface AutoIterationServiceOptions {
   readonly completionRouter?: Pick<ReviewCompletionRouter, "collect">;
   readonly verdictParser?: Pick<ReviewVerdictParser, "parse">;
   readonly extensionDeliveries?: ExtensionDeliveryService;
+  readonly extensionReviewCompletions?: ExtensionReviewCompletionService;
   readonly extensionDeliveryReadiness?: ExtensionDeliveryReadinessCheck;
   readonly dispatchCommandBroker?: Pick<DispatchCommandBroker, "dispatch">;
   readonly reviewDeliveryAdapter?: ReviewDeliveryAdapter;
@@ -454,6 +456,7 @@ export class AutoIterationService {
     this.reviewVerdictSubmission = new ReviewVerdictSubmissionService(registry, {
       storageRoot: this.storageRoot,
       extensionDeliveries: this.extensionDeliveries,
+      extensionReviewCompletions: options.extensionReviewCompletions,
       listLoops: () => this.listLoops(),
     });
     this.terminalListener = options.terminalListener;
@@ -1022,7 +1025,7 @@ export class AutoIterationService {
       if (request.verdict_protocol === "tool_v1") {
         const confirmed = await this.reviewVerdictSubmission.awaitConfirmed(
           loop.workspace_id, reviewRequestId,
-          Date.parse(result.created_at) + REVIEW_VERDICT_CONFIRMATION_TIMEOUT_MS,
+          Date.parse(result.completed_at ?? result.created_at) + REVIEW_VERDICT_CONFIRMATION_TIMEOUT_MS,
         );
         if (this.disposed) return;
         if (confirmed === null) {

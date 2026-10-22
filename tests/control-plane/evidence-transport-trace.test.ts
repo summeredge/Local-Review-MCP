@@ -16,6 +16,7 @@ import {
   evidenceTransportTraceStateFile,
 } from "../../src/control-plane/evidence-transport-trace.js";
 import { identityHash } from "../../src/control-plane/identity-trace.js";
+import { ReviewVerdictSubmissionError } from "../../src/control-plane/review-verdict-submission.js";
 import type { GoalSubmissionRequest, GoalSubmissionResult } from "../../src/control-plane/goal-submission.js";
 import {
   PendingGoalSubmissionService,
@@ -123,6 +124,27 @@ function result(request: GoalSubmissionRequest): GoalSubmissionResult {
 }
 
 describe("EvidenceTransportTraceService", () => {
+  it.each([
+    { error: new ReviewVerdictSubmissionError("VERDICT_EVIDENCE_IDENTITY_INVALID", "private details"), status: 409, code: "VERDICT_EVIDENCE_IDENTITY_INVALID" },
+    { error: new Error("private filesystem details"), status: 503, code: "identity_evidence_unavailable" },
+  ])("records the Bridge rejection status and safe code, then permits a retry ($status)", async ({ error, status, code }) => {
+    const trace = new EvidenceTransportTraceService(await makeRoot("lrm-verdict-bridge-rejection-"));
+    let unavailable = true;
+    await startBridge({ ports: [0], evidenceTransportTrace: trace, onIdentityEvidence: async () => {
+      if (unavailable) throw error;
+      return { accepted: true, durable: true };
+    } });
+    const token = await pair();
+    expect(await request("/identity-evidence", { method: "POST", token, body: evidence() }))
+      .toEqual({ status, body: { error: code } });
+    expect((await trace.getEvidenceTransportTrace(KEY_A)).events.at(-1))
+      .toEqual({ event: "bridge_evidence_rejected", timestamp: expect.any(String), http_status: status, error_code: code });
+    unavailable = false;
+    expect(await request("/identity-evidence", { method: "POST", token, body: evidence() }))
+      .toEqual({ status: 202, body: { accepted: true, durable: true } });
+    expect(await readFile(trace.file, "utf8")).not.toContain("private");
+  });
+
   it('reads bounded recent browser diagnostics including rows without a key', async () => {
     const trace = new EvidenceTransportTraceService(await makeRoot('lrm-recent-browser-diagnostic-'));
     const diagnostic = { stage: 'fiber_scanned' as const, scan_id: 1, navigation_epoch: 0,

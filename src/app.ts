@@ -181,6 +181,7 @@ export function createAppContext(
   const autoIteration = new AutoIterationService(registry, {
     storageRoot,
     extensionDeliveries,
+    extensionReviewCompletions,
     completionRouter,
     controlledActuation,
   });

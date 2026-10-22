@@ -44,14 +44,14 @@ Extension 沿用现有 canonical Fiber selector、isolated content document、MV
 
 证据包含原有 `request_id`、canonical `conversation_id`、worker 确认的 `document_id` / `navigation_epoch`，以及 `tool_name`、`connector`、`workspace_id`、`review_request_id`、`expected_user_message_id`、`tool_call_id` 和 **实际工具参数中的完整 verdict**。
 
-服务端核对 Registry → 当前 AutoIteration → Review Request → Routing → Review Delivery → Execution 的绑定，要求 Execution passed，并核对已持久化 Extension Delivery 的真实用户消息回执。证据的 document / epoch 必须与该投递回执一致；页面重载后若无法提供相同归属证据，安全进入人工处理，不通过 URL fallback 放宽关联。最后比对 correlation key，以及严格 Schema 规范化后的 MCP 裁决 SHA-256 与独立证据的完整裁决，防止同 key 不同内容被确认。Verdict 证据不进入 `submit_goal` 的 correlation registry。
+服务端核对 Registry → 当前 AutoIteration → Review Request → Routing → Review Delivery → Execution 的绑定，要求 Execution passed，并核对已持久化 Extension Delivery 的真实用户消息回执。证据的 document / epoch 必须与投递回执一致，或与同一 Workspace / Task / Review / Delivery / Conversation / 用户消息锚点的已完成 Extension Completion 回执一致。后者允许正常重载或导航后的采集恢复；只有未完成的 lease、URL 或另一回合的回执都不能授权。最后比对 correlation key，以及严格 Schema 规范化后的 MCP 裁决 SHA-256 与独立证据的完整裁决，防止同 key 不同内容被确认。Verdict 证据不进入 `submit_goal` 的 correlation registry。
 
 ## 持久化、时序与恢复
 
 每条 Review 的记录保存在 `<storageRoot>/control-plane/review-verdicts/<workspace_id>/<review_request_id>.json`，复用 `serializeRecord` 和 `atomicWriteRecord`。记录包含绑定身份、Review 用户消息、接收时间、按 correlation key 区分的待确认工具提交摘要及认证来源、独立证据和 `confirmed_at`。待确认候选只存裁决 SHA-256，避免复制大量未经证明的载荷；最终完整 Verdict 保存在经过验证的证据内。
 
 - 工具和证据任一可先到，先到的一方也会持久化。未确认调用不能独占 Review：不同 key 的待确认提交可以并存，可信回合证据选择唯一匹配的裁决；每条 Review 最多接收 1000 个候选。同 key 不同内容拒绝，完全相同的重试不改写文件；最终可信裁决确定后拒绝新增或冲突提交。
-- 确认截止时间唯一采用持久化 `ReviewResult.created_at + 120 秒`；此前仍由现有 Review Completion 生命周期管理，不另设提前到期时间。重启不重置期限。
+- 确认截止时间采用持久化 `ReviewResult.completed_at + 120 秒`；旧记录缺少该字段时沿用 `created_at`，不改写历史记录。`created_at` 保留首次结果记录时间；`completed_at` 仅在第一次成功采集时写入，避免先 TIMEOUT 后 COMPLETED 时提前消耗确认窗口。重复采集和重启均不重置期限。
 - AutoIteration 仍先确认 Review Completion，再进入 verdict 阶段。`tool_v1` 只读取可信记录；未齐全时通过有界事件等待接收确认通知，没有轮询或第二次 Review 投递。
 - 工具和证据先完成时，仍等待 Completion。Completion 先完成时，等待工具及证据。超时进入 `human_required`；纯正文 APPROVE 不生效。
 - 已确认记录恢复后仍核对当前活动绑定，再复用原有决策和 ControlledActuation。原有稳定 Execution / Actuation ID、防重复派发、最大迭代次数保持原样。

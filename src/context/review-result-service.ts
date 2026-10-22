@@ -100,11 +100,13 @@ export class ReviewResultService {
     }
     if (existing !== null && existing.status === "COMPLETED") return existing;
 
+    const now = new Date().toISOString();
     const result = reviewResultSchema.parse({
       ...parsed,
       result_id: existing?.result_id ?? parsed.result_id ?? createResultId(),
       task_id: delivery.task_id,
-      created_at: existing?.created_at ?? new Date().toISOString(),
+      created_at: existing?.created_at ?? now,
+      ...(parsed.status === "COMPLETED" ? { completed_at: now } : {}),
     });
     const directory = reviewResultsDirectory(this.storageRoot, result.workspace_id);
     await mkdir(directory, { recursive: true, mode: 0o700 });

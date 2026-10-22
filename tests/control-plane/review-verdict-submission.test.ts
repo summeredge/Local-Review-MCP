@@ -6,6 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { AutoIterationService, AutoIterationStore, autoIterationSchema } from "../../src/control-plane/auto-iteration.js";
 import { ExtensionDeliveryService } from "../../src/control-plane/extension-delivery.js";
+import { ExtensionReviewCompletionService } from "../../src/control-plane/extension-review-completion.js";
 import { ReviewVerdictSubmissionService, REVIEW_VERDICT_CONFIRMATION_TIMEOUT_MS, submitReviewVerdictInputSchema } from "../../src/control-plane/review-verdict-submission.js";
 import { ControlledActuationService, ActuationAuthorizationStore } from "../../src/control-plane/controlled-actuation.js";
 import { TaskContextService } from "../../src/context/service.js";
@@ -68,15 +69,92 @@ async function fixture(decision: "APPROVE" | "ITERATE" | "HUMAN_REQUIRED" = "APP
   // The production authorization boundary is exercised even though the Codex process is a test double.
   const controlled = new ControlledActuationService(registry, { storageRoot: root, adapter: { start } });
   await new ActuationAuthorizationStore(root).createAuthorization({ actuation_id: "initial", workspace_id: request.workspace_id, task_id: request.task_id, execution_id: request.execution_id, instruction: "initial", execution_mode: "batch" });
-  const options = { storageRoot: root, extensionDeliveries: extension, completionRouter: { collect }, controlledActuation: controlled };
+  const completions = new ExtensionReviewCompletionService(root);
+  const options = { storageRoot: root, extensionDeliveries: extension, extensionReviewCompletions: completions, completionRouter: { collect }, controlledActuation: controlled };
   const auto = new AutoIterationService(registry, options);
   autos.push(auto);
   const input = submitReviewVerdictInputSchema.parse({ workspace_id: request.workspace_id, correlation_key: key, verdict: { schema_version: 1, review_request_id: request.review_request_id, decision, summary: "最终审查结论", ...(decision === "ITERATE" ? { iteration: { goal: "修复阻断缺陷", requirements: ["修复当前问题"], acceptance_criteria: ["相关回归通过"] } } : {}) } });
   const evidence = { request_id: key, conversation_id: owner.conversation_id, document_id: owner.document_id, navigation_epoch: owner.navigation_epoch, tool_name: "submit_review_verdict" as const, connector: "Local MCP Connector" as const, workspace_id: request.workspace_id, review_request_id: request.review_request_id, expected_user_message_id: "user-a", tool_call_id: "tool-a", verdict: input.verdict };
-  return { root, registry, request, routing, delivery, extension, store, auto, options, input, evidence, collect, start, results, service: auto.reviewVerdictSubmission };
+  return { root, registry, request, routing, delivery, extension, completions, store, auto, options, input, evidence, collect, start, results, service: auto.reviewVerdictSubmission };
 }
 
 describe("tool_v1 structured Review Verdict", () => {
+  it.each([119_999, 120_000])("enforces the persisted successful Completion deadline at +%s ms", async (elapsed) => {
+    const f = await fixture();
+    const result = await f.collect();
+    const service = new ReviewVerdictSubmissionService(f.registry, {
+      storageRoot: f.root, extensionDeliveries: f.extension, listLoops: () => f.auto.listLoops(),
+      now: () => Date.parse(result.completed_at!) + elapsed,
+    });
+    if (elapsed === 120_000) {
+      await expect(service.accept(f.input, proof)).rejects.toMatchObject({ code: "VERDICT_CONFIRMATION_EXPIRED" });
+      await expect(service.receiveIdentityEvidence(f.evidence)).rejects.toMatchObject({ code: "VERDICT_CONFIRMATION_EXPIRED" });
+    } else {
+      await service.accept(f.input, proof);
+      await service.receiveIdentityEvidence(f.evidence);
+      expect(await service.getConfirmed("workspace-a", "review-a")).toEqual(f.input.verdict);
+    }
+  });
+
+  it("starts the confirmation window at successful Completion after an earlier collection timeout", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const f = await fixture();
+    const timeout = await f.results.createReviewResult({ workspace_id: "workspace-a", task_id: "task-a",
+      review_request_id: "review-a", delivery_id: "delivery-a", status: "TIMEOUT", error: "still generating" });
+    await vi.advanceTimersByTimeAsync(180_000);
+    await f.service.accept(f.input, proof);
+    const running = f.auto.advance("loop-a");
+    await vi.waitFor(async () => expect((await f.auto.getLoop("loop-a"))?.stage).toBe("verdict"));
+    await vi.advanceTimersByTimeAsync(60_000);
+    await f.service.receiveIdentityEvidence(f.evidence);
+    expect((await running).stage).toBe("completed");
+    const result = await f.results.getReviewResultByRequest("workspace-a", "review-a");
+    expect(result?.created_at).toBe(timeout.created_at);
+    expect(result?.result_id).toBe(timeout.result_id);
+  });
+
+  it.each([false, true])("confirms recovered page evidence only after its matching Completion receipt (restart=%s)", async (restart) => {
+    const f = await fixture("ITERATE");
+    const recoveredOwner = { ...owner, document_id: "reloaded-document", navigation_epoch: 2 };
+    const evidence = { ...f.evidence, document_id: recoveredOwner.document_id, navigation_epoch: 2 };
+    await f.service.accept(f.input, proof);
+    const completion = await f.completions.enqueue({ workspace_id: "workspace-a", task_id: "task-a",
+      review_request_id: "review-a", review_delivery_id: "delivery-a", conversation_id: owner.conversation_id,
+      expected_user_message_id: "user-a" });
+    await f.completions.claim(recoveredOwner);
+    await expect(f.service.receiveIdentityEvidence(evidence)).rejects.toMatchObject({ code: "VERDICT_EVIDENCE_IDENTITY_INVALID" });
+    await f.completions.acknowledge({ ...recoveredOwner, completion_id: completion.completion_id,
+      status: "completed", assistant_message_id: "assistant-a", content: "Review completed" });
+    const service = restart ? new ReviewVerdictSubmissionService(f.registry, {
+      storageRoot: f.root, extensionDeliveries: f.extension, listLoops: () => f.auto.listLoops(),
+    }) : f.service;
+    await service.receiveIdentityEvidence(evidence);
+    await service.receiveIdentityEvidence(evidence);
+    expect(await service.getConfirmed("workspace-a", "review-a")).toEqual(f.input.verdict);
+    expect((await f.auto.advance("loop-a")).stage).toBe("execution");
+    await f.auto.recover();
+    expect(f.start).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { workspace_id: "workspace-b" }, { task_id: "another-task" },
+    { review_delivery_id: "another-delivery" }, { expected_user_message_id: "historical-user" },
+  ])("rejects a recovered Completion from a different Review binding %j", async (patch) => {
+    const f = await fixture();
+    const recoveredOwner = { ...owner, document_id: "reloaded-document", navigation_epoch: 2 };
+    const completion = await f.completions.enqueue({ workspace_id: "workspace-a", task_id: "task-a",
+      review_request_id: "review-a", review_delivery_id: "delivery-a", conversation_id: owner.conversation_id,
+      expected_user_message_id: "user-a", ...patch });
+    await f.completions.claim(recoveredOwner);
+    await f.completions.acknowledge({ ...recoveredOwner, completion_id: completion.completion_id,
+      status: "completed", assistant_message_id: "assistant-a", content: "Review completed" });
+    await f.service.accept(f.input, proof);
+    await expect(f.service.receiveIdentityEvidence({ ...f.evidence,
+      document_id: recoveredOwner.document_id, navigation_epoch: recoveredOwner.navigation_epoch }))
+      .rejects.toMatchObject({ code: "VERDICT_EVIDENCE_IDENTITY_INVALID" });
+    expect(await f.service.getConfirmed("workspace-a", "review-a")).toBeNull();
+  });
+
   it.each(["APPROVE", "ITERATE", "HUMAN_REQUIRED"] as const)("applies %s through the existing controller only after Completion", async (decision) => {
     const f = await fixture(decision);
     await f.service.accept(f.input, proof);
@@ -207,10 +285,11 @@ describe("tool_v1 structured Review Verdict", () => {
     await expect(f.service.receiveIdentityEvidence(f.evidence)).rejects.toThrow();
   });
 
-  it("recovers the Completion deadline after restart without extending it or dispatching", async () => {
+  it.each([false, true])("recovers the Completion deadline after restart without extending it or dispatching (legacy=%s)", async (legacy) => {
     const f = await fixture();
     const result = await f.collect();
-    await writeFile(reviewResultFile(f.root, "workspace-a", result.result_id), JSON.stringify({ ...result, created_at: new Date(Date.now() - REVIEW_VERDICT_CONFIRMATION_TIMEOUT_MS - 1).toISOString() }));
+    const expired = new Date(Date.now() - REVIEW_VERDICT_CONFIRMATION_TIMEOUT_MS - 1).toISOString();
+    await writeFile(reviewResultFile(f.root, "workspace-a", result.result_id), JSON.stringify({ ...result, created_at: expired, completed_at: legacy ? undefined : expired }));
     await f.store.put({ ...(await f.store.get("loop-a"))!, stage: "verdict", review_result_id: result.result_id });
     await f.auto.recover();
     expect((await f.auto.getLoop("loop-a"))?.terminal_reason).toBe("VERDICT_CONFIRMATION_TIMEOUT");

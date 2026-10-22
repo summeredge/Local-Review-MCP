@@ -40,6 +40,8 @@ export const evidenceTransportTraceEventNameSchema = z.enum(EVIDENCE_TRANSPORT_T
 export const evidenceTransportTraceFailureReasonSchema = z.enum(EVIDENCE_TRANSPORT_FAILURE_REASONS);
 const timestampSchema = z.string().datetime({ offset: true });
 const hashSchema = z.string().regex(/^(?:[a-f0-9]{64})?$/u);
+const bridgeStatusSchema = z.number().int().min(100).max(599);
+const bridgeErrorSchema = z.string().max(128).regex(/^[A-Za-z][A-Za-z0-9_]*$/u);
 const diagnosticCountSchema = z.union([z.number().int().min(0).max(100000), z.literal('unknown')]);
 export const browserIdentityDiagnosticSchema = z.object({
   fiber_revision: z.enum(['0.1.5', 'unknown']).optional(),
@@ -81,6 +83,8 @@ export const browserIdentityDiagnosticSchema = z.object({
 }).strict();
 
 const evidenceTransportTraceEventSchema = z.object({
+  http_status: bridgeStatusSchema.optional(),
+  error_code: bridgeErrorSchema.optional(),
   correlation_key_hash: hashSchema,
   conversation_id_hash: hashSchema,
   timestamp: timestampSchema,
@@ -90,6 +94,8 @@ const evidenceTransportTraceEventSchema = z.object({
 }).strict();
 
 const evidenceTransportTraceQueryEventSchema = z.object({
+  http_status: bridgeStatusSchema.optional(),
+  error_code: bridgeErrorSchema.optional(),
   event: evidenceTransportTraceEventNameSchema,
   timestamp: timestampSchema,
   reason: evidenceTransportTraceFailureReasonSchema.optional(),
@@ -100,6 +106,8 @@ export type EvidenceTransportTraceEvent = z.infer<typeof evidenceTransportTraceE
 export type EvidenceTransportTraceEventName = typeof EVIDENCE_TRANSPORT_TRACE_EVENTS[number];
 
 export interface EvidenceTransportTraceRecordInput {
+  readonly http_status?: number;
+  readonly error_code?: string;
   readonly diagnostic?: z.infer<typeof browserIdentityDiagnosticSchema>;
   readonly event: EvidenceTransportTraceEventName;
   readonly reason?: z.infer<typeof evidenceTransportTraceFailureReasonSchema>;
@@ -165,6 +173,8 @@ export class EvidenceTransportTraceService {
   public record(input: EvidenceTransportTraceRecordInput): void {
     try {
       const event = evidenceTransportTraceEventSchema.parse({
+        ...(input.http_status === undefined ? {} : { http_status: input.http_status }),
+        ...(input.error_code === undefined ? {} : { error_code: input.error_code }),
         correlation_key_hash: input.diagnostic?.correlation_key_hash ?? optionalHash(input.correlation_key),
         conversation_id_hash: input.diagnostic?.conversation_id_hash ?? optionalHash(input.conversation_id),
         ...(input.diagnostic ? { diagnostic: input.diagnostic } : {}),
@@ -238,6 +248,8 @@ export class EvidenceTransportTraceService {
         ? candidate.data.event !== "browser_identity_diagnostic"
         : candidate.data.correlation_key_hash !== correlationHash) continue;
       events.push({
+        ...(candidate.data.http_status === undefined ? {} : { http_status: candidate.data.http_status }),
+        ...(candidate.data.error_code === undefined ? {} : { error_code: candidate.data.error_code }),
         event: candidate.data.event,
         timestamp: candidate.data.timestamp,
         ...(candidate.data.reason === undefined ? {} : { reason: candidate.data.reason }),

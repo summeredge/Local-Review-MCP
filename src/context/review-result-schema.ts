@@ -32,8 +32,14 @@ export const reviewResultSchema = z.object({
   content: contentSchema.optional(),
   error: errorSchema.optional(),
   created_at: timestampSchema,
+  completed_at: timestampSchema.optional(),
   extension_transport: z.unknown().optional(),
 }).strict().superRefine((result, context) => {
+  if (result.completed_at !== undefined && (result.status !== "COMPLETED"
+    || Date.parse(result.completed_at) < Date.parse(result.created_at))) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["completed_at"],
+      message: "completion timestamp requires a completed result and cannot precede creation" });
+  }
   if (result.status === "COMPLETED" && result.content === undefined) {
     context.addIssue({
       code: z.ZodIssueCode.custom,

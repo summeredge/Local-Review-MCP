@@ -16,6 +16,7 @@ import { correlationKeySchema } from "../mcp/schema/common.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
 import type { AutoIteration } from "./auto-iteration.js";
 import type { ExtensionDeliveryService } from "./extension-delivery.js";
+import { ExtensionReviewCompletionService } from "./extension-review-completion.js";
 import { extensionIdentityEvidenceSchema } from "./extension-identity.js";
 import { goalConnectorProvenanceSchema, type GoalConnectorProvenance } from "./goal-preflight.js";
 import { identityEvidenceAck } from "./identity-evidence-inbox.js";
@@ -73,6 +74,7 @@ export class ReviewVerdictSubmissionError extends Error {
 export interface ReviewVerdictSubmissionOptions {
   readonly storageRoot: string;
   readonly extensionDeliveries: Pick<ExtensionDeliveryService, "getByLogicalDeliveryId">;
+  readonly extensionReviewCompletions?: Pick<ExtensionReviewCompletionService, "getByReviewRequestId">;
   readonly listLoops: () => Promise<AutoIteration[]>;
   readonly now?: () => number;
 }
@@ -145,9 +147,21 @@ export class ReviewVerdictSubmissionService {
       const delivery = await this.options.extensionDeliveries.getByLogicalDeliveryId(binding.delivery_id);
       const receipt = delivery?.receipt;
       if (evidence.conversation_id !== binding.conversation_id
-        || evidence.expected_user_message_id !== binding.expected_user_message_id
-        || receipt?.document_id !== evidence.document_id
-        || receipt.navigation_epoch !== evidence.navigation_epoch) this.fail("VERDICT_EVIDENCE_IDENTITY_INVALID");
+        || evidence.expected_user_message_id !== binding.expected_user_message_id) this.fail("VERDICT_EVIDENCE_IDENTITY_INVALID");
+      if (receipt?.document_id !== evidence.document_id || receipt.navigation_epoch !== evidence.navigation_epoch) {
+        // A recovered page must prove the same Review through its durable Completion receipt.
+        const completion = await (this.options.extensionReviewCompletions
+          ?? new ExtensionReviewCompletionService(this.storageRoot))
+          .getByReviewRequestId(binding.review_request_id, binding.workspace_id);
+        if (completion?.workspace_id !== binding.workspace_id || completion.task_id !== binding.task_id
+          || completion.review_request_id !== binding.review_request_id
+          || completion.review_delivery_id !== binding.delivery_id
+          || completion.conversation_id !== binding.conversation_id
+          || completion.expected_user_message_id !== binding.expected_user_message_id
+          || completion.phase !== "completed" || completion.receipt?.status !== "completed"
+          || completion.receipt.document_id !== evidence.document_id
+          || completion.receipt.navigation_epoch !== evidence.navigation_epoch) this.fail("VERDICT_EVIDENCE_IDENTITY_INVALID");
+      }
       await this.save(file, this.confirm({ ...record, evidence }));
     });
     this.wake(file);
@@ -249,7 +263,7 @@ export class ReviewVerdictSubmissionService {
   private async assertUnexpired(record: VerdictRecord) {
     const result = await new ReviewResultService(this.storageRoot).getReviewResultByRequest(record.workspace_id, record.review_request_id);
     if (result?.status === "COMPLETED"
-      && this.now() >= Date.parse(result.created_at) + REVIEW_VERDICT_CONFIRMATION_TIMEOUT_MS) this.fail("VERDICT_CONFIRMATION_EXPIRED");
+      && this.now() >= Date.parse(result.completed_at ?? result.created_at) + REVIEW_VERDICT_CONFIRMATION_TIMEOUT_MS) this.fail("VERDICT_CONFIRMATION_EXPIRED");
   }
 
   private file(workspaceId: string, requestId: string) {
