@@ -82,6 +82,13 @@ function verdict(reviewRequestId: string, decision: ReviewDecision): string {
   })}</lrm-review-result>`;
 }
 
+function legacyTextReviewRequests(root: string): ReviewRequestService {
+  const service = new ReviewRequestService(root);
+  const create = service.createReviewRequest.bind(service);
+  service.createReviewRequest = (input) => create({ ...input, verdict_protocol: "text_v1" });
+  return service;
+}
+
 function goalIdentity(kind: string, goalId: string, phaseId: string, taskId: string): string {
   const digest = createHash("sha256")
     .update(`${goalId}\0${phaseId}\0${taskId}\0${kind}`)
@@ -377,6 +384,7 @@ async function createHarness(
   );
   const auto = new AutoIterationService(registry, {
     storageRoot: root,
+    reviewRequestService: legacyTextReviewRequests(root),
     taskContextService: tasks,
     executionContextService: executions,
     browserRouter,
@@ -428,6 +436,7 @@ async function createExtensionHarness(
   const completionRouter = new ReviewCompletionRouter(base.root, extension.completionAdapter);
   const auto = new AutoIterationService(base.registry, {
     storageRoot: base.root,
+    reviewRequestService: legacyTextReviewRequests(base.root),
     taskContextService: base.tasks,
     executionContextService: base.executions,
     authorizationStore: base.authorizations,
@@ -476,6 +485,7 @@ async function restart(harness: Harness): Promise<RestartedHarness> {
   );
   const auto = new AutoIterationService(harness.registry, {
     storageRoot: harness.root,
+    reviewRequestService: legacyTextReviewRequests(harness.root),
     taskContextService: tasks,
     executionContextService: executions,
     browserRouter,
@@ -593,6 +603,7 @@ async function createReviewChain(harness: Harness, loop: AutoIteration): Promise
     execution_id: loop.execution_id,
     workspace_id: loop.workspace_id,
     conversation_id: loop.conversation_id,
+    verdict_protocol: "text_v1",
   });
   await new ConversationRoutingService(harness.root).createRouting({
     routing_id: routingId,

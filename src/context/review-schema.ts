@@ -18,6 +18,7 @@ export const reviewRequestIdSchema = z.string()
   .refine((value) => !isReservedWindowsName(value), "review_request_id is a reserved filename");
 
 export const reviewRequestStatusSchema = z.enum(REVIEW_REQUEST_STATUSES);
+export const verdictProtocolSchema = z.enum(["text_v1", "tool_v1"]);
 const timestampSchema = z.string().datetime({ offset: true });
 const sha256HexSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 
@@ -34,6 +35,7 @@ export const reviewRequestContextSchema = z.object({
   workspace_id: workspaceIdSchema,
   conversation_id: conversationIdSchema.optional(),
   status: reviewRequestStatusSchema,
+  verdict_protocol: verdictProtocolSchema.optional(),
   created_at: timestampSchema,
   updated_at: timestampSchema,
   review_snapshot: reviewSnapshotSchema.optional(),
@@ -46,6 +48,7 @@ export const createReviewRequestInputSchema = z.object({
   workspace_id: workspaceIdSchema,
   conversation_id: conversationIdSchema.optional(),
   status: reviewRequestStatusSchema.default("pending"),
+  verdict_protocol: verdictProtocolSchema.optional(),
   review_snapshot: reviewSnapshotSchema.optional(),
 }).strict();
 

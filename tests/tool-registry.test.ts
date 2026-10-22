@@ -29,7 +29,7 @@ describe("MCP tool registry", () => {
     const result = await client.listTools();
     const names = result.tools.map((tool) => tool.name).sort();
 
-    expect(names).toHaveLength(22);
+    expect(names).toHaveLength(23);
     expect(names).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
     for (const [legacy, preferred] of [
       ["list_files", "workspace_list_files"],
@@ -141,8 +141,8 @@ describe("MCP tool registry", () => {
       },
     });
     expect(submitGoal?.inputSchema).not.toHaveProperty("properties.conversation_id");
-    expect(submitGoal?.description).toContain("new UUID v4 correlation_key");
-    expect(submitGoal?.description).toContain("never reuse one");
+    expect(submitGoal?.description).toContain("fresh UUID v4 correlation_key");
+    expect(submitGoal?.description).toContain("for each new submission");
     expect(submitGoal?.outputSchema).toMatchObject({
       type: "object",
       properties: {

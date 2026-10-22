@@ -947,8 +947,10 @@ export class GoalOrchestrationService {
           ? "Review 需要用户决策：请确认审查意见和下一步修改要求。"
           : reason === "MAX_ITERATIONS_REACHED"
             ? "已达到最大迭代次数：请决定是否继续，并明确后续范围与迭代上限。"
-            : reason.startsWith("INVALID_VERDICT_")
-              ? "Review 内容已返回，但 Verdict 格式无效，不能确认审查通过；缺失块会自动补充一次，仍失败才暂停。请检查原 Review 与补充结果，不重新执行 Codex 代码任务。"
+            : reason.startsWith("INVALID_VERDICT_") || reason.startsWith("VERDICT_")
+              ? "Review 阶段的 Verdict 处理未能完成；未确认的 Verdict 不会自动通过，Codex Execution 状态保持原记录。请检查 Review Request、Review Result 与错误码后决定如何处理，不重新执行代码任务。"
+              : reason.startsWith("REVIEW_")
+                ? "Review 阶段异常，Codex Execution 状态保持原记录。请检查 Review Request、Review Result 与错误详情后决定如何处理，不因 Review 异常重跑代码任务。"
               : "执行或基础设施异常：请检查错误详情，处理连接、授权或环境问题后明确是否继续。";
         const active = this.activeTask(goal);
         const completedTasks = goal.phases.flatMap(phase => {

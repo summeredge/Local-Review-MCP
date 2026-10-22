@@ -155,6 +155,7 @@ export const REVIEW_REQUEST_STATUSES = [
 export type ReviewRequestStatus = typeof REVIEW_REQUEST_STATUSES[number];
 
 export interface ReviewRequestContext {
+  readonly verdict_protocol?: "text_v1" | "tool_v1";
   readonly review_request_id: string;
   readonly task_id: string;
   readonly execution_id: string;
@@ -168,6 +169,7 @@ export interface ReviewRequestContext {
 }
 
 export interface CreateReviewRequestInput {
+  readonly verdict_protocol?: "text_v1" | "tool_v1";
   readonly review_request_id?: string;
   readonly task_id: string;
   readonly execution_id: string;

@@ -137,6 +137,7 @@ describe("DispatchCommandBroker", () => {
       attempt_count: 1,
     });
     expect(claimed.message).toContain("review_request_id: review-conversationnormal");
+    expect(claimed.message).toContain("submit_review_verdict");
     expect(readiness).toHaveBeenCalledWith(conversationId);
     expect((await persistedDeliveries(root))[0]).toMatchObject({
       delivery_id: claimed.delivery_id,

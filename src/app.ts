@@ -230,6 +230,7 @@ export function createAppContext(
     statusQuery,
     controlledActuation,
     autoIteration,
+    reviewVerdictSubmission: autoIteration.reviewVerdictSubmission,
     goalPreflight,
     goalOrchestration,
     goalSubmission,
@@ -466,6 +467,13 @@ export async function startApp(
             conversation_id: evidence.conversation_id,
           });
           const pendingService = context.pendingGoalSubmission;
+          if (evidence.tool_name !== undefined || evidence.verdict !== undefined || evidence.connector !== undefined
+            || evidence.review_request_id !== undefined || evidence.workspace_id !== undefined
+            || evidence.expected_user_message_id !== undefined || evidence.tool_call_id !== undefined) {
+            const verdictService = context.autoIteration?.reviewVerdictSubmission;
+            if (verdictService === undefined) throw new Error("review verdict identity channel unavailable");
+            return verdictService.receiveIdentityEvidence(evidence);
+          }
           if (pendingService === undefined) throw new Error("identity evidence state unavailable");
           const ack = await pendingService.receiveIdentityEvidence(evidence);
           await options.onIdentityEvidence?.(evidence);

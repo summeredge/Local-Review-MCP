@@ -1,6 +1,7 @@
 import { defaultTaskContextStorageRoot } from "../context/task.js";
 import { ConversationRoutingService } from "../context/conversation-routing-service.js";
 import { ReviewDeliveryService } from "../context/review-delivery-service.js";
+import { ReviewRequestService } from "../context/review-request-service.js";
 import type { ReviewDelivery } from "../context/review-delivery.js";
 import type { WorkspaceIdentity } from "../workspace/types.js";
 import { conversationUrl } from "../delivery/conversation-url.js";
@@ -70,6 +71,8 @@ export class BrowserRouter {
       conversation_id: attempt.conversation_id,
       ...(message === undefined ? {} : { message }),
       ...(routing.execution_id === undefined ? {} : { execution_id: routing.execution_id }),
+      verdict_protocol: (await new ReviewRequestService(this.deliveries.storageRoot)
+        .getReviewRequest(workspaceId, routing.review_request_id))?.verdict_protocol ?? "text_v1",
     };
 
     let result: ReviewDeliveryResult;

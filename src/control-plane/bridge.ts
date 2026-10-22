@@ -37,6 +37,7 @@ import type {
 } from "./evidence-transport-trace.js";
 import { browserIdentityDiagnosticSchema } from "./evidence-transport-trace.js";
 import { IdentityEvidenceConflictError, type IdentityEvidenceAck } from "./identity-evidence-inbox.js";
+import { ReviewVerdictSubmissionError } from "./review-verdict-submission.js";
 import {
   BRIDGE_PROTOCOL_HEADER,
   EVIDENCE_TRANSPORT_EVENT_HEADER,
@@ -347,6 +348,10 @@ async function receiveIdentityEvidence(
     if (ack?.accepted !== true || ack.durable !== true) throw new Error("identity evidence was not durably accepted");
     json(response, 202, ack, origin);
   } catch (error) {
+    if (error instanceof ReviewVerdictSubmissionError) {
+      json(response, 409, { error: error.code }, origin);
+      return;
+    }
     json(response, error instanceof IdentityEvidenceConflictError ? 409 : 503,
       { error: error instanceof IdentityEvidenceConflictError ? "identity_evidence_conflict" : "identity_evidence_unavailable" }, origin);
   }

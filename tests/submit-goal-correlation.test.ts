@@ -144,10 +144,12 @@ function scanFiber(messages: unknown[]): Record<string, any> {
 async function contentMessages(
   reply: Record<string, unknown>,
   options: { fiberReplyDelayMs?: number; navigateBeforeFiberReply?: string; dropReply?: boolean;
-    registrationFails?: boolean; workerFails?: boolean } = {},
+    registrationFails?: boolean; workerFails?: boolean; followingReplies?: Record<string, unknown>[] } = {},
 ): Promise<Record<string, unknown>[]> {
   const listeners = new Map<string, Set<(event: Record<string, unknown>) => void>>();
   const messages: Record<string, unknown>[] = [];
+  let activeReply = reply;
+  const intervals: (() => void)[] = [];
   const location = { origin: ORIGIN, href: `${ORIGIN}/c/${CONVERSATION}` };
   let navigated = false;
   const history = {
@@ -179,7 +181,7 @@ async function contentMessages(
           listener({
             source: window,
             origin: ORIGIN,
-            data: { ...reply, source: "lrm-extension-identity-reply", nonce: (data as Record<string, unknown>).nonce },
+            data: { ...activeReply, source: "lrm-extension-identity-reply", nonce: (data as Record<string, unknown>).nonce },
           });
         }
       };
@@ -202,11 +204,16 @@ async function contentMessages(
     URL,
     setTimeout,
     clearTimeout,
-    setInterval: () => 1,
+    setInterval: (callback: () => void) => { intervals.push(callback); return intervals.length; },
   }, { filename: "content.js" });
   const settleMs = options.dropReply ? 1800 : options.fiberReplyDelayMs && options.fiberReplyDelayMs > 0
     ? 440 + options.fiberReplyDelayMs : 220;
   await new Promise((resolve) => setTimeout(resolve, settleMs));
+  for (const next of options.followingReplies ?? []) {
+    activeReply = next;
+    for (const callback of intervals) callback();
+    await new Promise(resolve => setTimeout(resolve, 220));
+  }
   return messages;
 }
 
@@ -280,6 +287,123 @@ describe("Extension submit_goal correlation evidence", () => {
           ? { memoizedProps: { conversationId: options.parentConversation }, return: null } : null } } };
     return scanFiberSections([section], 'section[data-testid^="conversation-turn"], [data-turn-key]');
   }
+
+  const reviewUser = { type: 'user-message', messageId: 'review-user', serverMessageId: 'review-user' };
+  const verdict = { schema_version: 1, review_request_id: 'review-1', decision: 'APPROVE', summary: '通过审查' };
+  function verdictCall(): Record<string, any> {
+    return { type: 'mcp-tool-call', callId: 'call-review-1', functionName: 'Local_MCP_Connector.submit_review_verdict',
+      invocation: { server: 'Local MCP Connector', tool: 'Local_MCP_Connector.submit_review_verdict',
+        arguments: { workspace_id: 'workspace-1', correlation_key: KEY_A, verdict: { ...verdict } } } };
+  }
+  function verdictEvidence(call = verdictCall()) {
+    return { request_id: call.invocation.arguments.correlation_key, fiber_conversation_id: CONVERSATION,
+      tool_name: 'submit_review_verdict', connector: 'Local MCP Connector', workspace_id: 'workspace-1',
+      review_request_id: verdict.review_request_id, expected_user_message_id: reviewUser.messageId,
+      tool_call_id: call.callId, verdict: call.invocation.arguments.verdict };
+  }
+
+  it('binds direct and linked Verdict calls to real timeline callId/user and forwards the complete arguments', async () => {
+    for (const decision of ['APPROVE', 'ITERATE', 'HUMAN_REQUIRED']) {
+      const call = verdictCall();
+      call.invocation.arguments.verdict.decision = decision;
+      if (decision === 'ITERATE') call.invocation.arguments.verdict.iteration = {
+        goal: '修复', requirements: ['保留原行为'], acceptance_criteria: ['相关测试通过'],
+      };
+      const reply = scanTimeline([reviewUser, { type: 'chatgpt-reasoning-group', items: [call] }]);
+      expect(reply.evidence).toEqual([verdictEvidence(call)]);
+      const { fiber_conversation_id, ...expected } = verdictEvidence(call);
+      expect(await contentMessages(reply)).toContainEqual(expect.objectContaining({ type: 'identity_evidence',
+        ...expected, conversation_id: CONVERSATION, navigation_epoch: 0 }));
+    }
+    const linked = verdictCall();
+    linked.invocation.tool = 'link_test/submit_review_verdict';
+    linked.functionName = 'Local MCP Connector__link_test/submit_review_verdict';
+    expect(scanTimeline([reviewUser, linked]).evidence).toEqual([verdictEvidence(linked)]);
+  });
+
+  it('requires a current real user and callId, without using self-reported argument identities or older calls', () => {
+    for (const mutate of [
+      (call: Record<string, any>) => { delete call.callId; },
+      (call: Record<string, any>) => { call.callId = ''; },
+      (call: Record<string, any>) => { call.callId = 'invalid id'; },
+      (call: Record<string, any>) => { delete call.invocation.arguments.workspace_id; },
+      (call: Record<string, any>) => { delete call.invocation.arguments.verdict; },
+      (call: Record<string, any>) => { call.invocation.arguments.verdict.review_request_id = ''; },
+      (call: Record<string, any>) => { call.invocation.arguments.correlation_key = 'not-uuid'; },
+      (call: Record<string, any>) => { call.invocation.arguments.expected_user_message_id = 'self-reported'; },
+    ]) {
+      const call = verdictCall(); mutate(call);
+      expect(scanTimeline([reviewUser, verdictCall(), call]).evidence).toEqual([]);
+    }
+    const fakeIds = verdictCall();
+    delete fakeIds.callId;
+    fakeIds.id = 'not-a-call-id';
+    fakeIds.invocation.arguments.verdict.tool_call_id = 'self-reported';
+    expect(scanTimeline([reviewUser, fakeIds]).evidence).toEqual([]);
+    expect(scanTimeline([verdictCall()]).evidence).toEqual([]);
+    for (const user of [{ type: 'user-message' }, { ...reviewUser, messageId: undefined },
+      { ...reviewUser, serverMessageId: 'conflicting-user' }]) {
+      expect(scanTimeline([user, verdictCall()]).evidence).toEqual([]);
+    }
+    expect(scanTimeline([reviewUser, verdictCall(), { type: 'user-message', messageId: 'new-user' }]).evidence).toEqual([]);
+    expect(scanTimeline([reviewUser, verdictCall()], { current: false }).evidence).toEqual([]);
+    expect(scanTimeline([reviewUser, verdictCall()], { parentConversation: CONVERSATION_B }).evidence).toEqual([]);
+    expect(scanTimeline([reviewUser, verdictCall()], { conversation: 'unreadable identity' }).evidence).toEqual([]);
+    expect(scanTimeline([reviewUser, { type: 'chatgpt-reasoning-group', items: null }, verdictCall()]).evidence).toEqual([]);
+  });
+
+  it('rejects inconsistent or missing actual Verdict connector/tool fields', () => {
+    for (const fields of [
+      { server: 'Other', tool: 'Local_MCP_Connector.submit_review_verdict' },
+      { tool: 'Local_MCP_Connector.submit_review_verdict' },
+      { server: 'Local MCP Connector' },
+      { server: 'Local MCP Connector', tool: 'workspace_info' },
+    ]) {
+      const call = verdictCall();
+      call.invocation = { ...fields, arguments: call.invocation.arguments };
+      expect(scanTimeline([reviewUser, verdictCall(), call]).evidence).toEqual([]);
+    }
+    const call = verdictCall();
+    call.functionName = 'Other.submit_review_verdict';
+    expect(scanTimeline([reviewUser, verdictCall(), call]).evidence).toEqual([]);
+    expect(scanTimeline([reviewUser, { type: 'assistant-message', content: JSON.stringify(verdictCall()) }]).evidence).toEqual([]);
+    expect(scanFiber([userMessage(), { author: { role: 'assistant' }, recipient: 'api_tool.call_tool',
+      content: { content_type: 'code', text: JSON.stringify({ path: '/Local/submit_review_verdict', args: verdictCall().invocation.arguments }) } }])
+      .evidence).toEqual([]);
+  });
+
+  it('rejects partial and conflicting Verdict evidence and preserves navigation/registration guards', async () => {
+    const full = verdictEvidence();
+    const malformed = Object.keys(full).filter(key => !['request_id', 'fiber_conversation_id'].includes(key))
+      .map(key => { const entry: Record<string, unknown> = { ...full }; delete entry[key]; return entry; });
+    malformed.push({ ...full, connector: 'Other' }, { ...full, verdict: { ...verdict, review_request_id: 'other' } });
+    for (const entry of malformed) {
+      const messages = await contentMessages({ version: 1, conversation_id: CONVERSATION, evidence: [entry] });
+      expect(messages.filter(message => message.type === 'identity_evidence')).toEqual([]);
+    }
+    for (const conflict of [{ ...full, tool_call_id: 'other-call' }, { ...full, workspace_id: 'other-workspace' },
+      { ...full, expected_user_message_id: 'other-user' }, { ...full, verdict: { ...verdict, summary: '篡改' } }]) {
+      const messages = await contentMessages({ version: 1, conversation_id: CONVERSATION, evidence: [full, conflict] });
+      expect(messages.filter(message => message.type === 'identity_evidence')).toEqual([]);
+    }
+    const reply = scanTimeline([reviewUser, verdictCall()]);
+    for (const options of [{ registrationFails: true }, { navigateBeforeFiberReply: `${ORIGIN}/c/${CONVERSATION_B}` }]) {
+      expect((await contentMessages(reply, options)).filter(message => message.type === 'identity_evidence')).toEqual([]);
+    }
+    const reordered = { ...full, verdict: { summary: verdict.summary, decision: verdict.decision,
+      review_request_id: verdict.review_request_id, schema_version: 1 } };
+    expect((await contentMessages({ ...reply, evidence: [full, reordered] }))
+      .filter(message => message.type === 'identity_evidence')).toHaveLength(1);
+  });
+
+  it('does not hide changed same-key Verdict content behind the sent-key deduplication', async () => {
+    const reply = scanTimeline([reviewUser, verdictCall()]);
+    const changed = { ...reply, evidence: [{ ...verdictEvidence(), verdict: { ...verdict, summary: 'different' } }] };
+    const messages = await contentMessages(reply, { followingReplies: [reply, changed, changed] });
+    const proofs = messages.filter(message => message.type === 'identity_evidence');
+    expect(proofs).toHaveLength(2);
+    expect(proofs.map(proof => (proof.verdict as Record<string, unknown>).summary)).toEqual([verdict.summary, 'different']);
+  });
 
   it('distinguishes absent, unsupported and selected calls before timeline selection without leaking payloads', async () => {
     const absent = scanTimeline([{ type: 'user-message', messageId: 'user-current' }]);
@@ -548,6 +672,24 @@ describe("Extension submit_goal correlation evidence", () => {
     const viaServer = directTimelineCall();
     viaServer.invocation.tool = 'submit_goal';
     expect(scanTimeline([viaServer]).evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+  });
+
+  it('case A2: reads the ChatGPT app tool namespace for both Connector submissions', () => {
+    const goalCall = { ...directTimelineCall(), functionName: 'mcp__Local_MCP_Connector__submit_goal',
+      invocation: { server: 'Local MCP Connector', tool: 'submit_goal', arguments: { correlation_key: KEY_A } } };
+    expect(scanTimeline([goalCall]).evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+    const foreignGoal = { ...goalCall, invocation: { ...goalCall.invocation, server: 'Other' } };
+    expect(scanTimeline([directTimelineCall(), foreignGoal]).evidence).toEqual([]);
+
+    const call = verdictCall();
+    call.functionName = 'mcp__Local_MCP_Connector__submit_review_verdict';
+    call.invocation = { server: 'Local MCP Connector', tool: 'submit_review_verdict', arguments: call.invocation.arguments };
+    expect(scanTimeline([reviewUser, call]).evidence).toEqual([verdictEvidence(call)]);
+
+    const foreign = { ...call, invocation: { ...call.invocation, server: 'Other' } };
+    expect(scanTimeline([reviewUser, call, foreign]).evidence).toEqual([]);
+    const wrongTool = { ...call, invocation: { ...call.invocation, tool: 'workspace_info' } };
+    expect(scanTimeline([reviewUser, call, wrongTool]).evidence).toEqual([]);
   });
 
   it('case B: fails closed on a malformed correlation_key in the direct submit_goal format', () => {

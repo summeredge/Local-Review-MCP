@@ -32,6 +32,13 @@ import { WorkspaceRegistry } from "../src/workspace/registry.js";
 
 const temporaryDirectories: string[] = [];
 
+function legacyTextReviewRequests(root: string): ReviewRequestService {
+  const service = new ReviewRequestService(root);
+  const create = service.createReviewRequest.bind(service);
+  service.createReviewRequest = (input) => create({ ...input, verdict_protocol: "text_v1" });
+  return service;
+}
+
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {
     recursive: true,
@@ -415,6 +422,7 @@ describe("terminal Session recovery", () => {
       const request = startRequest;
       const sessions = new SessionStore(value.root);
       const makeAuto = () => new AutoIterationService(registry, { storageRoot: value.root,
+        reviewRequestService: legacyTextReviewRequests(value.root),
         browserRouter: new BrowserRouter(value.root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
         completionRouter: new ReviewCompletionRouter(value.root, { collect: async input => ({ status: "COMPLETED",
           content: '<lrm-review-result>' + JSON.stringify({ schema_version: 1, review_request_id: input.review_request_id,
@@ -473,6 +481,7 @@ it.each(["failed response", "lost response", "completed response"])(
     const initial = await controlled.authorize({ ...startRequest, actuation_id: "initial-actuation" });
     let reviews = 0;
     const auto = new AutoIterationService(registry, { storageRoot: root, controlledActuation: controlled,
+      reviewRequestService: legacyTextReviewRequests(root),
       browserRouter: new BrowserRouter(root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
       completionRouter: new ReviewCompletionRouter(root, { collect: async input => ({ status: "COMPLETED",
         content: '<lrm-review-result>' + JSON.stringify({ schema_version: 1, review_request_id: input.review_request_id,
@@ -525,6 +534,7 @@ it("runs AppServer through ITERATE and reviews each execution exactly once", asy
   let reviews = 0;
   const identities: string[] = [];
   const auto = new AutoIterationService(registry, { storageRoot: root, controlledActuation: controlled,
+    reviewRequestService: legacyTextReviewRequests(root),
     browserRouter: new BrowserRouter(root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
     completionRouter: new ReviewCompletionRouter(root, { collect: async input => {
       identities.push((await new ReviewRequestService(root).getReviewRequest("workspace-1", input.review_request_id))!.execution_id);
@@ -563,6 +573,7 @@ it("continues the original AppServer Thread for the next ITERATE turn", async ()
   const initial = await controlled.authorize({ ...startRequest, actuation_id: "initial-actuation" });
   let reviews = 0;
   const makeAuto = () => new AutoIterationService(registry, { storageRoot: value.root,
+    reviewRequestService: legacyTextReviewRequests(value.root),
     controlledActuation: controlled,
     browserRouter: new BrowserRouter(value.root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
     completionRouter: new ReviewCompletionRouter(value.root, { collect: async input => ({
@@ -671,6 +682,7 @@ it.each(["passed", "failed"] as const)("restarts from durable %s with an unsynch
   const registry = new WorkspaceRegistry([{ id: "workspace-1", name: "Workspace", path: value.root }]);
   const request = startRequest;
   const makeAuto = () => new AutoIterationService(registry, { storageRoot: value.root,
+    reviewRequestService: legacyTextReviewRequests(value.root),
     browserRouter: new BrowserRouter(value.root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
     completionRouter: new ReviewCompletionRouter(value.root, { collect: async input => ({ status: "COMPLETED",
       content: '<lrm-review-result>' + JSON.stringify({ schema_version: 1, review_request_id: input.review_request_id,

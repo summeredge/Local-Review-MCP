@@ -230,7 +230,9 @@ describe("Goal terminal persistence failures", () => {
     expect(await f.deliveries.claim(owner)).toBeNull();
     expect(f.starts).toHaveBeenCalledTimes(1);
   });
-  it.each(["REVIEW_REQUIRES_HUMAN", "MAX_ITERATIONS_REACHED", "EXTENSION_NOT_READY", "INVALID_VERDICT_VERDICT_BLOCK_MISSING"])(
+  it.each(["REVIEW_REQUIRES_HUMAN", "MAX_ITERATIONS_REACHED", "EXTENSION_NOT_READY",
+    "REVIEW_COMPLETION_FAILED", "REVIEW_RESULT_IDENTITY_INVALID", "VERDICT_CONFIRMATION_TIMEOUT",
+    "INVALID_VERDICT_VERDICT_BLOCK_MISSING"])(
     "persists and delivers %s to the original conversation without another execution", async reason => {
       const f = await fixture();
       await f.service.createGoal(input());
@@ -257,11 +259,17 @@ describe("Goal terminal persistence failures", () => {
       expect(notice.message).toContain(reason);
       expect(notice.message).toContain(reason === "REVIEW_REQUIRES_HUMAN" ? "Review 需要用户决策"
         : reason === "MAX_ITERATIONS_REACHED" ? "已达到最大迭代次数"
-          : reason.startsWith("INVALID_VERDICT_") ? "Review 内容已返回，但 Verdict 格式无效" : "执行或基础设施异常");
-      if (reason.startsWith("INVALID_VERDICT_")) {
+          : reason.startsWith("INVALID_VERDICT_") || reason.startsWith("VERDICT_")
+            ? "Review 阶段的 Verdict 处理未能完成"
+            : reason.startsWith("REVIEW_") ? "Review 阶段异常" : "执行或基础设施异常");
+      if (reason.startsWith("INVALID_VERDICT_") || reason.startsWith("VERDICT_")
+        || (reason.startsWith("REVIEW_") && reason !== "REVIEW_REQUIRES_HUMAN")) {
         expect(notice.message).not.toContain("执行或基础设施异常");
-        expect(notice.message).toContain("不调用 submit_goal 重跑代码任务");
-        expect(notice.message).toContain("原 Goal 保持 human_required");
+        if (reason.startsWith("INVALID_VERDICT_")) {
+          expect(notice.message).not.toContain("缺失块会自动补充一次");
+          expect(notice.message).toContain("不调用 submit_goal 重跑代码任务");
+          expect(notice.message).toContain("原 Goal 保持 human_required");
+        }
         expect(stopped.human_required_info!.completed_work).toContain("passed");
       }
       const rows = await new StatusQueryService({ storageRoot: f.root, goals: f.service }).listExecutionSummaries();

@@ -20,6 +20,10 @@ const REVIEW_REQUEST = buildReviewMessage({
   review_request_id: "review-request-realistic-001",
   routing_id: "routing-realistic-001",
 });
+const TOOL_REVIEW_REQUEST = buildReviewMessage({
+  workspace_id: "workspace-local-review", task_id: "task-realistic-001", execution_id: "execution-realistic-001",
+  review_request_id: "review-request-realistic-001", routing_id: "routing-realistic-001", verdict_protocol: "tool_v1",
+});
 
 let contentSource = "";
 let domSource = "";
@@ -478,8 +482,8 @@ describe("ChatGPT DOM delivery adapter", () => {
     expect(REVIEW_REQUEST).toContain("routing_id: routing-realistic-001");
     expect(REVIEW_REQUEST).toContain("\n\nUse Local Review MCP");
     expect(REVIEW_REQUEST).toContain('\n  "schema_version": 1,');
-    expect(REVIEW_REQUEST).toContain("<lrm-review-result>\n");
-    expect(REVIEW_REQUEST).toContain("\n</lrm-review-result>");
+    expect(REVIEW_REQUEST).toContain("LRM_REVIEW_VERDICT_BEGIN\n");
+    expect(REVIEW_REQUEST).toContain("\nLRM_REVIEW_VERDICT_END");
 
     const harness = domHarness({ blockComposer: true, normalizeAsync: true, message: REVIEW_REQUEST });
     await expect(harness.dom.insertPrompt(REVIEW_REQUEST)).resolves.toBe(true);
@@ -492,6 +496,17 @@ describe("ChatGPT DOM delivery adapter", () => {
     await expect(harness.dom.send(REVIEW_REQUEST, () => true, 20)).resolves.toEqual({
       clicked: true,
       message_id: "review-request-message",
+    });
+  });
+
+  it('delivers a tool_v1 Review Request exactly and preserves the receipt without requiring a text Verdict', async () => {
+    expect(TOOL_REVIEW_REQUEST).toContain('submit_review_verdict');
+    expect(TOOL_REVIEW_REQUEST).not.toContain('LRM_REVIEW_VERDICT_BEGIN');
+    const harness = domHarness({ blockComposer: true, normalizeAsync: true, message: TOOL_REVIEW_REQUEST });
+    await expect(harness.dom.insertPrompt(TOOL_REVIEW_REQUEST)).resolves.toBe(true);
+    harness.setClickReceipt('review-tool-message');
+    await expect(harness.dom.send(TOOL_REVIEW_REQUEST, () => true, 20)).resolves.toEqual({
+      clicked: true, message_id: 'review-tool-message',
     });
   });
 

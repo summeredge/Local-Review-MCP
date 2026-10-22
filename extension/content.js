@@ -11,6 +11,8 @@
   const REQUEST_ID = /^[A-Za-z0-9_-]{1,100}$/u;
   const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
   const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+  const VERDICT_FIELDS = ['tool_name', 'connector', 'workspace_id', 'review_request_id',
+    'expected_user_message_id', 'tool_call_id', 'verdict'];
   const COMPLETION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
   const MAX_COMPLETION_CONTENT = 256 * 1024;
   const FIBER_TIMEOUT_MS = 1500;
@@ -31,7 +33,7 @@
   let identityScan = null;
   let completionInFlight = null;
   let completionScanTimer = null;
-  const sent = new Set();
+  const sent = new Map();
   let scanSequence = 0;
   const diagnosticStates = new Map();
   function identityDiagnostic(stage, scanId, details = {}) {
@@ -195,6 +197,28 @@
     await deliveryInFlight;
   }
 
+  function sameJson(left, right) {
+    if (left === right) return true;
+    if (!left || !right || typeof left !== 'object' || typeof right !== 'object'
+      || Array.isArray(left) !== Array.isArray(right)) return false;
+    const keys = Object.keys(left);
+    return keys.length === Object.keys(right).length
+      && keys.every(key => Object.prototype.hasOwnProperty.call(right, key) && sameJson(left[key], right[key]));
+  }
+
+  function validVerdictEvidence(entry) {
+    return VERDICT_FIELDS.every(key => Object.prototype.hasOwnProperty.call(entry, key))
+      && entry.tool_name === 'submit_review_verdict' && entry.connector === 'Local MCP Connector'
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(entry.request_id)
+      && typeof entry.workspace_id === 'string' && Boolean(entry.workspace_id.trim())
+      && typeof entry.review_request_id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(entry.review_request_id)
+      && typeof entry.expected_user_message_id === 'string' && MESSAGE_ID.test(entry.expected_user_message_id)
+      && typeof entry.tool_call_id === 'string' && MESSAGE_ID.test(entry.tool_call_id)
+      && entry.verdict && typeof entry.verdict === 'object' && !Array.isArray(entry.verdict)
+      && entry.verdict.review_request_id === entry.review_request_id
+      && JSON.stringify(entry.verdict).length <= 512 * 1024;
+  }
+
   function fiberScan() {
     return new Promise((resolve) => {
       const nonce = `${++nonceCounter}-${Math.random().toString(36).slice(2)}`;
@@ -220,14 +244,19 @@
         const conflicts = new Set();
         for (const entry of data.evidence.slice(0, 200)) {
           if (!entry || typeof entry !== 'object'
-            || Object.keys(entry).length !== 2
             || typeof entry.request_id !== 'string'
             || typeof entry.fiber_conversation_id !== 'string'
             || !REQUEST_ID.test(entry.request_id)
             || !CONVERSATION_ID.test(entry.fiber_conversation_id)) continue;
+          const verdictEvidence = VERDICT_FIELDS.some(key => Object.prototype.hasOwnProperty.call(entry, key));
+          if (Object.keys(entry).length !== (verdictEvidence ? 9 : 2)
+            || (verdictEvidence && !validVerdictEvidence(entry))) {
+            conflicts.add(entry.request_id);
+            continue;
+          }
           const previous = byRequest.get(entry.request_id);
-          if (previous !== undefined && previous !== entry.fiber_conversation_id) conflicts.add(entry.request_id);
-          else if (previous === undefined) byRequest.set(entry.request_id, entry.fiber_conversation_id);
+          if (previous !== undefined && !sameJson(previous, entry)) conflicts.add(entry.request_id);
+          else if (previous === undefined) byRequest.set(entry.request_id, entry);
         }
         const diagnostic = {};
         const observation = data.scan_diagnostic;
@@ -272,8 +301,7 @@
         const canonical = data.conversation_id;
         finish({ diagnostic, fiber_reply_received: true,
           conversation_id: typeof canonical === 'string' && CONVERSATION_ID.test(canonical) ? canonical : null,
-          evidence: [...byRequest].filter(([requestId]) => !conflicts.has(requestId))
-          .map(([request_id, fiber_conversation_id]) => ({ request_id, fiber_conversation_id })) });
+          evidence: [...byRequest].filter(([requestId]) => !conflicts.has(requestId)).map(([, entry]) => entry) });
       };
       timer = setTimeout(() => finish({ evidence: [], conversation_id: null, fiber_reply_received: false }), FIBER_TIMEOUT_MS);
       window.addEventListener('message', listener);
@@ -468,17 +496,20 @@
         identityDiagnostic('route_checked', scanId, details);
         if (entry.fiber_conversation_id !== conversationId) continue;
         const key = `${askedEpoch}\u0000${conversationId}\u0000${entry.request_id}`;
-        if (sent.has(key)) { identityDiagnostic('deduplicated', scanId, details); continue; }
+        if (sent.has(key) && (!entry.tool_name || sameJson(sent.get(key), entry))) {
+          identityDiagnostic('deduplicated', scanId, details); continue;
+        }
         identityDiagnostic('worker_send_attempted', scanId, details);
         const reply = await sendToWorker({
           type: 'identity_evidence',
           ...identityFields(),
           request_id: entry.request_id,
           conversation_id: conversationId,
+          ...(entry.tool_name ? Object.fromEntries(VERDICT_FIELDS.map(field => [field, entry[field]])) : {}),
           navigation_epoch: askedEpoch
         });
         identityDiagnostic('worker_send_finished', scanId, { ...details, worker_reply_ok: reply?.ok === true });
-        if (reply?.ok === true) sent.add(key);
+        if (reply?.ok === true) sent.set(key, entry);
       }
     })().finally(() => {
       scanInFlight = null;

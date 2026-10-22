@@ -102,6 +102,7 @@ async function makeChain(): Promise<CoreChain> {
     workspace_id: task.workspace_id,
     conversation_id: "request-compat-conversation",
     review_snapshot: snapshot,
+    verdict_protocol: "text_v1",
   });
   const routing = await new ConversationRoutingService(storageRoot).createRouting({
     routing_id: "routing-001",

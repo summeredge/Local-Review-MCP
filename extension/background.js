@@ -14,6 +14,8 @@
   const DELIVERY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
   const COMPLETION_ID = DELIVERY_ID;
   const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+  const VERDICT_FIELDS = ['tool_name', 'connector', 'workspace_id', 'review_request_id',
+    'expected_user_message_id', 'tool_call_id', 'verdict'];
   const MAX_COMPLETION_CONTENT = 256 * 1024;
   const REQUEST_TIMEOUT_MS = 3000;
   const PORT_TRUST_MS = 10_000;
@@ -393,11 +395,23 @@
       || !REQUEST_ID.test(raw.request_id)
       || !CONVERSATION_ID.test(raw.conversation_id)
       || !DOCUMENT_ID.test(documentId)) return null;
+    const verdictEvidence = VERDICT_FIELDS.some(key => Object.prototype.hasOwnProperty.call(raw, key));
+    if (verdictEvidence && (!VERDICT_FIELDS.every(key => Object.prototype.hasOwnProperty.call(raw, key))
+      || raw.tool_name !== 'submit_review_verdict' || raw.connector !== 'Local MCP Connector'
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(raw.request_id)
+      || typeof raw.workspace_id !== 'string' || !raw.workspace_id.trim()
+      || typeof raw.review_request_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(raw.review_request_id)
+      || typeof raw.expected_user_message_id !== 'string' || !MESSAGE_ID.test(raw.expected_user_message_id)
+      || typeof raw.tool_call_id !== 'string' || !MESSAGE_ID.test(raw.tool_call_id)
+      || !raw.verdict || typeof raw.verdict !== 'object' || Array.isArray(raw.verdict)
+      || raw.verdict.review_request_id !== raw.review_request_id
+      || JSON.stringify(raw.verdict).length > 512 * 1024)) return null;
     return {
       request_id: raw.request_id,
       conversation_id: raw.conversation_id,
       document_id: documentId,
-      navigation_epoch: navigationEpoch
+      navigation_epoch: navigationEpoch,
+      ...(verdictEvidence ? Object.fromEntries(VERDICT_FIELDS.map(key => [key, raw[key]])) : {})
     };
   }
 
@@ -548,7 +562,7 @@
     const entries = Object.prototype.hasOwnProperty.call(stored, 'identityEvidenceOutbox')
       ? stored.identityEvidenceOutbox : [];
     const valid = validStoredDeliveryEntries(entries, (entry) => entry
-      && Object.keys(entry).length === 6
+      && Object.keys(entry).length === (entry.tool_name === 'submit_review_verdict' ? 13 : 6)
       && evidenceFromMessage(entry, entry.document_id, entry.navigation_epoch)
       && requestedEpoch(entry) !== null
       && Number.isSafeInteger(entry.received_at) && entry.received_at >= 0
@@ -570,7 +584,10 @@
       const entries = await pruneEvidenceOutbox();
       const previous = entries.find(entry => entry.request_id === evidence.request_id);
       if (previous) {
-        return previous.conversation_id === evidence.conversation_id
+        const identical = previous.tool_name || evidence.tool_name
+          ? sameJson(evidenceFromMessage(previous, previous.document_id, previous.navigation_epoch), evidence)
+          : previous.conversation_id === evidence.conversation_id;
+        return identical
           ? { ok: true } : { ok: false, error: 'identity_evidence_conflict' };
       }
       if (entries.length >= 1000) return { ok: false, error: 'identity_evidence_outbox_full' };
@@ -579,6 +596,15 @@
         { ...evidence, received_at: now, expires_at: now + EVIDENCE_TTL_MS }] });
       return { ok: true };
     });
+  }
+
+  function sameJson(left, right) {
+    if (left === right) return true;
+    if (!left || !right || typeof left !== 'object' || typeof right !== 'object'
+      || Array.isArray(left) !== Array.isArray(right)) return false;
+    const keys = Object.keys(left);
+    return keys.length === Object.keys(right).length
+      && keys.every(key => Object.prototype.hasOwnProperty.call(right, key) && sameJson(left[key], right[key]));
   }
 
   function flushEvidenceOutbox() {
@@ -733,6 +759,8 @@
     }
     const evidence = evidenceFromMessage(message, source.documentId, authority.navigation_epoch);
     if (!evidence) return { ok: false, error: 'invalid_evidence' };
+    if (evidence.tool_name && (raw.identity_source !== 'fiber'
+      || authority.conversation_id !== evidence.conversation_id)) return { ok: false, error: 'wrong_conversation' };
     const queued = await queueEvidence(evidence);
     if (!queued.ok) return queued;
     evidenceDiagnostic('bridge_send_attempted', raw, sender);

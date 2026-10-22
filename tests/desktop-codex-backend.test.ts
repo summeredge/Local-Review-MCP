@@ -22,6 +22,7 @@ import { ExecutionContextService } from "../src/context/execution-service.js";
 import { SessionStore } from "../src/context/session-store.js";
 import { sessionFile } from "../src/context/session.js";
 import { TaskContextService } from "../src/context/service.js";
+import { ReviewRequestService } from "../src/context/review-request-service.js";
 import { EventStore, eventsFile } from "../src/control-plane/events/store.js";
 import { DesktopCodexBackend } from "../src/desktop-codex/desktop-codex-backend.js";
 import { CodexAppRuntimeError } from "../src/desktop-codex/codex-app-runtime.js";
@@ -402,6 +403,13 @@ const TASK_ID = "task-1";
 const EXECUTION_ID = "execution-1";
 const ACTUATION_ID = "actuation-1";
 
+function legacyTextReviewRequests(root: string): ReviewRequestService {
+  const service = new ReviewRequestService(root);
+  const create = service.createReviewRequest.bind(service);
+  service.createReviewRequest = (input) => create({ ...input, verdict_protocol: "text_v1" });
+  return service;
+}
+
 describe("Desktop Execution status checks and manual resolution", () => {
   it.each(["check", "close"] as const)("converges Goal, Task and Review Loop through existing terminal notifications: %s", async action => {
     const value = await fixture();
@@ -409,7 +417,7 @@ describe("Desktop Execution status checks and manual resolution", () => {
     const review = vi.fn(async request => ({ status: "COMPLETED" as const,
       content: `<lrm-review-result>${JSON.stringify({ schema_version: 1, review_request_id: request.review_request_id,
         decision: "APPROVE", summary: "Reviewed" })}</lrm-review-result>` }));
-    const auto = new AutoIterationService(value.registry, { storageRoot: value.root, controlledActuation: value.controlled,
+    const auto = new AutoIterationService(value.registry, { storageRoot: value.root, reviewRequestService: legacyTextReviewRequests(value.root), controlledActuation: value.controlled,
       browserRouter: new BrowserRouter(value.root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
       completionRouter: new ReviewCompletionRouter(value.root, { collect: review }) });
     const goals = new GoalOrchestrationService(value.registry, { storageRoot: value.root,
@@ -895,6 +903,7 @@ describe("P5.4.1 route selection", () => {
         review_request_id: request.review_request_id, decision: "APPROVE", summary: "Reviewed" })}</lrm-review-result>`,
     }));
     const auto = new AutoIterationService(value.registry, { storageRoot: value.root,
+      reviewRequestService: legacyTextReviewRequests(value.root),
       controlledActuation: value.controlled,
       browserRouter: new BrowserRouter(value.root, { deliver: async () => ({
         status: "delivered", delivered_at: new Date().toISOString(),
@@ -990,6 +999,7 @@ describe("P5.4.1 route selection", () => {
       },
     });
     const makeAuto = () => new AutoIterationService(value.registry, { storageRoot: value.root,
+      reviewRequestService: legacyTextReviewRequests(value.root),
       browserRouter, completionRouter, controlledActuation: value.controlled });
     let auto = makeAuto();
     const makeGoals = () => new GoalOrchestrationService(value.registry, { storageRoot: value.root,
@@ -2135,6 +2145,7 @@ describe("terminal Session recovery", () => {
       const request = interactiveRequest();
       const sessions = value.sessions;
       const makeAuto = () => new AutoIterationService(registry, { storageRoot: value.root,
+        reviewRequestService: legacyTextReviewRequests(value.root),
         browserRouter: new BrowserRouter(value.root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
         completionRouter: new ReviewCompletionRouter(value.root, { collect: async input => ({ status: "COMPLETED",
           content: '<lrm-review-result>' + JSON.stringify({ schema_version: 1, review_request_id: input.review_request_id,
@@ -2192,6 +2203,7 @@ it.each(["passed", "failed"] as const)("restarts from durable %s with an unsynch
   const registry = value.registry;
   const request = interactiveRequest();
   const makeAuto = () => new AutoIterationService(registry, { storageRoot: value.root,
+    reviewRequestService: legacyTextReviewRequests(value.root),
     browserRouter: new BrowserRouter(value.root, { deliver: async () => ({ status: "delivered", delivered_at: new Date().toISOString() }) }),
     completionRouter: new ReviewCompletionRouter(value.root, { collect: async input => ({ status: "COMPLETED",
       content: '<lrm-review-result>' + JSON.stringify({ schema_version: 1, review_request_id: input.review_request_id,

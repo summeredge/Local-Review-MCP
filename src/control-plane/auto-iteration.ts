@@ -54,6 +54,7 @@ import {
 import type { ReviewVerdict, ReviewVerdictIteration } from "../control/review-verdict.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
 import { EventStore } from "./events/store.js";
+import { ReviewVerdictSubmissionService, REVIEW_VERDICT_CONFIRMATION_TIMEOUT_MS } from "./review-verdict-submission.js";
 
 const STATE_VERSION = 1;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
@@ -382,6 +383,7 @@ export class AutoIterationService {
   public readonly completionRouter: Pick<ReviewCompletionRouter, "collect">;
   public readonly controlledActuation: ControlledActuationPort;
   public readonly extensionDeliveries: ExtensionDeliveryService;
+  public readonly reviewVerdictSubmission: ReviewVerdictSubmissionService;
 
   private readonly store: AutoIterationStore;
   private readonly tasks: TaskContextService;
@@ -449,6 +451,11 @@ export class AutoIterationService {
         executionContextService: this.executions,
       });
     this.store = new AutoIterationStore(this.storageRoot);
+    this.reviewVerdictSubmission = new ReviewVerdictSubmissionService(registry, {
+      storageRoot: this.storageRoot,
+      extensionDeliveries: this.extensionDeliveries,
+      listLoops: () => this.listLoops(),
+    });
     this.terminalListener = options.terminalListener;
 
     for (const dependency of [
@@ -475,6 +482,7 @@ export class AutoIterationService {
 
   public dispose(): void {
     this.disposed = true;
+    this.reviewVerdictSubmission.dispose();
     this.infrastructureRetries.clear();
     for (const timer of this.retryTimers.values()) clearTimeout(timer);
     this.retryTimers.clear();
@@ -603,6 +611,7 @@ export class AutoIterationService {
     for (let step = 0; step < 32; step += 1) {
       let loop = await this.store.get(loopId);
       if (loop === null) throw new Error(`Auto iteration loop "${loopId}" was not found.`);
+      if (this.disposed) return loop;
       if (loop.stage === "completed" || loop.stage === "human_required" || loop.stage === "failed") {
         this.cancelRetry(loop.loop_id);
         return loop;
@@ -754,6 +763,7 @@ export class AutoIterationService {
             execution_id: current.execution_id,
             workspace_id: current.workspace_id,
             conversation_id: current.conversation_id,
+            ...(current.verdict_recovery === undefined ? {} : { verdict_protocol: "text_v1" as const }),
           });
         } catch (error: unknown) {
           request = await this.reviewRequests.getReviewRequest(
@@ -1006,7 +1016,23 @@ export class AutoIterationService {
       }
 
       let verdict: ReviewVerdict;
-      try {
+      const request = await this.reviewRequests.getReviewRequest(loop.workspace_id, reviewRequestId);
+      if (request === null) throw new Error("Review request was not found.");
+      this.assertReviewRequest(loop, request);
+      if (request.verdict_protocol === "tool_v1") {
+        const confirmed = await this.reviewVerdictSubmission.awaitConfirmed(
+          loop.workspace_id, reviewRequestId,
+          Date.parse(result.created_at) + REVIEW_VERDICT_CONFIRMATION_TIMEOUT_MS,
+        );
+        if (this.disposed) return;
+        if (confirmed === null) {
+          const diagnostic = await this.reviewVerdictSubmission.confirmationDiagnostic(loop.workspace_id, reviewRequestId);
+          await this.humanRequired(loop, "VERDICT_CONFIRMATION_TIMEOUT",
+            `Review 阶段：${diagnostic}；TOOL_VERDICT_CONFIRMATION_TIMEOUT。Completion 后的确认窗口已结束，未确认的 Verdict 不会触发执行。Review Result：${result.result_id}。`);
+          return;
+        }
+        verdict = confirmed;
+      } else try {
         verdict = this.parser.parse(result);
       } catch (error: unknown) {
         const code = error instanceof ReviewVerdictParseError ? error.code : "VERDICT_INVALID";
@@ -1024,7 +1050,7 @@ export class AutoIterationService {
           return;
         }
         await this.humanRequired(loop, `INVALID_VERDICT_${code}`,
-          `Review 内容已返回（COMPLETED），但 Verdict 协议无效；尚未确认审查通过。原始证据：${result.result_id}；review_request_id：${reviewRequestId}。${errorMessage(error)}`);
+          `${code === "VERDICT_BLOCK_INCOMPLETE" ? "TEXT_VERDICT_INCOMPLETE；" : ""}Review 内容已返回（COMPLETED），但 Verdict 协议无效；尚未确认审查通过。原始证据：${result.result_id}；review_request_id：${reviewRequestId}。${errorMessage(error)}`);
         return;
       }
       const parsed = reviewVerdictSchema.safeParse(verdict);

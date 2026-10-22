@@ -4,9 +4,29 @@ import { REVIEW_VERDICT_BEGIN, REVIEW_VERDICT_END } from "../control/review-verd
 
 export function buildReviewMessage(
   request: Pick<ReviewDeliveryRequest,
-    "workspace_id" | "task_id" | "execution_id" | "review_request_id" | "routing_id">,
+    "workspace_id" | "task_id" | "execution_id" | "review_request_id" | "routing_id" | "verdict_protocol">,
   original?: ReviewResult,
 ): string {
+  if (request.verdict_protocol === "tool_v1" && original === undefined) {
+    return [
+      "Review this change using Local Review MCP.",
+      `workspace_id: ${request.workspace_id}`,
+      `task_id: ${request.task_id}`,
+      ...(request.execution_id === undefined ? [] : [`execution_id: ${request.execution_id}`]),
+      `review_request_id: ${request.review_request_id}`,
+      `routing_id: ${request.routing_id}`,
+      "verdict_protocol: tool_v1",
+      "",
+      "Use Local Review MCP to read the corresponding Workspace, Review Context, Git status, and uncommitted diff, then review this change.",
+      "When the review is complete, call submit_review_verdict exactly once with your final decision. Supply workspace_id above, a fresh UUID v4 correlation_key, and verdict {schema_version: 1, review_request_id above, decision, summary, iteration?}. Summary must contain non-whitespace text; unknown fields are forbidden.",
+      "Use exactly one decision: APPROVE, ITERATE, HUMAN_REQUIRED.",
+      "APPROVE means no blocking defect within the current task scope; future refactors, naming preferences, optional cleanup, and non-blocking optimizations may remain suggestions and must not force ITERATE.",
+      "ITERATE requires a blocking issue within scope and complete Codex repair instructions in iteration: {goal, requirements: [at least one concrete requirement], acceptance_criteria: [at least one verifiable outcome]}. Other decisions must omit iteration.",
+      "HUMAN_REQUIRED means user decision or clarification is needed, an issue is outside the task scope, or the review cannot be safely decided. Do not expand the iteration for out-of-scope issues.",
+      "accepted=true acknowledges receipt only; the server independently confirms this Review turn and waits for Review Completion before applying the verdict. A failed or missing submission cannot approve the task.",
+      "After the tool call, output a concise human-readable review directly in this reply. No machine-readable verdict block or follow-up Review message is required. Do not submit a goal or run Codex yourself.",
+    ].join("\n");
+  }
   return [
     original === undefined ? "Review this change using Local Review MCP." : "Complete only the missing LRM Review Verdict for the original review below.",
     `workspace_id: ${request.workspace_id}`,

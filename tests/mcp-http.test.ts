@@ -578,7 +578,7 @@ describe("MCP HTTP runtime", () => {
 
     await client.connect(transport);
     const result = await client.listTools();
-    expect(result.tools).toHaveLength(22);
+    expect(result.tools).toHaveLength(23);
     expect(result.tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_REGISTERED_TOOL_NAMES].sort());
 
     const infoCall = await client.callTool({ name: "workspace_info", arguments: {} });

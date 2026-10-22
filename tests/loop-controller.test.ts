@@ -62,6 +62,7 @@ async function makeDeliveredChain(
     task_id: task.task_id,
     execution_id: execution.execution_id,
     workspace_id: task.workspace_id,
+    verdict_protocol: "text_v1",
     ...(reviewSnapshot === null ? {} : { review_snapshot: reviewSnapshot }),
   });
   const routing = await new ConversationRoutingService(storageRoot).createRouting({

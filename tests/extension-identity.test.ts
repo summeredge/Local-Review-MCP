@@ -577,6 +577,105 @@ const evidenceMessage = (conversationId: string, navigation_epoch: number, extra
   ...extra,
 });
 
+describe('Extension Verdict identity transport', () => {
+  const url = `${ORIGIN}/c/${CONVERSATION_A}`;
+  const verdict = { schema_version: 1, review_request_id: 'review-1', decision: 'ITERATE', summary: '修复阻断问题',
+    iteration: { goal: '修复', requirements: ['保留原行为'], acceptance_criteria: ['测试通过'] } };
+  const fields = { tool_name: 'submit_review_verdict', connector: 'Local MCP Connector', workspace_id: 'workspace-1',
+    review_request_id: 'review-1', expected_user_message_id: 'review-user', tool_call_id: 'call-review-1', verdict };
+  const message = (extra: Record<string, unknown> = {}) => evidenceMessage(CONVERSATION_A, 0,
+    { identity_source: 'fiber', ...fields, ...extra });
+  const register = (worker: ReturnType<typeof loadBackground>, documentId = 'document-1', epoch = 0) => worker.send({
+    type: 'register_document', identity_source: 'fiber', conversation_id: CONVERSATION_A, navigation_epoch: epoch,
+  }, documentId, 7, url);
+  const unavailable = async (requestUrl: URL) => requestUrl.pathname === '/hello'
+    ? response(200, bridgeHello) : response(503, {});
+
+  it('preserves every Verdict field in durable custody and on restart until durable acceptance', async () => {
+    const storage = new Storage({ port: 12081, token: 'paired-token' });
+    const first = loadBackground(storage, unavailable);
+    await register(first);
+    expect(await first.send(message({ document_id: 'spoofed' }), 'document-1', 7, url)).toMatchObject({ ok: false, status: 503 });
+    const saved = structuredClone(storage.data.identityEvidenceOutbox) as Record<string, unknown>[];
+    expect(saved).toHaveLength(1);
+    expect(Object.keys(saved[0]!)).toHaveLength(13);
+    const expected = { request_id: UUID_REQUEST_ID, conversation_id: CONVERSATION_A,
+      document_id: 'document-1', navigation_epoch: 0, ...fields };
+    expect(saved[0]).toMatchObject(expected);
+    const posted = first.calls.find(call => new URL(call.input).pathname === '/identity-evidence');
+    expect(JSON.parse(String(posted?.init.body))).toEqual(expected);
+    const restarted = loadBackground(storage, async requestUrl => requestUrl.pathname === '/hello'
+      ? response(200, bridgeHello) : response(202, { accepted: true, durable: true }), true);
+    await waitForEvidence(() => (storage.data.identityEvidenceOutbox as unknown[]).length === 0);
+    const retry = restarted.calls.find(call => new URL(call.input).pathname === '/identity-evidence');
+    expect(JSON.parse(String(retry?.init.body))).toEqual(expected);
+  });
+
+  it('deduplicates the complete proof and rejects same-key changes to verdict, workspace, user, call, document or epoch', async () => {
+    const storage = new Storage({ port: 12081, token: 'paired-token' });
+    const worker = loadBackground(storage, unavailable);
+    await register(worker);
+    await worker.send(message(), 'document-1', 7, url);
+    const saved = structuredClone(storage.data.identityEvidenceOutbox);
+    const reordered = { summary: verdict.summary, review_request_id: verdict.review_request_id,
+      schema_version: 1, iteration: verdict.iteration, decision: verdict.decision };
+    expect(await worker.send(message({ verdict: reordered }), 'document-1', 7, url)).toMatchObject({ ok: false, status: 503 });
+    for (const extra of [{ workspace_id: 'other-workspace' }, { expected_user_message_id: 'other-user' },
+      { tool_call_id: 'other-call' }, { verdict: { ...verdict, summary: 'different' } },
+      { verdict: { ...verdict, iteration: { ...verdict.iteration, requirements: ['different'] } } },
+      { review_request_id: 'other-review', verdict: { ...verdict, review_request_id: 'other-review' } }]) {
+      expect(await worker.send(message(extra), 'document-1', 7, url))
+        .toMatchObject({ ok: false, error: 'identity_evidence_conflict' });
+    }
+    expect(await worker.send(evidenceMessage(CONVERSATION_A, 0), 'document-1', 7, url))
+      .toMatchObject({ ok: false, error: 'identity_evidence_conflict' });
+    await register(worker, 'document-1', 1);
+    expect(await worker.send(message({ navigation_epoch: 1 }), 'document-1', 7, url))
+      .toMatchObject({ ok: false, error: 'identity_evidence_conflict' });
+    await register(worker, 'document-2');
+    expect(await worker.send(message(), 'document-2', 7, url))
+      .toMatchObject({ ok: false, error: 'identity_evidence_conflict' });
+    expect(storage.data.identityEvidenceOutbox).toEqual(saved);
+  });
+
+  it('rejects incomplete Verdict fields, wrong source and stale document/navigation without queueing reduced goal evidence', async () => {
+    const storage = new Storage({ port: 12081, token: 'paired-token' });
+    const worker = loadBackground(storage, unavailable);
+    await register(worker);
+    for (const field of Object.keys(fields)) {
+      const partial: Record<string, unknown> = message(); delete partial[field];
+      expect(await worker.send(partial, 'document-1', 7, url)).toMatchObject({ ok: false, error: 'invalid_evidence' });
+    }
+    for (const extra of [{ tool_call_id: '' }, { connector: 'Other' }, { request_id: 'not-uuid' },
+      { verdict: { ...verdict, review_request_id: 'wrong-review' } }, { verdict: null }]) {
+      expect(await worker.send(message(extra), 'document-1', 7, url)).toMatchObject({ ok: false, error: 'invalid_evidence' });
+    }
+    expect(await worker.send(message({ identity_source: undefined }), 'document-1', 7, url))
+      .toMatchObject({ ok: false, error: 'wrong_conversation' });
+    expect(await worker.send(message({ conversation_id: CONVERSATION_B }), 'document-1', 7, url))
+      .toMatchObject({ ok: false });
+    await register(worker, 'document-1', 1);
+    expect(await worker.send(message(), 'document-1', 7, url)).toMatchObject({ ok: false, error: 'stale_navigation' });
+    await register(worker, 'document-2');
+    expect(await worker.send(message({ navigation_epoch: 1 }), 'document-1', 7, url))
+      .toMatchObject({ ok: false, error: 'stale_document' });
+    expect(storage.data.identityEvidenceOutbox ?? []).toEqual([]);
+    expect(worker.calls.some(call => new URL(call.input).pathname === '/identity-evidence')).toBe(false);
+  });
+
+  it('fails closed on partial durable Verdict evidence without overwriting or posting it', async () => {
+    const malformed = { request_id: UUID_REQUEST_ID, conversation_id: CONVERSATION_A,
+      document_id: 'document-1', navigation_epoch: 0, ...fields, tool_call_id: undefined,
+      received_at: Date.now(), expires_at: Date.now() + 5 * 60 * 1000 };
+    const storage = new Storage({ identityEvidenceOutbox: [malformed] });
+    const worker = loadBackground(storage, unavailable);
+    await register(worker);
+    expect(await worker.send(message(), 'document-1', 7, url)).toMatchObject({ ok: false, error: 'internal_error' });
+    expect(storage.data.identityEvidenceOutbox).toEqual([malformed]);
+    expect(worker.calls.some(call => new URL(call.input).pathname === '/identity-evidence')).toBe(false);
+  });
+});
+
 async function waitForEvidence(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 1000;
   while (!predicate()) {

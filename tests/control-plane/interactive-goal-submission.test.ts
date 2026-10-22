@@ -31,6 +31,7 @@ import type { GoalPreflightInput, GoalPreflightResult } from "../../src/control-
 import { ExecutionRoutingService } from "../../src/control-plane/execution-routing.js";
 import { GoalStartError, GoalSubmissionService, type GoalSubmissionRequest } from "../../src/control-plane/goal-submission.js";
 import { ExecutionContextService } from "../../src/context/execution-service.js";
+import { ReviewRequestService } from "../../src/context/review-request-service.js";
 import type { ExecutionContext } from "../../src/context/types.js";
 import { SessionStore } from "../../src/context/session-store.js";
 import { TaskContextService } from "../../src/context/service.js";
@@ -38,6 +39,13 @@ import { WorkspaceRegistry } from "../../src/workspace/registry.js";
 import { CapabilityNegotiator, StandaloneCapabilityProvider } from "../../src/control-plane/capability-negotiation.js";
 
 const temporaryDirectories: string[] = [];
+
+function legacyTextReviewRequests(root: string): ReviewRequestService {
+  const service = new ReviewRequestService(root);
+  const create = service.createReviewRequest.bind(service);
+  service.createReviewRequest = (input) => create({ ...input, verdict_protocol: "text_v1" });
+  return service;
+}
 
 it("expires a repeated authenticated submission without changing the running Goal, Execution or Session", async () => {
   const value = await fixture();
@@ -280,6 +288,7 @@ async function fixture(options: { readonly terminalRouting?: boolean } = {}): Pr
   const loops = new Map<string, AutoIteration>();
   const runtimeAuto = options.terminalRouting ? new AutoIterationService(registry, {
     storageRoot: root,
+    reviewRequestService: legacyTextReviewRequests(root),
     taskContextService: tasks,
     executionContextService: executions,
     controlledActuation: controlled,

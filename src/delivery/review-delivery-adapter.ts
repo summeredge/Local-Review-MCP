@@ -9,6 +9,7 @@ export interface ReviewDeliveryRequest {
   readonly conversation_id: string;
   readonly message?: string;
   readonly execution_id?: string;
+  readonly verdict_protocol?: "text_v1" | "tool_v1";
 }
 
 export type ReviewDeliveryResult =

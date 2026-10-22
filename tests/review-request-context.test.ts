@@ -43,6 +43,7 @@ describe("ReviewRequestService", () => {
       execution_id: "exec-001",
       workspace_id: "workspace-a",
       status: "pending",
+      verdict_protocol: "tool_v1",
     });
     expect(request.review_request_id).toBeTruthy();
     expect(request.conversation_id).toBeUndefined();

@@ -48,6 +48,10 @@ import {
 } from "../control-plane/pending-goal-submission.js";
 import { validateWorkspaceIdentityConsistency } from "../workspace/identity.js";
 import { WorkspaceManager, WorkspacePathError } from "../workspace/manager.js";
+import {
+  ReviewVerdictSubmissionError, submitReviewVerdictInputSchema, submitReviewVerdictAcceptedSchema,
+  type ReviewVerdictSubmissionService,
+} from "../control-plane/review-verdict-submission.js";
 import type { WorkspaceRegistry, WorkspaceSelection } from "../workspace/registry.js";
 import { searchText } from "../workspace/search.js";
 import { containsNullByte, readBoundedBytes } from "../workspace/text.js";
@@ -82,6 +86,7 @@ import {
 } from "./schema/workspace.js";
 
 export interface McpRuntimeContext {
+  readonly reviewVerdictSubmission?: Pick<ReviewVerdictSubmissionService, "accept">;
   readonly workspace?: WorkspaceManager;
   readonly registry: WorkspaceRegistry;
   readonly correlations?: Pick<ConversationCorrelationRegistry, "correlation" | "awaitCorrelation">;
@@ -127,7 +132,7 @@ export const WORKSPACE_REVIEW_TOOL_NAMES = [
   "workspace_search",
   "workspace_review_context",
 ] as const;
-export const CONTROL_PLANE_TOOL_NAMES = ["submit_goal"] as const;
+export const CONTROL_PLANE_TOOL_NAMES = ["submit_goal", "submit_review_verdict"] as const;
 export const STATUS_QUERY_TOOL_NAMES = [
   "get_session_status",
   "get_execution_status",
@@ -337,6 +342,9 @@ interface ListedEntry {
 }
 
 export function toToolError(error: unknown) {
+  if (error instanceof ReviewVerdictSubmissionError) {
+    return { content: [{ type: "text" as const, text: JSON.stringify({ error: error.code }) }], isError: true as const };
+  }
   if (error instanceof ModelResolutionError) {
     return {
       content: [{ type: "text" as const, text: JSON.stringify({
@@ -1244,5 +1252,18 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
   );
 
+  server.registerTool("submit_review_verdict", {
+    description: "Submit exactly one final structured verdict for the current tool_v1 Review. Supply the workspace_id and review_request_id from its Review request and a fresh UUID v4 correlation_key. verdict uses schema_version=1, decision=APPROVE|ITERATE|HUMAN_REQUIRED, and a nonblank summary; only ITERATE requires iteration {goal, requirements, acceptance_criteria}. accepted=true acknowledges durable receipt only: the server separately verifies the actual Connector call and Review user message through Extension evidence, then waits for Review Completion before the existing controller acts. Never substitute prose or a verdict text block for this call, or submit a new goal.",
+    inputSchema: submitReviewVerdictInputSchema,
+    outputSchema: submitReviewVerdictAcceptedSchema,
+  }, async (input, extra) => {
+    try {
+      if (context.reviewVerdictSubmission === undefined) throw new ReviewVerdictSubmissionError("VERDICT_RUNTIME_UNAVAILABLE", "Verdict runtime unavailable");
+      const proof = authenticatedMcpInvocationProof(extra);
+      if (proof === undefined) throw new ReviewVerdictSubmissionError("VERDICT_AUTHENTICATION_REQUIRED", "Authenticated MCP invocation required");
+      const accepted = await context.reviewVerdictSubmission.accept(input, proof);
+      return structuredResponse(submitReviewVerdictAcceptedSchema, accepted);
+    } catch (error) { return toToolError(error); }
+  });
   return server;
 }

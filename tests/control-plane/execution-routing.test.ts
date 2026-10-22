@@ -59,6 +59,13 @@ function verdict(reviewRequestId: string, decision: Exclude<ReviewDecision, "FAI
   })}</lrm-review-result>`;
 }
 
+function legacyTextReviewRequests(root: string): ReviewRequestService {
+  const service = new ReviewRequestService(root);
+  const create = service.createReviewRequest.bind(service);
+  service.createReviewRequest = (input) => create({ ...input, verdict_protocol: "text_v1" });
+  return service;
+}
+
 class FakeReviewDelivery implements ReviewDeliveryAdapter {
   public readonly requests: ReviewDeliveryRequest[] = [];
 
@@ -170,6 +177,7 @@ async function harness(options: {
   const completionRouter = new ReviewCompletionRouter(root, completions);
   const auto = new AutoIterationService(registry, {
     storageRoot: root,
+    reviewRequestService: legacyTextReviewRequests(root),
     taskContextService: tasks,
     executionContextService: executions,
     browserRouter,

@@ -96,6 +96,8 @@ describe("BrowserRouter", () => {
       .getReviewRequest("workspace-a", "review-001");
     expect(request?.status).toBe("pending");
     expect(request?.status).not.toBe("completed");
+    expect(request?.verdict_protocol).toBe("tool_v1");
+    expect(requests[0]?.message).toContain("submit_review_verdict");
   });
 
   it("records a retryable failure and permits a later retry", async () => {

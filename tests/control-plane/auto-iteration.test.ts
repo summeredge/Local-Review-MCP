@@ -79,6 +79,13 @@ function verdict(
   })}</lrm-review-result>`;
 }
 
+function legacyTextReviewRequests(root: string): ReviewRequestService {
+  const service = new ReviewRequestService(root);
+  const create = service.createReviewRequest.bind(service);
+  service.createReviewRequest = (input) => create({ ...input, verdict_protocol: "text_v1" });
+  return service;
+}
+
 async function fixture(
   decisions: Array<"APPROVE" | "ITERATE" | "HUMAN_REQUIRED"> = ["APPROVE"],
   delivery: "delivered" | "failed" | "ambiguous" = "delivered",
@@ -169,10 +176,12 @@ async function fixture(
     };
   });
   const router = new BrowserRouter(root, { deliver: deliveryCalls });
+  const reviewRequests = legacyTextReviewRequests(root);
   const auto = new AutoIterationService(registry, {
     storageRoot: root,
     taskContextService: taskService,
     executionContextService: executionService,
+    reviewRequestService: reviewRequests,
     browserRouter: router,
     completionRouter: completion,
     controlledActuation: controlled,
@@ -201,6 +210,7 @@ async function createDurableReviewChain(root: string, suffix: string): Promise<{
     execution_id: "execution-001",
     workspace_id: "workspace-a",
     conversation_id: "conversation-001",
+    verdict_protocol: "text_v1",
   });
   const routing = await new ConversationRoutingService(root).createRouting({
     routing_id: `routing-${suffix}`,
@@ -476,7 +486,7 @@ describe("AutoIterationService", () => {
     } });
     const make = () => new AutoIterationService(f.registry, { storageRoot: f.root,
       browserRouter: f.auto.browserRouter, completionRouter: completion,
-      controlledActuation: f.auto.controlledActuation, retryDelayMs: 50 });
+      controlledActuation: f.auto.controlledActuation, reviewRequestService: legacyTextReviewRequests(f.root), retryDelayMs: 50 });
     const first = make();
     const waiting = await first.start(startInput());
     expect(waiting).toMatchObject({ stage: 'delivery', retry_at: expect.any(String) });
@@ -671,6 +681,7 @@ describe("AutoIterationService", () => {
     }));
     const auto = new AutoIterationService(value.registry, { storageRoot: value.root,
       browserRouter: value.auto.browserRouter, controlledActuation: value.auto.controlledActuation,
+      reviewRequestService: legacyTextReviewRequests(value.root),
       completionRouter: new ReviewCompletionRouter(value.root,
         new BrowserWorkerReviewCompletionAdapter({ collectCompletion: collect })) });
     const loop = await auto.start(startInput());
@@ -793,6 +804,7 @@ describe("AutoIterationService", () => {
     }));
     const invalidAuto = new AutoIterationService(invalid.registry, {
       storageRoot: invalid.root,
+      reviewRequestService: legacyTextReviewRequests(invalid.root),
       completionRouter: invalidCompletion,
       browserRouter: invalid.auto.browserRouter,
       controlledActuation: invalid.auto.controlledActuation,
@@ -802,6 +814,9 @@ describe("AutoIterationService", () => {
       stage: "human_required",
       terminal_reason: reason,
     });
+    if (reason === "INVALID_VERDICT_VERDICT_BLOCK_INCOMPLETE") {
+      expect(stopped.terminal_summary).toContain("TEXT_VERDICT_INCOMPLETE");
+    }
     const results = await new ReviewResultService(invalid.root).listReviewResults("workspace-a");
     expect(results).toHaveLength(reason.endsWith("VERDICT_BLOCK_MISSING") ? 2 : 1);
     expect(results.every(result => result.status === "COMPLETED" && result.content === content)).toBe(true);
@@ -824,7 +839,8 @@ describe("AutoIterationService", () => {
       }));
       const completion = new ReviewCompletionRouter(f.root, new BrowserWorkerReviewCompletionAdapter({ collectCompletion: collect }));
       const auto = new AutoIterationService(f.registry, { storageRoot: f.root, browserRouter: f.auto.browserRouter,
-        completionRouter: completion, controlledActuation: f.auto.controlledActuation });
+        completionRouter: completion, controlledActuation: f.auto.controlledActuation,
+        reviewRequestService: legacyTextReviewRequests(f.root) });
       const loop = await auto.start(startInput());
       expect(loop).toMatchObject({ execution_id: "execution-001", iteration: 1,
         stage: decision === "APPROVE" ? "completed" : "human_required" });
@@ -858,7 +874,7 @@ describe("AutoIterationService", () => {
     });
     const completion = new ReviewCompletionRouter(f.root, new BrowserWorkerReviewCompletionAdapter({ collectCompletion: collect }));
     const options = { storageRoot: f.root, browserRouter: f.auto.browserRouter, completionRouter: completion,
-      controlledActuation: f.auto.controlledActuation, retryDelayMs: 60_000 };
+      controlledActuation: f.auto.controlledActuation, reviewRequestService: legacyTextReviewRequests(f.root), retryDelayMs: 60_000 };
     const first = new AutoIterationService(f.registry, options);
     const waiting = await first.start(startInput());
     expect(waiting).toMatchObject({ stage: "review_completion", completion_attempt_count: 1,
@@ -1140,6 +1156,7 @@ describe("AutoIterationService", () => {
       execution_id: "execution-001",
       workspace_id: "workspace-a",
       conversation_id: "conversation-other",
+      verdict_protocol: "text_v1",
     });
     await persistLoop(reviewConflict.root, checkpoint({
       loop_id: "loop-review-identity-conflict",
@@ -1311,6 +1328,7 @@ describe("AutoIterationService", () => {
     const extension = new ExtensionDeliveryService(value.root);
     const auto = new AutoIterationService(value.registry, {
       storageRoot: value.root,
+      reviewRequestService: legacyTextReviewRequests(value.root),
       extensionDeliveries: extension,
       extensionDeliveryReadiness: () => ({ ready: true }),
       completionRouter: value.auto.completionRouter,
@@ -1637,7 +1655,8 @@ describe("Interactive infrastructure recovery", () => {
     f.deliveryCalls.mockImplementationOnce(async () => ({ status: "failed" as const, retryable: true,
       error: { code: "TEMPORARY_TRANSPORT", message: "retry delivery" } }));
     const auto = new AutoIterationService(f.registry, { storageRoot: f.root, browserRouter: f.auto.browserRouter,
-      completionRouter: f.completionRouter, controlledActuation: f.auto.controlledActuation, retryDelayMs: 30_000 });
+      completionRouter: f.completionRouter, controlledActuation: f.auto.controlledActuation,
+      reviewRequestService: legacyTextReviewRequests(f.root), retryDelayMs: 30_000 });
     const internal = auto as unknown as { store: { put(loop: AutoIteration): Promise<AutoIteration>; get(id: string): Promise<AutoIteration | null> }; retryTimers: Map<string, unknown>; cancelRetry(id: string): void; scheduleRetry(id: string, delay: number): void };
     let spy: { mockRestore(): void } | undefined;
     try {
@@ -1669,7 +1688,8 @@ describe("Interactive infrastructure recovery", () => {
     f.deliveryCalls.mockImplementationOnce(async () => ({ status: "failed" as const, retryable: true,
       error: { code: "TEMPORARY_TRANSPORT", message: "retry delivery" } }));
     const auto = new AutoIterationService(f.registry, { storageRoot: f.root, browserRouter: f.auto.browserRouter,
-      completionRouter: f.completionRouter, controlledActuation: f.auto.controlledActuation, retryDelayMs: 30_000 });
+      completionRouter: f.completionRouter, controlledActuation: f.auto.controlledActuation,
+      reviewRequestService: legacyTextReviewRequests(f.root), retryDelayMs: 30_000 });
     const original = ReviewRequestService.prototype.updateReviewRequest;
     let failed = false;
     const spy = vi.spyOn(ReviewRequestService.prototype, "updateReviewRequest").mockImplementation(async function(this: ReviewRequestService, workspace, id, patch) {
@@ -1733,7 +1753,8 @@ it("Interactive infrastructure recovery resumes the persisted checkpoint after r
   const f = await fixture(["APPROVE"], "delivered", { execution_mode: "interactive", goal_id: "goal-interactive" });
   f.deliveryCalls.mockImplementationOnce(async () => ({ status: "failed" as const, retryable: true, error: { code: "TEMPORARY_TRANSPORT", message: "retry delivery" } }));
   const make = () => new AutoIterationService(f.registry, { storageRoot: f.root, browserRouter: f.auto.browserRouter,
-    completionRouter: f.completionRouter, controlledActuation: f.auto.controlledActuation, retryDelayMs: 30_000 });
+    completionRouter: f.completionRouter, controlledActuation: f.auto.controlledActuation,
+    reviewRequestService: legacyTextReviewRequests(f.root), retryDelayMs: 30_000 });
   const first = make();
   const internal = first as unknown as { store: { put(loop: AutoIteration): Promise<AutoIteration> }; infrastructureRetries: Map<string, number>;
     cancelRetry(id: string): void; scheduleRetry(id: string, delay: number): void };

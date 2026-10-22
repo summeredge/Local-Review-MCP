@@ -48,6 +48,7 @@ export class ReviewRequestService {
       workspace_id: parsed.workspace_id,
       ...(parsed.conversation_id === undefined ? {} : { conversation_id: parsed.conversation_id }),
       status: parsed.status,
+      verdict_protocol: parsed.verdict_protocol ?? "tool_v1",
       created_at: timestamp,
       updated_at: timestamp,
       ...(parsed.review_snapshot === undefined ? {} : { review_snapshot: parsed.review_snapshot }),

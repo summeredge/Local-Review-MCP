@@ -444,12 +444,12 @@
     }
   }
 
-  function submitGoalInspectionOf(message) {
+  function submitGoalInspectionOf(message, toolName = 'submit_goal') {
     const inspection = { recognized: false, key: null, reason: 'recipient_mismatch' };
     if (!message || typeof message !== 'object' || message.author?.role !== 'assistant') return inspection;
     const recipient = message.recipient;
-    const legacy = recipient === 'api_tool.call_tool';
-    const current = recipient === 'Local_MCP_Connector.submit_goal';
+    const legacy = toolName === 'submit_goal' && recipient === 'api_tool.call_tool';
+    const current = recipient === `Local_MCP_Connector.${toolName}`;
     if (!legacy && !current) return inspection;
     inspection.recognized = current;
 
@@ -458,7 +458,7 @@
       inspection.reason = 'unsupported_content_type';
       return inspection;
     }
-    if (own(content, 'name') && content.name !== 'submit_goal') {
+    if (own(content, 'name') && content.name !== toolName) {
       inspection.recognized = false;
       return inspection;
     }
@@ -475,12 +475,12 @@
     }
 
     const pathName = own(payload, 'path') ? toolNameFromPath(payload.path) : null;
-    if ((legacy && pathName !== 'submit_goal') || (own(payload, 'path') && pathName !== 'submit_goal')) {
+    if ((legacy && pathName !== toolName) || (own(payload, 'path') && pathName !== toolName)) {
       inspection.recognized = false;
       return inspection;
     }
     for (const key of ['name', 'tool', 'tool_name']) {
-      if (own(payload, key) && payload[key] !== 'submit_goal') {
+      if (own(payload, key) && payload[key] !== toolName) {
         inspection.recognized = false;
         return inspection;
       }
@@ -521,6 +521,25 @@
       inspection.reason = 'invalid_correlation_key';
       return inspection;
     }
+    if (toolName === 'submit_review_verdict') {
+      const identity = message.reviewIdentity;
+      const verdict = args.verdict;
+      // Only the timeline adapter supplies callId and the actual user, never tool arguments.
+      if (!identity?.tool_call_id || !identity.expected_user_message_id
+        || typeof args.workspace_id !== 'string' || !args.workspace_id.trim()
+        || !verdict || typeof verdict !== 'object' || Array.isArray(verdict)
+        || typeof verdict.review_request_id !== 'string'
+        || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(verdict.review_request_id)
+        || Object.keys(args).length !== 3
+        || JSON.stringify(args).length > MAX_TOOL_PAYLOAD) {
+        inspection.reason = 'missing_tool_payload';
+        return inspection;
+      }
+      inspection.evidence = { tool_name: toolName, connector: 'Local MCP Connector',
+        workspace_id: args.workspace_id, review_request_id: verdict.review_request_id,
+        expected_user_message_id: identity.expected_user_message_id,
+        tool_call_id: identity.tool_call_id, verdict };
+    }
     inspection.key = args.correlation_key;
     inspection.reason = null;
     return inspection;
@@ -530,14 +549,19 @@
     return submitGoalInspectionOf(message).key;
   }
 
-  function currentToolCorrelationOf(messages) {
+  function currentToolCorrelationOf(messages, anchorUserId) {
     if (!Array.isArray(messages)) return { found: false, key: null, submit_goal_found: false, reason: 'recipient_mismatch' };
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (!requestOf(message)) continue;
-      const inspection = submitGoalInspectionOf(message);
+      const goal = submitGoalInspectionOf(message);
+      const inspection = goal.recognized ? goal : submitGoalInspectionOf(message, 'submit_review_verdict');
       if (!inspection.recognized) continue;
-      return { found: true, key: inspection.key, submit_goal_found: inspection.recognized, reason: inspection.reason };
+      if (inspection.evidence && inspection.evidence.expected_user_message_id !== anchorUserId) {
+        return { found: true, key: null, reason: 'missing_tool_payload' };
+      }
+      return { found: true, key: inspection.key, submit_goal_found: goal.recognized,
+        evidence: inspection.evidence, reason: inspection.reason };
     }
     return { found: false, key: null, submit_goal_found: false, reason: 'recipient_mismatch' };
   }
@@ -584,21 +608,28 @@
   }
 
   // Current ChatGPT uses ordered timeline items, including structured MCP invocations.
-  // A direct Connector call is named once, qualified as `Local_MCP_Connector.<tool>`;
-  // the legacy linked tool spelled the same call `<server>__link_xxx/submit_goal` over a
-  // `link_xxx/submit_goal` tool. Both must normalize to one internal submit_goal request.
-  const DIRECT_SUBMIT_NAME = 'Local_MCP_Connector.submit_goal';
+  // Connector function names may use the direct or app-qualified spelling; linked tools
+  // use `<server>__link_xxx/<tool>` over `link_xxx/<tool>`.
   const CONNECTOR_SERVERS = ['Local MCP Connector', 'Local_MCP_Connector'];
-  const LEGACY_SUBMIT_FUNCTION = /^Local MCP Connector__link_[A-Za-z0-9_-]+\/submit_goal$/u;
-  const LEGACY_SUBMIT_TOOL = /^link_[A-Za-z0-9_-]+\/submit_goal$/u;
+  const LEGACY_SUBMIT_FUNCTION = /^Local MCP Connector__link_[A-Za-z0-9_-]+\/(submit_goal|submit_review_verdict)$/u;
+  const LEGACY_SUBMIT_TOOL = /^link_[A-Za-z0-9_-]+\/(submit_goal|submit_review_verdict)$/u;
+  const APP_SUBMIT_FUNCTION = /^mcp__Local_MCP_Connector__(submit_goal|submit_review_verdict)$/u;
 
-  function timelineSubmitGoalArgumentsOf(item) {
+  function timelineSubmitGoalArgumentsOf(item, toolName = 'submit_goal') {
     const invocation = item && typeof item.invocation === 'object' ? item.invocation : null;
     const functionName = typeof item?.functionName === 'string' ? item.functionName : null;
     const tool = typeof invocation?.tool === 'string' ? invocation.tool : null;
     const server = typeof invocation?.server === 'string' ? invocation.server : null;
-    const legacyFunction = functionName !== null && LEGACY_SUBMIT_FUNCTION.test(functionName);
-    if (legacyFunction || (tool !== null && LEGACY_SUBMIT_TOOL.test(tool))) {
+    const appToolName = functionName === null ? null : APP_SUBMIT_FUNCTION.exec(functionName)?.[1] ?? null;
+    if (appToolName === toolName) {
+      const consistent = (server === null || CONNECTOR_SERVERS.includes(server))
+        && (tool === null || tool === toolName || tool === `Local_MCP_Connector.${toolName}`
+          || tool === functionName)
+        && (toolName === 'submit_goal' || tool !== null);
+      return { recognized: true, arguments: consistent ? invocation.arguments : null };
+    }
+    const legacyFunction = functionName !== null && LEGACY_SUBMIT_FUNCTION.exec(functionName)?.[1] === toolName;
+    if (legacyFunction || (tool !== null && LEGACY_SUBMIT_TOOL.exec(tool)?.[1] === toolName)) {
       const consistent = server === 'Local MCP Connector' && tool !== null
         && functionName === `${server}__${tool}`;
       return { recognized: true, arguments: consistent ? invocation.arguments : null };
@@ -606,13 +637,15 @@
     // The connector may qualify the tool itself, or qualify it through its server.
     // A Local submit_goal name is authority only while every other present field agrees:
     // a foreign server never inherits it, and an absent field is not a conflict.
-    const localServer = server === null || CONNECTOR_SERVERS.includes(server);
-    const namedDirect = functionName === DIRECT_SUBMIT_NAME;
-    const directTool = tool !== null && (tool === DIRECT_SUBMIT_NAME || tool === 'submit_goal');
+    const directName = `Local_MCP_Connector.${toolName}`;
+    const localServer = (toolName === 'submit_goal' && server === null) || CONNECTOR_SERVERS.includes(server);
+    const namedDirect = functionName === directName;
+    const directTool = tool !== null && (tool === directName || tool === toolName);
     if (!namedDirect && !directTool) return { recognized: false, arguments: null };
     // A recognized but inconsistent/malformed latest invocation must block fallback.
     const consistent = localServer
-      && (functionName === null || namedDirect) && (tool === null || directTool);
+      && (functionName === null || namedDirect) && (tool === null || directTool)
+      && (toolName === 'submit_goal' || (directTool && (!own(item, 'functionName') || namedDirect)));
     return { recognized: true, arguments: consistent ? invocation.arguments : null };
   }
 
@@ -629,15 +662,23 @@
     // A timeline entry can contain consecutive users; only the last anchors this exchange.
     // Keep earlier tools so the selector still rejects calls before that user boundary.
     const lastUserIndex = ordered.findLastIndex((item) => item?.type === 'user-message');
+    const user = ordered[lastUserIndex];
+    const reviewUserId = validMessageId(user?.messageId);
+    const userConsistent = reviewUserId && (user.serverMessageId == null || user.serverMessageId === reviewUserId);
     for (let index = 0; index < ordered.length; index += 1) {
       const item = ordered[index];
       if (item?.type === 'user-message') {
         if (index !== lastUserIndex) continue;
         messages.push({ id: item.messageId, author: { role: 'user' } });
       } else if (item?.type === 'mcp-tool-call') {
-        const call = timelineSubmitGoalArgumentsOf(item);
+        const goal = timelineSubmitGoalArgumentsOf(item);
+        const toolName = goal.recognized ? 'submit_goal' : 'submit_review_verdict';
+        const call = goal.recognized ? goal : timelineSubmitGoalArgumentsOf(item, toolName);
         if (!call.recognized) continue;
-        messages.push({ author: { role: 'assistant' }, recipient: 'Local_MCP_Connector.submit_goal',
+        messages.push({ author: { role: 'assistant' }, recipient: `Local_MCP_Connector.${toolName}`,
+          ...(toolName === 'submit_review_verdict' ? { reviewIdentity: {
+            tool_call_id: validMessageId(item.callId),
+            expected_user_message_id: userConsistent ? reviewUserId : null } } : {}),
           content: { content_type: 'tool_call', arguments: { arguments: call.arguments } } });
       }
     }
@@ -686,7 +727,8 @@
           if (id && id !== anchorUserId) return { status: 'other_user', snapshot: null };
           userBoundaryIndex = at;
         }
-        if (requestOf(message) && submitGoalInspectionOf(message).recognized) lastSubmitGoalIndex = at;
+        if (requestOf(message) && (submitGoalInspectionOf(message).recognized
+          || submitGoalInspectionOf(message, 'submit_review_verdict').recognized)) lastSubmitGoalIndex = at;
       }
       if (lastSubmitGoalIndex < 0) {
         continue;
@@ -695,7 +737,7 @@
         return { status: 'user_boundary', snapshot: null };
       }
       return { status: 'selected', snapshot: { ...snapshot,
-        currentTool: currentToolCorrelationOf(snapshot.messages) } };
+        currentTool: currentToolCorrelationOf(snapshot.messages, anchorUserId) } };
     }
     return { status: 'no_tool', snapshot: null };
   }
@@ -906,7 +948,7 @@
     }
 
     const assistantToolCalls = Array.isArray(messages) ? messages.filter(requestOf) : [];
-    const submitGoalInspections = assistantToolCalls.map(submitGoalInspectionOf);
+    const submitGoalInspections = assistantToolCalls.map(message => submitGoalInspectionOf(message));
     const submitGoalFound = submitGoalInspections.some((inspection) => inspection.recognized);
     const correlationKeyFound = submitGoalInspections.some((inspection) => inspection.key !== null);
     try {
@@ -928,7 +970,8 @@
     }
 
     const evidence = currentTool.key && currentTurnConversationId
-      ? [{ request_id: currentTool.key, fiber_conversation_id: currentTurnConversationId }]
+      ? [{ request_id: currentTool.key, fiber_conversation_id: currentTurnConversationId,
+        ...currentTool.evidence }]
       : [];
     post({
       source: REPLY,
