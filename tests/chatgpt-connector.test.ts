@@ -1,12 +1,19 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ResolvedSettings } from "../src/config/settings.js";
 import { OAuthTokenStore } from "../src/auth/token.js";
+import {
+  migrateOAuthStateToInstance,
+  workspaceOAuthStatePaths,
+  type OAuthInstanceStateMigration,
+} from "../src/auth/migration.js";
+import { WorkspaceGrantStore } from "../src/auth/workspace-grants.js";
 import {
   CONNECTOR_EVIDENCE_TTL_MS,
   ChatGPTConnectorStore,
@@ -16,11 +23,8 @@ import {
   diagnoseChatGPTConnector,
   legacyChatgptConnectorStateFile,
   mcpUrlFromPublic,
-  migrateLegacyOAuthState,
   normalizePublicUrl,
   parseConnectorConfirmArgs,
-  type WorkspaceOAuthState,
-  workspaceOAuthStatePaths,
 } from "../src/control-plane/chatgpt-connector.js";
 import { createHttpServer } from "../src/mcp/http.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
@@ -196,48 +200,44 @@ function legacyAccessToken(overrides: Record<string, unknown> = {}): Record<stri
   };
 }
 
-async function writeLegacyOAuthState(
+async function writeWorkspaceOAuthState(
   root: string,
+  workspaceId: string,
   options: { readonly clients?: readonly unknown[]; readonly tokens?: unknown } = {},
-): Promise<void> {
-  await writeJson(legacyChatgptConnectorStateFile(root), {
-    schema_version: 1,
-    bindings: [verifiedBinding()],
-  });
-  await writeLegacyClients(root, options.clients);
-  if (options.tokens !== undefined) {
-    await writeJson(join(root, "oauth", "tokens.json"), options.tokens);
-  }
-}
-
-async function writeLegacyClients(root: string, clients?: readonly unknown[]): Promise<void> {
-  await writeJson(join(root, "oauth", "clients.json"), {
+): Promise<{ clientRegistryPath: string; tokenStorePath: string }> {
+  const paths = workspaceOAuthStatePaths(workspaceId, root);
+  await writeJson(paths.clientRegistryPath, {
     version: 1,
-    clients: clients ?? [legacyClient()],
+    clients: options.clients ?? [legacyClient()],
   });
+  if (options.tokens !== undefined) await writeJson(paths.tokenStorePath, options.tokens);
+  return paths;
 }
 
-function upgradeWith(root: string, singleWorkspace: boolean): Promise<WorkspaceOAuthState> {
-  return migrateLegacyOAuthState({
-    workspaceId: "workspace-1",
+function migrateInstance(
+  root: string,
+  options: {
+    readonly workspaceIds?: readonly string[];
+    readonly activeWorkspaceId?: string;
+  } = {},
+): OAuthInstanceStateMigration {
+  return migrateOAuthStateToInstance({
     storageRoot: root,
-    singleWorkspace,
+    workspaceIds: options.workspaceIds ?? ["workspace-1"],
+    activeWorkspaceId: options.activeWorkspaceId ?? "workspace-1",
+    grants: new WorkspaceGrantStore({ path: join(root, "oauth", "workspace-grants.json") }),
     now: NOW,
   });
 }
 
-function upgrade(root: string): Promise<WorkspaceOAuthState> {
-  return upgradeWith(root, true);
-}
-
-async function scopedClientIds(path: string): Promise<string[]> {
+async function clientIds(path: string): Promise<string[]> {
   const registry = JSON.parse(await readFile(path, "utf8")) as {
     clients: readonly { client_id: string }[];
   };
   return registry.clients.map((client) => client.client_id);
 }
 
-async function scopedTokenHashes(path: string): Promise<string[]> {
+async function tokenHashes(path: string): Promise<string[]> {
   const state = JSON.parse(await readFile(path, "utf8")) as {
     tokens: readonly { hash: string }[];
   };
@@ -617,277 +617,213 @@ describe("connector binding adoption", () => {
   });
 });
 
-describe("legacy migration", () => {
-  it("copies one exact legacy connector binding without deleting the legacy file", async () => {
+describe("instance OAuth migration and workspace grants", () => {
+  it("merges workspace-scoped clients and tokens without touching the source files", async () => {
     const root = await temporaryRoot();
-    const legacyFile = legacyChatgptConnectorStateFile(root);
-    await writeJson(legacyFile, {
-      schema_version: 1,
-      bindings: [verifiedBinding()],
+    const scoped = await writeWorkspaceOAuthState(root, "workspace-1", {
+      tokens: { schema_version: 1, tokens: [legacyAccessToken()] },
     });
-    const store = new ChatGPTConnectorStore("workspace-1", root);
-    await expect(store.read()).resolves.toMatchObject({ workspace_id: "workspace-1", status: "verified" });
-    expect(JSON.parse(await readFile(chatgptConnectorStateFile("workspace-1", root), "utf8")))
-      .toMatchObject({ schema_version: 1, binding: { workspace_id: "workspace-1" }, evidence: [] });
-    await expect(new ChatGPTConnectorStore("workspace-1", root).read())
-      .resolves.toMatchObject({ workspace_id: "workspace-1" });
-    await expect(readFile(legacyFile, "utf8")).resolves.toContain("workspace-1");
+    const scopedBefore = await readFile(scoped.clientRegistryPath, "utf8");
+
+    const migration = migrateInstance(root);
+
+    expect(migration.migration).toBe("migrated");
+    expect(migration.conflicts).toBe(0);
+    expect(await clientIds(join(root, "oauth", "clients.json"))).toEqual([LEGACY_CLIENT_ID]);
+    expect(await tokenHashes(join(root, "oauth", "tokens.json"))).toEqual(["a".repeat(64)]);
+    expect(JSON.parse(await readFile(join(root, "oauth", "tokens.json"), "utf8")))
+      .toMatchObject({ tokens: [{ client_id: LEGACY_CLIENT_ID, subject: "owner" }] });
+    expect(await readFile(scoped.clientRegistryPath, "utf8")).toBe(scopedBefore);
+    expect(new WorkspaceGrantStore({ path: join(root, "oauth", "workspace-grants.json") })
+      .isGranted("owner", "workspace-1")).toBe(true);
   });
 
-  it("migrates uniquely owned OAuth state once and omits revoked tokens", async () => {
+  it("is idempotent and keeps the grant for existing tokens", async () => {
     const root = await temporaryRoot();
-    await writeJson(legacyChatgptConnectorStateFile(root), {
+    await writeWorkspaceOAuthState(root, "workspace-1", {
+      tokens: { schema_version: 1, tokens: [legacyAccessToken()] },
+    });
+    expect(migrateInstance(root).migration).toBe("migrated");
+
+    expect(migrateInstance(root).migration).toBe("not_needed");
+    const status = new WorkspaceGrantStore({ path: join(root, "oauth", "workspace-grants.json") })
+      .getStatus();
+    expect(status.grant_count).toBe(1);
+    expect(status.grants).toEqual([
+      expect.objectContaining({ subject: "owner", workspace_id: "workspace-1" }),
+    ]);
+  });
+
+  it("does not restore a revoked grant on the next migration", async () => {
+    const root = await temporaryRoot();
+    await writeWorkspaceOAuthState(root, "workspace-1", {
+      tokens: { schema_version: 1, tokens: [legacyAccessToken()] },
+    });
+    expect(migrateInstance(root).granted_workspaces).toEqual(["workspace-1"]);
+    const grants = new WorkspaceGrantStore({ path: join(root, "oauth", "workspace-grants.json") });
+    expect(grants.revoke("owner", "workspace-1")).toBe(true);
+
+    const again = migrateInstance(root);
+
+    expect(again.migration).toBe("not_needed");
+    expect(again.granted_workspaces).toEqual([]);
+    expect(grants.getStatus().grant_count).toBe(0);
+  });
+
+  it("does not grant legacy access when a grants file predates the migration marker", async () => {
+    const root = await temporaryRoot();
+    await writeWorkspaceOAuthState(root, "workspace-1", {
+      tokens: { schema_version: 1, tokens: [legacyAccessToken()] },
+    });
+    await writeJson(join(root, "oauth", "workspace-grants.json"), {
       schema_version: 1,
-      bindings: [verifiedBinding()],
+      grants: [],
     });
-    await writeJson(join(root, "oauth", "clients.json"), {
-      version: 1,
-      clients: [{
-        client_id: "client-1",
-        client_name: "ChatGPT",
-        redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
-        grant_types: ["authorization_code", "refresh_token"],
-        token_endpoint_auth_method: "none",
-        response_types: ["code"],
-        created_at: 1,
-      }],
-    });
+
+    const migration = migrateInstance(root);
+
+    expect(migration.granted_workspaces).toEqual([]);
+    expect(migration.migration).toBe("migrated");
+    expect(existsSync(join(root, "oauth", "instance-migration.json"))).toBe(true);
+    expect(new WorkspaceGrantStore({ path: join(root, "oauth", "workspace-grants.json") })
+      .getStatus().grant_count).toBe(0);
+  });
+
+  it("grants only the previously active workspace for a legacy global token set", async () => {
+    const root = await temporaryRoot();
+    await writeJson(join(root, "oauth", "clients.json"), { version: 1, clients: [legacyClient()] });
     await writeJson(join(root, "oauth", "tokens.json"), {
       schema_version: 1,
-      tokens: [
-        {
-          hash: "a".repeat(64), kind: "access", client_id: "client-1", resource: CURRENT_URL,
-          issued_at: NOW - 1_000, expires_at: NOW + 60_000, revoked: false,
-        },
-        {
-          hash: "b".repeat(64), kind: "refresh", client_id: "client-1", resource: CURRENT_URL,
-          issued_at: NOW - 1_000, expires_at: NOW + 60_000, revoked: true,
-        },
-      ],
+      tokens: [legacyAccessToken()],
     });
 
-    const migrated = await migrateLegacyOAuthState({
-      workspaceId: "workspace-1",
-      storageRoot: root,
-      singleWorkspace: true,
-      now: NOW,
-    });
-    expect(migrated.migration).toBe("migrated");
-    expect(JSON.parse(await readFile(migrated.tokenStorePath, "utf8")))
-      .toMatchObject({ tokens: [{ hash: "a".repeat(64), revoked: false }] });
-    await expect(migrateLegacyOAuthState({
-      workspaceId: "workspace-1",
-      storageRoot: root,
-      singleWorkspace: true,
-      now: NOW,
-    })).resolves.toMatchObject({ migration: "not_needed" });
-    await expect(readFile(join(root, "oauth", "tokens.json"), "utf8")).resolves.toContain("b".repeat(64));
-  });
-
-  it("refuses ambiguous multi-workspace OAuth migration without writing scoped state", async () => {
-    const root = await temporaryRoot();
-    await writeJson(legacyChatgptConnectorStateFile(root), {
-      schema_version: 1,
-      bindings: [
-        verifiedBinding("workspace-1", CURRENT_URL),
-        verifiedBinding("workspace-2", "https://two.example/mcp"),
-      ],
-    });
-    await writeJson(join(root, "oauth", "clients.json"), { version: 1, clients: [] });
-    await writeJson(join(root, "oauth", "tokens.json"), { schema_version: 1, tokens: [] });
-
-    await expect(migrateLegacyOAuthState({
-      workspaceId: "workspace-1",
-      storageRoot: root,
-      singleWorkspace: false,
-    })).resolves.toMatchObject({ migration: "reauthorization_required" });
-    const paths = workspaceOAuthStatePaths("workspace-1", root);
-    await expect(readFile(paths.clientRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(readFile(paths.tokenStorePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-  });
-});
-
-describe("legacy OAuth upgrade regression", () => {
-  it("A: keeps the legacy client_id when the legacy token file is missing", async () => {
-    const root = await temporaryRoot();
-    await writeLegacyOAuthState(root);
-
-    const migrated = await upgrade(root);
-    expect(migrated.migration).toBe("migrated");
-    await expect(scopedClientIds(migrated.clientRegistryPath)).resolves.toEqual([LEGACY_CLIENT_ID]);
-    await expect(scopedTokenHashes(migrated.tokenStorePath)).resolves.toEqual([]);
-    await expect(upgrade(root)).resolves.toMatchObject({ migration: "not_needed" });
-    await expect(diagnoseChatGPTConnector(settings(), {
-      storageRoot: root,
-      fetch: healthyOAuthFetch(),
-    })).resolves.toMatchObject({
-      oauth: { migration: "not_needed", reauthorization_required: false },
-    });
-  });
-
-  it("B: migrates an empty legacy token set", async () => {
-    const root = await temporaryRoot();
-    await writeLegacyOAuthState(root, { tokens: { schema_version: 1, tokens: [] } });
-
-    const migrated = await upgrade(root);
-    expect(migrated.migration).toBe("migrated");
-    await expect(scopedClientIds(migrated.clientRegistryPath)).resolves.toEqual([LEGACY_CLIENT_ID]);
-    await expect(scopedTokenHashes(migrated.tokenStorePath)).resolves.toEqual([]);
-  });
-
-  it("A2: fails closed when the legacy connector state is missing", async () => {
-    const root = await temporaryRoot();
-    await writeLegacyClients(root);
-
-    await expect(upgrade(root)).resolves.toMatchObject({ migration: "reauthorization_required" });
-    const paths = workspaceOAuthStatePaths("workspace-1", root);
-    await expect(readFile(paths.clientRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(readFile(paths.tokenStorePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-  });
-
-  it("A3: fails closed when the only legacy binding belongs to another workspace", async () => {
-    const root = await temporaryRoot();
-    await writeJson(legacyChatgptConnectorStateFile(root), {
-      schema_version: 1,
-      bindings: [verifiedBinding("workspace-2", "https://two.example/mcp")],
-    });
-    await writeLegacyClients(root);
-
-    await expect(upgrade(root)).resolves.toMatchObject({ migration: "reauthorization_required" });
-    const paths = workspaceOAuthStatePaths("workspace-1", root);
-    await expect(readFile(paths.clientRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-  });
-
-  it("A4: fails closed on legacy bindings that cannot be resolved uniquely", async () => {
-    const root = await temporaryRoot();
-    await writeJson(legacyChatgptConnectorStateFile(root), {
-      schema_version: 1,
-      bindings: [
-        verifiedBinding("workspace-1", CURRENT_URL),
-        verifiedBinding("workspace-2", "https://two.example/mcp"),
-      ],
-    });
-    await writeLegacyClients(root);
-
-    await expect(upgrade(root)).resolves.toMatchObject({ migration: "reauthorization_required" });
-    const paths = workspaceOAuthStatePaths("workspace-1", root);
-    await expect(readFile(paths.clientRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-  });
-
-  it("A5: fails closed on an invalid legacy connector state", async () => {
-    const root = await temporaryRoot();
-    await writeJson(legacyChatgptConnectorStateFile(root), {
-      schema_version: 1,
-      bindings: [{ ...verifiedBinding(), verified_mcp_url: null }],
-    });
-    await writeLegacyClients(root);
-
-    await expect(upgrade(root)).resolves.toMatchObject({ migration: "reauthorization_required" });
-    const paths = workspaceOAuthStatePaths("workspace-1", root);
-    await expect(readFile(paths.clientRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-  });
-
-  it("A6: keeps an already scoped exact client without the legacy ownership proof", async () => {
-    const root = await temporaryRoot();
-    await writeLegacyClients(root);
-    const paths = workspaceOAuthStatePaths("workspace-1", root);
-    await writeJson(paths.clientRegistryPath, { version: 1, clients: [legacyClient()] });
-    const before = await readFile(paths.clientRegistryPath, "utf8");
-
-    await expect(upgrade(root)).resolves.toMatchObject({ migration: "not_needed" });
-    await expect(readFile(paths.clientRegistryPath, "utf8")).resolves.toBe(before);
-  });
-
-  it("C: keeps the legacy client while omitting an expired token", async () => {
-    const root = await temporaryRoot();
-    await writeLegacyOAuthState(root, {
-      tokens: { schema_version: 1, tokens: [legacyAccessToken({ expires_at: NOW - 1 })] },
+    const migration = migrateInstance(root, {
+      workspaceIds: ["workspace-1", "workspace-2"],
+      activeWorkspaceId: "workspace-2",
     });
 
-    const migrated = await upgrade(root);
-    expect(migrated.migration).toBe("migrated");
-    await expect(scopedClientIds(migrated.clientRegistryPath)).resolves.toEqual([LEGACY_CLIENT_ID]);
-    await expect(scopedTokenHashes(migrated.tokenStorePath)).resolves.toEqual([]);
+    expect(migration.granted_workspaces).toEqual(["workspace-2"]);
+    const grants = new WorkspaceGrantStore({ path: join(root, "oauth", "workspace-grants.json") });
+    expect(grants.isGranted("owner", "workspace-1")).toBe(false);
+    expect(grants.isGranted("owner", "workspace-2")).toBe(true);
   });
 
-  it("D: keeps the legacy client while omitting mismatched and unknown-client tokens", async () => {
+  it("fails closed on a conflicting client registration and keeps both registries intact", async () => {
     const root = await temporaryRoot();
-    await writeLegacyOAuthState(root, {
+    await writeJson(join(root, "oauth", "clients.json"), { version: 1, clients: [legacyClient()] });
+    const scoped = await writeWorkspaceOAuthState(root, "workspace-1", {
+      clients: [legacyClient({
+        redirect_uris: ["https://chatgpt.com/connector/oauth/conflict"],
+      })],
+    });
+    const instanceBefore = await readFile(join(root, "oauth", "clients.json"), "utf8");
+    const scopedBefore = await readFile(scoped.clientRegistryPath, "utf8");
+
+    const migration = migrateInstance(root);
+
+    expect(migration.migration).toBe("reauthorization_required");
+    expect(migration.conflicts).toBe(1);
+    expect(await readFile(join(root, "oauth", "clients.json"), "utf8")).toBe(instanceBefore);
+    expect(await readFile(scoped.clientRegistryPath, "utf8")).toBe(scopedBefore);
+  });
+
+  it("keeps the client while omitting expired and revoked tokens", async () => {
+    const root = await temporaryRoot();
+    await writeWorkspaceOAuthState(root, "workspace-1", {
       tokens: {
         schema_version: 1,
         tokens: [
-          legacyAccessToken({ hash: "b".repeat(64), resource: "https://other.example/mcp" }),
-          legacyAccessToken({ hash: "c".repeat(64), client_id: "unknown-client" }),
+          legacyAccessToken({ hash: "b".repeat(64), expires_at: NOW - 1 }),
+          legacyAccessToken({ hash: "c".repeat(64), revoked: true }),
         ],
       },
     });
 
-    const migrated = await upgrade(root);
-    expect(migrated.migration).toBe("migrated");
-    await expect(scopedClientIds(migrated.clientRegistryPath)).resolves.toEqual([LEGACY_CLIENT_ID]);
-    await expect(scopedTokenHashes(migrated.tokenStorePath)).resolves.toEqual([]);
+    expect(migrateInstance(root).migration).toBe("migrated");
+    expect(await clientIds(join(root, "oauth", "clients.json"))).toEqual([LEGACY_CLIENT_ID]);
+    expect(await tokenHashes(join(root, "oauth", "tokens.json"))).toEqual([]);
   });
 
-  it("E: merges a missing compatible legacy client into existing scoped state", async () => {
+  it("fails closed when the same token hash belongs to a different client", async () => {
     const root = await temporaryRoot();
-    await writeLegacyOAuthState(root);
-    const paths = workspaceOAuthStatePaths("workspace-1", root);
-    await writeJson(paths.clientRegistryPath, {
+    await writeJson(join(root, "oauth", "clients.json"), {
       version: 1,
-      clients: [legacyClient({ client_id: "scoped-client-id" })],
+      clients: [legacyClient({ client_id: "client-a" }), legacyClient({ client_id: "client-b" })],
+    });
+    await writeJson(join(root, "oauth", "tokens.json"), {
+      schema_version: 1,
+      tokens: [legacyAccessToken({ client_id: "client-a" })],
+    });
+    await writeWorkspaceOAuthState(root, "workspace-1", {
+      clients: [],
+      tokens: { schema_version: 1, tokens: [legacyAccessToken({ client_id: "client-b" })] },
     });
 
-    await expect(upgrade(root)).resolves.toMatchObject({ migration: "migrated" });
-    await expect(scopedClientIds(paths.clientRegistryPath))
-      .resolves.toEqual(["scoped-client-id", LEGACY_CLIENT_ID]);
-  });
-
-  it("F: treats an exact duplicate legacy client as idempotent", async () => {
-    const root = await temporaryRoot();
-    await writeLegacyOAuthState(root);
-    const paths = workspaceOAuthStatePaths("workspace-1", root);
-    await writeJson(paths.clientRegistryPath, { version: 1, clients: [legacyClient()] });
-    const before = await readFile(paths.clientRegistryPath, "utf8");
-
-    await expect(upgrade(root)).resolves.toMatchObject({ migration: "not_needed" });
-    await expect(readFile(paths.clientRegistryPath, "utf8")).resolves.toBe(before);
-  });
-
-  it("G: fails closed on conflicting registration for the same client_id", async () => {
-    const root = await temporaryRoot();
-    await writeLegacyOAuthState(root);
-    const paths = workspaceOAuthStatePaths("workspace-1", root);
-    await writeJson(paths.clientRegistryPath, {
-      version: 1,
-      clients: [legacyClient({ redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect/other"] })],
+    expect(migrateInstance(root)).toMatchObject({
+      migration: "reauthorization_required",
+      conflicts: 1,
     });
-    const scopedBefore = await readFile(paths.clientRegistryPath, "utf8");
-    const legacyBefore = await readFile(join(root, "oauth", "clients.json"), "utf8");
-
-    await expect(upgrade(root)).resolves.toMatchObject({ migration: "reauthorization_required" });
-    await expect(readFile(paths.clientRegistryPath, "utf8")).resolves.toBe(scopedBefore);
-    await expect(readFile(join(root, "oauth", "clients.json"), "utf8")).resolves.toBe(legacyBefore);
+    expect(JSON.parse(await readFile(join(root, "oauth", "tokens.json"), "utf8")))
+      .toMatchObject({ tokens: [{ hash: "a".repeat(64), client_id: "client-a" }] });
   });
 
-  it("H: keeps ambiguous multi-workspace ownership failing closed", async () => {
+  it("backs up an invalid instance registry before replacing it", async () => {
     const root = await temporaryRoot();
-    await writeLegacyOAuthState(root);
-    const paths = workspaceOAuthStatePaths("workspace-1", root);
+    await writeJson(join(root, "oauth", "clients.json"), { invalid: true });
+    await writeWorkspaceOAuthState(root, "workspace-1");
 
-    await expect(upgradeWith(root, false)).resolves.toMatchObject({ migration: "reauthorization_required" });
-    await expect(readFile(paths.clientRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(migrateInstance(root).migration).toBe("reauthorization_required");
+    expect(await clientIds(join(root, "oauth", "clients.json"))).toEqual([LEGACY_CLIENT_ID]);
+    const backups = await readdir(join(root, "oauth", "backups"));
+    expect(backups).toContainEqual(expect.stringMatching(/^clients\.json\.\d+\.bak\.json$/u));
+  });
 
-    await writeJson(paths.clientRegistryPath, {
-      version: 1,
-      clients: [legacyClient({ client_id: "scoped-client-id" })],
+  it("reports the instance migration status through diagnoseChatGPTConnector", async () => {
+    const root = await temporaryRoot();
+    await writeWorkspaceOAuthState(root, "workspace-1");
+
+    await expect(diagnoseChatGPTConnector(settings(), {
+      storageRoot: root,
+      fetch: healthyOAuthFetch(),
+      now: () => NOW,
+    })).resolves.toMatchObject({
+      oauth: { migration: "migrated", reauthorization_required: false },
     });
-    await expect(upgradeWith(root, false)).resolves.toMatchObject({ migration: "reauthorization_required" });
-    await expect(scopedClientIds(paths.clientRegistryPath)).resolves.toEqual(["scoped-client-id"]);
+    await expect(diagnoseChatGPTConnector(settings(), {
+      storageRoot: root,
+      fetch: healthyOAuthFetch(),
+      now: () => NOW,
+    })).resolves.toMatchObject({
+      oauth: { migration: "migrated", reauthorization_required: false },
+    });
+  });
 
-    await writeJson(paths.clientRegistryPath, { version: 1, clients: [legacyClient()] });
-    await expect(upgradeWith(root, false)).resolves.toMatchObject({ migration: "not_needed" });
+  it("diagnoses legacy OAuth state without granting workspace access", async () => {
+    const root = await temporaryRoot();
+    await writeWorkspaceOAuthState(root, "workspace-1");
+
+    await expect(diagnoseChatGPTConnector(settings(), {
+      storageRoot: root,
+      fetch: healthyOAuthFetch(),
+      now: () => NOW,
+    })).resolves.toMatchObject({ oauth: { migration: "migrated" } });
+
+    expect(existsSync(join(root, "oauth", "instance-migration.json"))).toBe(false);
+    expect(existsSync(join(root, "oauth", "clients.json"))).toBe(false);
+    expect(new WorkspaceGrantStore({ path: join(root, "oauth", "workspace-grants.json") })
+      .getStatus().grant_count).toBe(0);
+
+    const customClientRegistry = join(root, "custom-oauth", "clients.json");
+    await diagnoseChatGPTConnector(settings(), {
+      storageRoot: root,
+      oauthClientRegistryPath: customClientRegistry,
+      fetch: healthyOAuthFetch(),
+      now: () => NOW,
+    });
+    expect(existsSync(join(root, "custom-oauth", "workspace-grants.json"))).toBe(false);
   });
 });
+
 
 describe("diagnose-chatgpt-connector", () => {
   it("reports create, persists only a pending URL, and contains no configured secrets", async () => {
@@ -997,31 +933,6 @@ describe("diagnose-chatgpt-connector", () => {
       await expect(readFile(chatgptConnectorStateFile("workspace-1", root), "utf8"))
         .rejects.toMatchObject({ code: "ENOENT" });
     }
-  });
-
-  it("reports ambiguous legacy OAuth ownership as requiring reauthorization", async () => {
-    const root = await temporaryRoot();
-    await writeJson(legacyChatgptConnectorStateFile(root), {
-      schema_version: 1,
-      bindings: [
-        verifiedBinding("workspace-1", CURRENT_URL),
-        verifiedBinding("workspace-2", "https://two.example/mcp"),
-      ],
-    });
-    await writeJson(join(root, "oauth", "clients.json"), { version: 1, clients: [] });
-    await writeJson(join(root, "oauth", "tokens.json"), { schema_version: 1, tokens: [] });
-    const current = settings();
-    const identity2 = { id: "workspace-2", name: "Workspace Two", path: "C:\\workspace-two" };
-    current.workspaces = [...(current.workspaces ?? []), identity2];
-
-    await expect(diagnoseChatGPTConnector(current, {
-      storageRoot: root,
-      fetch: healthyOAuthFetch(),
-    })).resolves.toMatchObject({
-      ok: true,
-      oauth: { migration: "reauthorization_required", reauthorization_required: true },
-      connector: { reason: "legacy_oauth_reauthorization_required" },
-    });
   });
 
   it("keeps remote health separate from OAuth readiness", async () => {

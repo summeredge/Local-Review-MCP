@@ -80,8 +80,9 @@ The runtime registers 22 tools: 20 read-only tools, the `submit_goal` Control Pl
 - `workspace_edit_file` and `workspace_*` review data-plane tools require explicit `workspace_id`; they never inherit active/default workspace. Legacy tools retain the following behavior.
 - `workspace_id` is an optional string of 1..128 characters on
   workspace-scoped tools. When present it selects a registered workspace; when
-  omitted the active workspace is used. `workspace_list` is registry-scoped
-  and has no `workspace_id` input.
+  omitted the active workspace is used only if the OAuth subject is granted
+  access to it. `workspace_list` has no `workspace_id` input and returns only
+  the workspaces granted to the calling subject.
 - Workspace paths are relative to the selected workspace and pass the existing
   containment and sensitive-path policy. Absolute paths and path traversal are
   rejected.

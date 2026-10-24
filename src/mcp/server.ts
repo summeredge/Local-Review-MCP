@@ -1008,7 +1008,7 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
     },
     async () => {
       try {
-        return structuredResponse(workspaceListOutputSchema, { workspaces: [...registry.list()] });
+        return structuredResponse(workspaceListOutputSchema, { workspaces: [...registry.listAuthorized()] });
       } catch (error: unknown) {
         return toToolError(error);
       }
@@ -1159,6 +1159,10 @@ export function createMcpServer(context: McpRuntimeContext): McpServer {
           return toToolError(new Error("Identity trace runtime is unavailable."));
         }
         const trace = await context.identityTrace.getIdentityTrace(input);
+        // A trace can only reveal workspaces this connection is allowed to resolve.
+        for (const workspaceId of new Set(trace.events.map((event) => event.workspace_id))) {
+          registry.resolve(workspaceId);
+        }
         const record = await context.pendingGoalSubmission?.get?.(input.correlation_key);
         const result = record?.state === "started" ? record
           : record?.state === "failed" || record?.state === "indeterminate" ? record.result : undefined;

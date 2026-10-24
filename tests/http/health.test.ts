@@ -75,6 +75,14 @@ describe("health endpoint", () => {
         loaded: true,
         client_count: 0,
         clients: [],
+        error: null,
+      },
+      oauth_tokens: { loaded: true, token_count: 0, error: null },
+      workspace_access: {
+        loaded: true,
+        granted_workspace_count: 0,
+        registered_workspace_count: 1,
+        error: null,
       },
     });
     expect(response.text).not.toContain(workspace);

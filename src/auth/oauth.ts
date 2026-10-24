@@ -9,6 +9,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
+  OAUTH_DEFAULT_SUBJECT,
   OAuthTokenStore,
   type IssuedOAuthToken,
 } from "./token.js";
@@ -127,15 +128,7 @@ function persistedClient(client: OAuthRegisteredClient): PersistedOAuthClient {
   };
 }
 
-function loadClientRegistry(path: string): Map<string, OAuthRegisteredClient> {
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Map();
-    throw new Error("OAuth client registry could not be loaded", { cause: error });
-  }
-
+function parseClientRegistry(raw: string): Map<string, OAuthRegisteredClient> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -187,6 +180,28 @@ function loadClientRegistry(path: string): Map<string, OAuthRegisteredClient> {
     });
   }
   return clients;
+}
+
+function loadClientRegistry(path: string): Map<string, OAuthRegisteredClient> {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Map();
+    throw new Error("OAuth client registry could not be loaded", { cause: error });
+  }
+  return parseClientRegistry(raw);
+}
+
+export function readOAuthClientRecords(path: string): OAuthRegisteredClient[] {
+  return [...loadClientRegistry(path).values()];
+}
+
+export function writeOAuthClientRecords(
+  path: string,
+  clients: Iterable<OAuthRegisteredClient>,
+): void {
+  saveClientRegistry(path, clients);
 }
 
 function saveClientRegistry(path: string, clients: Iterable<OAuthRegisteredClient>): void {
@@ -384,6 +399,12 @@ export class OAuthService {
     this.tokens = new OAuthTokenStore({
       path: resolve(options.tokenStorePath ?? join(dirname(this.clientRegistryPath), "tokens.json")),
     });
+    const tokenStatus = this.tokens.status();
+    console.log([
+      "OAuth token registry loaded",
+      `Active tokens: ${tokenStatus.token_count}`,
+      `Status: ${tokenStatus.loaded ? "ok" : "unavailable"}`,
+    ].join("\n"));
     if (registryLoaded) {
       console.log([
         "OAuth registry loaded",
@@ -538,7 +559,7 @@ export class OAuthService {
       throw new OAuthRequestError("invalid_grant", "code_verifier does not match the challenge");
     }
 
-    return this.tokens.issue(stored.resource, stored.clientId);
+    return this.tokens.issue(stored.resource, stored.clientId, OAUTH_DEFAULT_SUBJECT);
   }
 
   public refreshToken(request: {
@@ -561,11 +582,4 @@ export class OAuthService {
     return token;
   }
 
-  public validateAccessToken(token: string | undefined, resource: string): boolean {
-    try {
-      return this.tokens.validate(token, normalizeResource(resource));
-    } catch {
-      return false;
-    }
-  }
 }

@@ -29,6 +29,12 @@ It is responsible for:
 The MCP runtime reads this registry. It does not add, remove, or mutate
 registry entries.
 
+Registration is not the same as remote access. An OAuth-authenticated caller
+may only resolve workspaces explicitly granted to its subject in
+`oauth/workspace-grants.json`; Launcher and CLI operations that use the local
+static token are not restricted by that list. A grant or revocation applies to
+existing access tokens immediately.
+
 ## Workspace context
 
 The shared context schema is:

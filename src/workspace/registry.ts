@@ -29,6 +29,7 @@ export class WorkspaceRegistry {
   private readonly records: readonly WorkspaceSelection[];
   private readonly recordsById: ReadonlyMap<string, WorkspaceSelection>;
   public readonly activeWorkspaceId: string;
+  private authorizer: ((workspaceId: string) => void) | undefined;
 
   public constructor(
     entries: readonly WorkspaceRegistryEntry[],
@@ -105,6 +106,11 @@ export class WorkspaceRegistry {
     this.activeWorkspaceId = activeWorkspaceId ?? records[0]!.id;
   }
 
+  /** Injected by the runtime: every workspace resolving path must pass this check. */
+  public setWorkspaceAuthorizer(authorizer: (workspaceId: string) => void): void {
+    this.authorizer = authorizer;
+  }
+
   public static fromManager(manager: WorkspaceManager): WorkspaceRegistry {
     return new WorkspaceRegistry([{
       ...manager.identity,
@@ -112,7 +118,9 @@ export class WorkspaceRegistry {
   }
 
   public get active(): WorkspaceSelection {
-    return this.resolve();
+    // The default workspace is presentation/routing state; every tool access still resolves and
+    // passes the authorizer with the effective workspace_id.
+    return this.recordsById.get(this.activeWorkspaceId)!;
   }
 
   public resolve(workspaceId?: string): WorkspaceSelection {
@@ -121,6 +129,7 @@ export class WorkspaceRegistry {
     if (selected === undefined) {
       throw new WorkspacePathError("UNKNOWN_WORKSPACE_ID", "Unknown workspace_id.");
     }
+    this.authorizer?.(selected.id);
     return selected;
   }
 
@@ -128,9 +137,21 @@ export class WorkspaceRegistry {
     return this.records.map(({ id, name }) => ({ id, name }));
   }
 
+  public listAuthorized(): readonly WorkspaceSummary[] {
+    if (this.authorizer === undefined) return this.list();
+    return this.records.filter((record) => {
+      try {
+        this.authorizer?.(record.id);
+        return true;
+      } catch {
+        return false;
+      }
+    }).map(({ id, name }) => ({ id, name }));
+  }
+
   public resolveForSubmission(workspaceId?: string): WorkspaceSelection {
     if (workspaceId !== undefined) return this.resolve(workspaceId);
-    if (this.records.length === 1) return this.records[0]!;
+    if (this.records.length === 1) return this.resolve(this.activeWorkspaceId);
     throw new WorkspacePathError(
       "WORKSPACE_ID_REQUIRED",
       "WORKSPACE_ID_REQUIRED: Specify workspace_id for the intended project; multiple workspaces are registered.",

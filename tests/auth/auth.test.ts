@@ -8,10 +8,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAppContext, startApp } from "../../src/app.js";
 import { OAuthService } from "../../src/auth/oauth.js";
 import { OAuthTokenStore } from "../../src/auth/token.js";
-import {
-  legacyChatgptConnectorStateFile,
-  workspaceOAuthStatePaths,
-} from "../../src/control-plane/chatgpt-connector.js";
+import { workspaceOAuthStatePaths } from "../../src/auth/migration.js";
+import type { ResolvedSettings } from "../../src/config/settings.js";
+import { legacyChatgptConnectorStateFile } from "../../src/control-plane/chatgpt-connector.js";
 import { defaultTaskContextStorageRoot } from "../../src/context/task.js";
 
 const runningServers: Server[] = [];
@@ -227,31 +226,7 @@ describe("HTTP Bearer authentication", () => {
 });
 
 describe("MCP OAuth compatibility", () => {
-  it("keeps OAuth clients and tokens isolated by workspace state root", async () => {
-    const root = await mkdtemp(join(tmpdir(), "local-review-mcp-oauth-isolation-"));
-    temporaryDirectories.push(root);
-    const pathsA = workspaceOAuthStatePaths("workspace-a", root);
-    const pathsB = workspaceOAuthStatePaths("workspace-b", root);
-    const serviceA = new OAuthService({
-      clientRegistryPath: pathsA.clientRegistryPath,
-      tokenStorePath: pathsA.tokenStorePath,
-    });
-    const serviceB = new OAuthService({
-      clientRegistryPath: pathsB.clientRegistryPath,
-      tokenStorePath: pathsB.tokenStorePath,
-    });
-    const clientA = serviceA.registerClient({
-      client_name: "Workspace A",
-      redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
-    });
-    const tokenA = serviceA.tokens.issue("https://a.example/mcp", clientA.client_id);
-
-    expect(pathsA.clientRegistryPath).not.toBe(pathsB.clientRegistryPath);
-    expect(serviceB.getClient(clientA.client_id)).toBeUndefined();
-    expect(serviceB.validateAccessToken(tokenA.token, "https://a.example/mcp")).toBe(false);
-  });
-
-  it("injects the active workspace OAuth paths through the app HTTP construction", async () => {
+  it("stores OAuth clients and tokens at the LRM instance root, not the active workspace", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-oauth-app-workspace-"));
     const stateBase = await mkdtemp(join(tmpdir(), "local-review-mcp-oauth-app-state-"));
     temporaryDirectories.push(workspace, stateBase);
@@ -286,10 +261,12 @@ describe("MCP OAuth compatibility", () => {
     const client = JSON.parse(registration.text) as { client_id: string };
     await authorizeAndExchange(address.port, client.client_id, redirectUri);
 
-    const paths = workspaceOAuthStatePaths(identity.id, context.storageRoot);
-    await expect(readFile(paths.clientRegistryPath, "utf8")).resolves.toContain(client.client_id);
-    await expect(readFile(paths.tokenStorePath, "utf8")).resolves.toContain('"kind": "refresh"');
-    await expect(readFile(join(context.storageRoot!, "oauth", "clients.json"), "utf8"))
+    const storageRoot = context.storageRoot!;
+    await expect(readFile(join(storageRoot, "oauth", "clients.json"), "utf8"))
+      .resolves.toContain(client.client_id);
+    await expect(readFile(join(storageRoot, "oauth", "tokens.json"), "utf8"))
+      .resolves.toContain('"kind": "refresh"');
+    await expect(readFile(workspaceOAuthStatePaths(identity.id, storageRoot).clientRegistryPath, "utf8"))
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -363,8 +340,8 @@ describe("MCP OAuth compatibility", () => {
     await authorizeAndExchange(portOf(firstServer), legacyClientId, redirectUri);
     await stopServer(firstServer);
 
-    const paths = workspaceOAuthStatePaths(identity.id, storageRoot);
-    await expect(readFile(paths.clientRegistryPath, "utf8")).resolves.toContain(legacyClientId);
+    await expect(readFile(join(storageRoot, "oauth", "clients.json"), "utf8"))
+      .resolves.toContain(legacyClientId);
 
     const restarted = await startApp(appSettings, createAppContext(appSettings, environment));
     runningServers.push(restarted);
@@ -728,44 +705,6 @@ describe("MCP OAuth compatibility", () => {
     }
   });
 
-  it("keeps the workspace-scoped runtime available when registry JSON is malformed", async () => {
-    const workspace = await mkdtemp(join(tmpdir(), "local-review-mcp-invalid-scoped-registry-"));
-    const stateBase = await mkdtemp(join(tmpdir(), "local-review-mcp-invalid-scoped-state-"));
-    temporaryDirectories.push(workspace, stateBase);
-    const identity = { id: "invalid-scoped", name: "Invalid Scoped", path: workspace };
-    const settings = {
-      host: "127.0.0.1" as const,
-      port: 0,
-      workspace,
-      workspaceIdentity: identity,
-      workspaces: [identity],
-      auth: { token: TOKEN },
-      remote: { enabled: false, endpoint: "" },
-      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
-    };
-    const environment = { ...process.env, LOCALAPPDATA: stateBase, XDG_STATE_HOME: stateBase };
-    const paths = workspaceOAuthStatePaths(identity.id, defaultTaskContextStorageRoot(environment));
-    await mkdir(dirname(paths.clientRegistryPath), { recursive: true });
-    await writeFile(paths.clientRegistryPath, "not-json", "utf8");
-    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
-    try {
-      const server = await startApp(settings, createAppContext(settings, environment));
-      runningServers.push(server);
-      const address = server.address();
-      if (address === null || typeof address === "string") throw new Error("test server has no port");
-      expect(warning).toHaveBeenCalledWith("OAuth registry unavailable");
-      await expect(requestText(
-        address.port,
-        "/health",
-        "GET",
-        undefined,
-        { authorization: `Bearer ${TOKEN}` },
-      )).resolves.toMatchObject({ status: 200 });
-    } finally {
-      warning.mockRestore();
-    }
-  });
-
   it("completes public-client registration, PKCE code exchange, and MCP access", async () => {
     const { port } = await makeServer();
     const redirectUri = "https://client.example/callback";
@@ -891,6 +830,7 @@ describe("MCP OAuth compatibility", () => {
           hash: expect.any(String),
           kind: "access",
           client_id: client.client_id,
+          subject: "owner",
           resource: `http://127.0.0.1:${first.port}/mcp`,
           issued_at: expect.any(Number),
           expires_at: expect.any(Number),
@@ -900,6 +840,7 @@ describe("MCP OAuth compatibility", () => {
           hash: expect.any(String),
           kind: "refresh",
           client_id: client.client_id,
+          subject: "owner",
           resource: `http://127.0.0.1:${first.port}/mcp`,
           issued_at: expect.any(Number),
           expires_at: expect.any(Number),
@@ -1047,5 +988,214 @@ describe("MCP OAuth compatibility", () => {
     );
     expect(authorization.status).toBe(302);
     expect(new URL(authorization.headers.location ?? "").searchParams.get("error")).toBe("invalid_request");
+  });
+});
+
+async function callMcpTool(
+  port: number,
+  accessToken: string,
+  name: string,
+  args: Record<string, unknown> = {},
+): Promise<{ isError: boolean; payload: Record<string, unknown> }> {
+  const body = Buffer.from(JSON.stringify({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: { name, arguments: args },
+  }), "utf8");
+  const response = await new Promise<{ status: number; text: string }>((resolve, reject) => {
+    const request = httpRequest({
+      host: "127.0.0.1",
+      port,
+      path: "/mcp",
+      method: "POST",
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+        "content-length": body.byteLength,
+        authorization: `Bearer ${accessToken}`,
+      },
+    }, (res) => {
+      let text = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk: string) => { text += chunk; });
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, text }));
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
+  const data = response.text.trim().startsWith("{")
+    ? response.text
+    : response.text.split(/\r?\n/u)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trim())
+      .join("");
+  const rpc = JSON.parse(data) as {
+    result?: { isError?: boolean; content?: Array<{ text?: string }> };
+    error?: unknown;
+  };
+  if (rpc.error !== undefined) throw new Error(JSON.stringify(rpc.error));
+  const contentText = rpc.result?.content?.[0]?.text ?? "{}";
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(contentText) as Record<string, unknown>;
+  } catch {
+    payload = { error: contentText };
+  }
+  return {
+    isError: rpc.result?.isError ?? false,
+    payload,
+  };
+}
+
+async function setWorkspaceGrant(
+  port: number,
+  workspaceId: string,
+  granted: boolean,
+): Promise<number> {
+  const response = await requestText(
+    port,
+    granted ? "/oauth/workspaces" : `/oauth/workspaces/${encodeURIComponent(workspaceId)}`,
+    granted ? "POST" : "DELETE",
+    granted ? JSON.stringify({ workspace_id: workspaceId }) : undefined,
+    {
+      authorization: `Bearer ${TOKEN}`,
+      ...(granted ? { "content-type": "application/json" } : {}),
+    },
+  );
+  return response.status;
+}
+
+describe("multi-workspace OAuth access", () => {
+  it("uses one connection, independent grants, and live revocation across workspace switches", async () => {
+    const workspaceA = await mkdtemp(join(tmpdir(), "local-review-mcp-oauth-ws-a-"));
+    const workspaceB = await mkdtemp(join(tmpdir(), "local-review-mcp-oauth-ws-b-"));
+    const stateBase = await mkdtemp(join(tmpdir(), "local-review-mcp-oauth-multi-state-"));
+    temporaryDirectories.push(workspaceA, workspaceB, stateBase);
+    await writeFile(join(workspaceA, "README.md"), "workspace-a\n", "utf8");
+    await writeFile(join(workspaceB, "README.md"), "workspace-b\n", "utf8");
+    const identityA = { id: "workspace-a", name: "Workspace A", path: workspaceA };
+    const identityB = { id: "workspace-b", name: "Workspace B", path: workspaceB };
+    const workspaceSettings = (active: typeof identityA): ResolvedSettings => ({
+      host: "127.0.0.1",
+      port: 0,
+      workspace: active.path,
+      workspaceIdentity: active,
+      workspaces: [identityA, identityB],
+      auth: { token: TOKEN },
+      remote: { enabled: false, endpoint: "" },
+      supervisor: { enabled: false, healthIntervalSeconds: 30, maxRestartAttempts: 3 },
+    });
+    const environment = { ...process.env, LOCALAPPDATA: stateBase, XDG_STATE_HOME: stateBase };
+    const firstSettings = workspaceSettings(identityA);
+    const first = await startApp(firstSettings, createAppContext(firstSettings, environment));
+    runningServers.push(first);
+    const address = first.address();
+    if (address === null || typeof address === "string") throw new Error("test server has no port");
+    const port = address.port;
+    const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
+    const registration = await requestText(
+      port,
+      "/oauth/register",
+      "POST",
+      JSON.stringify({ client_name: "ChatGPT", redirect_uris: [redirectUri] }),
+      { "content-type": "application/json" },
+    );
+    const client = JSON.parse(registration.text) as { client_id: string };
+    const token = await authorizeAndExchange(port, client.client_id, redirectUri);
+    await expect(requestText(port, "/oauth/workspaces", "GET"))
+      .resolves.toMatchObject({ status: 401 });
+    expect(await setWorkspaceGrant(port, "missing-workspace", true)).toBe(404);
+
+    const ungranted = await callMcpTool(port, token.access_token, "workspace_read_file", {
+      workspace_id: "workspace-b",
+      path: "README.md",
+    });
+    expect(ungranted.isError).toBe(true);
+    expect(ungranted.payload).toMatchObject({ error: "WORKSPACE_NOT_AUTHORIZED" });
+    expect((await callMcpTool(port, token.access_token, "workspace_list")).payload)
+      .toMatchObject({ workspaces: [] });
+
+    expect(await setWorkspaceGrant(port, "workspace-a", true)).toBe(200);
+    expect(await setWorkspaceGrant(port, "workspace-b", true)).toBe(200);
+    const readA = await callMcpTool(port, token.access_token, "workspace_read_file", {
+      workspace_id: "workspace-a",
+      path: "README.md",
+    });
+    const readB = await callMcpTool(port, token.access_token, "workspace_read_file", {
+      workspace_id: "workspace-b",
+      path: "README.md",
+    });
+    expect(readA.isError).toBe(false);
+    expect(readB.isError).toBe(false);
+    expect(String(readA.payload.content)).toContain("workspace-a");
+    expect(String(readB.payload.content)).toContain("workspace-b");
+    const listed = await callMcpTool(port, token.access_token, "workspace_list");
+    expect(listed.payload).toMatchObject({
+      workspaces: [expect.objectContaining({ id: "workspace-a" }), expect.objectContaining({ id: "workspace-b" })],
+    });
+
+    // Switching the Launcher default only changes the active workspace: same port, same token.
+    await stopServer(first);
+    const secondSettings = workspaceSettings(identityB);
+    const second = await startApp(
+      { ...secondSettings, port },
+      createAppContext({ ...secondSettings, port }, environment),
+    );
+    runningServers.push(second);
+    expect((await callMcpTool(port, token.access_token, "workspace_read_file", {
+      workspace_id: "workspace-a",
+      path: "README.md",
+    })).isError).toBe(false);
+    expect((await callMcpTool(port, token.access_token, "workspace_read_file", {
+      workspace_id: "workspace-b",
+      path: "README.md",
+    })).isError).toBe(false);
+    expect((await callMcpTool(port, token.access_token, "workspace_info")).payload)
+      .toMatchObject({ workspace_id: "workspace-b" });
+
+    const refreshed = await requestText(
+      port,
+      "/oauth/token",
+      "POST",
+      new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: client.client_id,
+        refresh_token: token.refresh_token,
+      }).toString(),
+      { "content-type": "application/x-www-form-urlencoded" },
+    );
+    const rotated = JSON.parse(refreshed.text) as { access_token: string; refresh_token: string };
+    expect(refreshed.status).toBe(200);
+
+    expect(await setWorkspaceGrant(port, "workspace-b", false)).toBe(200);
+    const revoked = await callMcpTool(port, rotated.access_token, "workspace_read_file", {
+      workspace_id: "workspace-b",
+      path: "README.md",
+    });
+    expect(revoked.payload).toMatchObject({ error: "WORKSPACE_NOT_AUTHORIZED" });
+    expect((await callMcpTool(port, rotated.access_token, "workspace_read_file", {
+      workspace_id: "workspace-a",
+      path: "README.md",
+    })).isError).toBe(false);
+    // The active workspace is still B, but an omitted workspace_id must not bypass the grant.
+    expect((await callMcpTool(port, rotated.access_token, "workspace_info")).payload)
+      .toMatchObject({ error: "WORKSPACE_NOT_AUTHORIZED" });
+
+    // A restart must not turn the explicit revocation into a fresh grant.
+    await stopServer(second);
+    const third = await startApp(
+      { ...secondSettings, port },
+      createAppContext({ ...secondSettings, port }, environment),
+    );
+    runningServers.push(third);
+    expect((await callMcpTool(port, rotated.access_token, "workspace_read_file", {
+      workspace_id: "workspace-b",
+      path: "README.md",
+    })).payload).toMatchObject({ error: "WORKSPACE_NOT_AUTHORIZED" });
+    expect((await callMcpTool(port, rotated.access_token, "workspace_read_file", {
+      workspace_id: "workspace-a",
+      path: "README.md",
+    })).isError).toBe(false);
   });
 });

@@ -50,7 +50,8 @@ Existing clients may continue to call the nine established read-only tools
 `git_diff`, `workspace_list`, `review_summary`, and `execution_output`) and
 receive their existing response structures. These legacy workspace-scoped
 tools retain their optional `workspace_id` behavior and active registered
-workspace fallback; `workspace_list` remains registry-wide. New workspace-scoped
+workspace fallback, but an OAuth caller only sees and resolves workspaces it has
+been granted; `workspace_list` returns that authorized subset. New workspace-scoped
 `workspace_*` read/review tools require an explicit registered `workspace_id`
 and never inherit the active workspace. `workspace_edit_file` also requires
 explicit registered `workspace_id` and original-byte `expected_sha256`; manual

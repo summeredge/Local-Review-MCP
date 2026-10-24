@@ -304,6 +304,8 @@ class LauncherWindow(QMainWindow):
         self.delete_workspace_button = QPushButton("删除工作区")
         self.rename_workspace_button = QPushButton("编辑名称")
         self.set_current_workspace_button = QPushButton("设为默认")
+        self.grant_workspace_button = QPushButton("授权 ChatGPT")
+        self.revoke_workspace_button = QPushButton("撤销授权")
         self.open_config_button = QPushButton("打开配置文件")
         self.backup_config_button = QPushButton("备份配置")
         self.validate_config_button = QPushButton("校验配置")
@@ -344,6 +346,8 @@ class LauncherWindow(QMainWindow):
         self.delete_workspace_button.clicked.connect(self.delete_workspace)
         self.rename_workspace_button.clicked.connect(self.rename_workspace)
         self.set_current_workspace_button.clicked.connect(self.set_current_workspace)
+        self.grant_workspace_button.clicked.connect(self.grant_workspace_access)
+        self.revoke_workspace_button.clicked.connect(self.revoke_workspace_access)
         self.open_config_button.clicked.connect(self.open_config)
         self.backup_config_button.clicked.connect(self.backup_config)
         self.validate_config_button.clicked.connect(self.validate_config)
@@ -407,6 +411,8 @@ class LauncherWindow(QMainWindow):
         workspace_buttons.addWidget(self.delete_workspace_button)
         workspace_buttons.addWidget(self.rename_workspace_button)
         workspace_buttons.addWidget(self.set_current_workspace_button)
+        workspace_buttons.addWidget(self.grant_workspace_button)
+        workspace_buttons.addWidget(self.revoke_workspace_button)
         startup_layout.addLayout(workspace_buttons)
         startup_layout.addSpacing(6)
         startup_layout.addWidget(self._section_title("配置"))
@@ -507,6 +513,8 @@ class LauncherWindow(QMainWindow):
             self.delete_workspace_button,
             self.rename_workspace_button,
             self.set_current_workspace_button,
+            self.grant_workspace_button,
+            self.revoke_workspace_button,
             self.open_config_button,
             self.backup_config_button,
             self.validate_config_button,
@@ -1524,6 +1532,8 @@ class LauncherWindow(QMainWindow):
         )
         self.refresh_oauth_button.setEnabled(oauth_available)
         self.reset_oauth_button.setEnabled(oauth_available)
+        self.grant_workspace_button.setEnabled(oauth_available)
+        self.revoke_workspace_button.setEnabled(oauth_available)
         self.clear_persisted_task_button.setEnabled(
             status.mcp_running
             and self.state not in (LauncherState.STARTING, LauncherState.STOPPING)
@@ -1822,6 +1832,45 @@ class LauncherWindow(QMainWindow):
             return
         self.message_label.setText(f"OAuth 客户端已删除：{client.client_id}")
         self.refresh_status()
+
+    def grant_workspace_access(self) -> None:
+        workspace_id = self._selected_workspace_id()
+        if workspace_id is None or not self._last_status.mcp_running:
+            self._show_error("请先选择一个工作区，并确保 MCP 正在运行。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "授权 ChatGPT 访问",
+            f"允许当前 ChatGPT OAuth 连接访问此工作区吗？\n\n工作区 ID：{workspace_id}\n\n"
+            "授权立即生效，无需重新连接；撤销后现有连接也会失去访问权限。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self.status_checker.grant_workspace_access(workspace_id):
+            self._show_error("无法授权工作区访问。")
+            return
+        self.message_label.setText(f"已授权工作区：{workspace_id}")
+
+    def revoke_workspace_access(self) -> None:
+        workspace_id = self._selected_workspace_id()
+        if workspace_id is None or not self._last_status.mcp_running:
+            self._show_error("请先选择一个工作区，并确保 MCP 正在运行。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "撤销工作区授权",
+            f"立即撤销此工作区的 ChatGPT 访问权限吗？\n\n工作区 ID：{workspace_id}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self.status_checker.revoke_workspace_access(workspace_id):
+            self._show_error("无法撤销工作区授权，或该工作区尚未授权。")
+            return
+        self.message_label.setText(f"已撤销工作区授权：{workspace_id}")
 
     def choose_workspace(self) -> None:
         initial = self.configuration.workspace if self.configuration.workspace and Path(self.configuration.workspace).is_dir() else ""

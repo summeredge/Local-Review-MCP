@@ -1068,6 +1068,31 @@ class StatusCheckerTests(unittest.TestCase):
             with self.subTest(type=type(failure).__name__), patch("status_checker.urlopen", side_effect=failure):
                 self.assertFalse(StatusChecker().delete_oauth_client("client-1"))
 
+    def test_grant_workspace_access_posts_workspace_id_with_auth(self) -> None:
+        response = MagicMock(status=200)
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+        with patch("status_checker.urlopen", return_value=response) as open_url:
+            self.assertTrue(StatusChecker(auth_token="secret").grant_workspace_access("workspace-1"))
+
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:12080/oauth/workspaces")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+        self.assertEqual(json.loads(request.data), {"workspace_id": "workspace-1"})
+
+    def test_revoke_workspace_access_uses_encoded_delete(self) -> None:
+        response = MagicMock(status=200)
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+        with patch("status_checker.urlopen", return_value=response) as open_url:
+            self.assertTrue(StatusChecker(auth_token="secret").revoke_workspace_access("workspace/a"))
+
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:12080/oauth/workspaces/workspace%2Fa")
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+
     def test_remote_timeout_is_offline(self) -> None:
         with patch("status_checker.urlopen", side_effect=TimeoutError("remote timeout")):
             self.assertFalse(StatusChecker._reachable("https://example.invalid/health"))

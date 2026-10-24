@@ -1,16 +1,8 @@
-* text=auto
+# Normalize to LF inside the repository; keep LF in the working tree too so a
+# file has exactly one byte form on every machine.
+* text=auto eol=lf
 
-# Source and documentation files use LF
-*.py   text eol=lf
-*.js   text eol=lf
-*.css  text eol=lf
-*.html text eol=lf
-*.md   text eol=lf
-*.json text eol=lf
-*.toml text eol=lf
-*.yml  text eol=lf
-*.yaml text eol=lf
-
-# Windows command scripts use CRLF
-*.bat  text eol=crlf
-*.cmd  text eol=crlf
+# Windows launchers: keep the byte form these have always had on disk.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.vbs text eol=crlf

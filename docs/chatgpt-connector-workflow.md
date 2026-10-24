@@ -4,7 +4,9 @@ Connector 管理属于 Control Plane，不得注册成 MCP tool。每次连接�
 
 1. 运行 `npm run diagnose:chatgpt-connector -- --config <config>`，读取 JSON。`ok=false` 时先修复本地服务、Remote MCP 或 OAuth，不操作 ChatGPT；`oauth.reauthorization_required=true` 时不要信任旧全局 OAuth state，按后续 exact connector 探针结果重新授权或重建。
 
-   单 workspace 启动时会把旧全局 `<storageRoot>/oauth/clients.json` 的 client registration 迁移进 workspace-scoped registry，原 `client_id` 原样保留。只有旧全局 `control-plane/chatgpt-connectors.json` 合法、且其中唯一的 legacy binding 明确属于当前 workspace 时才迁移；legacy connector state 缺失、非法、属于其他 workspace 或多个 binding 无法唯一判定时一律 fail closed，要求重新授权。旧版 `tokens.json` 缺失是正常状态（旧 TokenStore 只在内存保存），只有 active、未撤销、resource 精确匹配且 client_id 有效的 token 才会迁移，其余丢弃后重新授权。已经 scoped 且与 legacy 完全一致的 registry 不再依赖该归属证明；同一 `client_id` 的注册信息冲突时仍要求重新授权。
+   OAuth client 与 token 现在是 LRM 实例级状态：`<storageRoot>/oauth/clients.json`、`tokens.json` 由所有工作区共享，工作区访问权另存于 `oauth/workspace-grants.json`。启动时会把旧 `workspaces/ws-<id>/oauth/` 与旧全局 registry 合并到实例级文件，原 `client_id`、token 哈希、有效期与授权主体保持不变；源文件不删除、不覆盖，写入前保留备份。授权迁移只执行一次，完成后写入 `oauth/instance-migration.json`，因此显式撤销的工作区不会在下次启动时被自动恢复；诊断命令只读取并报告迁移状态，不会写入授权。同一 `client_id` 注册冲突或无法归属的 token 会标记 `reauthorization_required`，其余有效数据仍会保留。
+
+   ChatGPT 连接本身不再绑定活动工作区。新增工作区后，在 Launcher 的“工作区注册表”中选择该工作区并点击“授权 ChatGPT”（或运行 `lrm workspace-access grant <workspace_id>`）；撤销使用“撤销授权”或 `lrm workspace-access revoke <workspace_id>`。授权变更对现有 Token 立即生效，无需重新 OAuth。`workspace_list` 只返回已授权工作区，未指定 `workspace_id` 时仅在默认工作区已授权时使用默认值。
 
    `ok=false` 时 `connector.reason` 直接标出失败层：`oauth_protected_resource_metadata_missing`、`oauth_protected_resource_metadata_unavailable`、`oauth_protected_resource_metadata_invalid`、`oauth_resource_mismatch`、`oauth_authorization_server_metadata_missing`、`oauth_authorization_server_metadata_unavailable`、`oauth_authorization_server_metadata_invalid`、`oauth_issuer_invalid`、`oauth_authorization_endpoint_missing`、`oauth_token_endpoint_missing`、`oauth_registration_not_supported`、`oauth_authorization_code_not_supported`、`oauth_refresh_token_not_supported`、`oauth_pkce_s256_not_supported`。
 2. 使用 ChatGPT Browser Use 打开 `pages.plugins`，只按完整、区分大小写的 `connector.name` 检查当前 workspace 的 connector；不得模糊匹配或操作其他 connector。

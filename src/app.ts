@@ -1,5 +1,5 @@
 import type { Server } from "node:http";
-import { basename, dirname, join } from "node:path";
+import { basename } from "node:path";
 import { endpoint, localOrigin, type ResolvedSettings } from "./config/settings.js";
 import { isPortInUse, startHttpServer, type HttpServerOptions } from "./mcp/http.js";
 import { REGISTERED_TOOL_NAMES, type McpRuntimeContext } from "./mcp/server.js";
@@ -41,7 +41,6 @@ import { ExtensionReviewCompletionAdapter } from "./delivery/extension-review-co
 import { ReviewCompletionRouter } from "./router/review-completion-router.js";
 import {
   ChatGPTConnectorStore,
-  migrateLegacyOAuthState,
 } from "./control-plane/chatgpt-connector.js";
 import type { ExtensionIdentityEvidence } from "./control-plane/extension-identity.js";
 import { createTunnelManager, TunnelManager } from "./tunnel/manager.js";
@@ -74,6 +73,14 @@ import {
 } from "./control-plane/capability-negotiation.js";
 import { CapabilityTimeline } from "./control-plane/capability-timeline.js";
 import { DoctorRunner } from "./diagnostic/doctor.js";
+import {
+  migrateOAuthStateToInstance,
+  resolveInstanceOAuthStatePaths,
+  type InstanceOAuthStatePaths,
+} from "./auth/migration.js";
+import { WorkspaceGrantStore } from "./auth/workspace-grants.js";
+import { inboundRequestOrigin } from "./mcp/inbound.js";
+import { WorkspacePathError } from "./workspace/path.js";
 
 export interface AppContext extends McpRuntimeContext {
   readonly storageRoot?: string;
@@ -376,15 +383,57 @@ export async function startApp(
     desktopToolsPipeHandoff.clear();
   };
   try {
-    const workspaceOAuth = context.storageRoot === undefined
-      ? undefined
-      : await migrateLegacyOAuthState({
-          workspaceId: context.registry.active.id,
+    // OAuth clients and tokens belong to this LRM instance, never to the active workspace.
+    const instancePaths: InstanceOAuthStatePaths | undefined = resolveInstanceOAuthStatePaths(
+      context.storageRoot,
+      {
+        ...(options.oauthClientRegistryPath === undefined
+          ? {}
+          : { clientRegistryPath: options.oauthClientRegistryPath }),
+        ...(options.oauthTokenStorePath === undefined
+          ? {}
+          : { tokenStorePath: options.oauthTokenStorePath }),
+      },
+    );
+    const workspaceGrants = instancePaths === undefined
+      ? new WorkspaceGrantStore()
+      : new WorkspaceGrantStore({ path: instancePaths.workspaceGrantsPath });
+    if (context.storageRoot !== undefined) {
+      try {
+        const migration = migrateOAuthStateToInstance({
           storageRoot: context.storageRoot,
-          singleWorkspace: context.registry.list().length === 1,
+          instancePaths,
+          workspaceIds: context.registry.list().map((workspace) => workspace.id),
+          activeWorkspaceId: context.registry.activeWorkspaceId,
+          grants: workspaceGrants,
         });
+        writeRuntimeDiagnostic(runtimeDiagnosticLogger, {
+          event: "oauth_instance_state",
+          timestamp: new Date().toISOString(),
+          migration: migration.migration,
+          granted_workspace_count: migration.granted_workspaces.length,
+          conflicts: migration.conflicts,
+        });
+      } catch {
+        // Existing workspace access stays fail-closed; the original files were not deleted.
+        console.warn("OAuth instance migration failed; workspace access requires a fresh grant");
+      }
+    }
+    context.registry.setWorkspaceAuthorizer((workspaceId) => {
+      const origin = inboundRequestOrigin();
+      // The local static token belongs to the LRM owner process, not to a ChatGPT connection.
+      if (origin?.authentication !== "oauth" || origin.subject === undefined) return;
+      if (!workspaceGrants.isGranted(origin.subject, workspaceId)) {
+        console.warn(`Workspace access denied: ${workspaceId} (no grant for ${origin.subject})`);
+        throw new WorkspacePathError(
+          "WORKSPACE_NOT_AUTHORIZED",
+          "Workspace is not authorized for this connection.",
+        );
+      }
+    });
     const server = await startHttpServer(settings, {
       ...context,
+      workspaceGrants,
       browserReadiness: extensionDeliveryReadiness,
       desktopSyncObserver,
       desktopSyncManager,
@@ -394,11 +443,8 @@ export async function startApp(
       desktopInteractivePreflight: () => desktopInteractivePreflight.check(),
       doctorRunner,
     }, {
-      oauthClientRegistryPath: options.oauthClientRegistryPath ?? workspaceOAuth?.clientRegistryPath,
-      oauthTokenStorePath: options.oauthTokenStorePath
-        ?? (options.oauthClientRegistryPath === undefined
-          ? workspaceOAuth?.tokenStorePath
-          : join(dirname(options.oauthClientRegistryPath), "tokens.json")),
+      oauthClientRegistryPath: instancePaths?.clientRegistryPath,
+      oauthTokenStorePath: instancePaths?.tokenStorePath,
       silent: options.silent,
     });
     removeDesktopToolsPipeStateListener = desktopSyncObserver.onStateChanged?.((state) => {

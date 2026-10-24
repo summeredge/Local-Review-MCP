@@ -115,6 +115,14 @@ $env:LOCAL_REVIEW_MCP_TOKEN = "替换为自己生成的长随机令牌"
 
 界面名称可能随 ChatGPT 账号、工作区和版本变化。若找不到添加自定义连接的入口，请联系工作区管理员确认相关权限。
 
+OAuth 连接只用于识别本机 LRM 的所有者，不会自动授予任何项目访问权。首次添加工作区后，在 Launcher 的“工作区注册表”中选择该工作区并点击“授权 ChatGPT”，或运行：
+
+~~~powershell
+lrm workspace-access grant <workspace_id> --config ".\config.production.json" --token $env:LOCAL_REVIEW_MCP_TOKEN
+~~~
+
+授权对现有连接立即生效，新增工作区不需要重新创建连接。需要收回访问权时点击“撤销授权”，或运行 `lrm workspace-access revoke <workspace_id>`。`workspace_list` 只显示已授权工作区。
+
 ### 5. 启用网页端 Codex 任务（只做 Review 可跳过）
 
 ChatGPT 连接完成后即可读取项目并做 Review。若要从网页对话提交任务给本地 Codex，还需加载仓库自带的浏览器扩展：

@@ -56,7 +56,7 @@ import {
   offlineDoctorReport,
   type DoctorReport,
 } from "./diagnostic/doctor.js";
-import { LAUNCHER_DOCTOR_PATH } from "./mcp/http.js";
+import { LAUNCHER_DOCTOR_PATH, OAUTH_WORKSPACES_PATH } from "./mcp/http.js";
 
 function printErrorDetails(error: unknown, warning = false): void {
   const log = warning ? console.warn : console.error;
@@ -95,10 +95,46 @@ async function runDoctorCommand(argv: readonly string[]): Promise<void> {
   if (report.status === "FAILED") process.exitCode = 1;
 }
 
+async function runWorkspaceAccessCommand(argv: readonly string[]): Promise<void> {
+  const action = argv[0] ?? "list";
+  const workspaceId = action === "grant" || action === "revoke" ? argv[1] : undefined;
+  if ((action === "grant" || action === "revoke")
+    ? workspaceId === undefined || workspaceId.startsWith("--")
+    : action !== "list") {
+    throw new Error("usage: lrm workspace-access list|grant <workspace_id>|revoke <workspace_id>");
+  }
+  const settingsArgs: string[] = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === "--config" || argument === "--port" || argument === "--token") {
+      const value = argv[index + 1];
+      if (value === undefined) throw new Error(`${argument} requires a value`);
+      settingsArgs.push(argument, value);
+      index += 1;
+    }
+  }
+  const settings = await loadSettings(settingsArgs);
+  const url = `${localOrigin(settings)}${OAUTH_WORKSPACES_PATH}`
+    + (action === "revoke" ? `/${encodeURIComponent(workspaceId!)}` : "");
+  const response = await fetch(url, {
+    method: action === "grant" ? "POST" : action === "revoke" ? "DELETE" : "GET",
+    headers: {
+      authorization: `Bearer ${settings.auth.token}`,
+      ...(action === "grant" ? { "content-type": "application/json" } : {}),
+    },
+    ...(action === "grant" ? { body: JSON.stringify({ workspace_id: workspaceId }) } : {}),
+  });
+  const body = await response.json() as unknown;
+  console.log(JSON.stringify(body, null, 2));
+  if (!response.ok) process.exitCode = 1;
+}
+
 try {
   const argv = process.argv.slice(2);
   if (argv[0] === "doctor") {
     await runDoctorCommand(argv.slice(1));
+  } else if (argv[0] === "workspace-access") {
+    await runWorkspaceAccessCommand(argv.slice(1));
   } else if (argv[0] === "diagnose-desktop-ipc") {
     await runDesktopIPCDiagnostic(argv.slice(1));
   } else if (argv[0] === "diagnose-desktop-thread-visibility") {

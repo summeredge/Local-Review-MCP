@@ -7,6 +7,13 @@ import { z } from "zod";
 import type { ResolvedSettings } from "../config/settings.js";
 import { defaultTaskContextStorageRoot, workspaceStateRoot } from "../context/task.js";
 import { WorkspaceManager } from "../workspace/manager.js";
+import {
+  instanceOAuthStatePaths,
+  migrateOAuthStateToInstance,
+  resolveInstanceOAuthStatePaths,
+  type OAuthInstanceStateMigrationStatus,
+} from "../auth/migration.js";
+import { WorkspaceGrantStore } from "../auth/workspace-grants.js";
 
 export const CHATGPT_PLUGINS_URL = "https://chatgpt.com/plugins";
 export const CHATGPT_CREATE_CONNECTOR_URL =
@@ -436,246 +443,7 @@ export class ChatGPTConnectorStore {
   }
 }
 
-const persistedOAuthClientSchema = z.object({
-  client_id: z.string().min(1),
-  client_secret: z.string().optional(),
-  client_name: z.string().min(1).max(200),
-  redirect_uris: z.array(z.string().url()).min(1).max(20),
-  grant_types: z.array(z.string()).min(1).max(2),
-  token_endpoint_auth_method: z.literal("none"),
-  response_types: z.array(z.string()).min(1),
-  created_at: z.number().int().nonnegative(),
-}).strict();
-
-const oauthClientStateSchema = z.object({
-  version: z.literal(1),
-  clients: z.array(persistedOAuthClientSchema),
-}).strict();
-
-const persistedOAuthTokenSchema = z.object({
-  hash: z.string().regex(/^[a-f0-9]{64}$/u),
-  kind: z.enum(["access", "refresh"]),
-  client_id: z.string().min(1),
-  resource: z.string().url(),
-  issued_at: z.number().int().nonnegative(),
-  expires_at: z.number().int().positive(),
-  revoked: z.boolean(),
-}).strict();
-
-const oauthTokenStateSchema = z.object({
-  schema_version: z.literal(1),
-  tokens: z.array(persistedOAuthTokenSchema),
-}).strict();
-
-export type OAuthLegacyMigrationStatus = "not_needed" | "migrated" | "reauthorization_required";
-
-export interface WorkspaceOAuthState {
-  readonly clientRegistryPath: string;
-  readonly tokenStorePath: string;
-  readonly migration: OAuthLegacyMigrationStatus;
-}
-
-export function workspaceOAuthStatePaths(
-  workspaceId: string,
-  storageRoot = defaultTaskContextStorageRoot(),
-): Omit<WorkspaceOAuthState, "migration"> {
-  const oauthRoot = join(workspaceStateRoot(storageRoot, workspaceId), "oauth");
-  return {
-    clientRegistryPath: join(oauthRoot, "clients.json"),
-    tokenStorePath: join(oauthRoot, "tokens.json"),
-  };
-}
-
-async function readOptionalJson(path: string): Promise<unknown | null> {
-  try {
-    return JSON.parse(await readFile(path, "utf8")) as unknown;
-  } catch (error: unknown) {
-    if (errorCode(error) === "ENOENT") return null;
-    throw error;
-  }
-}
-
-async function writeAtomicJson(path: string, value: unknown): Promise<void> {
-  const directory = dirname(path);
-  const temporary = join(directory, `.migration-${process.pid}-${randomUUID()}.tmp`);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  await chmod(directory, 0o700);
-  try {
-    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    await rename(temporary, path);
-    await chmod(path, 0o600);
-  } finally {
-    await rm(temporary, { force: true }).catch(() => undefined);
-  }
-}
-
-type PersistedOAuthClient = z.infer<typeof persistedOAuthClientSchema>;
-type PersistedOAuthToken = z.infer<typeof persistedOAuthTokenSchema>;
-
-interface LegacyOAuthFiles {
-  readonly clients: unknown;
-  readonly tokens: unknown;
-  readonly connector: unknown;
-}
-
-async function readLegacyOAuthFiles(storageRoot: string): Promise<LegacyOAuthFiles | null> {
-  try {
-    const oauthRoot = join(storageRoot, "oauth");
-    const [clients, connector] = await Promise.all([
-      readOptionalJson(join(oauthRoot, "clients.json")),
-      readOptionalJson(legacyChatgptConnectorStateFile(storageRoot)),
-    ]);
-    // ponytail: token files are read separately because only the client registry decides migration.
-    const tokens = await readOptionalJson(join(oauthRoot, "tokens.json")).catch(() => null);
-    return { clients, tokens, connector };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * The pre-upgrade runtime shared one global OAuth registry and one legacy connector state file
- * across every workspace, so the legacy state only belongs to a workspace when it names that
- * workspace in exactly one binding. Anything else stays unproven and must not be migrated.
- */
-function legacyWorkspaceBinding(
-  connector: unknown,
-  workspaceId: string,
-): ChatGPTConnectorBinding | null {
-  const connectors = legacyStateSchema.safeParse(connector);
-  if (!connectors.success || connectors.data.bindings.length !== 1) return null;
-  const binding = connectors.data.bindings[0];
-  return binding?.workspace_id === workspaceId ? binding : null;
-}
-
-function legacyTokenResources(connector: unknown, workspaceId: string): ReadonlySet<string> | null {
-  const binding = legacyWorkspaceBinding(connector, workspaceId);
-  if (binding === null) return null;
-  return new Set(
-    [binding.verified_mcp_url, binding.pending_mcp_url]
-      .filter((resource): resource is string => resource !== null)
-      .map(normalizePublicUrl),
-  );
-}
-
-function activeLegacyTokens(
-  tokens: unknown,
-  clientIds: ReadonlySet<string>,
-  resources: ReadonlySet<string>,
-  now: number,
-): readonly PersistedOAuthToken[] {
-  const parsed = oauthTokenStateSchema.safeParse(tokens);
-  if (!parsed.success) return [];
-  return parsed.data.tokens.filter((token) =>
-    !token.revoked
-    && token.expires_at > now
-    && clientIds.has(token.client_id)
-    && resources.has(normalizePublicUrl(token.resource)));
-}
-
-function sameClientRegistration(left: PersistedOAuthClient, right: PersistedOAuthClient): boolean {
-  return left.client_id === right.client_id
-    && left.client_secret === right.client_secret
-    && left.client_name === right.client_name
-    && left.created_at === right.created_at
-    && left.grant_types.length === right.grant_types.length
-    && left.grant_types.every((value, index) => value === right.grant_types[index])
-    && left.response_types.length === right.response_types.length
-    && left.response_types.every((value, index) => value === right.response_types[index])
-    && left.redirect_uris.length === right.redirect_uris.length
-    && left.redirect_uris.every((value, index) => value === right.redirect_uris[index]);
-}
-
-export async function migrateLegacyOAuthState(options: {
-  readonly workspaceId: string;
-  readonly storageRoot?: string;
-  readonly singleWorkspace: boolean;
-  readonly now?: number;
-}): Promise<WorkspaceOAuthState> {
-  const storageRoot = resolve(options.storageRoot ?? defaultTaskContextStorageRoot());
-  const paths = workspaceOAuthStatePaths(options.workspaceId, storageRoot);
-  const [scopedClientsRaw, scopedTokensRaw, legacy] = await Promise.all([
-    readOptionalJson(paths.clientRegistryPath).catch(() => undefined),
-    readOptionalJson(paths.tokenStorePath),
-    readLegacyOAuthFiles(storageRoot),
-  ]);
-  const parsedScoped = scopedClientsRaw === null
-    ? null
-    : oauthClientStateSchema.safeParse(scopedClientsRaw);
-  if (parsedScoped !== null && !parsedScoped.success) {
-    return { ...paths, migration: "reauthorization_required" };
-  }
-  const scopedClients = parsedScoped !== null && parsedScoped.success ? parsedScoped.data : null;
-  if (legacy === null) {
-    return {
-      ...paths,
-      migration: scopedClients === null ? "reauthorization_required" : "not_needed",
-    };
-  }
-  if (legacy.clients === null && legacy.tokens === null) {
-    return { ...paths, migration: "not_needed" };
-  }
-
-  const parsedLegacyClients = legacy.clients === null
-    ? null
-    : oauthClientStateSchema.safeParse(legacy.clients);
-  // Importing the global legacy registry needs proven workspace ownership: one configured
-  // workspace whose legacy connector state names it in a single valid binding. A missing, invalid,
-  // foreign, or ambiguous legacy binding never proves ownership.
-  const ownershipProven = options.singleWorkspace
-    && legacyWorkspaceBinding(legacy.connector, options.workspaceId) !== null;
-  const tokenResources = legacyTokenResources(legacy.connector, options.workspaceId);
-
-  // Client registration migration and token migration stay independent: a missing, empty, or
-  // stale legacy token set must never stop the legacy client_id from reaching the scoped registry.
-  if (scopedClients === null) {
-    if (!ownershipProven || parsedLegacyClients === null || !parsedLegacyClients.success) {
-      return { ...paths, migration: "reauthorization_required" };
-    }
-    const clientIds = new Set(parsedLegacyClients.data.clients.map((client) => client.client_id));
-    const tokens = tokenResources === null
-      ? []
-      : activeLegacyTokens(legacy.tokens, clientIds, tokenResources, options.now ?? Date.now());
-    if (scopedTokensRaw === null) {
-      await writeAtomicJson(paths.tokenStorePath, { schema_version: 1, tokens });
-    }
-    await writeAtomicJson(paths.clientRegistryPath, parsedLegacyClients.data);
-    return { ...paths, migration: "migrated" };
-  }
-
-  // Idempotent reconcile: a scoped registry that already holds the exact legacy clients needs
-  // nothing from the legacy global state, so it neither re-imports nor depends on the proof.
-  if (parsedLegacyClients === null) return { ...paths, migration: "not_needed" };
-  if (!parsedLegacyClients.success) return { ...paths, migration: "reauthorization_required" };
-  const scopedById = new Map(
-    scopedClients.clients.map((client) => [client.client_id, client] as const),
-  );
-  const unresolved = parsedLegacyClients.data.clients.some((client) => {
-    const scopedClient = scopedById.get(client.client_id);
-    return scopedClient === undefined || !sameClientRegistration(scopedClient, client);
-  });
-  if (!unresolved) return { ...paths, migration: "not_needed" };
-  if (!ownershipProven) return { ...paths, migration: "reauthorization_required" };
-  const merged = [...scopedClients.clients];
-  for (const client of parsedLegacyClients.data.clients) {
-    const scopedClient = scopedById.get(client.client_id);
-    if (scopedClient === undefined) {
-      merged.push(client);
-      continue;
-    }
-    if (!sameClientRegistration(scopedClient, client)) {
-      return { ...paths, migration: "reauthorization_required" };
-    }
-  }
-  if (merged.length === scopedClients.clients.length) {
-    return { ...paths, migration: "not_needed" };
-  }
-  await writeAtomicJson(paths.clientRegistryPath, { version: 1, clients: merged });
-  return { ...paths, migration: "migrated" };
-}
+export type OAuthLegacyMigrationStatus = OAuthInstanceStateMigrationStatus;
 
 export interface ChatGPTConnectorDiagnostic {
   ok: boolean;
@@ -1088,6 +856,8 @@ export async function diagnoseChatGPTConnector(
   dependencies: {
     readonly fetch?: typeof fetch;
     readonly storageRoot?: string;
+    readonly oauthClientRegistryPath?: string;
+    readonly oauthTokenStorePath?: string;
     readonly now?: () => number;
     readonly sleep?: (milliseconds: number) => Promise<void>;
     readonly remoteReadinessTimeoutMs?: number;
@@ -1098,15 +868,33 @@ export async function diagnoseChatGPTConnector(
   const storageRoot = dependencies.storageRoot ?? defaultTaskContextStorageRoot();
   const store = new ChatGPTConnectorStore(workspace.id, storageRoot);
   const existing = await store.read();
-  const oauthState = await migrateLegacyOAuthState({
-    workspaceId: workspace.id,
-    storageRoot,
-    singleWorkspace: (settings.workspaces?.length ?? 1) === 1,
-  });
+  const instancePaths = resolveInstanceOAuthStatePaths(storageRoot, {
+    ...(dependencies.oauthClientRegistryPath === undefined
+      ? {}
+      : { clientRegistryPath: dependencies.oauthClientRegistryPath }),
+    ...(dependencies.oauthTokenStorePath === undefined
+      ? {}
+      : { tokenStorePath: dependencies.oauthTokenStorePath }),
+  }) ?? instanceOAuthStatePaths(storageRoot);
+  let migration: OAuthInstanceStateMigrationStatus = "reauthorization_required";
+  try {
+    migration = migrateOAuthStateToInstance({
+      storageRoot,
+      instancePaths,
+      workspaceIds: settings.workspaces?.map((entry) => entry.id) ?? [workspace.id],
+      activeWorkspaceId: workspace.id,
+      grants: new WorkspaceGrantStore({ path: instancePaths.workspaceGrantsPath }),
+      applyGrants: false,
+      applyCredentials: false,
+      ...(dependencies.now === undefined ? {} : { now: dependencies.now() }),
+    }).migration;
+  } catch {
+    // Reported as reauthorization_required: never present unreadable state as migrated.
+  }
   const currentMcpUrl = settings.remote.enabled
     ? mcpUrlFromPublic(settings.remote.endpoint)
     : null;
-  const result = resultBase(workspace, existing, currentMcpUrl, oauthState.migration);
+  const result = resultBase(workspace, existing, currentMcpUrl, migration);
   if (currentMcpUrl === null) return result;
 
   const fetchImpl = dependencies.fetch ?? fetch;
@@ -1168,7 +956,7 @@ export async function diagnoseChatGPTConnector(
       result.connector.status = prepared.binding.status;
       result.connector.action = prepared.action;
       result.connector.verified_mcp_url = prepared.binding.verified_mcp_url;
-      result.connector.reason = oauthState.migration === "reauthorization_required"
+      result.connector.reason = migration === "reauthorization_required"
         ? "legacy_oauth_reauthorization_required"
         : prepared.action === "create"
           ? "first_connection"

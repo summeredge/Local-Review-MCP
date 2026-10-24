@@ -6,6 +6,7 @@ export interface InboundRequestOrigin {
   readonly requestId: string;
   readonly mcpResource: string | null;
   readonly authentication: InboundAuthentication;
+  readonly subject?: string;
 }
 
 const store = new AsyncLocalStorage<InboundRequestOrigin | null>();

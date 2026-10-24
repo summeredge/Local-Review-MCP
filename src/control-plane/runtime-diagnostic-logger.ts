@@ -35,10 +35,19 @@ export interface DesktopToolsPipeLifecycleDiagnosticEvent {
   readonly discard_reason?: "expired" | "disconnected" | "owner_mismatch";
 }
 
+export interface OAuthInstanceStateDiagnosticEvent {
+  readonly event: "oauth_instance_state";
+  readonly timestamp: string;
+  readonly migration: "not_needed" | "migrated" | "reauthorization_required";
+  readonly granted_workspace_count: number;
+  readonly conflicts: number;
+}
+
 export type RuntimeDiagnosticEvent =
   | { readonly event: "desktop_thread_activation"; readonly timestamp: string;
       readonly state: "requested" | "failed" | "no_binding" }
   | BridgeStartedDiagnosticEvent
+  | OAuthInstanceStateDiagnosticEvent
   | DesktopWaitDiagnosticEvent
   | DesktopToolsPipeLifecycleDiagnosticEvent;
 

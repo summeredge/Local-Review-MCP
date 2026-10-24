@@ -13,7 +13,9 @@ import {
   isValidCodeChallenge,
   validateRedirectUri,
 } from "../auth/oauth.js";
-import { authenticationSource, isAuthenticated } from "../auth/middleware.js";
+import { authenticateRequest, isAuthenticated } from "../auth/middleware.js";
+import { OAUTH_DEFAULT_SUBJECT } from "../auth/token.js";
+import type { WorkspaceGrantStore } from "../auth/workspace-grants.js";
 import type { ExtensionDeliveryReadiness } from "../control-plane/extension-delivery.js";
 import type { DesktopIPCObserver } from "../desktop-sync/desktop-ipc-observer.js";
 import type { DesktopSyncManager } from "../desktop-sync/desktop-sync-manager.js";
@@ -52,6 +54,7 @@ import { createMcpServer, registeredMcpToolsMessage, type McpRuntimeContext } fr
 
 export const MAX_MCP_REQUEST_BYTES = 1024 * 1024;
 export const OAUTH_CLIENTS_PATH = "/oauth/clients";
+export const OAUTH_WORKSPACES_PATH = "/oauth/workspaces";
 export const LAUNCHER_SESSION_CATALOG_PATH = "/launcher/sessions";
 export const LAUNCHER_EXECUTION_CATALOG_PATH = "/launcher/executions";
 export const LAUNCHER_DESKTOP_SYNC_PATH = "/launcher/desktop-sync";
@@ -93,6 +96,7 @@ type HttpRuntimeContext = Omit<McpRuntimeContext, "statusQuery"> & {
   readonly doctorRunner?: Pick<DoctorRunner, "run">;
   readonly statusQuery?: HttpStatusQuery;
   readonly tunnel?: Pick<TunnelProvider, "status">;
+  readonly workspaceGrants?: WorkspaceGrantStore;
 };
 
 export interface HttpServerOptions {
@@ -188,6 +192,8 @@ async function handleHealthRequest(
   }
   const activeWorkspace = context.registry?.active;
   const workspace = activeWorkspace?.manager ?? context.workspace;
+  const tokenStatus = oauth.tokens.status();
+  const grantStatus = context.workspaceGrants?.getStatus();
   sendJson(response, 200, {
     service: SERVICE_NAME,
     status: "ok",
@@ -202,7 +208,23 @@ async function handleHealthRequest(
           : "stopped"
       : "ready",
     ...(tunnel.endpoint === undefined ? {} : { endpoint: tunnel.endpoint }),
-    oauth_registry: safeOAuthRegistryStatus(oauth),
+    oauth_registry: {
+      ...safeOAuthRegistryStatus(oauth),
+      error: oauth.getRegistryStatus().loaded ? null : "client_registry_unavailable",
+    },
+    oauth_tokens: {
+      loaded: tokenStatus.loaded,
+      token_count: tokenStatus.token_count,
+      error: tokenStatus.error === null ? null : "token_registry_unavailable",
+    },
+    workspace_access: grantStatus === undefined
+      ? null
+      : {
+          loaded: grantStatus.loaded,
+          granted_workspace_count: grantStatus.grant_count,
+          registered_workspace_count: context.registry.list().length,
+          error: grantStatus.error === null ? null : "workspace_grant_registry_unavailable",
+        },
   });
 }
 
@@ -929,8 +951,111 @@ async function handleOAuthRequest(
   path: string,
   urls: OAuthUrls,
   oauth: OAuthService,
+  context: HttpRuntimeContext,
   authToken: string,
 ): Promise<boolean> {
+  if (path === OAUTH_WORKSPACES_PATH || path.startsWith(`${OAUTH_WORKSPACES_PATH}/`)) {
+    if (!isDirectLoopbackRequest(request)) {
+      request.resume();
+      sendJson(response, 404, { error: "not_found" });
+      return true;
+    }
+    if (!isAuthenticated(request, authToken)) {
+      request.resume();
+      sendUnauthorized(response);
+      return true;
+    }
+    const grants = context.workspaceGrants;
+    if (grants === undefined) {
+      request.resume();
+      sendJson(response, 503, { error: "workspace_grants_unavailable" });
+      return true;
+    }
+    const summary = (): Record<string, unknown> => {
+      const status = grants.getStatus();
+      return {
+        storage_path: status.storage_path,
+        loaded: status.loaded,
+        grant_count: status.grant_count,
+        grants: status.grants,
+        workspaces: context.registry.list().map((workspace) => ({
+          workspace_id: workspace.id,
+          name: workspace.name,
+          granted: status.grants.some((grant) =>
+            grant.subject === OAUTH_DEFAULT_SUBJECT && grant.workspace_id === workspace.id),
+        })),
+      };
+    };
+
+    if (path === OAUTH_WORKSPACES_PATH || path === `${OAUTH_WORKSPACES_PATH}/`) {
+      if (request.method === "GET") {
+        sendJson(response, 200, summary(), { "cache-control": "no-store" });
+        return true;
+      }
+      if (request.method === "POST") {
+        let body: unknown;
+        try {
+          body = await parseBody(request);
+        } catch {
+          sendJson(response, 400, { error: "invalid_json_body" });
+          return true;
+        }
+        const workspaceId = typeof body === "object" && body !== null && !Array.isArray(body)
+          ? (body as Record<string, unknown>).workspace_id
+          : undefined;
+        if (typeof workspaceId !== "string" || workspaceId === "") {
+          sendJson(response, 400, { error: "workspace_id_required" });
+          return true;
+        }
+        try {
+          context.registry.resolve(workspaceId);
+        } catch {
+          sendJson(response, 404, { error: "unknown_workspace" });
+          return true;
+        }
+        try {
+          grants.grant(OAUTH_DEFAULT_SUBJECT, workspaceId);
+          sendJson(response, 200, summary(), { "cache-control": "no-store" });
+        } catch {
+          sendJson(response, 503, { error: "workspace_grants_unavailable" });
+        }
+        return true;
+      }
+      request.resume();
+      sendJson(response, 405, { error: "method_not_allowed" });
+      return true;
+    }
+
+    if (request.method !== "DELETE") {
+      request.resume();
+      sendJson(response, 405, { error: "method_not_allowed" });
+      return true;
+    }
+    let workspaceId: string;
+    try {
+      workspaceId = decodeURIComponent(path.slice(`${OAUTH_WORKSPACES_PATH}/`.length));
+    } catch {
+      request.resume();
+      sendJson(response, 400, { error: "invalid_workspace_id" });
+      return true;
+    }
+    if (workspaceId === "" || workspaceId.includes("/")) {
+      request.resume();
+      sendJson(response, 404, { error: "unknown_workspace" });
+      return true;
+    }
+    try {
+      if (!grants.revoke(OAUTH_DEFAULT_SUBJECT, workspaceId)) {
+        sendJson(response, 404, { error: "grant_not_found" });
+      } else {
+        sendJson(response, 200, summary(), { "cache-control": "no-store" });
+      }
+    } catch {
+      sendJson(response, 503, { error: "workspace_grants_unavailable" });
+    }
+    return true;
+  }
+
   const clientPathPrefix = `${OAUTH_CLIENTS_PATH}/`;
   if (path === OAUTH_CLIENTS_PATH
     || path === `${OAUTH_CLIENTS_PATH}/`
@@ -1089,6 +1214,9 @@ async function handleOAuthRequest(
     const clientId = params.get("client_id");
     const client = clientId === null ? undefined : oauth.getClient(clientId);
     if (clientId === null || client === undefined) {
+      console.warn(`OAuth client lookup failed: ${oauth.getRegistryStatus().loaded
+        ? "unknown_client"
+        : "registry_unavailable"}`);
       sendOAuthError(response, 400, "invalid_client", "Invalid client_id");
       return true;
     }
@@ -1213,6 +1341,9 @@ async function handleOAuthRequest(
     }
     const client = oauth.getClient(clientId);
     if (client === undefined) {
+      console.warn(`OAuth client lookup failed: ${oauth.getRegistryStatus().loaded
+        ? "unknown_client"
+        : "registry_unavailable"}`);
       sendOAuthError(response, 400, "invalid_client", "Invalid client_id");
       return true;
     }
@@ -1363,7 +1494,7 @@ export function createHttpServer(
 
       if (path === MCP_PATH) {
         const urls = await oauthUrls(settings, context, request);
-        const authentication = authenticationSource(
+        const authentication = authenticateRequest(
           request,
           settings.auth.token,
           oauth.tokens,
@@ -1379,7 +1510,8 @@ export function createHttpServer(
         await withInboundRequestOrigin({
           requestId,
           mcpResource: urls.resource.href,
-          authentication,
+          authentication: authentication.source,
+          subject: authentication.subject,
         }, () => handleMcpRequest(request, response, context));
         return;
       }
@@ -1388,7 +1520,15 @@ export function createHttpServer(
         || path.startsWith(OAUTH_AUTHORIZATION_SERVER_PATH)
         || path.startsWith("/oauth/")) {
         const urls = await oauthUrls(settings, context, request);
-        if (await handleOAuthRequest(request, response, path, urls, oauth, settings.auth.token)) return;
+        if (await handleOAuthRequest(
+          request,
+          response,
+          path,
+          urls,
+          oauth,
+          context,
+          settings.auth.token,
+        )) return;
       }
 
       request.resume();
@@ -1398,6 +1538,7 @@ export function createHttpServer(
         response.destroy(error instanceof Error ? error : undefined);
         return;
       }
+      console.error(`HTTP request failed: ${error instanceof Error ? error.message : "unknown"}`);
       sendJson(response, 500, { error: "internal_server_error" });
     });
   });

@@ -887,6 +887,36 @@
     return summary;
   }
 
+  // Only adjacent timeline nodes with the same Fiber-proven canonical conversation
+  // can extend the active exchange. Retained nodes from a different conversation,
+  // even if still marked mostRecent, cannot contribute tool identity.
+  function currentTimelineExchangeTurnsOf(turns, latestSnapshot) {
+    const current = turns[turns.length - 1];
+    if (!current) return [];
+    if (!latestSnapshot?.mostRecent) return [current];
+    const active = conversationEvidenceDetailsOf(latestSnapshot.fiber);
+    if (!active.conversationId || active.conflict || active.unreadable) return [current];
+
+    const exchange = [current];
+    for (let index = turns.length - 2;
+      index >= 0 && exchange.length < MAX_UNANCHORED_TAIL_TURNS; index -= 1) {
+      const previous = turns[index];
+      let sameConversation = true;
+      for (const section of previous.sections) {
+        const snapshot = snapshotOf(section);
+        const identity = snapshot ? conversationEvidenceDetailsOf(snapshot.fiber) : null;
+        if (!identity?.conversationId || identity.conflict || identity.unreadable
+          || identity.conversationId !== active.conversationId) {
+          sameConversation = false;
+          break;
+        }
+      }
+      if (!sameConversation) break;
+      exchange.unshift(previous);
+    }
+    return exchange;
+  }
+
   function scan(nonce) {
     let sections;
     try {
@@ -924,13 +954,15 @@
     let selection = { snapshot: null, reason: snapshotSelectionReason };
     if (currentTurn) {
       try {
-        // A virtualized historical viewport is not the current exchange. New timeline
-        // entries already contain the complete user/tool sequence for a logical turn.
+        // A virtualized historical viewport is not the current exchange. A live
+        // exchange may span adjacent timeline nodes, but never cross a canonical
+        // conversation boundary; the selector still enforces user-message boundaries.
         selection = timeline && !latestSnapshot
           ? { snapshot: null, reason: 'snapshot_unreadable' }
           : timeline && !latestSnapshot.mostRecent
             ? { snapshot: null, reason: 'historical_viewport' }
-            : currentExchangeToolSnapshotOf(timeline ? [currentTurn] : turns, selectionProbe);
+            : currentExchangeToolSnapshotOf(
+              timeline ? currentTimelineExchangeTurnsOf(turns, latestSnapshot) : turns, selectionProbe);
         const snapshot = selection.snapshot;
         snapshotSelectionReason = selection.reason;
         const fiber = snapshot?.fiber;

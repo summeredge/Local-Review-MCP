@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 
 LOCAL_HEALTH_URL = "http://127.0.0.1:12080/health"
 LOCAL_OAUTH_CLIENTS_URL = "http://127.0.0.1:12080/oauth/clients"
+LOCAL_OAUTH_WORKSPACES_URL = "http://127.0.0.1:12080/oauth/workspaces"
 LOCAL_MCP_URL = "http://127.0.0.1:12080/mcp"
 LOCAL_SESSION_CATALOG_URL = "http://127.0.0.1:12080/launcher/sessions"
 LOCAL_EXECUTION_CATALOG_URL = "http://127.0.0.1:12080/launcher/executions"
@@ -548,6 +549,7 @@ class StatusChecker:
         self,
         auth_token: str | None = None,
         oauth_clients_url: str = LOCAL_OAUTH_CLIENTS_URL,
+        oauth_workspaces_url: str = LOCAL_OAUTH_WORKSPACES_URL,
         mcp_url: str = LOCAL_MCP_URL,
         session_catalog_url: str = LOCAL_SESSION_CATALOG_URL,
         execution_catalog_url: str = LOCAL_EXECUTION_CATALOG_URL,
@@ -561,6 +563,7 @@ class StatusChecker:
     ) -> None:
         self.auth_token = auth_token
         self.oauth_clients_url = oauth_clients_url
+        self.oauth_workspaces_url = oauth_workspaces_url
         self.mcp_url = mcp_url
         self.session_catalog_url = session_catalog_url
         self.execution_catalog_url = execution_catalog_url
@@ -1016,6 +1019,33 @@ class StatusChecker:
         try:
             with urlopen(Request(
                 f"{self.oauth_clients_url.rstrip('/')}/{quote(client_id, safe='')}",
+                method="DELETE",
+                headers=self._auth_headers(),
+            ), timeout=3) as response:
+                return 200 <= response.status < 300
+        except (HTTPError, URLError, OSError, TimeoutError):
+            return False
+
+    def grant_workspace_access(self, workspace_id: str) -> bool:
+        if not isinstance(workspace_id, str) or not workspace_id:
+            return False
+        try:
+            with urlopen(Request(
+                self.oauth_workspaces_url,
+                data=json.dumps({"workspace_id": workspace_id}).encode("utf-8"),
+                method="POST",
+                headers={**self._auth_headers(), "content-type": "application/json"},
+            ), timeout=3) as response:
+                return 200 <= response.status < 300
+        except (HTTPError, URLError, OSError, TimeoutError):
+            return False
+
+    def revoke_workspace_access(self, workspace_id: str) -> bool:
+        if not isinstance(workspace_id, str) or not workspace_id:
+            return False
+        try:
+            with urlopen(Request(
+                f"{self.oauth_workspaces_url.rstrip('/')}/{quote(workspace_id, safe='')}",
                 method="DELETE",
                 headers=self._auth_headers(),
             ), timeout=3) as response:

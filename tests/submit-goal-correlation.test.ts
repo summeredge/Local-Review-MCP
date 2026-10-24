@@ -446,6 +446,40 @@ describe("Extension submit_goal correlation evidence", () => {
       .toBe('tool_unsupported');
   });
 
+  it('selects a split same-conversation timeline call without crossing later users or retained conversations', () => {
+    function section(items: unknown[], conversationId: string, mostRecent: boolean) {
+      return { getAttribute: (name: string) => name === 'data-turn-key' ? 'timeline' : null,
+        __reactFiber$test: { memoizedProps: { entry: { conversationId,
+          isMostRecentTurn: mostRecent, turn: { items } } } } };
+    }
+    const requestTurn = section([
+      { type: 'user-message', messageId: 'user-current' }, directTimelineCall(KEY_A),
+    ], CONVERSATION, false);
+    const continuation = section([{ type: 'assistant-message' }], CONVERSATION, true);
+    const resumed = scanFiberSections([requestTurn, continuation]);
+    expect(resumed.evidence).toEqual([{ request_id: KEY_A, fiber_conversation_id: CONVERSATION }]);
+    expect(resumed.scan_diagnostic).toMatchObject({ snapshot_path: 'timeline',
+      searched_turn_count: 2, selection_reason: 'selected', excluded_tool_count: 0 });
+
+    const nextUser = section([{ type: 'user-message', messageId: 'user-next' }], CONVERSATION, true);
+    const boundary = scanFiberSections([requestTurn, nextUser]);
+    expect(boundary.evidence).toEqual([]);
+    expect(boundary.scan_diagnostic.selection_reason).toBe('user_boundary');
+
+    const otherConversation = section([{ type: 'assistant-message' }], CONVERSATION_B, true);
+    const retained = scanFiberSections([requestTurn, otherConversation]);
+    expect(retained.evidence).toEqual([]);
+    expect(retained.scan_diagnostic).toMatchObject({ searched_turn_count: 1,
+      selection_reason: 'tool_out_of_scope', recognized_submit_count: 1, excluded_tool_count: 1 });
+
+    const older = section([{ type: 'user-message', messageId: 'user-older' }, directTimelineCall(KEY_B)],
+      CONVERSATION, false);
+    const newerUser = section([{ type: 'user-message', messageId: 'user-current' }], CONVERSATION, false);
+    const olderBoundary = scanFiberSections([older, newerUser, continuation]);
+    expect(olderBoundary.evidence).toEqual([]);
+    expect(olderBoundary.scan_diagnostic.selection_reason).toBe('user_boundary');
+  });
+
   it('observes retained timeline calls but never binds their identity to the latest turn', () => {
     function section(items: unknown[], conversationId: string) {
       return { getAttribute: (name: string) => name === 'data-turn-key' ? 'timeline' : null,
