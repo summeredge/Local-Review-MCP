@@ -124,6 +124,17 @@ describe("DoctorRunner", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  it("does not degrade the report when the opt-in trampoline is not configured", async () => {
+    const { settings, registry, workspacePath } = await setup();
+    const { result } = runner(settings, registry, { trampolineProbe: undefined });
+    const report = await result.run();
+    expect(report.status).toBe("READY");
+    expect(report.checks.find((check) => check.component === "Desktop Trampoline")).toMatchObject({
+      status: "PASS",
+      details: { cli_path_configured: false, installed: false },
+    });
+  });
+
   it("returns DEGRADED when Desktop is unavailable", async () => {
     const { settings, registry } = await setup();
     const { result } = runner(settings, registry, {

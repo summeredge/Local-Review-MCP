@@ -91,10 +91,18 @@ healthy, bounded backoff, no retry on 400/401/403, and the pipe path never reach
 
 ## Build
 
-Launcher 的生产启动入口会自动调用 `scripts/setup.ps1` 完成构建、更新受限权限配置并设置用户级
-`CODEX_CLI_PATH`，重复启动无需手动配置。已运行的 Codex Desktop 需完整退出后重新启动，
-才能加载新的启动环境。token 只从配置/环境读入并写入被忽略的 INI，不进入 argv 或输出。
-setup 失败时生产入口继续现有 fallback；隔离部署测试使用 `-SkipDesktopBootstrap`。
+Desktop bootstrap 默认关闭，生产启动入口不再改写用户级 `CODEX_CLI_PATH`：Codex Desktop
+26.1021.2667.0 及之后的版本会把该变量指向的 trampoline 判为 `policy-read reason=protocol`，
+导致冷启动失败。仍保留显式启用入口：
+
+```powershell
+.\scripts\start-production.ps1 -Config ".\config.production.json" -EnableDesktopBootstrap
+```
+
+启用时由 `scripts/setup.ps1` 完成构建、更新受限权限配置并设置用户级 `CODEX_CLI_PATH`，
+已运行的 Codex Desktop 需完整退出后重新启动才能加载新的启动环境。token 只从配置/环境读入并
+写入被忽略的 INI，不进入 argv 或输出。setup 失败时生产入口继续现有 fallback；
+`-SkipDesktopBootstrap` 保持兼容，与默认行为一致，用于隔离部署测试。
 
 ```powershell
 pwsh -File tools/desktop-bootstrap-trampoline/scripts/build.ps1

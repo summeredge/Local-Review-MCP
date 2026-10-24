@@ -200,7 +200,8 @@ function inspectTrampoline(
     pipe_environment_valid: pipeValid,
   };
 
-  if (configuredCli === undefined) return { status: "WARN", reason: "trampoline_not_configured", details };
+  // Bootstrap is opt-in; without it the pipe arrives through the SessionStart hook instead.
+  if (configuredCli === undefined) return { status: "PASS", details: { ...details, installed: false } };
   if (!configPresent) return { status: "WARN", reason: "trampoline_config_missing", details };
   if (!cliPathValid) return { status: "WARN", reason: cliReason, details };
   if (!trampolinePathValid) return { status: "WARN", reason: "trampoline_cli_path_invalid", details };

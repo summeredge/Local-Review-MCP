@@ -401,6 +401,22 @@ describe("deployment scripts", () => {
     ]);
   }, POWERSHELL_TEST_TIMEOUT_MS);
 
+  it("keeps the desktop bootstrap disabled without an explicit opt-in", async () => {
+    const directory = await makeTemporaryDirectory();
+    const shimDirectory = await makeTemporaryDirectory();
+    await writeNpmShim(shimDirectory);
+    const config = await writeConfig(directory, { workspace: directory, remoteEnabled: false });
+
+    const result = await runPowerShell(
+      startProductionScript,
+      ["-Config", config],
+      withNpmShim(shimDirectory, 0),
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.output).toMatch(/desktop bootstrap: disabled/i);
+  }, POWERSHELL_TEST_TIMEOUT_MS);
+
   it("does not start the runtime when the production build fails", async () => {
     const directory = await makeTemporaryDirectory();
     const shimDirectory = await makeTemporaryDirectory();

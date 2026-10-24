@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$Config = "",
+    [switch]$EnableDesktopBootstrap,
     [switch]$SkipDesktopBootstrap
 )
 
@@ -83,7 +84,11 @@ try {
         }
         Write-Host "Build: PASS (local-review-mcp $packageVersion)"
 
-        if (-not $SkipDesktopBootstrap) {
+        # Desktop bootstrap is opt-in: it sets the user-level CODEX_CLI_PATH, which recent
+        # Codex Desktop builds reject with policy-read reason=protocol.
+        $desktopBootstrap = $EnableDesktopBootstrap -and -not $SkipDesktopBootstrap
+        Write-Host "Desktop bootstrap: $(if ($desktopBootstrap) { 'enabled' } else { 'disabled' })"
+        if ($desktopBootstrap) {
             try {
                 . (Join-Path $projectRoot 'tools\desktop-bootstrap-trampoline\scripts\setup.ps1')
                 Initialize-DesktopBootstrap -ConfigDocument $configDocument

@@ -361,9 +361,11 @@ submit_goal(execution_mode="interactive")
         -> terminal listener -> ExecutionRoutingService
 ```
 
-The production Launcher setup configures `CODEX_CLI_PATH` to the Desktop bootstrap
-trampoline. On Desktop cold start, the trampoline captures the inherited
-`CODEX_APP_TOOLS_PIPE_PATH` and offers it to the authenticated loopback handoff endpoint.
+The Desktop bootstrap trampoline is opt-in (`-EnableDesktopBootstrap`) and disabled by
+default: Codex Desktop 26.1021.2667.0 rejects a user-level `CODEX_CLI_PATH` trampoline with
+`policy-read reason=protocol`. When enabled, it configures `CODEX_CLI_PATH` to the trampoline
+and, on Desktop cold start, captures the inherited `CODEX_APP_TOOLS_PIPE_PATH` and offers it
+to the authenticated loopback handoff endpoint.
 LRM stages the handoff until the Desktop IPC observer establishes the owner identity;
 only then can the resolver return it as `pipeSource=handoff`. While the spawned
 `codex.exe` remains alive, the trampoline probes and re-offers the capability after an
@@ -373,7 +375,9 @@ LRM runtime restart. The pipe path is not persisted or logged.
 inherited `CODEX_APP_TOOLS_PIPE_PATH` only while Desktop IPC is connected and no accepted
 handoff has since become stale; otherwise it fails closed. It never enumerates or guesses
 pipe names. The inherited-environment source is compatibility behavior, not the normal
-Launcher-started production path.
+Launcher-started production path. Without the trampoline the pipe reaches LRM through the
+existing Desktop SessionStart hook handoff, or not at all; the Desktop route then stays
+fail-closed and `CapabilityNegotiator` offers the standalone fallback.
 
 If Desktop capability fails, `CapabilityNegotiator` exposes **Retry Desktop** and
 **Use Standalone** through the authenticated Launcher endpoint. A user selection starts
