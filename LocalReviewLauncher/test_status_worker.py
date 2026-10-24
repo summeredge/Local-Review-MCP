@@ -22,6 +22,7 @@ from status_checker import (
     DoctorCheckStatus,
     DoctorStatus,
     DesktopCapabilityStatus,
+    DesktopSessionStartStatus,
     DesktopSyncStatus,
     ExecutionViewModel,
     StatusQueryError,
@@ -279,6 +280,54 @@ class StatusCheckWorkerTests(unittest.TestCase):
 
 
 class StatusCheckerTests(unittest.TestCase):
+    def test_session_start_diagnostics_are_parsed_separately_from_readiness(self) -> None:
+        checker = StatusChecker()
+        for status in ("handoff_accepted", "handoff_pending", "pipe_env_unavailable",
+                       "host_unavailable", "handoff_rejected", "timeout"):
+            with self.subTest(status=status), patch.object(checker, "_request_json", return_value={
+                "ready": False, "pipeSource": None, "pipeState": "unavailable",
+                "sessionStart": {"installed": True, "enabled": False, "trustRecorded": True,
+                                 "execution": "observed", "status": status,
+                                 "timestamp": "2026-10-24T01:00:00Z", "pid": 123,
+                                 "extra": "must-not-be-returned"},
+            }):
+                result = checker.desktop_capability_status()
+                self.assertFalse(result.ready)
+                self.assertEqual(result.session_start, DesktopSessionStartStatus(
+                    True, False, True, "observed", status, "2026-10-24T01:00:00Z", 123,
+                ))
+                self.assertNotIn("must-not-be-returned", repr(result))
+
+    def test_session_start_missing_and_invalid_evidence_do_not_claim_execution(self) -> None:
+        checker = StatusChecker()
+        for receipt, expected in [
+            ({"installed": True, "enabled": True, "trustRecorded": False,
+              "execution": "not_observed", "status": None}, DesktopSessionStartStatus(True, True, False)),
+            ({"execution": "observed", "status": "unexpected"}, DesktopSessionStartStatus(execution="invalid")),
+            ({"installed": True, "enabled": True, "trustRecorded": True, "execution": "observed",
+              "status": "handoff_accepted", "timestamp": "2026-10-24T01:00:00Z", "pid": True},
+             DesktopSessionStartStatus(execution="invalid")),
+        ]:
+            with self.subTest(receipt=receipt), patch.object(checker, "_request_json", return_value={
+                "ready": True, "pipeSource": "handoff", "pipeState": "active", "sessionStart": receipt,
+            }):
+                result = checker.desktop_capability_status()
+                self.assertTrue(result.ready)
+                self.assertEqual(result.session_start, expected)
+
+    def test_stale_pipe_does_not_reuse_the_last_accepted_handoff_as_readiness(self) -> None:
+        checker = StatusChecker()
+        with patch.object(checker, "_request_json", return_value={
+            "ready": False, "pipeSource": None, "pipeState": "stale",
+            "sessionStart": {"installed": True, "enabled": True, "trustRecorded": True,
+                             "execution": "observed", "status": "handoff_accepted",
+                             "timestamp": "2026-10-24T01:00:00Z", "pid": 123},
+        }):
+            result = checker.desktop_capability_status()
+            self.assertFalse(result.ready)
+            self.assertEqual(result.pipe_state, "stale")
+            self.assertEqual(result.session_start.status, "handoff_accepted")
+
     def test_capability_timeline_parses_recent_events_and_uses_authenticated_endpoint(self) -> None:
         checker = StatusChecker(auth_token="secret")
         payload = {

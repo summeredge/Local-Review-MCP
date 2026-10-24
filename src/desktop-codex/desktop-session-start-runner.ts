@@ -1,4 +1,6 @@
 import { loadSettings } from "../config/settings.js";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { CODEX_APP_TOOLS_PIPE_ENV } from "./codex-app-runtime.js";
 import {
   DesktopToolsPipeHandoffError,
@@ -22,6 +24,22 @@ export interface DesktopSessionStartRunnerDependencies {
 
 const DEFAULT_HANDOFF_TIMEOUT_MS = 5000;
 
+/** Only status evidence is durable; capability values and credentials stay in memory. */
+export function recordDesktopSessionStartStatus(args: readonly string[], status: DesktopSessionStartHandoffStatus): void {
+  const configIndex = args.indexOf("--config");
+  const root = configIndex >= 0 && args[configIndex + 1] !== undefined
+    ? dirname(resolve(args[configIndex + 1]!)) : process.cwd();
+  const path = join(root, ".lrm", "desktop-session-start-status.json");
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const temporary = `${path}.${process.pid}.tmp`;
+    writeFileSync(temporary, JSON.stringify({ status, timestamp: new Date().toISOString(), pid: process.pid }));
+    renameSync(temporary, path);
+  } catch {
+    // Diagnostic I/O must never prevent native Desktop startup or capability handoff.
+  }
+}
+
 export async function runDesktopSessionStartHandoff(
   args: readonly string[] = [],
   dependencies: DesktopSessionStartRunnerDependencies = {},
@@ -30,6 +48,7 @@ export async function runDesktopSessionStartHandoff(
   const pipe = env[CODEX_APP_TOOLS_PIPE_ENV];
   // Diagnostics go to stderr so the hook's stdout stays free of non-JSON output for Codex.
   const log = dependencies.logStatus ?? ((status: DesktopSessionStartHandoffStatus) => {
+    recordDesktopSessionStartStatus(args, status);
     process.stderr.write(`${status}\n`);
   });
 
@@ -82,8 +101,9 @@ export async function runDesktopSessionStartHandoff(
     }
     if (error instanceof DesktopToolsPipeHandoffError) {
       if (error.code === "desktop_tools_pipe_unavailable") {
-        log("pipe_env_unavailable");
-        return "pipe_env_unavailable";
+        // The local environment was checked above; HTTP 409 means IPC is not ready yet.
+        log("host_unavailable");
+        return "host_unavailable";
       }
       if (error.code === "desktop_tools_pipe_request_failed") {
         log("host_unavailable");

@@ -17,3 +17,4 @@ LocalReviewLauncher/launcher.config.json
 /missing-cloudflared-home/
 /.review/p5-3-0-b-contract-probe/
 /.review/p5-4-1-first-turn-probe/
+/.lrm/

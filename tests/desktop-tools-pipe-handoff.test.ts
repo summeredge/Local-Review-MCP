@@ -529,6 +529,8 @@ it("automatically activates an ownerless conversation, promotes pending on owner
   stateListener!(state);
   const staleProbe = await fetch(probeUrl, { method: "POST", headers });
   expect(staleProbe.status).toBe(409);
+  const staleStatus = await fetch(readinessUrl, { headers });
+  expect(await staleStatus.json()).toMatchObject({ ready: false, pipeState: "stale", pipeSource: null });
   await new Promise<void>((resolve) => server.close(() => resolve()));
   const index = runningServers.indexOf(server);
   if (index >= 0) runningServers.splice(index, 1);

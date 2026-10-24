@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -6,6 +6,7 @@ import {
   buildLrmHookCommand,
   defaultPluginHooksFilePath,
   installLrmSessionStartHook,
+  inspectDesktopSessionStartRuntime,
   isLrmHookEntry,
   isLrmHookHandler,
   LRM_HOOK_MATCHER,
@@ -52,6 +53,75 @@ function readJson(path: string): Record<string, any> {
 
 /** The real plugin artifact this repository ships; the only production SessionStart entry. */
 const SHIPPED_PLUGIN_HOOKS_PATH = defaultPluginHooksFilePath(process.cwd());
+
+describe("Desktop SessionStart runtime diagnostics", () => {
+  function fixture() {
+    const codexHome = dirname(tempHooksPath());
+    const repoRoot = join(codexHome, "repo");
+    const statusFilePath = join(codexHome, "receipt.json");
+    return { codexHome, repoRoot, statusFilePath };
+  }
+
+  it("does not mistake the repository artifact for an installed plugin or execution", () => {
+    const options = fixture();
+    expect(inspectDesktopSessionStartRuntime(options)).toEqual({
+      installed: false, enabled: false, trustRecorded: false, execution: "not_observed",
+      status: null, timestamp: null, pid: null,
+    });
+  });
+
+  it("reads installation, enablement and trust independently without rewriting config", () => {
+    const options = fixture();
+    const hooks = join(options.codexHome, "plugins/cache/lrm-local/lrm-desktop-session-start/0.1.0/hooks");
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(join(hooks, "hooks.json"), readFileSync(SHIPPED_PLUGIN_HOOKS_PATH));
+    writeFileSync(join(hooks, "lrm-session-start-handoff.mjs"), "// fixture");
+    const configPath = join(options.codexHome, "config.toml");
+    const config = '[plugins."lrm-desktop-session-start@lrm-local"]\nenabled = true\n'
+      + '[hooks.state."lrm-desktop-session-start@lrm-local:hooks/hooks.json:session_start:0:0"]\n'
+      + 'trusted_hash = "sha256:test-record"\n';
+    writeFileSync(configPath, config);
+    expect(inspectDesktopSessionStartRuntime(options)).toMatchObject({ installed: true, enabled: true, trustRecorded: true });
+    expect(readFileSync(configPath, "utf8")).toBe(config);
+    writeFileSync(configPath, config.replace("enabled = true", "enabled = false"));
+    expect(inspectDesktopSessionStartRuntime(options)).toMatchObject({ installed: true, enabled: false, trustRecorded: true });
+    writeFileSync(configPath, '[plugins."lrm-desktop-session-start@lrm-local"]\nenabled = true\n');
+    expect(inspectDesktopSessionStartRuntime(options)).toMatchObject({ installed: true, enabled: true, trustRecorded: false });
+  });
+
+  it.each(["handoff_accepted", "handoff_pending", "pipe_env_unavailable", "host_unavailable", "handoff_rejected", "timeout"])(
+    "reports %s with only safe receipt fields", (status) => {
+      const options = fixture();
+      writeFileSync(options.statusFilePath, JSON.stringify({
+        status, timestamp: "2026-10-24T01:00:00.000Z", pid: 123,
+        extra: "must-not-be-returned",
+      }));
+      const result = inspectDesktopSessionStartRuntime(options);
+      expect(result).toMatchObject({ execution: "observed", status, timestamp: "2026-10-24T01:00:00.000Z", pid: 123 });
+      expect(JSON.stringify(result)).not.toContain("must-not-be-returned");
+    },
+  );
+
+  it("reads the agreed repository receipt path when no file override is provided", () => {
+    const options = fixture();
+    const evidenceDir = join(options.repoRoot, ".lrm");
+    mkdirSync(evidenceDir, { recursive: true });
+    writeFileSync(join(evidenceDir, "desktop-session-start-status.json"), JSON.stringify({
+      status: "pipe_env_unavailable", timestamp: "2026-10-24T01:00:00Z", pid: 123,
+    }));
+    expect(inspectDesktopSessionStartRuntime({ repoRoot: options.repoRoot, codexHome: options.codexHome }))
+      .toMatchObject({ execution: "observed", status: "pipe_env_unavailable" });
+  });
+
+  it.each(["{broken", "[]", '{"status":"unrecognized"}',
+    JSON.stringify({ status: "handoff_accepted", timestamp: "invalid", pid: 1 }),
+    JSON.stringify({ status: "handoff_accepted", timestamp: "2026-10-24T01:00:00Z", pid: 0 }),
+  ])("fails closed for invalid execution evidence", (raw) => {
+    const options = fixture();
+    writeFileSync(options.statusFilePath, raw);
+    expect(inspectDesktopSessionStartRuntime(options)).toMatchObject({ execution: "invalid", status: null, timestamp: null, pid: null });
+  });
+});
 
 function lrmLegacyEntry(): Record<string, unknown> {
   return { matcher: LRM_HOOK_MATCHER, hooks: [lrmShapedHandler()] };

@@ -62,12 +62,45 @@ function runner(
     standaloneBackend: { storageRoot: "doctor-storage" },
     appServerProbe: async () => ({ status: "PASS" }),
     trampolineProbe: () => ({ status: "PASS" }),
+    sessionStartProbe: () => ({ installed: true, enabled: true, trustRecorded: true, execution: "observed",
+      status: "handoff_accepted", timestamp: "2026-10-24T01:00:00.000Z", pid: 123 }),
     ...overrides,
   });
   return { result, snapshot, snapshotReader };
 }
 
 describe("DoctorRunner", () => {
+  it("does not treat an old accepted receipt as current capability", async () => {
+    const { settings, registry } = await setup();
+    const { result } = runner(settings, registry, {
+      handoff: { stateFor: () => "unavailable", hasAcceptedCapability: () => true },
+    });
+    const report = await result.run();
+    expect(report.checks.find((check) => check.component === "Desktop SessionStart"))
+      .toMatchObject({ status: "WARN", reason: "session_start_receipt_historical" });
+  });
+  it.each([
+    [{ installed: false }, "session_start_not_installed"],
+    [{ enabled: false }, "session_start_disabled"],
+    [{ trustRecorded: false }, "session_start_trust_not_recorded"],
+    [{ execution: "not_observed", status: null }, "session_start_not_observed"],
+    [{ execution: "invalid", status: null }, "session_start_evidence_invalid"],
+    [{ status: "pipe_env_unavailable" }, "pipe_env_unavailable"],
+    [{ status: "handoff_pending" }, "handoff_pending"],
+    [{ status: "handoff_rejected" }, "handoff_rejected"],
+    [{ status: "host_unavailable" }, "host_unavailable"],
+    [{ status: "timeout" }, "timeout"],
+  ] as const)("reports the SessionStart blocker independently", async (changes, reason) => {
+    const { settings, registry } = await setup();
+    const { result } = runner(settings, registry, {
+      sessionStartProbe: () => ({ installed: true, enabled: true, trustRecorded: true,
+        execution: "observed", status: "handoff_accepted", timestamp: "2026-10-24T01:00:00Z", pid: 123, ...changes }),
+    });
+    const report = await result.run();
+    expect(report.checks.find((check) => check.component === "Desktop SessionStart")).toMatchObject({ status: "WARN", reason });
+    expect(report.checks.find((check) => check.component === "Desktop Handoff")?.status).toBe("PASS");
+  });
+
   it("returns READY without executing a provider, changing capability, or selecting fallback", async () => {
     const { settings, registry } = await setup();
     const start = vi.fn();
@@ -78,7 +111,7 @@ describe("DoctorRunner", () => {
     const report = await result.run();
     expect(report.status).toBe("READY");
     expect(report.checks.map((check) => check.component)).toEqual([
-      "MCP Runtime", "Desktop IPC", "Desktop Handoff", "Desktop Trampoline", "Standalone Backend", "Codex App Server",
+      "MCP Runtime", "Desktop IPC", "Desktop Handoff", "Desktop SessionStart", "Desktop Trampoline", "Standalone Backend", "Codex App Server",
     ]);
     expect(report.checks.every((check) => check.status === "PASS")).toBe(true);
     expect(start).not.toHaveBeenCalled();

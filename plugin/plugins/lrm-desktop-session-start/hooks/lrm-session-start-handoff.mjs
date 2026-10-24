@@ -8,6 +8,7 @@
 
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { spawn } from "node:child_process";
 
 const repoRoot = process.argv[2];
 if (typeof repoRoot !== "string" || repoRoot.trim() === "") {
@@ -21,7 +22,15 @@ const configPath = join(repoRoot, "config.production.json");
 try {
   const { runDesktopSessionStartHandoff } = await import(pathToFileURL(runnerPath).href);
   await runDesktopSessionStartHandoff(["--config", configPath]);
+  if (process.env.CODEX_APP_TOOLS_PIPE_PATH) {
+    const worker = spawn(process.execPath, [
+      join(repoRoot, "dist", "src", "desktop-codex", "desktop-session-start-maintainer.js"),
+      "--config", configPath,
+    ], { detached: true, windowsHide: true, stdio: "ignore", env: process.env });
+    worker.on("error", () => process.stderr.write("lrm session-start maintenance: spawn_failed\n"));
+    worker.unref();
+  }
 } catch (error) {
-  process.stderr.write(String(error) + "\n");
+  process.stderr.write("lrm session-start handoff: runner_failed\n");
   process.exit(1);
 }

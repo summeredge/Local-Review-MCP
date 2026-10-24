@@ -1,6 +1,94 @@
-import { copyFileSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { DesktopSessionStartHandoffStatus } from "./desktop-session-start-runner.js";
+
+export interface DesktopSessionStartRuntimeOptions {
+  readonly repoRoot?: string;
+  readonly codexHome?: string;
+  readonly statusFilePath?: string;
+}
+
+export interface DesktopSessionStartRuntimeInspection {
+  readonly installed: boolean;
+  readonly enabled: boolean;
+  /** A trust record exists in Codex config; its private hash algorithm is not recomputed here. */
+  readonly trustRecorded: boolean;
+  readonly execution: "not_observed" | "observed" | "invalid";
+  readonly status: DesktopSessionStartHandoffStatus | null;
+  readonly timestamp: string | null;
+  readonly pid: number | null;
+}
+
+const SESSION_START_STATUSES: readonly DesktopSessionStartHandoffStatus[] = [
+  "handoff_accepted", "handoff_pending", "pipe_env_unavailable", "host_unavailable", "handoff_rejected", "timeout",
+];
+const LRM_PLUGIN_ID = "lrm-desktop-session-start@lrm-local";
+
+function sessionStartRepoRoot(): string {
+  let root = dirname(fileURLToPath(import.meta.url));
+  while (!existsSync(join(root, "package.json"))) {
+    const parent = dirname(root);
+    if (parent === root) throw new Error("lrm_repository_unavailable");
+    root = parent;
+  }
+  return root;
+}
+
+/** Reads Codex cache/config and the allowlisted execution receipt without changing trust state. */
+export function inspectDesktopSessionStartRuntime(
+  options: DesktopSessionStartRuntimeOptions = {},
+): DesktopSessionStartRuntimeInspection {
+  const codexHome = options.codexHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex");
+  const cache = join(codexHome, "plugins", "cache", "lrm-local", "lrm-desktop-session-start");
+  let installed = false;
+  try {
+    installed = readdirSync(cache, { withFileTypes: true }).some((version) => version.isDirectory()
+      && existsSync(join(cache, version.name, "hooks", "lrm-session-start-handoff.mjs"))
+      && inspectPluginHook(join(cache, version.name, "hooks", "hooks.json")).present);
+  } catch { /* Missing or unreadable cache is not installation evidence. */ }
+
+  let enabled = false;
+  let trustRecorded = false;
+  try {
+    let section = "";
+    for (const rawLine of readFileSync(join(codexHome, "config.toml"), "utf8").split(/\r?\n/u)) {
+      const line = rawLine.replace(/\s+#.*$/u, "").trim();
+      if (TABLE_HEADER.test(line)) section = line;
+      const pluginTable = /^\[\s*plugins\.(?:"([^"]+)"|'([^']+)')\s*\]$/u.exec(section);
+      if ((pluginTable?.[1] ?? pluginTable?.[2]) === LRM_PLUGIN_ID && /^enabled\s*=\s*true$/u.test(line)) {
+        enabled = true;
+      }
+      if (hookStateTableKey(section) === `${LRM_PLUGIN_ID}:hooks/hooks.json:session_start:0:0`
+        && /^trusted_hash\s*=\s*(?:"[^"]+"|'[^']+')$/u.test(line)) trustRecorded = true;
+    }
+  } catch { /* Unknown configuration must not be reported as enabled or trustRecorded. */ }
+
+  const base = { installed, enabled, trustRecorded, status: null, timestamp: null, pid: null };
+  let raw: string;
+  try {
+    raw = readFileSync(options.statusFilePath
+      ?? join(options.repoRoot ?? sessionStartRepoRoot(), ".lrm", "desktop-session-start-status.json"), "utf8");
+  } catch (error: unknown) {
+    return { ...base, execution: (error as NodeJS.ErrnoException).code === "ENOENT" ? "not_observed" : "invalid" };
+  }
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
+    const receipt = value as Record<string, unknown>;
+    if (!SESSION_START_STATUSES.includes(receipt.status as DesktopSessionStartHandoffStatus)
+      || typeof receipt.timestamp !== "string"
+      || !/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/u.test(receipt.timestamp)
+      || !Number.isFinite(Date.parse(receipt.timestamp))
+      || !Number.isSafeInteger(receipt.pid) || (receipt.pid as number) <= 0) throw new Error();
+    return { installed, enabled, trustRecorded, execution: "observed",
+      status: receipt.status as DesktopSessionStartHandoffStatus,
+      timestamp: receipt.timestamp, pid: receipt.pid as number };
+  } catch {
+    return { ...base, execution: "invalid" };
+  }
+}
 
 export const LRM_HOOK_STATUS_MESSAGE = "LRM Desktop session-start handoff";
 export const LRM_HOOK_MATCHER = "startup|resume|clear|compact";

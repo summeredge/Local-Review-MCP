@@ -44,6 +44,7 @@ from status_checker import (
     CapabilityStatus,
     CapabilityTimelineEvent,
     DesktopCapabilityStatus,
+    DesktopSessionStartStatus,
     DoctorCheckStatus,
     DoctorStatus,
     DesktopSyncStatus,
@@ -83,6 +84,35 @@ class FakeLocalServer:
 
 
 class LauncherLogTests(unittest.TestCase):
+    def test_session_start_installation_and_last_execution_are_distinct(self) -> None:
+        manager = Mock()
+        manager.load.return_value = LauncherConfig("C:/workspace", "config.production.json", False)
+        with patch("gui.ProductionProcessManager"), patch("gui.StatusChecker"), patch.object(
+            LauncherWindow, "refresh_status"
+        ), patch.object(LauncherWindow, "_render_runtime_info"):
+            window = LauncherWindow(Path.cwd(), manager)
+            self.addCleanup(window.close)
+            window.timer.stop()
+            for status, expected in [
+                (None, "未观测执行"), ("pipe_env_unavailable", "未获得 Pipe 环境"),
+                ("handoff_accepted", "已接受"), ("handoff_pending", "等待身份绑定"),
+                ("handoff_rejected", "交接被拒绝"), ("host_unavailable", "LRM 不可用"), ("timeout", "交接超时"),
+            ]:
+                with self.subTest(status=status):
+                    hook = DesktopSessionStartStatus(True, False, True,
+                        "observed" if status else "not_observed", status,
+                        "2026-10-24T01:00:00Z" if status else None, 123 if status else None)
+                    window._render_status(LauncherStatus(True, True, True,
+                        desktop_capability=DesktopCapabilityStatus(session_start=hook)))
+                    text = window.desktop_sync_status.text()
+                    self.assertIn("SessionStart：已安装 · 未启用 · 信任已记录", text)
+                    self.assertIn(f"最近交接：{expected}", text)
+                    self.assertIn("Tools Pipe：不可用", text)
+            window._render_status(LauncherStatus(True, True, True,
+                desktop_capability=DesktopCapabilityStatus(pipe_state="stale", session_start=hook)))
+            self.assertEqual(window.tools_pipe_status.text(), "已失效")
+            self.assertIn("Tools Pipe：已失效", window.desktop_sync_status.text())
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.application = QApplication.instance() or QApplication([])

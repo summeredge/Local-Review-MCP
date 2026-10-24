@@ -829,6 +829,7 @@ class LauncherWindow(QMainWindow):
         pipe_state = {
             "active": "活动",
             "pending": "等待中",
+            "stale": "已失效",
             "unavailable": "不可用",
         }.get(desktop_capability.pipe_state, "不可用")
         capability_state = (
@@ -861,7 +862,7 @@ class LauncherWindow(QMainWindow):
             self.tools_pipe_status,
             pipe_state,
             desktop_capability.pipe_state == "active",
-            warning=desktop_capability.pipe_state == "pending",
+            warning=desktop_capability.pipe_state in {"pending", "stale"},
         )
         self._set_status(
             self.pipe_source_status,
@@ -876,6 +877,27 @@ class LauncherWindow(QMainWindow):
             f"Tools Pipe：{pipe_state}",
             f"能力：{capability_state}",
         ]
+        hook = desktop_capability.session_start
+        if hook is not None:
+            def hook_flag(value: bool | None, positive: str, negative: str) -> str:
+                return "未知" if value is None else positive if value else negative
+
+            execution = {
+                "handoff_accepted": "已接受",
+                "handoff_pending": "等待身份绑定",
+                "pipe_env_unavailable": "未获得 Pipe 环境",
+                "host_unavailable": "LRM 不可用",
+                "handoff_rejected": "交接被拒绝",
+                "timeout": "交接超时",
+            }.get(hook.status, "证据无效" if hook.execution == "invalid" else "未观测执行")
+            capability_lines.extend([
+                "SessionStart：" + " · ".join([
+                    hook_flag(hook.installed, "已安装", "未安装"),
+                    hook_flag(hook.enabled, "已启用", "未启用"),
+                    hook_flag(hook.trust_recorded, "信任已记录", "无信任记录"),
+                ]),
+                f"最近交接：{execution}" + (f" · {self._format_timestamp(hook.timestamp)}" if hook.timestamp else ""),
+            ])
         if desktop_sync.active_source == "legacy_app_server":
             reason = {
                 "desktop_disconnected": "Desktop 不可用",

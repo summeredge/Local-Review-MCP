@@ -10,6 +10,25 @@ import {
 const VALID_PIPE = "\\\\.\\pipe\\codex-tools-test";
 
 describe("Desktop SessionStart Runner", () => {
+  it("keeps IPC startup HTTP 409 retryable instead of claiming the inherited pipe is missing", async () => {
+    const status = await runDesktopSessionStartHandoff(["--config", "config.production.json"], {
+      environment: { CODEX_APP_TOOLS_PIPE_PATH: VALID_PIPE },
+      fetch: vi.fn().mockResolvedValue({ ok: false, status: 409,
+        json: async () => ({ error: "desktop_tools_pipe_unavailable" }) }),
+      logStatus: () => {},
+    });
+    expect(status).toBe("host_unavailable");
+  });
+
+  it.each([401, 403])("reports HTTP %s as authorization rejection", async (httpStatus) => {
+    const status = await runDesktopSessionStartHandoff(["--config", "config.production.json"], {
+      environment: { CODEX_APP_TOOLS_PIPE_PATH: VALID_PIPE },
+      fetch: vi.fn().mockResolvedValue({ ok: false, status: httpStatus,
+        json: async () => ({ error: "unauthorized" }) }),
+      logStatus: () => {},
+    });
+    expect(status).toBe("handoff_rejected");
+  });
   it("exits with pipe_env_unavailable when CODEX_APP_TOOLS_PIPE_PATH is not in environment", async () => {
     const logged: DesktopSessionStartHandoffStatus[] = [];
     const status = await runDesktopSessionStartHandoff([], {

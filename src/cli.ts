@@ -48,6 +48,7 @@ import {
 } from "./desktop-codex/desktop-tools-pipe-handoff.js";
 import {
   installLrmSessionStartHook,
+  inspectDesktopSessionStartRuntime,
   migrateLrmSessionStartHookRegistration,
   uninstallLrmSessionStartHook,
 } from "./desktop-codex/desktop-hook-installer.js";
@@ -177,8 +178,11 @@ try {
   } else if (argv[0] === "desktop-session-start-hook-status"
     || argv[0] === "install-desktop-session-start-hook") {
     const result = installLrmSessionStartHook();
-    console.log(JSON.stringify(result, null, 2));
-    if (!result.ok) process.exitCode = 1;
+    const runtime = inspectDesktopSessionStartRuntime();
+    const ok = result.ok && runtime.installed && runtime.enabled
+      && (runtime.status === "handoff_accepted" || runtime.status === "handoff_pending");
+    console.log(JSON.stringify({ ...result, ok, runtime }, null, 2));
+    if (!ok) process.exitCode = 1;
   } else if (argv[0] === "uninstall-desktop-session-start-hook") {
     const result = uninstallLrmSessionStartHook();
     console.log(JSON.stringify(result, null, 2));

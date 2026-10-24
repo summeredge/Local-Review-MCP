@@ -16,6 +16,11 @@ import type {
   DesktopToolsPipeSource,
 } from "../desktop-codex/desktop-tools-pipe-resolver.js";
 import type { WorkspaceSelection } from "../workspace/registry.js";
+import {
+  inspectDesktopSessionStartRuntime,
+  type DesktopSessionStartRuntimeInspection,
+  type DesktopSessionStartRuntimeOptions,
+} from "../desktop-codex/desktop-hook-installer.js";
 
 export interface DoctorCheck {
   component: string;
@@ -71,6 +76,8 @@ export interface DoctorRunnerOptions {
   readonly runtimeRunning?: boolean;
   readonly runtimeCheck?: () => DoctorRuntimeCheck;
   readonly trampolineProbe?: () => DoctorProbeResult;
+  readonly sessionStartProbe?: () => DesktopSessionStartRuntimeInspection;
+  readonly sessionStartOptions?: DesktopSessionStartRuntimeOptions;
   readonly environment?: NodeJS.ProcessEnv;
   readonly now?: () => number;
 }
@@ -286,6 +293,7 @@ export class DoctorRunner {
     checks.push(await this.check("MCP Runtime", () => this.checkMcpRuntime()));
     checks.push(await this.check("Desktop IPC", () => this.checkDesktopIpc()));
     checks.push(await this.check("Desktop Handoff", () => this.checkDesktopHandoff()));
+    checks.push(await this.check("Desktop SessionStart", () => this.checkDesktopSessionStart()));
     checks.push(await this.check("Desktop Trampoline", () => this.checkDesktopTrampoline()));
     checks.push(await this.check("Standalone Backend", () => this.checkStandaloneBackend(appServerProbe)));
     checks.push(await this.check("Codex App Server", appServerProbe));
@@ -394,6 +402,22 @@ export class DoctorRunner {
   private checkDesktopTrampoline(): DoctorProbeResult {
     return this.options.trampolineProbe?.()
       ?? inspectTrampoline(this.environment, DEFAULT_TRAMPOLINE_ROOT);
+  }
+
+  private checkDesktopSessionStart(): DoctorProbeResult {
+    const inspection = this.options.sessionStartProbe?.()
+      ?? inspectDesktopSessionStartRuntime(this.options.sessionStartOptions);
+    const details = { ...inspection };
+    const reason = !inspection.installed ? "session_start_not_installed"
+      : !inspection.enabled ? "session_start_disabled"
+      : !inspection.trustRecorded ? "session_start_trust_not_recorded"
+      : inspection.execution === "not_observed" ? "session_start_not_observed"
+      : inspection.execution === "invalid" ? "session_start_evidence_invalid"
+      : inspection.status === "handoff_accepted"
+        ? this.options.handoff?.stateFor(this.options.desktopState()) === "active"
+          ? undefined : "session_start_receipt_historical"
+      : inspection.status ?? "session_start_not_observed";
+    return reason === undefined ? { status: "PASS", details } : { status: "WARN", reason, details };
   }
 
   private async checkStandaloneBackend(appServerProbe: () => Promise<DoctorProbeResult>): Promise<DoctorProbeResult> {

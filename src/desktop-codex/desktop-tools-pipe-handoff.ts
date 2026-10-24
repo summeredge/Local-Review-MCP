@@ -13,6 +13,7 @@ export type DesktopToolsPipeHandoffErrorCode =
   | "desktop_tools_pipe_invalid"
   | "desktop_tools_pipe_unavailable"
   | "desktop_tools_pipe_request_failed"
+  | "desktop_tools_pipe_rejected"
   | "desktop_tools_pipe_probe_failed";
 
 export class DesktopToolsPipeHandoffError extends Error {
@@ -409,6 +410,9 @@ export async function sendDesktopToolsPipeHandoff(
     );
   }
   if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new DesktopToolsPipeHandoffError("desktop_tools_pipe_rejected", "The local handoff was not authorized.");
+    }
     const code = responseError(body);
     throw new DesktopToolsPipeHandoffError(code, "The local desktop tools pipe handoff was not accepted.");
   }

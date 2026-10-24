@@ -32,6 +32,7 @@ import {
   type DesktopCodexRuntimeProvider,
 } from "../desktop-codex/desktop-tools-pipe-probe.js";
 import type { DesktopInteractiveReadiness } from "../desktop-codex/desktop-interactive-preflight.js";
+import { inspectDesktopSessionStartRuntime } from "../desktop-codex/desktop-hook-installer.js";
 import {
   capabilityActionSchema,
   type CapabilityNegotiator,
@@ -432,11 +433,12 @@ async function handleLauncherDesktopInteractivePreflightRequest(
   } catch {
     readiness = { ready: false, reason: "desktop_tools_pipe_unavailable" };
   }
-  let pipeState: DesktopToolsPipeHandoffState = readiness.ready ? "active" : "unavailable";
+  let pipeState: DesktopToolsPipeHandoffState | "stale" = readiness.ready ? "active" : "unavailable";
   if (!readiness.ready && context.desktopToolsPipeHandoff !== undefined) {
     try {
       const state = context.desktopSyncObserver?.getState();
       if (state !== undefined) pipeState = context.desktopToolsPipeHandoff.stateFor(state);
+      if (pipeState === "unavailable" && context.desktopToolsPipeHandoff.hasAcceptedCapability()) pipeState = "stale";
     } catch {
       pipeState = "unavailable";
     }
@@ -447,6 +449,7 @@ async function handleLauncherDesktopInteractivePreflightRequest(
     reason: readiness.reason ?? null,
     pipeSource: readiness.pipeSource ?? null,
     pipeState,
+    sessionStart: inspectDesktopSessionStartRuntime(),
   }, { "cache-control": "no-store" });
 }
 

@@ -235,6 +235,17 @@ class DesktopSyncStatus:
 
 
 @dataclass(frozen=True)
+class DesktopSessionStartStatus:
+    installed: bool | None = None
+    enabled: bool | None = None
+    trust_recorded: bool | None = None
+    execution: str = "not_observed"
+    status: str | None = None
+    timestamp: str | None = None
+    pid: int | None = None
+
+
+@dataclass(frozen=True)
 class DesktopCapabilityStatus:
     """Read-only Desktop codex_app capability, read from /launcher/desktop-interactive.
 
@@ -246,6 +257,7 @@ class DesktopCapabilityStatus:
     ready: bool = False
     pipe_source: str | None = None
     pipe_state: str = "unavailable"
+    session_start: DesktopSessionStartStatus | None = None
 
 
 @dataclass(frozen=True)
@@ -352,6 +364,28 @@ def _rfc3339_timestamp(value: object, label: str) -> str:
     if "T" not in text or parsed.tzinfo is None:
         raise StatusQueryError(f"{label} must be an RFC3339 timestamp")
     return text
+
+
+def _session_start_status(value: object) -> DesktopSessionStartStatus:
+    try:
+        document = _object(value, "SessionStart")
+        flags = [document.get(key) for key in ("installed", "enabled", "trustRecorded")]
+        if any(type(flag) is not bool for flag in flags):
+            raise StatusQueryError("SessionStart flags must be booleans")
+        execution = _status(document.get("execution"), "execution", frozenset({"not_observed", "observed", "invalid"}))
+        status = timestamp = pid = None
+        if execution == "observed":
+            status = _status(document.get("status"), "SessionStart status", frozenset({
+                "handoff_accepted", "handoff_pending", "pipe_env_unavailable",
+                "host_unavailable", "handoff_rejected", "timeout",
+            }))
+            timestamp = _rfc3339_timestamp(document.get("timestamp"), "SessionStart timestamp")
+            pid = document.get("pid")
+            if type(pid) is not int or pid <= 0:
+                raise StatusQueryError("SessionStart pid must be positive")
+        return DesktopSessionStartStatus(*flags, execution, status, timestamp, pid)
+    except StatusQueryError:
+        return DesktopSessionStartStatus(execution="invalid")
 
 
 def _optional_rfc3339_timestamp(value: object, label: str) -> str | None:
@@ -754,6 +788,7 @@ class StatusChecker:
             if type(ready) is not bool:
                 raise StatusQueryError("ready must be a boolean")
             source_value = document["pipeSource"]
+            session_start = _session_start_status(document["sessionStart"]) if "sessionStart" in document else None
             pipe_state_value = document.get("pipeState")
             pipe_state = (
                 ("active" if ready else "unavailable")
@@ -761,13 +796,13 @@ class StatusChecker:
                 else _status(
                     pipe_state_value,
                     "pipeState",
-                    frozenset({"active", "pending", "unavailable"}),
+                    frozenset({"active", "pending", "stale", "unavailable"}),
                 )
             )
             if not ready:
                 if source_value is not None:
                     raise StatusQueryError("Unavailable Desktop capability has a pipe source")
-                return DesktopCapabilityStatus(pipe_state=pipe_state)
+                return DesktopCapabilityStatus(pipe_state=pipe_state, session_start=session_start)
             if pipe_state != "active":
                 raise StatusQueryError("Ready Desktop capability must have an active pipe")
             return DesktopCapabilityStatus(
@@ -778,6 +813,7 @@ class StatusChecker:
                     frozenset({"handoff", "current_environment"}),
                 ),
                 pipe_state=pipe_state,
+                session_start=session_start,
             )
         except StatusQueryError:
             return DesktopCapabilityStatus()

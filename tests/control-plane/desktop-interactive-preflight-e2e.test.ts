@@ -312,12 +312,13 @@ describe("production interactive Desktop preflight", () => {
     );
     expect(response.status).toBe(200);
     const body = await response.json() as Record<string, unknown>;
-    expect(body).toEqual({
+    expect(body).toMatchObject({
       ready: false,
       reason: "desktop_tools_pipe_unavailable",
       pipeSource: null,
       pipeState: "unavailable",
     });
+    expect(body.sessionStart).toMatchObject({ installed: expect.any(Boolean), execution: expect.any(String) });
     expect(JSON.stringify(body)).not.toContain(PIPE_PREFIX);
 
     // The pipe handoff endpoint stays the only acquisition seam; the probe endpoint must not be
@@ -335,7 +336,7 @@ describe("production interactive Desktop preflight", () => {
       `http://127.0.0.1:${address.port}/launcher/desktop-interactive`,
       { headers: { authorization: "Bearer test-token" } },
     );
-    await expect(afterHandoff.json()).resolves.toEqual({
+    await expect(afterHandoff.json()).resolves.toMatchObject({
       ready: true,
       reason: null,
       pipeSource: "handoff",
